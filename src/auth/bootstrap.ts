@@ -206,19 +206,26 @@ export async function authorizeRecoveryAndIssueGrant({
 		throw new AuthError("RECOVERY_CODE_INVALID", "Invalid recovery code");
 	}
 
-	// 4. Issue RECOVERY enrollment grant
-	const grantResult = await issueEnrollmentGrant({
-		db,
-		userId: singletonUser.id,
-		purpose: "RECOVERY",
-		recoveryCodeId: activeCode.id,
-	});
+	// 4. Issue RECOVERY enrollment grant (with transaction safety & source revalidation)
+	try {
+		const grantResult = await issueEnrollmentGrant({
+			db,
+			userId: singletonUser.id,
+			purpose: "RECOVERY",
+			recoveryCodeId: activeCode.id,
+		});
 
-	return {
-		user: {
-			id: singletonUser.id,
-			displayName: singletonUser.displayName,
-		},
-		enrollmentGrant: grantResult.token,
-	};
+		return {
+			user: {
+				id: singletonUser.id,
+				displayName: singletonUser.displayName,
+			},
+			enrollmentGrant: grantResult.token,
+		};
+	} catch (err: unknown) {
+		if (err instanceof Error && err.message === "RECOVERY_SOURCE_INVALID") {
+			throw new AuthError("RECOVERY_CODE_INVALID", "Invalid recovery code");
+		}
+		throw err;
+	}
 }

@@ -1,6 +1,10 @@
 import { and, eq, isNull } from "drizzle-orm";
 import type { Database } from "../db/client";
-import { authRecoveryCodes } from "../db/schema/auth";
+import {
+	authEnrollmentGrants,
+	authRecoveryCodes,
+	users,
+} from "../db/schema/auth";
 
 export const RECOVERY_CODE_BYTES = 24; // 192 bits of entropy
 export const RECOVERY_CODE_CANONICAL_LENGTH = 32; // 24 bytes unpadded base64url is 32 chars
@@ -82,12 +86,13 @@ export interface RotateRecoveryCodeParams {
 }
 
 /**
- * Rotates the recovery code for a user.
- * Transactional:
- * 1. Revokes any existing active recovery code for the user
- * 2. Generates new high-entropy code
- * 3. Persists only the SHA-256 hash
- * 4. Returns canonical & display codes to caller once
+ * Rotates the recovery code for a user inside an atomic transaction.
+ * User-level serialization:
+ * 1. Locks the user row using FOR UPDATE
+ * 2. Revokes all active recovery codes for the user
+ * 3. Revokes all pending RECOVERY enrollment grants for the user (invalidating stale grants)
+ * 4. Inserts the new recovery code hash
+ * 5. Returns canonical & display codes to caller once
  */
 export async function rotateRecoveryCode({
 	db,
@@ -97,37 +102,64 @@ export async function rotateRecoveryCode({
 	const generated = generateRecoveryCode();
 	const codeHash = await hashRecoveryCode(generated.canonical);
 
-	// 1. Revoke existing active codes for user
-	await db
-		.update(authRecoveryCodes)
-		.set({ revokedAt: now })
-		.where(
-			and(
-				eq(authRecoveryCodes.userId, userId),
-				isNull(authRecoveryCodes.consumedAt),
-				isNull(authRecoveryCodes.revokedAt),
-			),
-		);
+	return await db.transaction(async (tx) => {
+		// 1. Lock user row FOR UPDATE
+		const [user] = await tx
+			.select({ id: users.id })
+			.from(users)
+			.where(eq(users.id, userId))
+			.for("update")
+			.limit(1);
 
-	// 2. Insert new code hash
-	const [created] = await db
-		.insert(authRecoveryCodes)
-		.values({
-			userId,
-			codeHash,
-			createdAt: now,
-		})
-		.returning();
+		if (!user) {
+			throw new Error("User not found during recovery code rotation");
+		}
 
-	if (!created) {
-		throw new Error("Failed to create recovery code row");
-	}
+		// 2. Revoke existing active recovery codes for user
+		await tx
+			.update(authRecoveryCodes)
+			.set({ revokedAt: now })
+			.where(
+				and(
+					eq(authRecoveryCodes.userId, userId),
+					isNull(authRecoveryCodes.consumedAt),
+					isNull(authRecoveryCodes.revokedAt),
+				),
+			);
 
-	return {
-		canonical: generated.canonical,
-		display: generated.display,
-		recoveryCodeId: created.id,
-	};
+		// 3. Revoke all pending RECOVERY enrollment grants for this user
+		await tx
+			.update(authEnrollmentGrants)
+			.set({ revokedAt: now })
+			.where(
+				and(
+					eq(authEnrollmentGrants.userId, userId),
+					eq(authEnrollmentGrants.purpose, "RECOVERY"),
+					isNull(authEnrollmentGrants.consumedAt),
+					isNull(authEnrollmentGrants.revokedAt),
+				),
+			);
+
+		// 4. Insert new code hash
+		const [created] = await tx
+			.insert(authRecoveryCodes)
+			.values({
+				userId,
+				codeHash,
+				createdAt: now,
+			})
+			.returning();
+
+		if (!created) {
+			throw new Error("Failed to create recovery code row");
+		}
+
+		return {
+			canonical: generated.canonical,
+			display: generated.display,
+			recoveryCodeId: created.id,
+		};
+	});
 }
 
 export interface FindActiveRecoveryCodeByHashParams {

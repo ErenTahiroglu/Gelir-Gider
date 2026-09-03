@@ -83,38 +83,49 @@ describe("Bootstrap Authorization Service", () => {
 			authInitializedAt: null,
 		};
 
+		const mockTx = {
+			select: vi.fn().mockReturnValue({
+				from: vi.fn().mockReturnValue({
+					where: vi.fn().mockReturnValue({
+						for: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([{ id: "user-1" }]),
+						}),
+					}),
+				}),
+			}),
+			update: vi.fn().mockReturnValue({
+				set: vi.fn().mockReturnValue({
+					where: vi.fn().mockResolvedValue([]),
+				}),
+			}),
+			insert: vi.fn().mockReturnValue({
+				values: vi.fn().mockReturnValue({
+					returning: vi.fn().mockResolvedValue([
+						{
+							id: "grant-1",
+							userId: "user-1",
+							purpose: "BOOTSTRAP",
+						},
+					]),
+				}),
+			}),
+		};
+
 		const mockDb = {
 			select: vi.fn().mockReturnValue({
 				from: vi.fn().mockReturnValue({
 					limit: vi.fn().mockResolvedValue([]), // No user initially
 				}),
 			}),
-			insert: vi
-				.fn()
-				// 1st insert: user
-				.mockReturnValueOnce({
-					values: vi.fn().mockReturnValue({
-						onConflictDoNothing: vi.fn().mockReturnValue({
-							returning: vi.fn().mockResolvedValue([mockCreatedUser]),
-						}),
-					}),
-				})
-				// 2nd insert: grant
-				.mockReturnValueOnce({
-					values: vi.fn().mockReturnValue({
-						returning: vi.fn().mockResolvedValue([
-							{
-								id: "grant-1",
-								userId: "user-1",
-								purpose: "BOOTSTRAP",
-							},
-						]),
+			insert: vi.fn().mockReturnValue({
+				values: vi.fn().mockReturnValue({
+					onConflictDoNothing: vi.fn().mockReturnValue({
+						returning: vi.fn().mockResolvedValue([mockCreatedUser]),
 					}),
 				}),
-			update: vi.fn().mockReturnValue({
-				set: vi.fn().mockReturnValue({
-					where: vi.fn().mockResolvedValue([]),
-				}),
+			}),
+			transaction: vi.fn().mockImplementation(async (callback) => {
+				return await callback(mockTx);
 			}),
 		} as unknown as Database;
 
@@ -129,6 +140,7 @@ describe("Bootstrap Authorization Service", () => {
 		expect(result.user.displayName).toBe("Eren");
 		expect(result.enrollmentGrant).toBeDefined();
 		expect(result.enrollmentGrant.length).toBe(43);
+		expect(mockDb.transaction).toHaveBeenCalled();
 	});
 
 	it("issues grant for existing uninitialized user", async () => {
@@ -138,10 +150,19 @@ describe("Bootstrap Authorization Service", () => {
 			authInitializedAt: null,
 		};
 
-		const mockDb = {
+		const mockTx = {
 			select: vi.fn().mockReturnValue({
 				from: vi.fn().mockReturnValue({
-					limit: vi.fn().mockResolvedValue([mockExistingUser]),
+					where: vi.fn().mockReturnValue({
+						for: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([{ id: "user-existing" }]),
+						}),
+					}),
+				}),
+			}),
+			update: vi.fn().mockReturnValue({
+				set: vi.fn().mockReturnValue({
+					where: vi.fn().mockResolvedValue([]),
 				}),
 			}),
 			insert: vi.fn().mockReturnValue({
@@ -155,10 +176,16 @@ describe("Bootstrap Authorization Service", () => {
 					]),
 				}),
 			}),
-			update: vi.fn().mockReturnValue({
-				set: vi.fn().mockReturnValue({
-					where: vi.fn().mockResolvedValue([]),
+		};
+
+		const mockDb = {
+			select: vi.fn().mockReturnValue({
+				from: vi.fn().mockReturnValue({
+					limit: vi.fn().mockResolvedValue([mockExistingUser]),
 				}),
+			}),
+			transaction: vi.fn().mockImplementation(async (callback) => {
+				return await callback(mockTx);
 			}),
 		} as unknown as Database;
 
@@ -171,6 +198,7 @@ describe("Bootstrap Authorization Service", () => {
 
 		expect(result.user.id).toBe("user-existing");
 		expect(result.enrollmentGrant).toBeDefined();
+		expect(mockDb.transaction).toHaveBeenCalled();
 	});
 
 	it("rejects with BOOTSTRAP_ALREADY_COMPLETED when instance is already initialized", async () => {

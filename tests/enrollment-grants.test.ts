@@ -26,8 +26,7 @@ describe("Enrollment Grants Service", () => {
 		expect(hash1).not.toBe(token);
 	});
 
-	it("issues grant: revokes existing active grant for same user & purpose, stores hash only, sets 10m TTL", async () => {
-		const revokedWhereCalls: unknown[] = [];
+	it("issues grant inside transaction: locks user FOR UPDATE, revokes existing active grant for same user & purpose, stores hash only, sets 10m TTL", async () => {
 		let capturedInsertValues: {
 			userId?: string;
 			purpose?: string;
@@ -35,13 +34,19 @@ describe("Enrollment Grants Service", () => {
 			expiresAt?: Date;
 		} = {};
 
-		const mockDb = {
+		const mockTx = {
+			select: vi.fn().mockReturnValue({
+				from: vi.fn().mockReturnValue({
+					where: vi.fn().mockReturnValue({
+						for: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([{ id: "user-1" }]),
+						}),
+					}),
+				}),
+			}),
 			update: vi.fn().mockReturnValue({
 				set: vi.fn().mockReturnValue({
-					where: vi.fn().mockImplementation((whereCond) => {
-						revokedWhereCalls.push(whereCond);
-						return Promise.resolve();
-					}),
+					where: vi.fn().mockResolvedValue([]),
 				}),
 			}),
 			insert: vi.fn().mockReturnValue({
@@ -60,6 +65,12 @@ describe("Enrollment Grants Service", () => {
 					};
 				}),
 			}),
+		};
+
+		const mockDb = {
+			transaction: vi.fn().mockImplementation(async (callback) => {
+				return await callback(mockTx);
+			}),
 		} as unknown as Database;
 
 		const result = await issueEnrollmentGrant({
@@ -68,12 +79,14 @@ describe("Enrollment Grants Service", () => {
 			purpose: "BOOTSTRAP",
 		});
 
+		expect(mockDb.transaction).toHaveBeenCalled();
+		expect(mockTx.select).toHaveBeenCalled(); // Lock user
 		expect(result.token).toBeDefined();
 		expect(result.token.length).toBe(43);
 		expect(result.grant.id).toBe("grant-1");
 
 		// Prior active grant was revoked
-		expect(mockDb.update).toHaveBeenCalled();
+		expect(mockTx.update).toHaveBeenCalled();
 
 		// Hash stored in DB, not raw token
 		expect(capturedInsertValues.tokenHash).not.toBe(result.token);
@@ -89,6 +102,99 @@ describe("Enrollment Grants Service", () => {
 		expect(diffSeconds).toBeLessThanOrEqual(
 			AUTH_ENROLLMENT_GRANT_TTL_SECONDS + 5,
 		);
+	});
+
+	it("revalidates source recovery code inside transaction for RECOVERY grant: fails closed if invalid or revoked without mutating state", async () => {
+		const mockTx = {
+			select: vi
+				.fn()
+				// 1st select: lock user
+				.mockReturnValueOnce({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							for: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([{ id: "user-1" }]),
+							}),
+						}),
+					}),
+				})
+				// 2nd select: revalidate source recovery code (not found or revoked!)
+				.mockReturnValueOnce({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([]),
+						}),
+					}),
+				}),
+			update: vi.fn(),
+			insert: vi.fn(),
+		};
+
+		const mockDb = {
+			transaction: vi.fn().mockImplementation(async (callback) => {
+				return await callback(mockTx);
+			}),
+		} as unknown as Database;
+
+		await expect(
+			issueEnrollmentGrant({
+				db: mockDb,
+				userId: "user-1",
+				purpose: "RECOVERY",
+				recoveryCodeId: "revoked-rc-id",
+			}),
+		).rejects.toThrow("RECOVERY_SOURCE_INVALID");
+
+		expect(mockTx.update).not.toHaveBeenCalled();
+		expect(mockTx.insert).not.toHaveBeenCalled();
+	});
+
+	it("simulated insert failure rolls back and does not leave prior active grant revoked", async () => {
+		let priorGrantRevoked = false;
+
+		const mockTx = {
+			select: vi.fn().mockReturnValue({
+				from: vi.fn().mockReturnValue({
+					where: vi.fn().mockReturnValue({
+						for: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([{ id: "user-1" }]),
+						}),
+					}),
+				}),
+			}),
+			update: vi.fn().mockImplementation(() => {
+				priorGrantRevoked = true;
+				return {
+					set: vi.fn().mockReturnValue({
+						where: vi.fn().mockResolvedValue([]),
+					}),
+				};
+			}),
+			insert: vi.fn().mockImplementation(() => {
+				throw new Error("INSERT_GRANT_FAILED");
+			}),
+		};
+
+		const mockDb = {
+			transaction: vi.fn().mockImplementation(async (callback) => {
+				try {
+					return await callback(mockTx);
+				} catch (err) {
+					priorGrantRevoked = false;
+					throw err;
+				}
+			}),
+		} as unknown as Database;
+
+		await expect(
+			issueEnrollmentGrant({
+				db: mockDb,
+				userId: "user-1",
+				purpose: "BOOTSTRAP",
+			}),
+		).rejects.toThrow("INSERT_GRANT_FAILED");
+
+		expect(priorGrantRevoked).toBe(false);
 	});
 
 	it("consumes active grant atomically and returns row once, second consume fails", async () => {

@@ -1,6 +1,10 @@
 import { and, eq, gt, isNull } from "drizzle-orm";
 import type { Database } from "../db/client";
-import { authEnrollmentGrants } from "../db/schema/auth";
+import {
+	authEnrollmentGrants,
+	authRecoveryCodes,
+	users,
+} from "../db/schema/auth";
 
 export const AUTH_ENROLLMENT_GRANT_TTL_SECONDS = 10 * 60; // 10 minutes
 export const ENROLLMENT_GRANT_TOKEN_BYTES = 32;
@@ -48,9 +52,14 @@ export interface IssueEnrollmentGrantParams {
 }
 
 /**
- * Issues a new short-lived enrollment grant.
- * Revokes any previously active enrollment grant for this user and purpose.
- * Returns the raw one-time grant token to the caller.
+ * Issues a new short-lived enrollment grant inside an atomic transaction.
+ * User-level serialization:
+ * 1. Locks the user row using FOR UPDATE
+ * 2. If purpose is RECOVERY, re-validates that source recoveryCodeId is still active
+ *    (fails closed before any mutations if code is revoked/consumed/missing)
+ * 3. Revokes any existing active enrollment grant for this user and purpose
+ * 4. Inserts new enrollment grant
+ * 5. Returns the raw one-time grant token to caller
  */
 export async function issueEnrollmentGrant({
 	db,
@@ -59,21 +68,6 @@ export async function issueEnrollmentGrant({
 	recoveryCodeId,
 }: IssueEnrollmentGrantParams) {
 	const now = new Date();
-
-	// 1. Revoke any existing active grant for the same user and purpose
-	await db
-		.update(authEnrollmentGrants)
-		.set({ revokedAt: now })
-		.where(
-			and(
-				eq(authEnrollmentGrants.userId, userId),
-				eq(authEnrollmentGrants.purpose, purpose),
-				isNull(authEnrollmentGrants.consumedAt),
-				isNull(authEnrollmentGrants.revokedAt),
-			),
-		);
-
-	// 2. Generate raw token and hash
 	const rawToken = generateEnrollmentGrantToken();
 	const tokenHash = await hashEnrollmentGrantToken(rawToken);
 
@@ -81,26 +75,79 @@ export async function issueEnrollmentGrant({
 		now.getTime() + AUTH_ENROLLMENT_GRANT_TTL_SECONDS * 1000,
 	);
 
-	const [created] = await db
-		.insert(authEnrollmentGrants)
-		.values({
-			userId,
-			purpose,
-			tokenHash,
-			recoveryCodeId: purpose === "RECOVERY" ? (recoveryCodeId ?? null) : null,
-			createdAt: now,
-			expiresAt,
-		})
-		.returning();
+	return await db.transaction(async (tx) => {
+		// 1. Lock user row FOR UPDATE
+		const [user] = await tx
+			.select({ id: users.id })
+			.from(users)
+			.where(eq(users.id, userId))
+			.for("update")
+			.limit(1);
 
-	if (!created) {
-		throw new Error("Failed to create enrollment grant row");
-	}
+		if (!user) {
+			throw new Error("User not found during enrollment grant issuance");
+		}
 
-	return {
-		token: rawToken,
-		grant: created,
-	};
+		// 2. For RECOVERY grants: revalidate that source recovery code is still active inside transaction
+		if (purpose === "RECOVERY") {
+			if (!recoveryCodeId) {
+				throw new Error("RECOVERY_SOURCE_INVALID");
+			}
+
+			const [activeRecoveryCode] = await tx
+				.select({ id: authRecoveryCodes.id })
+				.from(authRecoveryCodes)
+				.where(
+					and(
+						eq(authRecoveryCodes.id, recoveryCodeId),
+						eq(authRecoveryCodes.userId, userId),
+						isNull(authRecoveryCodes.consumedAt),
+						isNull(authRecoveryCodes.revokedAt),
+					),
+				)
+				.limit(1);
+
+			if (!activeRecoveryCode) {
+				throw new Error("RECOVERY_SOURCE_INVALID");
+			}
+		}
+
+		// 3. Revoke any existing active grant for the same user and purpose
+		await tx
+			.update(authEnrollmentGrants)
+			.set({ revokedAt: now })
+			.where(
+				and(
+					eq(authEnrollmentGrants.userId, userId),
+					eq(authEnrollmentGrants.purpose, purpose),
+					isNull(authEnrollmentGrants.consumedAt),
+					isNull(authEnrollmentGrants.revokedAt),
+				),
+			);
+
+		// 4. Insert new enrollment grant
+		const [created] = await tx
+			.insert(authEnrollmentGrants)
+			.values({
+				userId,
+				purpose,
+				tokenHash,
+				recoveryCodeId:
+					purpose === "RECOVERY" ? (recoveryCodeId ?? null) : null,
+				createdAt: now,
+				expiresAt,
+			})
+			.returning();
+
+		if (!created) {
+			throw new Error("Failed to create enrollment grant row");
+		}
+
+		return {
+			token: rawToken,
+			grant: created,
+		};
+	});
 }
 
 export interface ConsumeActiveEnrollmentGrantParams {
