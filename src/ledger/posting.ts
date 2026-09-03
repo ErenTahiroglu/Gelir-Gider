@@ -52,7 +52,7 @@ interface NormalizedLine {
 
 /**
  * Computes a deterministic SHA-256 posting fingerprint (64 lowercase hex)
- * using the standard Web Crypto API.
+ * using versioned structured canonical array serialization and standard Web Crypto API.
  */
 export async function calculatePostingFingerprint(params: {
 	userId: string;
@@ -62,27 +62,25 @@ export async function calculatePostingFingerprint(params: {
 	source: JournalSourceInput | null;
 	lines: NormalizedLine[];
 }): Promise<string> {
-	const sourcePart = params.source
-		? `${params.source.type.trim()}:${params.source.ref.trim()}`
-		: "";
-
-	const linesPart = params.lines
-		.map(
-			(line) =>
-				`${line.accountId}:${line.side}:${line.amountNormalized}:${line.memo ?? ""}`,
-		)
-		.join("|");
-
-	const canonicalString = [
+	const canonicalPayload = [
+		"ledger-posting-v1",
 		params.userId,
 		params.occurredAt.toISOString(),
 		params.currency,
-		params.memo ?? "",
-		sourcePart,
-		linesPart,
-	].join("\n");
+		params.memo,
+		params.source
+			? [params.source.type.trim(), params.source.ref.trim()]
+			: null,
+		params.lines.map((line) => [
+			line.accountId,
+			line.side,
+			line.amountNormalized,
+			line.memo,
+		]),
+	];
 
-	const encoded = new TextEncoder().encode(canonicalString);
+	const serialized = JSON.stringify(canonicalPayload);
+	const encoded = new TextEncoder().encode(serialized);
 	const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
 	const hashArray = Array.from(new Uint8Array(hashBuffer));
 	return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");

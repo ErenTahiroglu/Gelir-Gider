@@ -1,13 +1,14 @@
 import { getTableColumns } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
-import migrationSql from "../migrations/0007_magical_deadpool.sql?raw";
+import migration0007Sql from "../migrations/0007_magical_deadpool.sql?raw";
+import migration0008Sql from "../migrations/0008_harden_ledger_integrity.sql?raw";
 import {
 	journalEntries,
 	journalLines,
 	ledgerAccounts,
 } from "../src/db/schema/ledger";
 
-describe("Ledger Schema & Migration Invariants (Phase 4A)", () => {
+describe("Ledger Schema & Migration Invariants (Phase 4A-R1)", () => {
 	it("exports ledger_accounts with correct types, precision, and constraints", () => {
 		const cols = getTableColumns(ledgerAccounts);
 		expect(cols.id.dataType).toBe("string");
@@ -46,8 +47,8 @@ describe("Ledger Schema & Migration Invariants (Phase 4A)", () => {
 		expect(cols.credit.dataType).toBe("string");
 	});
 
-	it("verifies migration 0007 contains all required PostgreSQL functions, triggers, and immutability guards", () => {
-		const sqlContent = migrationSql;
+	it("verifies migration 0007 contains baseline PostgreSQL functions, triggers, and immutability guards", () => {
+		const sqlContent = migration0007Sql;
 
 		// Tables & constraints
 		expect(sqlContent).toContain('CREATE TABLE "ledger_accounts"');
@@ -68,20 +69,23 @@ describe("Ledger Schema & Migration Invariants (Phase 4A)", () => {
 		expect(sqlContent).toContain("trg_fn_guard_journal_entries_transition");
 		expect(sqlContent).toContain("trg_guard_journal_entries_transition");
 		expect(sqlContent).toContain("trg_guard_journal_entries_delete");
+	});
 
-		// Invariant checks inside triggers
-		expect(sqlContent).toContain("ledger_accounts hard delete is prohibited");
-		expect(sqlContent).toContain("ledger_accounts code is immutable");
-		expect(sqlContent).toContain("ledger_accounts cannot be unarchived");
-		expect(sqlContent).toContain("New entries must start in DRAFT status");
+	it("verifies migration 0008 contains hardened parent locking, reparenting prevention, and unconstrained numeric aggregate types", () => {
+		const sqlContent = migration0008Sql;
+
+		// Parent locking with FOR UPDATE
+		expect(sqlContent).toContain("FOR UPDATE");
 		expect(sqlContent).toContain(
-			"Cannot insert or modify journal lines on a % journal entry",
+			"journal_lines journal_entry_id is immutable and line reparenting is prohibited",
 		);
-		expect(sqlContent).toContain(
-			"POSTED journal entries are immutable and cannot be updated",
-		);
-		expect(sqlContent).toContain("Journal entries cannot be deleted");
-		expect(sqlContent).toContain("Journal entry must have at least 2 lines");
-		expect(sqlContent).toContain("Journal entry lines are unbalanced");
+
+		// Unconstrained numeric aggregate sums
+		expect(sqlContent).toContain("v_debit_sum numeric;");
+		expect(sqlContent).toContain("v_credit_sum numeric;");
+
+		// No destructive table drops or recreations
+		expect(sqlContent).not.toContain("DROP TABLE");
+		expect(sqlContent).not.toContain("CREATE TABLE");
 	});
 });

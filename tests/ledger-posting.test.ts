@@ -94,6 +94,88 @@ describe("Ledger Posting Service (Phase 4A)", () => {
 
 			expect(fpDifferent).not.toBe(fp1);
 		});
+
+		it("prevents delimiter collision between ambiguous boundary fields (Adversarial Collision Test)", async () => {
+			const occurredAt = new Date("2026-09-03T12:00:00Z");
+			const commonLines = [
+				{
+					accountId: "acc-1",
+					side: "DEBIT" as const,
+					amountNormalized: "100.00",
+					cents: 10000n,
+					memo: "Line 1",
+				},
+				{
+					accountId: "acc-2",
+					side: "CREDIT" as const,
+					amountNormalized: "100.00",
+					cents: 10000n,
+					memo: "Line 2",
+				},
+			];
+
+			// Payload A: memo = "M\nX", source.type = "Y", source.ref = "Z"
+			const fpA = await calculatePostingFingerprint({
+				userId: "user-1",
+				occurredAt,
+				currency: "TRY",
+				memo: "M\nX",
+				source: { type: "Y", ref: "Z" },
+				lines: commonLines,
+			});
+
+			// Payload B: memo = "M", source.type = "X\nY", source.ref = "Z"
+			const fpB = await calculatePostingFingerprint({
+				userId: "user-1",
+				occurredAt,
+				currency: "TRY",
+				memo: "M",
+				source: { type: "X\nY", ref: "Z" },
+				lines: commonLines,
+			});
+
+			expect(fpA).not.toBe(fpB);
+		});
+
+		it("handles arbitrary delimiter characters in memos and sources deterministically", async () => {
+			const occurredAt = new Date("2026-09-03T12:00:00Z");
+			const specialLines = [
+				{
+					accountId: "acc-1",
+					side: "DEBIT" as const,
+					amountNormalized: "50.00",
+					cents: 5000n,
+					memo: 'Delimiters: | : \n \t " \\ special',
+				},
+				{
+					accountId: "acc-2",
+					side: "CREDIT" as const,
+					amountNormalized: "50.00",
+					cents: 5000n,
+					memo: null,
+				},
+			];
+
+			const fp1 = await calculatePostingFingerprint({
+				userId: "user-1",
+				occurredAt,
+				currency: "TRY",
+				memo: 'Memo with "quotes" and | pipes : colons \n newlines',
+				source: { type: "SRC:PIPE|", ref: 'REF"123\\' },
+				lines: specialLines,
+			});
+
+			const fp2 = await calculatePostingFingerprint({
+				userId: "user-1",
+				occurredAt,
+				currency: "TRY",
+				memo: 'Memo with "quotes" and | pipes : colons \n newlines',
+				source: { type: "SRC:PIPE|", ref: 'REF"123\\' },
+				lines: specialLines,
+			});
+
+			expect(fp1).toBe(fp2);
+		});
 	});
 
 	describe("postJournalEntry Input Validation", () => {
