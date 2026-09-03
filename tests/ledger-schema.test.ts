@@ -2,13 +2,14 @@ import { getTableColumns } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import migration0007Sql from "../migrations/0007_magical_deadpool.sql?raw";
 import migration0008Sql from "../migrations/0008_harden_ledger_integrity.sql?raw";
+import migration0009Sql from "../migrations/0009_serialize_ledger_account_state.sql?raw";
 import {
 	journalEntries,
 	journalLines,
 	ledgerAccounts,
 } from "../src/db/schema/ledger";
 
-describe("Ledger Schema & Migration Invariants (Phase 4A-R1)", () => {
+describe("Ledger Schema & Migration Invariants (Phase 4A-R2)", () => {
 	it("exports ledger_accounts with correct types, precision, and constraints", () => {
 		const cols = getTableColumns(ledgerAccounts);
 		expect(cols.id.dataType).toBe("string");
@@ -85,6 +86,23 @@ describe("Ledger Schema & Migration Invariants (Phase 4A-R1)", () => {
 		expect(sqlContent).toContain("v_credit_sum numeric;");
 
 		// No destructive table drops or recreations
+		expect(sqlContent).not.toContain("DROP TABLE");
+		expect(sqlContent).not.toContain("CREATE TABLE");
+	});
+
+	it("verifies migration 0009 serializes account state during transition with deterministic locking (FOR UPDATE OF la ORDER BY la.id)", () => {
+		const sqlContent = migration0009Sql;
+
+		// Deterministic account row locking
+		expect(sqlContent).toContain("FOR UPDATE OF la");
+		expect(sqlContent).toContain("ORDER BY la.id");
+
+		// Account validation on locked rows
+		expect(sqlContent).toContain("v_account.user_id != NEW.user_id");
+		expect(sqlContent).toContain("v_account.currency != NEW.currency");
+		expect(sqlContent).toContain("v_account.archived_at IS NOT NULL");
+
+		// No table recreation
 		expect(sqlContent).not.toContain("DROP TABLE");
 		expect(sqlContent).not.toContain("CREATE TABLE");
 	});

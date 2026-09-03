@@ -245,7 +245,61 @@ export async function postJournalEntry({
 
 	// 3. Execute in a single database transaction
 	return await db.transaction(async (tx) => {
-		// Resolve user
+		// 3.1 Historical Replay Fast Path
+		// If an entry for this (userId, idempotencyKey) already exists, resolve it immediately
+		// without consulting current user currency or current account active states.
+		const [existingEarly] = await tx
+			.select({
+				id: journalEntries.id,
+				status: journalEntries.status,
+				currency: journalEntries.currency,
+				postingFingerprint: journalEntries.postingFingerprint,
+			})
+			.from(journalEntries)
+			.where(
+				and(
+					eq(journalEntries.userId, userId),
+					eq(journalEntries.idempotencyKey, trimmedIdempotencyKey),
+				),
+			)
+			.limit(1);
+
+		if (existingEarly) {
+			if (existingEarly.status !== "POSTED") {
+				throw new LedgerError(
+					"LEDGER_INCOMPLETE_STATE",
+					"Concurrent unfinalized draft exists for this idempotency key",
+				);
+			}
+
+			// Fingerprint must be computed with the historical journal currency
+			const candidateFingerprint = await calculatePostingFingerprint({
+				userId,
+				occurredAt,
+				currency: existingEarly.currency,
+				memo: normalizedMemo,
+				source: normalizedSource,
+				lines: normalizedLines,
+			});
+
+			if (existingEarly.postingFingerprint !== candidateFingerprint) {
+				throw new LedgerError(
+					"LEDGER_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used with different entry payload",
+				);
+			}
+
+			return {
+				entryId: existingEarly.id,
+				idempotentReplay: true,
+				currency: existingEarly.currency,
+				debitTotal: formatCentsToMoney(debitCentsSum),
+				creditTotal: formatCentsToMoney(creditCentsSum),
+				lineCount: normalizedLines.length,
+			};
+		}
+
+		// 3.2 New Posting Path: Resolve User and Validate Current Account States
 		const [user] = await tx
 			.select({ id: users.id, currency: users.currency })
 			.from(users)
@@ -297,7 +351,7 @@ export async function postJournalEntry({
 			}
 		}
 
-		// Calculate deterministic posting fingerprint
+		// Calculate deterministic posting fingerprint for new posting
 		const fingerprint = await calculatePostingFingerprint({
 			userId: user.id,
 			occurredAt,
@@ -327,9 +381,9 @@ export async function postJournalEntry({
 			})
 			.returning();
 
-		// If insertion conflicted on (userId, idempotencyKey)
+		// If insertion conflicted concurrently on (userId, idempotencyKey)
 		if (!insertedDraft) {
-			const [existing] = await tx
+			const [existingLate] = await tx
 				.select()
 				.from(journalEntries)
 				.where(
@@ -340,21 +394,30 @@ export async function postJournalEntry({
 				)
 				.limit(1);
 
-			if (!existing) {
+			if (!existingLate) {
 				throw new LedgerError(
 					"LEDGER_INCOMPLETE_STATE",
 					"Idempotency conflict detected but record could not be retrieved",
 				);
 			}
 
-			if (existing.status !== "POSTED") {
+			if (existingLate.status !== "POSTED") {
 				throw new LedgerError(
 					"LEDGER_INCOMPLETE_STATE",
 					"Concurrent unfinalized draft exists for this idempotency key",
 				);
 			}
 
-			if (existing.postingFingerprint !== fingerprint) {
+			const candidateFingerprint = await calculatePostingFingerprint({
+				userId: user.id,
+				occurredAt,
+				currency: existingLate.currency,
+				memo: normalizedMemo,
+				source: normalizedSource,
+				lines: normalizedLines,
+			});
+
+			if (existingLate.postingFingerprint !== candidateFingerprint) {
 				throw new LedgerError(
 					"LEDGER_IDEMPOTENCY_CONFLICT",
 					"Idempotency key already used with different entry payload",
@@ -363,9 +426,9 @@ export async function postJournalEntry({
 
 			// Same idempotency key and identical fingerprint -> Idempotent Replay
 			return {
-				entryId: existing.id,
+				entryId: existingLate.id,
 				idempotentReplay: true,
-				currency: existing.currency,
+				currency: existingLate.currency,
 				debitTotal: formatCentsToMoney(debitCentsSum),
 				creditTotal: formatCentsToMoney(creditCentsSum),
 				lineCount: normalizedLines.length,

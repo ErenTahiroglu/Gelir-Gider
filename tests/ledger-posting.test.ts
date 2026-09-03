@@ -524,7 +524,6 @@ describe("Ledger Posting Service (Phase 4A)", () => {
 			});
 
 			const { transaction } = createMockTxDb({
-				draftInsertConflict: true,
 				existingEntry: {
 					id: "existing-entry-id",
 					userId: "user-1",
@@ -557,9 +556,176 @@ describe("Ledger Posting Service (Phase 4A)", () => {
 			});
 		});
 
+		it("replays existing entry even if referenced accounts are currently archived (Historical Replay Fast Path)", async () => {
+			const occurredAt = new Date("2026-09-03T10:00:00Z");
+			const lines = [
+				{
+					accountId: "acc-archived",
+					side: "DEBIT" as const,
+					amountNormalized: "100.00",
+					cents: 10000n,
+					memo: null,
+				},
+				{
+					accountId: "acc-2",
+					side: "CREDIT" as const,
+					amountNormalized: "100.00",
+					cents: 10000n,
+					memo: null,
+				},
+			];
+			const fingerprint = await calculatePostingFingerprint({
+				userId: "user-1",
+				occurredAt,
+				currency: "TRY",
+				memo: null,
+				source: null,
+				lines,
+			});
+
+			// Notice: acc-archived has archivedAt set to a Date, which would fail on new posting
+			const { transaction, mockTx } = createMockTxDb({
+				accounts: [
+					{
+						id: "acc-archived",
+						userId: "user-1",
+						currency: "TRY",
+						archivedAt: new Date("2026-09-03T11:00:00Z"),
+					},
+					{ id: "acc-2", userId: "user-1", currency: "TRY", archivedAt: null },
+				],
+				existingEntry: {
+					id: "historical-entry-id",
+					userId: "user-1",
+					idempotencyKey: "idem-archived-replay",
+					postingFingerprint: fingerprint,
+					status: "POSTED",
+					currency: "TRY",
+				},
+			});
+			const mockDb = { transaction } as unknown as Database;
+
+			const result = await postJournalEntry({
+				db: mockDb,
+				userId: "user-1",
+				idempotencyKey: "idem-archived-replay",
+				occurredAt,
+				lines: [
+					{ accountId: "acc-archived", side: "DEBIT", amount: "100.00" },
+					{ accountId: "acc-2", side: "CREDIT", amount: "100.00" },
+				],
+			});
+
+			expect(result).toEqual({
+				entryId: "historical-entry-id",
+				idempotentReplay: true,
+				currency: "TRY",
+				debitTotal: "100.00",
+				creditTotal: "100.00",
+				lineCount: 2,
+			});
+
+			// Verify that users and accounts were not queried because early replay succeeded
+			expect(mockTx.insert).not.toHaveBeenCalled();
+		});
+
+		it("throws LEDGER_IDEMPOTENCY_CONFLICT even if referenced accounts are currently archived when payload differs", async () => {
+			const { transaction } = createMockTxDb({
+				accounts: [
+					{
+						id: "acc-archived",
+						userId: "user-1",
+						currency: "TRY",
+						archivedAt: new Date(),
+					},
+					{ id: "acc-2", userId: "user-1", currency: "TRY", archivedAt: null },
+				],
+				existingEntry: {
+					id: "historical-entry-id",
+					userId: "user-1",
+					idempotencyKey: "idem-archived-conflict",
+					postingFingerprint:
+						"0000000000000000000000000000000000000000000000000000000000000000",
+					status: "POSTED",
+					currency: "TRY",
+				},
+			});
+			const mockDb = { transaction } as unknown as Database;
+
+			await expect(
+				postJournalEntry({
+					db: mockDb,
+					userId: "user-1",
+					idempotencyKey: "idem-archived-conflict",
+					occurredAt: new Date("2026-09-03T10:00:00Z"),
+					lines: [
+						{ accountId: "acc-archived", side: "DEBIT", amount: "100.00" },
+						{ accountId: "acc-2", side: "CREDIT", amount: "100.00" },
+					],
+				}),
+			).rejects.toThrow(
+				"Idempotency key already used with different entry payload",
+			);
+		});
+
+		it("replays historical entry based on historical currency even if user currency changed later", async () => {
+			const occurredAt = new Date("2026-09-03T10:00:00Z");
+			const lines = [
+				{
+					accountId: "acc-1",
+					side: "DEBIT" as const,
+					amountNormalized: "100.00",
+					cents: 10000n,
+					memo: null,
+				},
+				{
+					accountId: "acc-2",
+					side: "CREDIT" as const,
+					amountNormalized: "100.00",
+					cents: 10000n,
+					memo: null,
+				},
+			];
+			// Fingerprint calculated with historical currency "TRY"
+			const fingerprint = await calculatePostingFingerprint({
+				userId: "user-1",
+				occurredAt,
+				currency: "TRY",
+				memo: null,
+				source: null,
+				lines,
+			});
+
+			const { transaction } = createMockTxDb({
+				userCurrency: "USD", // User's current base currency has changed to USD
+				existingEntry: {
+					id: "historical-entry-id",
+					userId: "user-1",
+					idempotencyKey: "idem-currency-test",
+					postingFingerprint: fingerprint,
+					status: "POSTED",
+					currency: "TRY",
+				},
+			});
+			const mockDb = { transaction } as unknown as Database;
+
+			const result = await postJournalEntry({
+				db: mockDb,
+				userId: "user-1",
+				idempotencyKey: "idem-currency-test",
+				occurredAt,
+				lines: [
+					{ accountId: "acc-1", side: "DEBIT", amount: "100.00" },
+					{ accountId: "acc-2", side: "CREDIT", amount: "100.00" },
+				],
+			});
+
+			expect(result.idempotentReplay).toBe(true);
+			expect(result.currency).toBe("TRY");
+		});
+
 		it("throws LEDGER_IDEMPOTENCY_CONFLICT when same idempotency key is submitted with different payload", async () => {
 			const { transaction } = createMockTxDb({
-				draftInsertConflict: true,
 				existingEntry: {
 					id: "existing-entry-id",
 					userId: "user-1",

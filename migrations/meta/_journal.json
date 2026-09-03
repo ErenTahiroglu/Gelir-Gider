@@ -64,6 +64,13 @@
       "when": 1788443967223,
       "tag": "0008_harden_ledger_integrity",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1788444850656,
+      "tag": "0009_serialize_ledger_account_state",
+      "breakpoints": true
     }
   ]
 }
