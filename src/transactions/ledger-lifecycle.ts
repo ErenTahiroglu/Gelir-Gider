@@ -1,5 +1,5 @@
 import { and, desc, eq } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { Database, DatabaseTransaction } from "../db/client";
 import { journalEntries } from "../db/schema/ledger";
 import { transactionLedgerBindings } from "../db/schema/transaction-ledger";
 import {
@@ -39,6 +39,20 @@ export interface CreateCanonicalTransactionWithLedgerParams {
 	};
 }
 
+export interface CreateCanonicalTransactionWithLedgerInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	kind: string;
+	idempotencyKey: string;
+	occurredAt: Date;
+	payload: Record<string, unknown>;
+	source: TransactionSourceInput;
+	ledger: {
+		memo?: string | null | undefined;
+		lines: JournalLineInput[];
+	};
+}
+
 export interface ReviseCanonicalTransactionWithLedgerParams {
 	db: Database;
 	userId: string;
@@ -56,8 +70,36 @@ export interface ReviseCanonicalTransactionWithLedgerParams {
 	};
 }
 
+export interface ReviseCanonicalTransactionWithLedgerInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	transactionId: string;
+	expectedRevisionNo: number;
+	idempotencyKey: string;
+	occurredAt: Date;
+	payload: Record<string, unknown>;
+	reasonCode: string;
+	reasonNote?: string | null | undefined;
+	source: TransactionSourceInput;
+	ledger: {
+		memo?: string | null | undefined;
+		lines: JournalLineInput[];
+	};
+}
+
 export interface VoidCanonicalTransactionWithLedgerParams {
 	db: Database;
+	userId: string;
+	transactionId: string;
+	expectedRevisionNo: number;
+	idempotencyKey: string;
+	reasonCode: string;
+	reasonNote?: string | null | undefined;
+	source: TransactionSourceInput;
+}
+
+export interface VoidCanonicalTransactionWithLedgerInTransactionParams {
+	tx: DatabaseTransaction;
 	userId: string;
 	transactionId: string;
 	expectedRevisionNo: number;
@@ -86,10 +128,11 @@ export interface CanonicalTransactionLedgerBindingItem {
 }
 
 /**
- * Atomically creates a canonical transaction and posts its double-entry ledger effect in ONE PostgreSQL transaction.
+ * Internal transaction-scoped helper for creating a canonical transaction with ledger posting.
+ * DOES NOT call db.transaction().
  */
-export async function createCanonicalTransactionWithLedger({
-	db,
+export async function createCanonicalTransactionWithLedgerInTransaction({
+	tx,
 	userId,
 	kind,
 	idempotencyKey,
@@ -97,7 +140,7 @@ export async function createCanonicalTransactionWithLedger({
 	payload,
 	source,
 	ledger,
-}: CreateCanonicalTransactionWithLedgerParams): Promise<BoundCanonicalTransactionResult> {
+}: CreateCanonicalTransactionWithLedgerInTransactionParams): Promise<BoundCanonicalTransactionResult> {
 	if (!ledger || !Array.isArray(ledger.lines)) {
 		throw new CanonicalTransactionError(
 			"TRANSACTION_INVALID_INPUT",
@@ -105,98 +148,37 @@ export async function createCanonicalTransactionWithLedger({
 		);
 	}
 
-	return await db.transaction(async (tx) => {
-		// 1. Create canonical transaction revision in transaction
-		const canonicalRes = await createCanonicalTransactionInTransaction({
-			tx,
-			userId,
-			kind,
-			idempotencyKey,
-			occurredAt,
-			payload,
-			source,
-		});
+	// 1. Create canonical transaction revision in transaction
+	const canonicalRes = await createCanonicalTransactionInTransaction({
+		tx,
+		userId,
+		kind,
+		idempotencyKey,
+		occurredAt,
+		payload,
+		source,
+	});
 
-		// 2. Handle Idempotent Replay
-		if (canonicalRes.idempotentReplay) {
-			const [existingBinding] = await tx
-				.select({
-					id: transactionLedgerBindings.id,
-					appliedJournalEntryId:
-						transactionLedgerBindings.appliedJournalEntryId,
-					reversalJournalEntryId:
-						transactionLedgerBindings.reversalJournalEntryId,
-				})
-				.from(transactionLedgerBindings)
-				.where(
-					eq(transactionLedgerBindings.revisionId, canonicalRes.revisionId),
-				)
-				.limit(1);
+	// 2. Handle Idempotent Replay
+	if (canonicalRes.idempotentReplay) {
+		const [existingBinding] = await tx
+			.select({
+				id: transactionLedgerBindings.id,
+				appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
+				reversalJournalEntryId:
+					transactionLedgerBindings.reversalJournalEntryId,
+			})
+			.from(transactionLedgerBindings)
+			.where(eq(transactionLedgerBindings.revisionId, canonicalRes.revisionId))
+			.limit(1);
 
-			if (!existingBinding?.appliedJournalEntryId) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-					"Canonical creation replayed but ledger binding or applied journal is missing",
-				);
-			}
-
-			let postRes: PostJournalEntryResult;
-			try {
-				postRes = await postJournalEntryInTransaction({
-					tx,
-					userId,
-					idempotencyKey: `txrev:${canonicalRes.revisionId}:apply`,
-					occurredAt,
-					memo: ledger.memo ?? undefined,
-					source: {
-						type: "CANONICAL_REVISION",
-						ref: canonicalRes.revisionId,
-					},
-					lines: ledger.lines,
-				});
-			} catch (err) {
-				if (
-					err instanceof LedgerError &&
-					err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
-				) {
-					throw new CanonicalTransactionError(
-						"TRANSACTION_LEDGER_EFFECT_CONFLICT",
-						"Canonical transaction creation replayed with changed ledger lines",
-					);
-				}
-				if (err instanceof LedgerError) {
-					throw new CanonicalTransactionError(
-						"TRANSACTION_LEDGER_EFFECT_INVALID",
-						err.message,
-					);
-				}
-				throw err;
-			}
-
-			if (
-				!postRes.idempotentReplay ||
-				postRes.entryId !== existingBinding.appliedJournalEntryId
-			) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-					"Ledger posting replay returned mismatched journal entry",
-				);
-			}
-
-			return {
-				transactionId: canonicalRes.transactionId,
-				revisionId: canonicalRes.revisionId,
-				revisionNo: canonicalRes.revisionNo,
-				operation: "CREATE",
-				idempotentReplay: true,
-				ledger: {
-					appliedJournalEntryId: existingBinding.appliedJournalEntryId,
-					reversalJournalEntryId: null,
-				},
-			};
+		if (!existingBinding?.appliedJournalEntryId) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+				"Canonical transaction replayed but matching ledger binding is missing",
+			);
 		}
 
-		// 3. Fresh Creation: Post ledger entry and insert binding
 		let postRes: PostJournalEntryResult;
 		try {
 			postRes = await postJournalEntryInTransaction({
@@ -218,7 +200,7 @@ export async function createCanonicalTransactionWithLedger({
 			) {
 				throw new CanonicalTransactionError(
 					"TRANSACTION_LEDGER_EFFECT_CONFLICT",
-					err.message,
+					"Canonical transaction creation replayed with changed ledger lines",
 				);
 			}
 			if (err instanceof LedgerError) {
@@ -230,22 +212,13 @@ export async function createCanonicalTransactionWithLedger({
 			throw err;
 		}
 
-		const [binding] = await tx
-			.insert(transactionLedgerBindings)
-			.values({
-				userId,
-				transactionId: canonicalRes.transactionId,
-				revisionId: canonicalRes.revisionId,
-				previousBindingId: null,
-				appliedJournalEntryId: postRes.entryId,
-				reversalJournalEntryId: null,
-			})
-			.returning();
-
-		if (!binding) {
+		if (
+			!postRes.idempotentReplay ||
+			postRes.entryId !== existingBinding.appliedJournalEntryId
+		) {
 			throw new CanonicalTransactionError(
 				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-				"Failed to insert transaction ledger binding for CREATE",
+				"Ledger posting replay returned mismatched journal entry",
 			);
 		}
 
@@ -254,20 +227,113 @@ export async function createCanonicalTransactionWithLedger({
 			revisionId: canonicalRes.revisionId,
 			revisionNo: canonicalRes.revisionNo,
 			operation: "CREATE",
-			idempotentReplay: false,
+			idempotentReplay: true,
 			ledger: {
-				appliedJournalEntryId: postRes.entryId,
+				appliedJournalEntryId: existingBinding.appliedJournalEntryId,
 				reversalJournalEntryId: null,
 			},
 		};
+	}
+
+	// 3. Fresh Creation: Post ledger entry and insert binding
+	let postRes: PostJournalEntryResult;
+	try {
+		postRes = await postJournalEntryInTransaction({
+			tx,
+			userId,
+			idempotencyKey: `txrev:${canonicalRes.revisionId}:apply`,
+			occurredAt,
+			memo: ledger.memo ?? undefined,
+			source: {
+				type: "CANONICAL_REVISION",
+				ref: canonicalRes.revisionId,
+			},
+			lines: ledger.lines,
+		});
+	} catch (err) {
+		if (
+			err instanceof LedgerError &&
+			err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
+		) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_EFFECT_CONFLICT",
+				err.message,
+			);
+		}
+		if (err instanceof LedgerError) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_EFFECT_INVALID",
+				err.message,
+			);
+		}
+		throw err;
+	}
+
+	const [binding] = await tx
+		.insert(transactionLedgerBindings)
+		.values({
+			userId,
+			transactionId: canonicalRes.transactionId,
+			revisionId: canonicalRes.revisionId,
+			previousBindingId: null,
+			appliedJournalEntryId: postRes.entryId,
+			reversalJournalEntryId: null,
+		})
+		.returning();
+
+	if (!binding) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+			"Failed to insert transaction ledger binding for CREATE",
+		);
+	}
+
+	return {
+		transactionId: canonicalRes.transactionId,
+		revisionId: canonicalRes.revisionId,
+		revisionNo: canonicalRes.revisionNo,
+		operation: "CREATE",
+		idempotentReplay: false,
+		ledger: {
+			appliedJournalEntryId: postRes.entryId,
+			reversalJournalEntryId: null,
+		},
+	};
+}
+
+/**
+ * Atomically creates a canonical transaction and posts its double-entry ledger effect in ONE PostgreSQL transaction.
+ */
+export async function createCanonicalTransactionWithLedger(
+	params: CreateCanonicalTransactionWithLedgerParams,
+): Promise<BoundCanonicalTransactionResult> {
+	if (!params.ledger || !Array.isArray(params.ledger.lines)) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"Ledger specification with lines array is required",
+		);
+	}
+
+	return await params.db.transaction(async (tx) => {
+		return await createCanonicalTransactionWithLedgerInTransaction({
+			tx,
+			userId: params.userId,
+			kind: params.kind,
+			idempotencyKey: params.idempotencyKey,
+			occurredAt: params.occurredAt,
+			payload: params.payload,
+			source: params.source,
+			ledger: params.ledger,
+		});
 	});
 }
 
 /**
- * Atomically updates a canonical transaction: reverses previous active journal and posts new journal in ONE transaction.
+ * Internal transaction-scoped helper for revising a canonical transaction with ledger correction.
+ * DOES NOT call db.transaction().
  */
-export async function reviseCanonicalTransactionWithLedger({
-	db,
+export async function reviseCanonicalTransactionWithLedgerInTransaction({
+	tx,
 	userId,
 	transactionId,
 	expectedRevisionNo,
@@ -278,7 +344,7 @@ export async function reviseCanonicalTransactionWithLedger({
 	reasonNote,
 	source,
 	ledger,
-}: ReviseCanonicalTransactionWithLedgerParams): Promise<BoundCanonicalTransactionResult> {
+}: ReviseCanonicalTransactionWithLedgerInTransactionParams): Promise<BoundCanonicalTransactionResult> {
 	if (!ledger || !Array.isArray(ledger.lines)) {
 		throw new CanonicalTransactionError(
 			"TRANSACTION_INVALID_INPUT",
@@ -286,188 +352,44 @@ export async function reviseCanonicalTransactionWithLedger({
 		);
 	}
 
-	return await db.transaction(async (tx) => {
-		// 1. Revise canonical transaction in transaction
-		const canonicalRes = await reviseCanonicalTransactionInTransaction({
-			tx,
-			userId,
-			transactionId,
-			expectedRevisionNo,
-			idempotencyKey,
-			occurredAt,
-			payload,
-			reasonCode,
-			reasonNote,
-			source,
-		});
+	// 1. Revise canonical transaction in transaction
+	const canonicalRes = await reviseCanonicalTransactionInTransaction({
+		tx,
+		userId,
+		transactionId,
+		expectedRevisionNo,
+		idempotencyKey,
+		occurredAt,
+		payload,
+		reasonCode,
+		reasonNote,
+		source,
+	});
 
-		// 2. Handle Idempotent Replay
-		if (canonicalRes.idempotentReplay) {
-			const [existingBinding] = await tx
-				.select({
-					id: transactionLedgerBindings.id,
-					appliedJournalEntryId:
-						transactionLedgerBindings.appliedJournalEntryId,
-					reversalJournalEntryId:
-						transactionLedgerBindings.reversalJournalEntryId,
-				})
-				.from(transactionLedgerBindings)
-				.where(
-					eq(transactionLedgerBindings.revisionId, canonicalRes.revisionId),
-				)
-				.limit(1);
+	// 2. Handle Idempotent Replay
+	if (canonicalRes.idempotentReplay) {
+		const [existingBinding] = await tx
+			.select({
+				id: transactionLedgerBindings.id,
+				appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
+				reversalJournalEntryId:
+					transactionLedgerBindings.reversalJournalEntryId,
+			})
+			.from(transactionLedgerBindings)
+			.where(eq(transactionLedgerBindings.revisionId, canonicalRes.revisionId))
+			.limit(1);
 
-			if (
-				!existingBinding?.appliedJournalEntryId ||
-				!existingBinding.reversalJournalEntryId
-			) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-					"Canonical update revision replayed but matching ledger binding is missing or incomplete",
-				);
-			}
-
-			// Validate reversal replay
-			const [currentRev] = await tx
-				.select({
-					previousRevisionId: transactionRevisions.previousRevisionId,
-				})
-				.from(transactionRevisions)
-				.where(eq(transactionRevisions.id, canonicalRes.revisionId))
-				.limit(1);
-
-			const [prevBinding] = currentRev?.previousRevisionId
-				? await tx
-						.select({
-							appliedJournalEntryId:
-								transactionLedgerBindings.appliedJournalEntryId,
-						})
-						.from(transactionLedgerBindings)
-						.where(
-							eq(
-								transactionLedgerBindings.revisionId,
-								currentRev.previousRevisionId,
-							),
-						)
-						.limit(1)
-				: [];
-
-			if (!prevBinding?.appliedJournalEntryId) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-					"Previous revision ledger binding is missing",
-				);
-			}
-
-			const [prevJournal] = await tx
-				.select({ occurredAt: journalEntries.occurredAt })
-				.from(journalEntries)
-				.where(eq(journalEntries.id, prevBinding.appliedJournalEntryId))
-				.limit(1);
-
-			if (!prevJournal) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-					"Previous applied journal is missing",
-				);
-			}
-
-			try {
-				const revReplay = await reverseJournalEntryInTransaction({
-					tx,
-					userId,
-					originalEntryId: prevBinding.appliedJournalEntryId,
-					idempotencyKey: `txrev:${canonicalRes.revisionId}:reverse`,
-					occurredAt: prevJournal.occurredAt,
-				});
-
-				if (
-					!revReplay.idempotentReplay ||
-					revReplay.entryId !== existingBinding.reversalJournalEntryId
-				) {
-					throw new CanonicalTransactionError(
-						"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-						"Reversal replay mismatch with existing binding",
-					);
-				}
-			} catch (err) {
-				if (err instanceof CanonicalTransactionError) throw err;
-				if (
-					err instanceof LedgerError &&
-					err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
-				) {
-					throw new CanonicalTransactionError(
-						"TRANSACTION_LEDGER_EFFECT_CONFLICT",
-						"Reversal idempotency conflict",
-					);
-				}
-				if (err instanceof LedgerError) {
-					throw new CanonicalTransactionError(
-						"TRANSACTION_LEDGER_EFFECT_INVALID",
-						err.message,
-					);
-				}
-				throw err;
-			}
-
-			// Validate apply replay
-			try {
-				const applyReplay = await postJournalEntryInTransaction({
-					tx,
-					userId,
-					idempotencyKey: `txrev:${canonicalRes.revisionId}:apply`,
-					occurredAt,
-					memo: ledger.memo ?? undefined,
-					source: {
-						type: "CANONICAL_REVISION",
-						ref: canonicalRes.revisionId,
-					},
-					lines: ledger.lines,
-				});
-
-				if (
-					!applyReplay.idempotentReplay ||
-					applyReplay.entryId !== existingBinding.appliedJournalEntryId
-				) {
-					throw new CanonicalTransactionError(
-						"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-						"Apply replay mismatch with existing binding",
-					);
-				}
-			} catch (err) {
-				if (err instanceof CanonicalTransactionError) throw err;
-				if (
-					err instanceof LedgerError &&
-					err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
-				) {
-					throw new CanonicalTransactionError(
-						"TRANSACTION_LEDGER_EFFECT_CONFLICT",
-						"Canonical update replayed with changed ledger lines",
-					);
-				}
-				if (err instanceof LedgerError) {
-					throw new CanonicalTransactionError(
-						"TRANSACTION_LEDGER_EFFECT_INVALID",
-						err.message,
-					);
-				}
-				throw err;
-			}
-
-			return {
-				transactionId: canonicalRes.transactionId,
-				revisionId: canonicalRes.revisionId,
-				revisionNo: canonicalRes.revisionNo,
-				operation: "UPDATE",
-				idempotentReplay: true,
-				ledger: {
-					appliedJournalEntryId: existingBinding.appliedJournalEntryId,
-					reversalJournalEntryId: existingBinding.reversalJournalEntryId,
-				},
-			};
+		if (
+			!existingBinding?.appliedJournalEntryId ||
+			!existingBinding.reversalJournalEntryId
+		) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+				"Canonical update revision replayed but matching ledger binding is missing or incomplete",
+			);
 		}
 
-		// 3. Fresh Update:
+		// Validate reversal replay
 		const [currentRev] = await tx
 			.select({
 				previousRevisionId: transactionRevisions.previousRevisionId,
@@ -476,28 +398,26 @@ export async function reviseCanonicalTransactionWithLedger({
 			.where(eq(transactionRevisions.id, canonicalRes.revisionId))
 			.limit(1);
 
-		if (!currentRev?.previousRevisionId) {
-			throw new CanonicalTransactionError(
-				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-				"UPDATE revision missing previous revision reference",
-			);
-		}
-
-		const [prevBinding] = await tx
-			.select({
-				id: transactionLedgerBindings.id,
-				appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
-			})
-			.from(transactionLedgerBindings)
-			.where(
-				eq(transactionLedgerBindings.revisionId, currentRev.previousRevisionId),
-			)
-			.limit(1);
+		const [prevBinding] = currentRev?.previousRevisionId
+			? await tx
+					.select({
+						appliedJournalEntryId:
+							transactionLedgerBindings.appliedJournalEntryId,
+					})
+					.from(transactionLedgerBindings)
+					.where(
+						eq(
+							transactionLedgerBindings.revisionId,
+							currentRev.previousRevisionId,
+						),
+					)
+					.limit(1)
+			: [];
 
 		if (!prevBinding?.appliedJournalEntryId) {
 			throw new CanonicalTransactionError(
 				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-				"Previous revision has no active applied journal entry to reverse",
+				"Previous revision ledger binding is missing",
 			);
 		}
 
@@ -510,29 +430,37 @@ export async function reviseCanonicalTransactionWithLedger({
 		if (!prevJournal) {
 			throw new CanonicalTransactionError(
 				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-				"Previous applied journal entry could not be found",
+				"Previous applied journal is missing",
 			);
 		}
 
-		// Reverse previous applied journal at its original economic date
-		let revRes: ReverseJournalEntryResult;
 		try {
-			revRes = await reverseJournalEntryInTransaction({
+			const revReplay = await reverseJournalEntryInTransaction({
 				tx,
 				userId,
 				originalEntryId: prevBinding.appliedJournalEntryId,
 				idempotencyKey: `txrev:${canonicalRes.revisionId}:reverse`,
 				occurredAt: prevJournal.occurredAt,
-				memo: null,
 			});
+
+			if (
+				!revReplay.idempotentReplay ||
+				revReplay.entryId !== existingBinding.reversalJournalEntryId
+			) {
+				throw new CanonicalTransactionError(
+					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+					"Reversal replay mismatch with existing binding",
+				);
+			}
 		} catch (err) {
+			if (err instanceof CanonicalTransactionError) throw err;
 			if (
 				err instanceof LedgerError &&
 				err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
 			) {
 				throw new CanonicalTransactionError(
 					"TRANSACTION_LEDGER_EFFECT_CONFLICT",
-					err.message,
+					"Reversal fingerprint mismatch on update replay",
 				);
 			}
 			if (err instanceof LedgerError) {
@@ -544,10 +472,9 @@ export async function reviseCanonicalTransactionWithLedger({
 			throw err;
 		}
 
-		// Post new journal entry
-		let postRes: PostJournalEntryResult;
+		// Validate apply replay
 		try {
-			postRes = await postJournalEntryInTransaction({
+			const applyReplay = await postJournalEntryInTransaction({
 				tx,
 				userId,
 				idempotencyKey: `txrev:${canonicalRes.revisionId}:apply`,
@@ -559,14 +486,25 @@ export async function reviseCanonicalTransactionWithLedger({
 				},
 				lines: ledger.lines,
 			});
+
+			if (
+				!applyReplay.idempotentReplay ||
+				applyReplay.entryId !== existingBinding.appliedJournalEntryId
+			) {
+				throw new CanonicalTransactionError(
+					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+					"Apply replay mismatch with existing binding",
+				);
+			}
 		} catch (err) {
+			if (err instanceof CanonicalTransactionError) throw err;
 			if (
 				err instanceof LedgerError &&
 				err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
 			) {
 				throw new CanonicalTransactionError(
 					"TRANSACTION_LEDGER_EFFECT_CONFLICT",
-					err.message,
+					"Canonical update replayed with changed ledger lines",
 				);
 			}
 			if (err instanceof LedgerError) {
@@ -578,44 +516,198 @@ export async function reviseCanonicalTransactionWithLedger({
 			throw err;
 		}
 
-		const [binding] = await tx
-			.insert(transactionLedgerBindings)
-			.values({
-				userId,
-				transactionId: canonicalRes.transactionId,
-				revisionId: canonicalRes.revisionId,
-				previousBindingId: prevBinding.id,
-				appliedJournalEntryId: postRes.entryId,
-				reversalJournalEntryId: revRes.entryId,
-			})
-			.returning();
-
-		if (!binding) {
-			throw new CanonicalTransactionError(
-				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-				"Failed to insert transaction ledger binding for UPDATE",
-			);
-		}
-
 		return {
 			transactionId: canonicalRes.transactionId,
 			revisionId: canonicalRes.revisionId,
 			revisionNo: canonicalRes.revisionNo,
 			operation: "UPDATE",
-			idempotentReplay: false,
+			idempotentReplay: true,
 			ledger: {
-				appliedJournalEntryId: postRes.entryId,
-				reversalJournalEntryId: revRes.entryId,
+				appliedJournalEntryId: existingBinding.appliedJournalEntryId,
+				reversalJournalEntryId: existingBinding.reversalJournalEntryId,
 			},
 		};
+	}
+
+	// 3. Fresh Update:
+	const [currentRev] = await tx
+		.select({
+			previousRevisionId: transactionRevisions.previousRevisionId,
+		})
+		.from(transactionRevisions)
+		.where(eq(transactionRevisions.id, canonicalRes.revisionId))
+		.limit(1);
+
+	if (!currentRev?.previousRevisionId) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+			"UPDATE revision missing previous revision reference",
+		);
+	}
+
+	const [prevBinding] = await tx
+		.select({
+			id: transactionLedgerBindings.id,
+			appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
+		})
+		.from(transactionLedgerBindings)
+		.where(
+			eq(transactionLedgerBindings.revisionId, currentRev.previousRevisionId),
+		)
+		.limit(1);
+
+	if (!prevBinding?.appliedJournalEntryId) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+			"Previous revision has no active applied journal entry to reverse",
+		);
+	}
+
+	const [prevJournal] = await tx
+		.select({ occurredAt: journalEntries.occurredAt })
+		.from(journalEntries)
+		.where(eq(journalEntries.id, prevBinding.appliedJournalEntryId))
+		.limit(1);
+
+	if (!prevJournal) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+			"Previous applied journal entry could not be found",
+		);
+	}
+
+	// Reverse previous applied journal at its original economic date
+	let revRes: ReverseJournalEntryResult;
+	try {
+		revRes = await reverseJournalEntryInTransaction({
+			tx,
+			userId,
+			originalEntryId: prevBinding.appliedJournalEntryId,
+			idempotencyKey: `txrev:${canonicalRes.revisionId}:reverse`,
+			occurredAt: prevJournal.occurredAt,
+			memo: null,
+		});
+	} catch (err) {
+		if (
+			err instanceof LedgerError &&
+			err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
+		) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_EFFECT_CONFLICT",
+				err.message,
+			);
+		}
+		if (err instanceof LedgerError) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_EFFECT_INVALID",
+				err.message,
+			);
+		}
+		throw err;
+	}
+
+	// Post new journal entry
+	let postRes: PostJournalEntryResult;
+	try {
+		postRes = await postJournalEntryInTransaction({
+			tx,
+			userId,
+			idempotencyKey: `txrev:${canonicalRes.revisionId}:apply`,
+			occurredAt,
+			memo: ledger.memo ?? undefined,
+			source: {
+				type: "CANONICAL_REVISION",
+				ref: canonicalRes.revisionId,
+			},
+			lines: ledger.lines,
+		});
+	} catch (err) {
+		if (
+			err instanceof LedgerError &&
+			err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
+		) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_EFFECT_CONFLICT",
+				err.message,
+			);
+		}
+		if (err instanceof LedgerError) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_EFFECT_INVALID",
+				err.message,
+			);
+		}
+		throw err;
+	}
+
+	const [insertedBinding] = await tx
+		.insert(transactionLedgerBindings)
+		.values({
+			userId,
+			transactionId: canonicalRes.transactionId,
+			revisionId: canonicalRes.revisionId,
+			previousBindingId: prevBinding.id,
+			appliedJournalEntryId: postRes.entryId,
+			reversalJournalEntryId: revRes.entryId,
+		})
+		.returning();
+
+	if (!insertedBinding) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+			"Failed to insert transaction ledger binding for UPDATE",
+		);
+	}
+
+	return {
+		transactionId: canonicalRes.transactionId,
+		revisionId: canonicalRes.revisionId,
+		revisionNo: canonicalRes.revisionNo,
+		operation: "UPDATE",
+		idempotentReplay: false,
+		ledger: {
+			appliedJournalEntryId: postRes.entryId,
+			reversalJournalEntryId: revRes.entryId,
+		},
+	};
+}
+
+/**
+ * Atomically updates a canonical transaction: reverses previous active journal and posts new journal in ONE transaction.
+ */
+export async function reviseCanonicalTransactionWithLedger(
+	params: ReviseCanonicalTransactionWithLedgerParams,
+): Promise<BoundCanonicalTransactionResult> {
+	if (!params.ledger || !Array.isArray(params.ledger.lines)) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"Ledger specification with lines array is required",
+		);
+	}
+
+	return await params.db.transaction(async (tx) => {
+		return await reviseCanonicalTransactionWithLedgerInTransaction({
+			tx,
+			userId: params.userId,
+			transactionId: params.transactionId,
+			expectedRevisionNo: params.expectedRevisionNo,
+			idempotencyKey: params.idempotencyKey,
+			occurredAt: params.occurredAt,
+			payload: params.payload,
+			reasonCode: params.reasonCode,
+			reasonNote: params.reasonNote,
+			source: params.source,
+			ledger: params.ledger,
+		});
 	});
 }
 
 /**
- * Atomically voids a canonical transaction and reverses its active journal in ONE transaction.
+ * Internal transaction-scoped helper for voiding a canonical transaction with ledger reversal.
+ * DOES NOT call db.transaction().
  */
-export async function voidCanonicalTransactionWithLedger({
-	db,
+export async function voidCanonicalTransactionWithLedgerInTransaction({
+	tx,
 	userId,
 	transactionId,
 	expectedRevisionNo,
@@ -623,152 +715,42 @@ export async function voidCanonicalTransactionWithLedger({
 	reasonCode,
 	reasonNote,
 	source,
-}: VoidCanonicalTransactionWithLedgerParams): Promise<BoundCanonicalTransactionResult> {
-	return await db.transaction(async (tx) => {
-		// 1. Void canonical transaction in transaction
-		const canonicalRes = await voidCanonicalTransactionInTransaction({
-			tx,
-			userId,
-			transactionId,
-			expectedRevisionNo,
-			idempotencyKey,
-			reasonCode,
-			reasonNote,
-			source,
-		});
+}: VoidCanonicalTransactionWithLedgerInTransactionParams): Promise<BoundCanonicalTransactionResult> {
+	// 1. Void canonical transaction in transaction
+	const canonicalRes = await voidCanonicalTransactionInTransaction({
+		tx,
+		userId,
+		transactionId,
+		expectedRevisionNo,
+		idempotencyKey,
+		reasonCode,
+		reasonNote,
+		source,
+	});
 
-		// 2. Handle Idempotent Replay
-		if (canonicalRes.idempotentReplay) {
-			const [existingBinding] = await tx
-				.select({
-					reversalJournalEntryId:
-						transactionLedgerBindings.reversalJournalEntryId,
-					appliedJournalEntryId:
-						transactionLedgerBindings.appliedJournalEntryId,
-				})
-				.from(transactionLedgerBindings)
-				.where(
-					eq(transactionLedgerBindings.revisionId, canonicalRes.revisionId),
-				)
-				.limit(1);
+	// 2. Handle Idempotent Replay
+	if (canonicalRes.idempotentReplay) {
+		const [existingBinding] = await tx
+			.select({
+				reversalJournalEntryId:
+					transactionLedgerBindings.reversalJournalEntryId,
+				appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
+			})
+			.from(transactionLedgerBindings)
+			.where(eq(transactionLedgerBindings.revisionId, canonicalRes.revisionId))
+			.limit(1);
 
-			if (
-				!existingBinding?.reversalJournalEntryId ||
-				existingBinding.appliedJournalEntryId !== null
-			) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-					"Canonical void revision replayed but matching ledger binding is missing or malformed",
-				);
-			}
-
-			// Load current VOID revision's previousRevisionId
-			const [currentRev] = await tx
-				.select({
-					previousRevisionId: transactionRevisions.previousRevisionId,
-				})
-				.from(transactionRevisions)
-				.where(eq(transactionRevisions.id, canonicalRes.revisionId))
-				.limit(1);
-
-			if (!currentRev?.previousRevisionId) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-					"VOID revision missing previous revision reference on replay",
-				);
-			}
-
-			// Resolve previous revision binding
-			const [prevBinding] = await tx
-				.select({
-					appliedJournalEntryId:
-						transactionLedgerBindings.appliedJournalEntryId,
-				})
-				.from(transactionLedgerBindings)
-				.where(
-					eq(
-						transactionLedgerBindings.revisionId,
-						currentRev.previousRevisionId,
-					),
-				)
-				.limit(1);
-
-			if (!prevBinding?.appliedJournalEntryId) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-					"Previous revision has no active applied journal entry on replay",
-				);
-			}
-
-			// Load previous applied journal's occurred_at
-			const [prevJournal] = await tx
-				.select({ occurredAt: journalEntries.occurredAt })
-				.from(journalEntries)
-				.where(eq(journalEntries.id, prevBinding.appliedJournalEntryId))
-				.limit(1);
-
-			if (!prevJournal) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-					"Previous applied journal entry could not be found on replay",
-				);
-			}
-
-			// Verify deterministic reversal replay
-			let revRes: ReverseJournalEntryResult;
-			try {
-				revRes = await reverseJournalEntryInTransaction({
-					tx,
-					userId,
-					originalEntryId: prevBinding.appliedJournalEntryId,
-					idempotencyKey: `txrev:${canonicalRes.revisionId}:reverse`,
-					occurredAt: prevJournal.occurredAt,
-					memo: null,
-				});
-			} catch (err) {
-				if (err instanceof CanonicalTransactionError) throw err;
-				if (
-					err instanceof LedgerError &&
-					err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
-				) {
-					throw new CanonicalTransactionError(
-						"TRANSACTION_LEDGER_EFFECT_CONFLICT",
-						err.message,
-					);
-				}
-				if (err instanceof LedgerError) {
-					throw new CanonicalTransactionError(
-						"TRANSACTION_LEDGER_EFFECT_INVALID",
-						err.message,
-					);
-				}
-				throw err;
-			}
-
-			if (
-				!revRes.idempotentReplay ||
-				revRes.entryId !== existingBinding.reversalJournalEntryId
-			) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-					"Reversal replay mismatch with existing binding",
-				);
-			}
-
-			return {
-				transactionId: canonicalRes.transactionId,
-				revisionId: canonicalRes.revisionId,
-				revisionNo: canonicalRes.revisionNo,
-				operation: "VOID",
-				idempotentReplay: true,
-				ledger: {
-					appliedJournalEntryId: null,
-					reversalJournalEntryId: existingBinding.reversalJournalEntryId,
-				},
-			};
+		if (
+			!existingBinding?.reversalJournalEntryId ||
+			existingBinding.appliedJournalEntryId !== null
+		) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+				"Canonical void revision replayed but matching ledger binding is missing or malformed",
+			);
 		}
 
-		// 3. Fresh Void: Reverse previous active journal
+		// Load current VOID revision's previousRevisionId
 		const [currentRev] = await tx
 			.select({
 				previousRevisionId: transactionRevisions.previousRevisionId,
@@ -780,13 +762,13 @@ export async function voidCanonicalTransactionWithLedger({
 		if (!currentRev?.previousRevisionId) {
 			throw new CanonicalTransactionError(
 				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-				"VOID revision missing previous revision reference",
+				"VOID revision missing previous revision reference on replay",
 			);
 		}
 
+		// Resolve previous revision binding
 		const [prevBinding] = await tx
 			.select({
-				id: transactionLedgerBindings.id,
 				appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
 			})
 			.from(transactionLedgerBindings)
@@ -798,10 +780,11 @@ export async function voidCanonicalTransactionWithLedger({
 		if (!prevBinding?.appliedJournalEntryId) {
 			throw new CanonicalTransactionError(
 				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-				"Previous revision has no active applied journal entry to reverse for VOID",
+				"Previous revision has no active applied journal entry on replay",
 			);
 		}
 
+		// Load previous applied journal's occurred_at
 		const [prevJournal] = await tx
 			.select({ occurredAt: journalEntries.occurredAt })
 			.from(journalEntries)
@@ -811,10 +794,11 @@ export async function voidCanonicalTransactionWithLedger({
 		if (!prevJournal) {
 			throw new CanonicalTransactionError(
 				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-				"Previous applied journal entry could not be found",
+				"Previous applied journal entry could not be found on replay",
 			);
 		}
 
+		// Verify deterministic reversal replay
 		let revRes: ReverseJournalEntryResult;
 		try {
 			revRes = await reverseJournalEntryInTransaction({
@@ -826,6 +810,7 @@ export async function voidCanonicalTransactionWithLedger({
 				memo: null,
 			});
 		} catch (err) {
+			if (err instanceof CanonicalTransactionError) throw err;
 			if (
 				err instanceof LedgerError &&
 				err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
@@ -844,22 +829,13 @@ export async function voidCanonicalTransactionWithLedger({
 			throw err;
 		}
 
-		const [insertedBinding] = await tx
-			.insert(transactionLedgerBindings)
-			.values({
-				userId,
-				transactionId: canonicalRes.transactionId,
-				revisionId: canonicalRes.revisionId,
-				previousBindingId: prevBinding.id,
-				appliedJournalEntryId: null,
-				reversalJournalEntryId: revRes.entryId,
-			})
-			.returning();
-
-		if (!insertedBinding) {
+		if (
+			!revRes.idempotentReplay ||
+			revRes.entryId !== existingBinding.reversalJournalEntryId
+		) {
 			throw new CanonicalTransactionError(
 				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
-				"Failed to insert transaction ledger binding for VOID",
+				"Reversal replay mismatch with existing binding",
 			);
 		}
 
@@ -868,12 +844,139 @@ export async function voidCanonicalTransactionWithLedger({
 			revisionId: canonicalRes.revisionId,
 			revisionNo: canonicalRes.revisionNo,
 			operation: "VOID",
-			idempotentReplay: false,
+			idempotentReplay: true,
 			ledger: {
 				appliedJournalEntryId: null,
-				reversalJournalEntryId: insertedBinding.reversalJournalEntryId,
+				reversalJournalEntryId: existingBinding.reversalJournalEntryId,
 			},
 		};
+	}
+
+	// 3. Fresh Void: Reverse previous active journal
+	const [currentRev] = await tx
+		.select({
+			previousRevisionId: transactionRevisions.previousRevisionId,
+		})
+		.from(transactionRevisions)
+		.where(eq(transactionRevisions.id, canonicalRes.revisionId))
+		.limit(1);
+
+	if (!currentRev?.previousRevisionId) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+			"VOID revision missing previous revision reference",
+		);
+	}
+
+	const [prevBinding] = await tx
+		.select({
+			id: transactionLedgerBindings.id,
+			appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
+		})
+		.from(transactionLedgerBindings)
+		.where(
+			eq(transactionLedgerBindings.revisionId, currentRev.previousRevisionId),
+		)
+		.limit(1);
+
+	if (!prevBinding?.appliedJournalEntryId) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+			"Previous revision has no active applied journal entry to reverse for VOID",
+		);
+	}
+
+	const [prevJournal] = await tx
+		.select({ occurredAt: journalEntries.occurredAt })
+		.from(journalEntries)
+		.where(eq(journalEntries.id, prevBinding.appliedJournalEntryId))
+		.limit(1);
+
+	if (!prevJournal) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+			"Previous applied journal entry could not be found",
+		);
+	}
+
+	let revRes: ReverseJournalEntryResult;
+	try {
+		revRes = await reverseJournalEntryInTransaction({
+			tx,
+			userId,
+			originalEntryId: prevBinding.appliedJournalEntryId,
+			idempotencyKey: `txrev:${canonicalRes.revisionId}:reverse`,
+			occurredAt: prevJournal.occurredAt,
+			memo: null,
+		});
+	} catch (err) {
+		if (
+			err instanceof LedgerError &&
+			err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
+		) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_EFFECT_CONFLICT",
+				err.message,
+			);
+		}
+		if (err instanceof LedgerError) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_EFFECT_INVALID",
+				err.message,
+			);
+		}
+		throw err;
+	}
+
+	const [insertedBinding] = await tx
+		.insert(transactionLedgerBindings)
+		.values({
+			userId,
+			transactionId: canonicalRes.transactionId,
+			revisionId: canonicalRes.revisionId,
+			previousBindingId: prevBinding.id,
+			appliedJournalEntryId: null,
+			reversalJournalEntryId: revRes.entryId,
+		})
+		.returning();
+
+	if (!insertedBinding) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+			"Failed to insert transaction ledger binding for VOID",
+		);
+	}
+
+	return {
+		transactionId: canonicalRes.transactionId,
+		revisionId: canonicalRes.revisionId,
+		revisionNo: canonicalRes.revisionNo,
+		operation: "VOID",
+		idempotentReplay: false,
+		ledger: {
+			appliedJournalEntryId: null,
+			reversalJournalEntryId: insertedBinding.reversalJournalEntryId,
+		},
+	};
+}
+
+/**
+ * Atomically voids a canonical transaction and reverses its active journal in ONE transaction.
+ */
+export async function voidCanonicalTransactionWithLedger(
+	params: VoidCanonicalTransactionWithLedgerParams,
+): Promise<BoundCanonicalTransactionResult> {
+	return await params.db.transaction(async (tx) => {
+		return await voidCanonicalTransactionWithLedgerInTransaction({
+			tx,
+			userId: params.userId,
+			transactionId: params.transactionId,
+			expectedRevisionNo: params.expectedRevisionNo,
+			idempotencyKey: params.idempotencyKey,
+			reasonCode: params.reasonCode,
+			reasonNote: params.reasonNote,
+			source: params.source,
+		});
 	});
 }
 
