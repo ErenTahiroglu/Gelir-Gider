@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import migration0015Sql from "../migrations/0015_harden_income_projection_integrity.sql?raw";
 import migration0016Sql from "../migrations/0016_brief_unicorn.sql?raw";
+import migration0017Sql from "../migrations/0017_harden_income_settlement_serialization.sql?raw";
 import {
 	incomeReceiptRevisions,
 	incomeReceipts,
@@ -153,18 +154,47 @@ describe("Income Schema Definitions", () => {
 		expect(sql).toContain("v_rev.payload ? 'amount'");
 		expect(sql).toContain("v_rev.payload ? 'expectedReceiptOn'");
 		expect(sql).toContain("v_rev.payload ? 'note'");
-		expect(sql).toContain("INCOME_ENTITLEMENT");
 
 		// Settlement payload checks
 		expect(sql).toContain("v_rev.payload ? 'incomeReceiptId'");
 		expect(sql).toContain("v_rev.payload ? 'allocations'");
-		expect(sql).toContain("INCOME_SETTLEMENT");
+		expect(sql).toContain("v_rev.payload ? 'note'");
+	});
 
-		// Caps and sorting
-		expect(sql).toContain("v_elem_ent_id <= v_prev_ent_id");
-		expect(sql).toContain("v_total_alloc > v_latest_receipt_rev.amount");
+	it("verifies migration 0017 contains hardened concurrency locks and cross-domain invariants", () => {
+		const sql = migration0017Sql;
+
+		// Receipt trigger locks receipt and guards against allocation reduction / void
+		expect(sql).toContain("trg_fn_guard_income_receipt_revisions_insert");
+		expect(sql).toContain("FOR UPDATE");
+		expect(sql).toContain("Cannot reduce receipt amount");
 		expect(sql).toContain(
-			"(v_other_alloc_total + v_elem_amount) > v_latest_ent_rev.amount",
+			"Cannot void income receipt with active settlement allocations",
+		);
+
+		// Entitlement trigger locks entitlement and guards against allocation reduction / void
+		expect(sql).toContain("trg_fn_guard_income_entitlement_revisions_insert");
+		expect(sql).toContain("Europe/Istanbul");
+		expect(sql).toContain("Cannot reduce entitlement amount");
+		expect(sql).toContain(
+			"Cannot void income entitlement with active settlement allocations",
+		);
+
+		// Settlement trigger locks receipt and referenced entitlements deterministically
+		expect(sql).toContain(
+			"trg_fn_guard_income_settlement_batch_revisions_insert",
+		);
+		expect(sql).toContain("ORDER BY id ASC");
+		expect(sql).toContain("FOR UPDATE");
+		expect(sql).toContain("jsonb_object_keys(v_alloc_elem)");
+		expect(sql).toContain(
+			"jsonb_typeof(v_alloc_elem->'entitlementId') != 'string'",
+		);
+		expect(sql).toContain(
+			"Total allocations % exceed active income receipt amount %",
+		);
+		expect(sql).toContain(
+			"Total allocation % exceeds active entitlement amount %",
 		);
 	});
 });

@@ -8,6 +8,7 @@ import {
 	type SettlementAllocationItem,
 } from "../db/schema/income-entitlements";
 import { parseMoneyString } from "../ledger/money";
+import { IncomeError } from "./errors";
 
 /**
  * Computes the total allocated amount in cents for an active income receipt in a transaction.
@@ -114,18 +115,15 @@ export async function getActiveEntitlementAllocatedCentsInTransaction(
 }
 
 /**
- * Concurrency row-locking helper:
- * Acquires row locks on receipt and sorted entitlement rows.
+ * Locks a single income receipt row FOR UPDATE.
  */
-export async function lockReceiptAndEntitlementsForSettlement(
+export async function lockIncomeReceiptForSettlementStateInTransaction(
 	tx: DatabaseTransaction,
 	userId: string,
 	incomeReceiptId: string,
-	entitlementIds: string[],
-): Promise<void> {
-	// 1. Lock receipt row
-	await tx
-		.select({ id: incomeReceipts.id })
+) {
+	const [receipt] = await tx
+		.select()
 		.from(incomeReceipts)
 		.where(
 			and(
@@ -133,13 +131,45 @@ export async function lockReceiptAndEntitlementsForSettlement(
 				eq(incomeReceipts.userId, userId),
 			),
 		)
-		.for("update");
+		.for("update")
+		.limit(1);
+
+	if (!receipt) {
+		throw new IncomeError(
+			"INCOME_RECEIPT_NOT_FOUND",
+			`Income receipt "${incomeReceiptId}" not found`,
+		);
+	}
+
+	return receipt;
+}
+
+/**
+ * Concurrency row-locking helper:
+ * Acquires row locks on receipt and sorted entitlement rows.
+ * Enforces deterministic ORDER BY id ASC FOR UPDATE and completeness.
+ */
+export async function lockReceiptAndEntitlementsForSettlement(
+	tx: DatabaseTransaction,
+	userId: string,
+	incomeReceiptId: string,
+	entitlementIds: string[],
+) {
+	// 1. Lock receipt row FOR UPDATE
+	const receipt = await lockIncomeReceiptForSettlementStateInTransaction(
+		tx,
+		userId,
+		incomeReceiptId,
+	);
 
 	// 2. Lock entitlement rows in deterministic sorted order
 	if (entitlementIds.length > 0) {
 		const uniqueSortedIds = Array.from(new Set(entitlementIds)).sort();
-		await tx
-			.select({ id: incomeEntitlements.id })
+		const lockedEnts = await tx
+			.select({
+				id: incomeEntitlements.id,
+				sourceId: incomeEntitlements.sourceId,
+			})
 			.from(incomeEntitlements)
 			.where(
 				and(
@@ -147,6 +177,16 @@ export async function lockReceiptAndEntitlementsForSettlement(
 					inArray(incomeEntitlements.id, uniqueSortedIds),
 				),
 			)
+			.orderBy(incomeEntitlements.id)
 			.for("update");
+
+		if (lockedEnts.length !== uniqueSortedIds.length) {
+			throw new IncomeError(
+				"INCOME_ENTITLEMENT_NOT_FOUND",
+				"One or more allocated entitlements not found",
+			);
+		}
 	}
+
+	return receipt;
 }

@@ -120,6 +120,13 @@
       "when": 1788471654007,
       "tag": "0016_brief_unicorn",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1788472909186,
+      "tag": "0017_harden_income_settlement_serialization",
+      "breakpoints": true
     }
   ]
 }

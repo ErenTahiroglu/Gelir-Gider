@@ -395,15 +395,33 @@ export async function createIncomeEntitlement(
 		}
 
 		// Insert entitlement identity
-		const [entitlement] = await tx
-			.insert(incomeEntitlements)
-			.values({
-				userId,
-				sourceId: source.id,
-				periodMonth: validPeriod,
-				canonicalTransactionId: canonRes.transactionId,
-			})
-			.returning();
+		let entitlement: typeof incomeEntitlements.$inferSelect | undefined;
+		try {
+			const [created] = await tx
+				.insert(incomeEntitlements)
+				.values({
+					userId,
+					sourceId: source.id,
+					periodMonth: validPeriod,
+					canonicalTransactionId: canonRes.transactionId,
+				})
+				.returning();
+			entitlement = created;
+		} catch (err: unknown) {
+			const errorObj = err as { code?: string; message?: string };
+			if (
+				errorObj?.code === "23505" ||
+				errorObj?.message?.includes(
+					"income_entitlements_user_id_source_id_period_month_unique",
+				)
+			) {
+				throw new IncomeError(
+					"INCOME_ENTITLEMENT_PERIOD_CONFLICT",
+					`Entitlement already exists for source "${source.code}" and period "${validPeriod}"`,
+				);
+			}
+			throw err;
+		}
 
 		if (!entitlement) {
 			throw new IncomeError(

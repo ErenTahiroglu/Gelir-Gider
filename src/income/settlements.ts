@@ -26,6 +26,9 @@ import {
 	lockReceiptAndEntitlementsForSettlement,
 } from "./settlement-state";
 
+const UUID_PATTERN =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export interface IncomeReceiptSettlementAllocationItem {
 	entitlementId: string;
 	periodMonth: string;
@@ -106,6 +109,13 @@ function normalizeAndSortAllocations(
 			);
 		}
 
+		if (!UUID_PATTERN.test(trimmedId)) {
+			throw new IncomeError(
+				"INCOME_INVALID_INPUT",
+				`Invalid allocation entitlementId format: "${trimmedId}". Must be a valid UUID`,
+			);
+		}
+
 		if (seenEntitlementIds.has(trimmedId)) {
 			throw new IncomeError(
 				"INCOME_INVALID_INPUT",
@@ -171,6 +181,13 @@ export async function createIncomeSettlement(
 		);
 	}
 
+	if (!UUID_PATTERN.test(trimmedReceiptId)) {
+		throw new IncomeError(
+			"INCOME_INVALID_INPUT",
+			`Invalid incomeReceiptId format: "${trimmedReceiptId}". Must be a valid UUID`,
+		);
+	}
+
 	if (!allocations || allocations.length === 0) {
 		throw new IncomeError(
 			"INCOME_INVALID_INPUT",
@@ -201,26 +218,18 @@ export async function createIncomeSettlement(
 	}
 
 	return await db.transaction(async (tx) => {
-		// 1. Fetch receipt
-		const [receipt] = await tx
-			.select()
-			.from(incomeReceipts)
-			.where(
-				and(
-					eq(incomeReceipts.id, trimmedReceiptId),
-					eq(incomeReceipts.userId, userId),
-				),
-			)
-			.limit(1);
+		// 1. Acquire row locks on receipt and all target entitlements FIRST
+		const targetEntitlementIds = normalizedAllocations.map(
+			(a) => a.entitlementId,
+		);
+		const receipt = await lockReceiptAndEntitlementsForSettlement(
+			tx,
+			userId,
+			trimmedReceiptId,
+			targetEntitlementIds,
+		);
 
-		if (!receipt) {
-			throw new IncomeError(
-				"INCOME_RECEIPT_NOT_FOUND",
-				`Income receipt "${trimmedReceiptId}" not found`,
-			);
-		}
-
-		// 2. Fetch latest receipt revision
+		// 2. AFTER lock: Fetch authoritative latest receipt revision
 		const [latestReceiptRev] = await tx
 			.select()
 			.from(incomeReceiptRevisions)
@@ -240,18 +249,7 @@ export async function createIncomeSettlement(
 			);
 		}
 
-		// 3. Acquire row locks on receipt and all target entitlements
-		const targetEntitlementIds = normalizedAllocations.map(
-			(a) => a.entitlementId,
-		);
-		await lockReceiptAndEntitlementsForSettlement(
-			tx,
-			userId,
-			receipt.id,
-			targetEntitlementIds,
-		);
-
-		// 4. Validate receipt cap
+		// 3. Validate receipt cap
 		let totalAllocatedCents = 0n;
 		for (const a of normalizedAllocations) {
 			totalAllocatedCents += parseMoneyString(a.amount).cents;
@@ -265,7 +263,7 @@ export async function createIncomeSettlement(
 			);
 		}
 
-		// 5. Validate each target entitlement (ownership, same source, not void, entitlement cap)
+		// 4. Validate each target entitlement (ownership, same source, not void, entitlement cap)
 		const entBreakdown: IncomeReceiptSettlementAllocationItem[] = [];
 
 		for (const alloc of normalizedAllocations) {
@@ -346,7 +344,7 @@ export async function createIncomeSettlement(
 			});
 		}
 
-		// 6. Check existing batch for this receipt
+		// 5. Check existing batch for this receipt
 		const [existingBatch] = await tx
 			.select()
 			.from(incomeSettlementBatches)
@@ -530,6 +528,13 @@ export async function reviseIncomeSettlement(
 		);
 	}
 
+	if (!UUID_PATTERN.test(trimmedReceiptId)) {
+		throw new IncomeError(
+			"INCOME_INVALID_INPUT",
+			`Invalid incomeReceiptId format: "${trimmedReceiptId}". Must be a valid UUID`,
+		);
+	}
+
 	const normalizedAllocations =
 		allocations && allocations.length > 0
 			? normalizeAndSortAllocations(allocations)
@@ -556,52 +561,13 @@ export async function reviseIncomeSettlement(
 	}
 
 	return await db.transaction(async (tx) => {
-		// 1. Fetch receipt
-		const [receipt] = await tx
-			.select()
-			.from(incomeReceipts)
-			.where(
-				and(
-					eq(incomeReceipts.id, trimmedReceiptId),
-					eq(incomeReceipts.userId, userId),
-				),
-			)
-			.limit(1);
-
-		if (!receipt) {
-			throw new IncomeError(
-				"INCOME_RECEIPT_NOT_FOUND",
-				`Income receipt "${trimmedReceiptId}" not found`,
-			);
-		}
-
-		// 2. Fetch latest receipt revision
-		const [latestReceiptRev] = await tx
-			.select()
-			.from(incomeReceiptRevisions)
-			.where(
-				and(
-					eq(incomeReceiptRevisions.incomeReceiptId, receipt.id),
-					eq(incomeReceiptRevisions.userId, userId),
-				),
-			)
-			.orderBy(desc(incomeReceiptRevisions.revisionNo))
-			.limit(1);
-
-		if (!latestReceiptRev || latestReceiptRev.operation === "VOID") {
-			throw new IncomeError(
-				"INCOME_RECEIPT_INVALID_STATE",
-				"Cannot revise settlement for a non-existent or VOIDED income receipt",
-			);
-		}
-
-		// 3. Fetch settlement batch
+		// 1. Fetch settlement batch identity
 		const [batch] = await tx
 			.select()
 			.from(incomeSettlementBatches)
 			.where(
 				and(
-					eq(incomeSettlementBatches.incomeReceiptId, receipt.id),
+					eq(incomeSettlementBatches.incomeReceiptId, trimmedReceiptId),
 					eq(incomeSettlementBatches.userId, userId),
 				),
 			)
@@ -610,11 +576,11 @@ export async function reviseIncomeSettlement(
 		if (!batch) {
 			throw new IncomeError(
 				"INCOME_SETTLEMENT_NOT_FOUND",
-				`Settlement batch not found for income receipt "${receipt.id}"`,
+				`Settlement batch not found for income receipt "${trimmedReceiptId}"`,
 			);
 		}
 
-		// 4. Fetch previous batch revision
+		// 2. Fetch previous batch revision
 		const [prevBatchRev] = await tx
 			.select()
 			.from(incomeSettlementBatchRevisions)
@@ -633,7 +599,7 @@ export async function reviseIncomeSettlement(
 			);
 		}
 
-		// 5. Collect all involved entitlement IDs (both from prev revision and new revision)
+		// 3. Collect all involved entitlement IDs (both from prev revision and new revision)
 		const allInvolvedEntitlementIds = new Set<string>();
 		if (Array.isArray(prevBatchRev.allocations)) {
 			for (const a of prevBatchRev.allocations as SettlementAllocationItem[]) {
@@ -644,12 +610,33 @@ export async function reviseIncomeSettlement(
 			allInvolvedEntitlementIds.add(a.entitlementId);
 		}
 
-		await lockReceiptAndEntitlementsForSettlement(
+		// 4. Acquire row locks on receipt and all involved entitlements FIRST
+		const receipt = await lockReceiptAndEntitlementsForSettlement(
 			tx,
 			userId,
-			receipt.id,
+			trimmedReceiptId,
 			Array.from(allInvolvedEntitlementIds),
 		);
+
+		// 5. AFTER lock: Fetch authoritative latest receipt revision
+		const [latestReceiptRev] = await tx
+			.select()
+			.from(incomeReceiptRevisions)
+			.where(
+				and(
+					eq(incomeReceiptRevisions.incomeReceiptId, receipt.id),
+					eq(incomeReceiptRevisions.userId, userId),
+				),
+			)
+			.orderBy(desc(incomeReceiptRevisions.revisionNo))
+			.limit(1);
+
+		if (!latestReceiptRev || latestReceiptRev.operation === "VOID") {
+			throw new IncomeError(
+				"INCOME_RECEIPT_INVALID_STATE",
+				"Cannot revise settlement for a non-existent or VOIDED income receipt",
+			);
+		}
 
 		// 6. Validate receipt cap
 		let totalAllocatedCents = 0n;

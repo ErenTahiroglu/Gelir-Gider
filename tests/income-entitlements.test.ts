@@ -135,7 +135,7 @@ describe("Income Entitlements Service", () => {
 			select: vi.fn().mockImplementation(() => ({
 				from: vi.fn().mockImplementation((table) => ({
 					where: vi.fn().mockImplementation(() => {
-						const resObj: any = {
+						const resObj: Record<string, unknown> = {
 							limit: vi.fn().mockImplementation(() => {
 								if (table === users)
 									return Promise.resolve([{ currency: "TRY" }]);
@@ -185,7 +185,11 @@ describe("Income Entitlements Service", () => {
 								return Promise.resolve([]);
 							}),
 							orderBy: vi.fn().mockImplementation(() => {
-								const p: any = Promise.resolve([]);
+								const p = Promise.resolve([]) as unknown as Promise<
+									unknown[]
+								> & {
+									limit: ReturnType<typeof vi.fn>;
+								};
 								p.limit = vi.fn().mockResolvedValue([]);
 								return p;
 							}),
@@ -391,7 +395,7 @@ describe("Income Entitlements Service", () => {
 			select: vi.fn().mockImplementation(() => ({
 				from: vi.fn().mockImplementation((table) => ({
 					where: vi.fn().mockImplementation(() => {
-						const resObj: any = {
+						const resObj: Record<string, unknown> = {
 							for: vi.fn().mockImplementation(() => ({
 								limit: vi.fn().mockResolvedValue([
 									{
@@ -480,7 +484,7 @@ describe("Income Entitlements Service", () => {
 			select: vi.fn().mockImplementation(() => ({
 				from: vi.fn().mockImplementation((table) => ({
 					where: vi.fn().mockImplementation(() => {
-						const resObj: any = {
+						const resObj: Record<string, unknown> = {
 							for: vi.fn().mockImplementation(() => ({
 								limit: vi.fn().mockResolvedValue([
 									{

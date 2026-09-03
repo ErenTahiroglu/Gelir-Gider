@@ -22,7 +22,10 @@ import {
 import type { TransactionSourceInput } from "../transactions/service";
 import { getIstanbulCalendarDate } from "./calendar";
 import { IncomeError } from "./errors";
-import { getActiveReceiptAllocatedCentsInTransaction } from "./settlement-state";
+import {
+	getActiveReceiptAllocatedCentsInTransaction,
+	lockIncomeReceiptForSettlementStateInTransaction,
+} from "./settlement-state";
 
 export interface IncomeReceiptItem {
 	incomeReceiptId: string;
@@ -545,24 +548,12 @@ export async function reviseIncomeReceipt(
 			throw new IncomeError("INCOME_INVALID_INPUT", "User not found");
 		}
 
-		// 2. Fetch income receipt
-		const [receipt] = await tx
-			.select()
-			.from(incomeReceipts)
-			.where(
-				and(
-					eq(incomeReceipts.id, trimmedReceiptId),
-					eq(incomeReceipts.userId, userId),
-				),
-			)
-			.limit(1);
-
-		if (!receipt) {
-			throw new IncomeError(
-				"INCOME_RECEIPT_NOT_FOUND",
-				`Income receipt "${trimmedReceiptId}" not found`,
-			);
-		}
+		// 2. Fetch and lock income receipt
+		const receipt = await lockIncomeReceiptForSettlementStateInTransaction(
+			tx,
+			userId,
+			trimmedReceiptId,
+		);
 
 		// 3. Fetch income source
 		const [source] = await tx
@@ -844,24 +835,12 @@ export async function voidIncomeReceipt(
 	}
 
 	return await db.transaction(async (tx) => {
-		// 1. Fetch receipt
-		const [receipt] = await tx
-			.select()
-			.from(incomeReceipts)
-			.where(
-				and(
-					eq(incomeReceipts.id, trimmedReceiptId),
-					eq(incomeReceipts.userId, userId),
-				),
-			)
-			.limit(1);
-
-		if (!receipt) {
-			throw new IncomeError(
-				"INCOME_RECEIPT_NOT_FOUND",
-				`Income receipt "${trimmedReceiptId}" not found`,
-			);
-		}
+		// 1. Fetch and lock receipt
+		const receipt = await lockIncomeReceiptForSettlementStateInTransaction(
+			tx,
+			userId,
+			trimmedReceiptId,
+		);
 
 		// 2. Fetch source
 		const [source] = await tx
