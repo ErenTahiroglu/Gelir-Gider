@@ -112,57 +112,75 @@ describe("Session Lifecycle & Policy Service", () => {
 		).toBeNull();
 	});
 
-	it("throttles touchSessionActivity: does not write to DB if last_seen_at is less than 15 min old", async () => {
-		const mockDb = {
-			update: vi.fn(),
-		} as unknown as Database;
+	describe("touchSessionActivity", () => {
+		it("returns true and updates lastSeenAt when DB match is found, without extending expires_at", async () => {
+			const capturedUpdate: {
+				lastSeenAt?: Date;
+				expiresAt?: Date;
+			} = {};
 
-		// 5 minutes ago
-		const recentLastSeen = new Date(Date.now() - 5 * 60 * 1000);
-
-		const updated = await touchSessionActivity({
-			db: mockDb,
-			sessionId: "session-1",
-			lastSeenAt: recentLastSeen,
-		});
-
-		expect(updated).toBe(false);
-		expect(mockDb.update).not.toHaveBeenCalled();
-	});
-
-	it("writes touchSessionActivity to DB if last_seen_at is older than 15 min or null without extending expires_at", async () => {
-		const capturedUpdate: {
-			lastSeenAt?: Date;
-			expiresAt?: Date;
-		} = {};
-
-		const mockDb = {
-			update: vi.fn().mockReturnValue({
-				set: vi.fn().mockImplementation((setVals) => {
-					capturedUpdate.lastSeenAt = setVals.lastSeenAt;
-					capturedUpdate.expiresAt = setVals.expiresAt;
-					return {
-						where: vi.fn().mockReturnValue({
-							returning: vi.fn().mockResolvedValue([{ id: "session-1" }]),
-						}),
-					};
+			const mockDb = {
+				update: vi.fn().mockReturnValue({
+					set: vi.fn().mockImplementation((setVals) => {
+						capturedUpdate.lastSeenAt = setVals.lastSeenAt;
+						capturedUpdate.expiresAt = setVals.expiresAt;
+						return {
+							where: vi.fn().mockReturnValue({
+								returning: vi.fn().mockResolvedValue([{ id: "session-1" }]),
+							}),
+						};
+					}),
 				}),
-			}),
-		} as unknown as Database;
+			} as unknown as Database;
 
-		// 20 minutes ago
-		const oldLastSeen = new Date(Date.now() - 20 * 60 * 1000);
+			const updated = await touchSessionActivity({
+				db: mockDb,
+				sessionId: "session-1",
+			});
 
-		const updated = await touchSessionActivity({
-			db: mockDb,
-			sessionId: "session-1",
-			lastSeenAt: oldLastSeen,
+			expect(updated).toBe(true);
+			expect(mockDb.update).toHaveBeenCalled();
+			expect(capturedUpdate.lastSeenAt).toBeDefined();
+			expect(capturedUpdate.expiresAt).toBeUndefined(); // strictly absolute TTL
 		});
 
-		expect(updated).toBe(true);
-		expect(capturedUpdate.lastSeenAt).toBeDefined();
-		// Must not touch expires_at
-		expect(capturedUpdate.expiresAt).toBeUndefined();
+		it("returns false when session is throttled (DB UPDATE matched 0 rows)", async () => {
+			const mockDb = {
+				update: vi.fn().mockReturnValue({
+					set: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							returning: vi.fn().mockResolvedValue([]), // throttled by WHERE predicate
+						}),
+					}),
+				}),
+			} as unknown as Database;
+
+			const updated = await touchSessionActivity({
+				db: mockDb,
+				sessionId: "session-throttled",
+			});
+
+			expect(updated).toBe(false);
+		});
+
+		it("returns false when session is idle-expired or revoked (DB UPDATE matched 0 rows)", async () => {
+			const mockDb = {
+				update: vi.fn().mockReturnValue({
+					set: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							returning: vi.fn().mockResolvedValue([]), // idle-expired or revoked
+						}),
+					}),
+				}),
+			} as unknown as Database;
+
+			const updated = await touchSessionActivity({
+				db: mockDb,
+				sessionId: "session-idle-or-revoked",
+			});
+
+			expect(updated).toBe(false);
+		});
 	});
 
 	it("revokes session by raw token safely and idempotently", async () => {

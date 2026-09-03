@@ -1,4 +1,4 @@
-import { and, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, eq, gt, isNull, lte, or, sql } from "drizzle-orm";
 import type { Database } from "../db/client";
 import { sessions } from "../db/schema/auth";
 
@@ -140,27 +140,33 @@ export async function findActiveSessionByToken({
 export interface TouchSessionActivityParams {
 	db: Database;
 	sessionId: string;
-	lastSeenAt: Date | null;
 }
 
 /**
- * Throttled activity update: only writes to DB if last_seen_at is older than 15 minutes or null.
+ * Throttled activity update: executes a single atomic UPDATE statement.
+ * Does NOT accept caller-provided lastSeenAt; throttling and validity decisions
+ * are made entirely within the database transaction/statement.
+ *
+ * Requirements enforced atomically in WHERE clause:
+ * - id = :sessionId
+ * - revoked_at IS NULL
+ * - expires_at > now
+ * - COALESCE(last_seen_at, created_at) > idleThreshold (prevents idle revival!)
+ * - (last_seen_at IS NULL OR last_seen_at <= touchThreshold)
+ *
  * Does NOT extend expires_at (absolute TTL remains strict).
- * Only updates active (unexpired, non-revoked) sessions.
  */
 export async function touchSessionActivity({
 	db,
 	sessionId,
-	lastSeenAt,
 }: TouchSessionActivityParams): Promise<boolean> {
 	const now = new Date();
 	const touchThreshold = new Date(
 		now.getTime() - SESSION_TOUCH_INTERVAL_SECONDS * 1000,
 	);
-
-	if (lastSeenAt && lastSeenAt > touchThreshold) {
-		return false; // Throttled: no DB write needed
-	}
+	const idleThreshold = new Date(
+		now.getTime() - SESSION_IDLE_TTL_SECONDS * 1000,
+	);
 
 	const [updated] = await db
 		.update(sessions)
@@ -172,6 +178,14 @@ export async function touchSessionActivity({
 				eq(sessions.id, sessionId),
 				isNull(sessions.revokedAt),
 				gt(sessions.expiresAt, now),
+				gt(
+					sql`COALESCE(${sessions.lastSeenAt}, ${sessions.createdAt})`,
+					idleThreshold,
+				),
+				or(
+					isNull(sessions.lastSeenAt),
+					lte(sessions.lastSeenAt, touchThreshold),
+				),
 			),
 		)
 		.returning({ id: sessions.id });
