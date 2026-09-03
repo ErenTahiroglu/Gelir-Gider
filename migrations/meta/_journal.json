@@ -92,6 +92,13 @@
       "when": 1788447611318,
       "tag": "0012_spooky_giant_man",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1788448275733,
+      "tag": "0013_sudden_hellcat",
+      "breakpoints": true
     }
   ]
 }

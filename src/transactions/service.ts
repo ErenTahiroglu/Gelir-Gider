@@ -1,5 +1,5 @@
 import { and, desc, eq } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	canonicalTransactions,
 	transactionRevisions,
@@ -29,6 +29,16 @@ export interface CreateCanonicalTransactionParams {
 	source: TransactionSourceInput;
 }
 
+export interface CreateCanonicalTransactionInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	kind: string;
+	idempotencyKey: string;
+	occurredAt: Date;
+	payload: Record<string, unknown>;
+	source: TransactionSourceInput;
+}
+
 export interface ReviseCanonicalTransactionParams {
 	db: Database;
 	userId: string;
@@ -38,7 +48,20 @@ export interface ReviseCanonicalTransactionParams {
 	occurredAt: Date;
 	payload: Record<string, unknown>;
 	reasonCode: string;
-	reasonNote?: string | null;
+	reasonNote?: string | null | undefined;
+	source: TransactionSourceInput;
+}
+
+export interface ReviseCanonicalTransactionInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	transactionId: string;
+	expectedRevisionNo: number;
+	idempotencyKey: string;
+	occurredAt: Date;
+	payload: Record<string, unknown>;
+	reasonCode: string;
+	reasonNote?: string | null | undefined;
 	source: TransactionSourceInput;
 }
 
@@ -49,7 +72,18 @@ export interface VoidCanonicalTransactionParams {
 	expectedRevisionNo: number;
 	idempotencyKey: string;
 	reasonCode: string;
-	reasonNote?: string | null;
+	reasonNote?: string | null | undefined;
+	source: TransactionSourceInput;
+}
+
+export interface VoidCanonicalTransactionInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	transactionId: string;
+	expectedRevisionNo: number;
+	idempotencyKey: string;
+	reasonCode: string;
+	reasonNote?: string | null | undefined;
 	source: TransactionSourceInput;
 }
 
@@ -269,17 +303,18 @@ function validateInitialRevisionReplay({
 }
 
 /**
- * Creates a new canonical transaction with initial revision #1 (CREATE) and source provenance record.
+ * Internal transaction-scoped helper for creating a canonical transaction within an existing PostgreSQL transaction.
+ * Does NOT initiate a new db.transaction().
  */
-export async function createCanonicalTransaction({
-	db,
+export async function createCanonicalTransactionInTransaction({
+	tx,
 	userId,
 	kind,
 	idempotencyKey,
 	occurredAt,
 	payload,
 	source,
-}: CreateCanonicalTransactionParams): Promise<CanonicalTransactionOperationResult> {
+}: CreateCanonicalTransactionInTransactionParams): Promise<CanonicalTransactionOperationResult> {
 	if (!userId || userId.trim() === "") {
 		throw new CanonicalTransactionError(
 			"TRANSACTION_INVALID_INPUT",
@@ -310,9 +345,81 @@ export async function createCanonicalTransaction({
 		source: sourceDescriptor,
 	});
 
-	return await db.transaction(async (tx) => {
-		// 1. Early idempotency check on canonical_transactions
-		const [existingTx] = await tx
+	// 1. Early idempotency check on canonical_transactions
+	const [existingTx] = await tx
+		.select({
+			id: canonicalTransactions.id,
+			creationFingerprint: canonicalTransactions.creationFingerprint,
+		})
+		.from(canonicalTransactions)
+		.where(
+			and(
+				eq(canonicalTransactions.userId, userId),
+				eq(canonicalTransactions.creationIdempotencyKey, normalizedKey),
+			),
+		)
+		.limit(1);
+
+	if (existingTx) {
+		if (existingTx.creationFingerprint !== fingerprint) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_IDEMPOTENCY_CONFLICT",
+				"Creation idempotency key was already used with a different transaction payload or source",
+			);
+		}
+
+		const [rev1] = await tx
+			.select({
+				id: transactionRevisions.id,
+				revisionNo: transactionRevisions.revisionNo,
+				operation: transactionRevisions.operation,
+				idempotencyKey: transactionRevisions.idempotencyKey,
+				revisionFingerprint: transactionRevisions.revisionFingerprint,
+			})
+			.from(transactionRevisions)
+			.where(
+				and(
+					eq(transactionRevisions.transactionId, existingTx.id),
+					eq(transactionRevisions.revisionNo, 1),
+				),
+			)
+			.limit(1);
+
+		const validatedRev1 = validateInitialRevisionReplay({
+			rev1,
+			expectedNormalizedKey: normalizedKey,
+			expectedFingerprint: existingTx.creationFingerprint,
+		});
+
+		return {
+			transactionId: existingTx.id,
+			revisionId: validatedRev1.id,
+			revisionNo: 1,
+			operation: "CREATE",
+			idempotentReplay: true,
+		};
+	}
+
+	// 2. Insert canonical identity row with race-safe ON CONFLICT DO NOTHING
+	const [insertedTx] = await tx
+		.insert(canonicalTransactions)
+		.values({
+			userId,
+			kind: normalizedKind,
+			creationIdempotencyKey: normalizedKey,
+			creationFingerprint: fingerprint,
+		})
+		.onConflictDoNothing({
+			target: [
+				canonicalTransactions.userId,
+				canonicalTransactions.creationIdempotencyKey,
+			],
+		})
+		.returning();
+
+	if (!insertedTx) {
+		// Concurrent race inserted canonical identity
+		const [existingLateTx] = await tx
 			.select({
 				id: canonicalTransactions.id,
 				creationFingerprint: canonicalTransactions.creationFingerprint,
@@ -326,186 +433,154 @@ export async function createCanonicalTransaction({
 			)
 			.limit(1);
 
-		if (existingTx) {
-			if (existingTx.creationFingerprint !== fingerprint) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_IDEMPOTENCY_CONFLICT",
-					"Creation idempotency key was already used with a different transaction payload or source",
-				);
-			}
-
-			const [rev1] = await tx
-				.select({
-					id: transactionRevisions.id,
-					revisionNo: transactionRevisions.revisionNo,
-					operation: transactionRevisions.operation,
-					idempotencyKey: transactionRevisions.idempotencyKey,
-					revisionFingerprint: transactionRevisions.revisionFingerprint,
-				})
-				.from(transactionRevisions)
-				.where(
-					and(
-						eq(transactionRevisions.transactionId, existingTx.id),
-						eq(transactionRevisions.revisionNo, 1),
-					),
-				)
-				.limit(1);
-
-			const validatedRev1 = validateInitialRevisionReplay({
-				rev1,
-				expectedNormalizedKey: normalizedKey,
-				expectedFingerprint: existingTx.creationFingerprint,
-			});
-
-			return {
-				transactionId: existingTx.id,
-				revisionId: validatedRev1.id,
-				revisionNo: 1,
-				operation: "CREATE",
-				idempotentReplay: true,
-			};
-		}
-
-		// 2. Insert canonical identity row with race-safe ON CONFLICT DO NOTHING
-		const [insertedTx] = await tx
-			.insert(canonicalTransactions)
-			.values({
-				userId,
-				kind: normalizedKind,
-				creationIdempotencyKey: normalizedKey,
-				creationFingerprint: fingerprint,
-			})
-			.onConflictDoNothing({
-				target: [
-					canonicalTransactions.userId,
-					canonicalTransactions.creationIdempotencyKey,
-				],
-			})
-			.returning();
-
-		if (!insertedTx) {
-			// Concurrent race inserted canonical identity
-			const [existingLateTx] = await tx
-				.select({
-					id: canonicalTransactions.id,
-					creationFingerprint: canonicalTransactions.creationFingerprint,
-				})
-				.from(canonicalTransactions)
-				.where(
-					and(
-						eq(canonicalTransactions.userId, userId),
-						eq(canonicalTransactions.creationIdempotencyKey, normalizedKey),
-					),
-				)
-				.limit(1);
-
-			if (!existingLateTx) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_INVALID_STATE",
-					"Failed to retrieve canonical transaction identity after conflict",
-				);
-			}
-
-			if (existingLateTx.creationFingerprint !== fingerprint) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_IDEMPOTENCY_CONFLICT",
-					"Creation idempotency key was already used with a different transaction payload or source",
-				);
-			}
-
-			const [rev1] = await tx
-				.select({
-					id: transactionRevisions.id,
-					revisionNo: transactionRevisions.revisionNo,
-					operation: transactionRevisions.operation,
-					idempotencyKey: transactionRevisions.idempotencyKey,
-					revisionFingerprint: transactionRevisions.revisionFingerprint,
-				})
-				.from(transactionRevisions)
-				.where(
-					and(
-						eq(transactionRevisions.transactionId, existingLateTx.id),
-						eq(transactionRevisions.revisionNo, 1),
-					),
-				)
-				.limit(1);
-
-			const validatedRev1 = validateInitialRevisionReplay({
-				rev1,
-				expectedNormalizedKey: normalizedKey,
-				expectedFingerprint: existingLateTx.creationFingerprint,
-			});
-
-			return {
-				transactionId: existingLateTx.id,
-				revisionId: validatedRev1.id,
-				revisionNo: 1,
-				operation: "CREATE",
-				idempotentReplay: true,
-			};
-		}
-
-		// 3. Insert initial revision #1 (CREATE)
-		const [insertedRev] = await tx
-			.insert(transactionRevisions)
-			.values({
-				userId,
-				transactionId: insertedTx.id,
-				revisionNo: 1,
-				previousRevisionId: null,
-				operation: "CREATE",
-				occurredAt,
-				payload: canonicalObject,
-				revisionFingerprint: fingerprint,
-				idempotencyKey: normalizedKey,
-				reasonCode: null,
-				reasonNote: null,
-			})
-			.returning();
-
-		if (!insertedRev) {
+		if (!existingLateTx) {
 			throw new CanonicalTransactionError(
 				"TRANSACTION_INVALID_STATE",
-				"Failed to insert initial transaction revision #1",
+				"Failed to retrieve canonical transaction identity after conflict",
 			);
 		}
 
-		// 4. Insert initial provenance record
-		try {
-			await tx.insert(transactionSources).values({
-				userId,
-				transactionId: insertedTx.id,
-				revisionId: insertedRev.id,
-				sourceType: sourceDbValues.sourceType,
-				sourceRef: sourceDbValues.sourceRef,
-				sourcePayloadHash: sourceDbValues.sourcePayloadHash,
-				observedAt: sourceDbValues.observedAt,
-			});
-		} catch (sourceErr) {
-			if (isSourceConflictError(sourceErr)) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_SOURCE_CONFLICT",
-					`External source reference "${sourceDbValues.sourceRef}" is already associated with another transaction for this user`,
-				);
-			}
-			throw sourceErr;
+		if (existingLateTx.creationFingerprint !== fingerprint) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_IDEMPOTENCY_CONFLICT",
+				"Creation idempotency key was already used with a different transaction payload or source",
+			);
 		}
 
+		const [rev1] = await tx
+			.select({
+				id: transactionRevisions.id,
+				revisionNo: transactionRevisions.revisionNo,
+				operation: transactionRevisions.operation,
+				idempotencyKey: transactionRevisions.idempotencyKey,
+				revisionFingerprint: transactionRevisions.revisionFingerprint,
+			})
+			.from(transactionRevisions)
+			.where(
+				and(
+					eq(transactionRevisions.transactionId, existingLateTx.id),
+					eq(transactionRevisions.revisionNo, 1),
+				),
+			)
+			.limit(1);
+
+		const validatedRev1 = validateInitialRevisionReplay({
+			rev1,
+			expectedNormalizedKey: normalizedKey,
+			expectedFingerprint: existingLateTx.creationFingerprint,
+		});
+
 		return {
-			transactionId: insertedTx.id,
-			revisionId: insertedRev.id,
+			transactionId: existingLateTx.id,
+			revisionId: validatedRev1.id,
 			revisionNo: 1,
 			operation: "CREATE",
-			idempotentReplay: false,
+			idempotentReplay: true,
 		};
+	}
+
+	// 3. Insert initial revision #1 (CREATE)
+	const [insertedRev] = await tx
+		.insert(transactionRevisions)
+		.values({
+			userId,
+			transactionId: insertedTx.id,
+			revisionNo: 1,
+			previousRevisionId: null,
+			operation: "CREATE",
+			occurredAt,
+			payload: canonicalObject,
+			revisionFingerprint: fingerprint,
+			idempotencyKey: normalizedKey,
+			reasonCode: null,
+			reasonNote: null,
+		})
+		.returning();
+
+	if (!insertedRev) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_STATE",
+			"Failed to insert initial transaction revision #1",
+		);
+	}
+
+	// 4. Insert initial provenance record
+	try {
+		await tx.insert(transactionSources).values({
+			userId,
+			transactionId: insertedTx.id,
+			revisionId: insertedRev.id,
+			sourceType: sourceDbValues.sourceType,
+			sourceRef: sourceDbValues.sourceRef,
+			sourcePayloadHash: sourceDbValues.sourcePayloadHash,
+			observedAt: sourceDbValues.observedAt,
+		});
+	} catch (sourceErr) {
+		if (isSourceConflictError(sourceErr)) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_SOURCE_CONFLICT",
+				`External source reference "${sourceDbValues.sourceRef}" is already associated with another transaction for this user`,
+			);
+		}
+		throw sourceErr;
+	}
+
+	return {
+		transactionId: insertedTx.id,
+		revisionId: insertedRev.id,
+		revisionNo: 1,
+		operation: "CREATE",
+		idempotentReplay: false,
+	};
+}
+
+/**
+ * Creates a new canonical transaction with initial revision #1 (CREATE) and source provenance record.
+ * Future financial domain modules must use bound ledger lifecycle orchestration.
+ * Raw canonical services do not create accounting effects.
+ */
+export async function createCanonicalTransaction(
+	params: CreateCanonicalTransactionParams,
+): Promise<CanonicalTransactionOperationResult> {
+	if (!params.userId || params.userId.trim() === "") {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"User ID is required",
+		);
+	}
+	normalizeKind(params.kind);
+	normalizeIdempotencyKey(params.idempotencyKey);
+	if (
+		!(params.occurredAt instanceof Date) ||
+		Number.isNaN(params.occurredAt.getTime())
+	) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"Valid occurredAt Date is required",
+		);
+	}
+	canonicalizePayload(params.payload);
+	normalizeSource(params.source);
+
+	return await params.db.transaction(async (tx) => {
+		return await createCanonicalTransactionInTransaction({
+			tx,
+			userId: params.userId,
+			kind: params.kind,
+			idempotencyKey: params.idempotencyKey,
+			occurredAt: params.occurredAt,
+			payload: params.payload,
+			source: params.source,
+		});
 	});
 }
 
 /**
- * Appends an UPDATE revision to an existing canonical transaction with optimistic concurrency check.
+ * Internal transaction-scoped helper for appending an UPDATE revision within an existing PostgreSQL transaction.
+ * Does NOT initiate a new db.transaction().
  */
-export async function reviseCanonicalTransaction({
-	db,
+export async function reviseCanonicalTransactionInTransaction({
+	tx,
 	userId,
 	transactionId,
 	expectedRevisionNo,
@@ -515,7 +590,7 @@ export async function reviseCanonicalTransaction({
 	reasonCode,
 	reasonNote,
 	source,
-}: ReviseCanonicalTransactionParams): Promise<CanonicalTransactionOperationResult> {
+}: ReviseCanonicalTransactionInTransactionParams): Promise<CanonicalTransactionOperationResult> {
 	if (!userId || userId.trim() === "") {
 		throw new CanonicalTransactionError(
 			"TRANSACTION_INVALID_INPUT",
@@ -553,129 +628,47 @@ export async function reviseCanonicalTransaction({
 	const { descriptor: sourceDescriptor, dbValues: sourceDbValues } =
 		normalizeSource(source);
 
-	return await db.transaction(async (tx) => {
-		// 1. Early idempotency replay check
-		const [existingRev] = await tx
-			.select({
-				id: transactionRevisions.id,
-				transactionId: transactionRevisions.transactionId,
-				revisionNo: transactionRevisions.revisionNo,
-				operation: transactionRevisions.operation,
-				revisionFingerprint: transactionRevisions.revisionFingerprint,
-			})
-			.from(transactionRevisions)
-			.where(
-				and(
-					eq(transactionRevisions.userId, userId),
-					eq(transactionRevisions.idempotencyKey, normalizedKey),
-				),
-			)
-			.limit(1);
+	// 1. Early idempotency replay check
+	const [existingRev] = await tx
+		.select({
+			id: transactionRevisions.id,
+			transactionId: transactionRevisions.transactionId,
+			revisionNo: transactionRevisions.revisionNo,
+			operation: transactionRevisions.operation,
+			revisionFingerprint: transactionRevisions.revisionFingerprint,
+		})
+		.from(transactionRevisions)
+		.where(
+			and(
+				eq(transactionRevisions.userId, userId),
+				eq(transactionRevisions.idempotencyKey, normalizedKey),
+			),
+		)
+		.limit(1);
 
-		if (existingRev) {
-			if (
-				existingRev.transactionId !== trimmedTxId ||
-				existingRev.operation !== "UPDATE"
-			) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_IDEMPOTENCY_CONFLICT",
-					"Idempotency key was used for a different transaction or operation",
-				);
-			}
-
-			// Fetch parent kind to compute candidate fingerprint
-			const [parentTx] = await tx
-				.select({ kind: canonicalTransactions.kind })
-				.from(canonicalTransactions)
-				.where(eq(canonicalTransactions.id, trimmedTxId))
-				.limit(1);
-
-			const candidateFingerprint = await calculateRevisionFingerprint({
-				operation: "UPDATE",
-				userId,
-				transactionId: trimmedTxId,
-				kind: parentTx?.kind ?? "",
-				occurredAt,
-				payload: canonicalObject,
-				reasonCode: normalizedReasonCode,
-				reasonNote: normalizedReasonNote,
-				source: sourceDescriptor,
-			});
-
-			if (existingRev.revisionFingerprint !== candidateFingerprint) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with a different update payload or reason",
-				);
-			}
-
-			return {
-				transactionId: trimmedTxId,
-				revisionId: existingRev.id,
-				revisionNo: existingRev.revisionNo,
-				operation: "UPDATE",
-				idempotentReplay: true,
-			};
+	if (existingRev) {
+		if (
+			existingRev.transactionId !== trimmedTxId ||
+			existingRev.operation !== "UPDATE"
+		) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_IDEMPOTENCY_CONFLICT",
+				"Idempotency key was used for a different transaction or operation",
+			);
 		}
 
-		// 2. Lock parent canonical transaction FOR UPDATE
+		// Fetch parent kind to compute candidate fingerprint
 		const [parentTx] = await tx
-			.select({
-				id: canonicalTransactions.id,
-				userId: canonicalTransactions.userId,
-				kind: canonicalTransactions.kind,
-			})
+			.select({ kind: canonicalTransactions.kind })
 			.from(canonicalTransactions)
 			.where(eq(canonicalTransactions.id, trimmedTxId))
-			.for("update")
 			.limit(1);
 
-		if (!parentTx || parentTx.userId !== userId) {
-			throw new CanonicalTransactionError(
-				"TRANSACTION_NOT_FOUND",
-				`Canonical transaction "${trimmedTxId}" not found for this user`,
-			);
-		}
-
-		// 3. Inspect current latest revision
-		const [trueLatest] = await tx
-			.select({
-				id: transactionRevisions.id,
-				revisionNo: transactionRevisions.revisionNo,
-				operation: transactionRevisions.operation,
-			})
-			.from(transactionRevisions)
-			.where(eq(transactionRevisions.transactionId, trimmedTxId))
-			.orderBy(desc(transactionRevisions.revisionNo))
-			.limit(1);
-
-		if (!trueLatest) {
-			throw new CanonicalTransactionError(
-				"TRANSACTION_INVALID_STATE",
-				"No existing revisions found for transaction",
-			);
-		}
-
-		if (trueLatest.operation === "VOID") {
-			throw new CanonicalTransactionError(
-				"TRANSACTION_ALREADY_VOIDED",
-				`Cannot update transaction "${trimmedTxId}" because it has been permanently voided`,
-			);
-		}
-
-		if (trueLatest.revisionNo !== expectedRevisionNo) {
-			throw new CanonicalTransactionError(
-				"TRANSACTION_REVISION_CONFLICT",
-				`Optimistic concurrency conflict: expected revision ${expectedRevisionNo}, but current revision is ${trueLatest.revisionNo}`,
-			);
-		}
-
-		// 4. Calculate fingerprint
-		const fingerprint = await calculateRevisionFingerprint({
+		const candidateFingerprint = await calculateRevisionFingerprint({
 			operation: "UPDATE",
 			userId,
 			transactionId: trimmedTxId,
-			kind: parentTx.kind,
+			kind: parentTx?.kind ?? "",
 			occurredAt,
 			payload: canonicalObject,
 			reasonCode: normalizedReasonCode,
@@ -683,68 +676,209 @@ export async function reviseCanonicalTransaction({
 			source: sourceDescriptor,
 		});
 
-		// 5. Insert revision
-		const [newRev] = await tx
-			.insert(transactionRevisions)
-			.values({
-				userId,
-				transactionId: trimmedTxId,
-				revisionNo: trueLatest.revisionNo + 1,
-				previousRevisionId: trueLatest.id,
-				operation: "UPDATE",
-				occurredAt,
-				payload: canonicalObject,
-				revisionFingerprint: fingerprint,
-				idempotencyKey: normalizedKey,
-				reasonCode: normalizedReasonCode,
-				reasonNote: normalizedReasonNote,
-			})
-			.returning();
-
-		if (!newRev) {
+		if (existingRev.revisionFingerprint !== candidateFingerprint) {
 			throw new CanonicalTransactionError(
-				"TRANSACTION_INVALID_STATE",
-				"Failed to insert update revision",
+				"TRANSACTION_IDEMPOTENCY_CONFLICT",
+				"Idempotency key already used with a different update payload or reason",
 			);
-		}
-
-		// 6. Insert source record
-		try {
-			await tx.insert(transactionSources).values({
-				userId,
-				transactionId: trimmedTxId,
-				revisionId: newRev.id,
-				sourceType: sourceDbValues.sourceType,
-				sourceRef: sourceDbValues.sourceRef,
-				sourcePayloadHash: sourceDbValues.sourcePayloadHash,
-				observedAt: sourceDbValues.observedAt,
-			});
-		} catch (sourceErr) {
-			if (isSourceConflictError(sourceErr)) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_SOURCE_CONFLICT",
-					`External source reference "${sourceDbValues.sourceRef}" is already associated with another transaction for this user`,
-				);
-			}
-			throw sourceErr;
 		}
 
 		return {
 			transactionId: trimmedTxId,
-			revisionId: newRev.id,
-			revisionNo: newRev.revisionNo,
+			revisionId: existingRev.id,
+			revisionNo: existingRev.revisionNo,
 			operation: "UPDATE",
-			idempotentReplay: false,
+			idempotentReplay: true,
 		};
+	}
+
+	// 2. Lock parent canonical transaction FOR UPDATE
+	const [parentTx] = await tx
+		.select({
+			id: canonicalTransactions.id,
+			userId: canonicalTransactions.userId,
+			kind: canonicalTransactions.kind,
+		})
+		.from(canonicalTransactions)
+		.where(eq(canonicalTransactions.id, trimmedTxId))
+		.for("update")
+		.limit(1);
+
+	if (!parentTx || parentTx.userId !== userId) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_NOT_FOUND",
+			`Canonical transaction "${trimmedTxId}" not found for this user`,
+		);
+	}
+
+	// 3. Inspect current latest revision
+	const [trueLatest] = await tx
+		.select({
+			id: transactionRevisions.id,
+			revisionNo: transactionRevisions.revisionNo,
+			operation: transactionRevisions.operation,
+		})
+		.from(transactionRevisions)
+		.where(eq(transactionRevisions.transactionId, trimmedTxId))
+		.orderBy(desc(transactionRevisions.revisionNo))
+		.limit(1);
+
+	if (!trueLatest) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_STATE",
+			"No existing revisions found for transaction",
+		);
+	}
+
+	if (trueLatest.operation === "VOID") {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_ALREADY_VOIDED",
+			`Cannot update transaction "${trimmedTxId}" because it has been permanently voided`,
+		);
+	}
+
+	if (trueLatest.revisionNo !== expectedRevisionNo) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_REVISION_CONFLICT",
+			`Optimistic concurrency conflict: expected revision ${expectedRevisionNo}, but current revision is ${trueLatest.revisionNo}`,
+		);
+	}
+
+	// 4. Calculate fingerprint
+	const fingerprint = await calculateRevisionFingerprint({
+		operation: "UPDATE",
+		userId,
+		transactionId: trimmedTxId,
+		kind: parentTx.kind,
+		occurredAt,
+		payload: canonicalObject,
+		reasonCode: normalizedReasonCode,
+		reasonNote: normalizedReasonNote,
+		source: sourceDescriptor,
+	});
+
+	// 5. Insert revision
+	const [newRev] = await tx
+		.insert(transactionRevisions)
+		.values({
+			userId,
+			transactionId: trimmedTxId,
+			revisionNo: trueLatest.revisionNo + 1,
+			previousRevisionId: trueLatest.id,
+			operation: "UPDATE",
+			occurredAt,
+			payload: canonicalObject,
+			revisionFingerprint: fingerprint,
+			idempotencyKey: normalizedKey,
+			reasonCode: normalizedReasonCode,
+			reasonNote: normalizedReasonNote,
+		})
+		.returning();
+
+	if (!newRev) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_STATE",
+			"Failed to insert update revision",
+		);
+	}
+
+	// 6. Insert source record
+	try {
+		await tx.insert(transactionSources).values({
+			userId,
+			transactionId: trimmedTxId,
+			revisionId: newRev.id,
+			sourceType: sourceDbValues.sourceType,
+			sourceRef: sourceDbValues.sourceRef,
+			sourcePayloadHash: sourceDbValues.sourcePayloadHash,
+			observedAt: sourceDbValues.observedAt,
+		});
+	} catch (sourceErr) {
+		if (isSourceConflictError(sourceErr)) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_SOURCE_CONFLICT",
+				`External source reference "${sourceDbValues.sourceRef}" is already associated with another transaction for this user`,
+			);
+		}
+		throw sourceErr;
+	}
+
+	return {
+		transactionId: trimmedTxId,
+		revisionId: newRev.id,
+		revisionNo: newRev.revisionNo,
+		operation: "UPDATE",
+		idempotentReplay: false,
+	};
+}
+
+/**
+ * Appends an UPDATE revision to an existing canonical transaction with optimistic concurrency check.
+ * Future financial domain modules must use bound ledger lifecycle orchestration.
+ * Raw canonical services do not create accounting effects.
+ */
+export async function reviseCanonicalTransaction(
+	params: ReviseCanonicalTransactionParams,
+): Promise<CanonicalTransactionOperationResult> {
+	if (!params.userId || params.userId.trim() === "") {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"User ID is required",
+		);
+	}
+	const trimmedTxId = params.transactionId?.trim();
+	if (!trimmedTxId) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"Transaction ID is required",
+		);
+	}
+	if (
+		!Number.isSafeInteger(params.expectedRevisionNo) ||
+		params.expectedRevisionNo < 1
+	) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"expectedRevisionNo must be a positive integer >= 1",
+		);
+	}
+	normalizeIdempotencyKey(params.idempotencyKey);
+	normalizeReasonCode(params.reasonCode);
+	normalizeReasonNote(params.reasonNote);
+	if (
+		!(params.occurredAt instanceof Date) ||
+		Number.isNaN(params.occurredAt.getTime())
+	) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"Valid occurredAt Date is required",
+		);
+	}
+	canonicalizePayload(params.payload);
+	normalizeSource(params.source);
+
+	return await params.db.transaction(async (tx) => {
+		return await reviseCanonicalTransactionInTransaction({
+			tx,
+			userId: params.userId,
+			transactionId: params.transactionId,
+			expectedRevisionNo: params.expectedRevisionNo,
+			idempotencyKey: params.idempotencyKey,
+			occurredAt: params.occurredAt,
+			payload: params.payload,
+			reasonCode: params.reasonCode,
+			reasonNote: params.reasonNote,
+			source: params.source,
+		});
 	});
 }
 
 /**
- * Appends a terminal VOID revision to an existing canonical transaction.
- * Copies the last known domain payload and occurrence timestamp exactly.
+ * Internal transaction-scoped helper for appending a VOID revision within an existing PostgreSQL transaction.
+ * Does NOT initiate a new db.transaction().
  */
-export async function voidCanonicalTransaction({
-	db,
+export async function voidCanonicalTransactionInTransaction({
+	tx,
 	userId,
 	transactionId,
 	expectedRevisionNo,
@@ -752,7 +886,7 @@ export async function voidCanonicalTransaction({
 	reasonCode,
 	reasonNote,
 	source,
-}: VoidCanonicalTransactionParams): Promise<CanonicalTransactionOperationResult> {
+}: VoidCanonicalTransactionInTransactionParams): Promise<CanonicalTransactionOperationResult> {
 	if (!userId || userId.trim() === "") {
 		throw new CanonicalTransactionError(
 			"TRANSACTION_INVALID_INPUT",
@@ -781,205 +915,253 @@ export async function voidCanonicalTransaction({
 	const { descriptor: sourceDescriptor, dbValues: sourceDbValues } =
 		normalizeSource(source);
 
-	return await db.transaction(async (tx) => {
-		// 1. Early idempotency replay check
-		const [existingRev] = await tx
-			.select({
-				id: transactionRevisions.id,
-				transactionId: transactionRevisions.transactionId,
-				revisionNo: transactionRevisions.revisionNo,
-				operation: transactionRevisions.operation,
-				revisionFingerprint: transactionRevisions.revisionFingerprint,
-			})
-			.from(transactionRevisions)
-			.where(
-				and(
-					eq(transactionRevisions.userId, userId),
-					eq(transactionRevisions.idempotencyKey, normalizedKey),
-				),
-			)
-			.limit(1);
+	// 1. Early idempotency replay check
+	const [existingRev] = await tx
+		.select({
+			id: transactionRevisions.id,
+			transactionId: transactionRevisions.transactionId,
+			revisionNo: transactionRevisions.revisionNo,
+			operation: transactionRevisions.operation,
+			revisionFingerprint: transactionRevisions.revisionFingerprint,
+		})
+		.from(transactionRevisions)
+		.where(
+			and(
+				eq(transactionRevisions.userId, userId),
+				eq(transactionRevisions.idempotencyKey, normalizedKey),
+			),
+		)
+		.limit(1);
 
-		if (existingRev) {
-			if (
-				existingRev.transactionId !== trimmedTxId ||
-				existingRev.operation !== "VOID"
-			) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_IDEMPOTENCY_CONFLICT",
-					"Idempotency key was used for a different transaction or operation",
-				);
-			}
-
-			const [parentTx] = await tx
-				.select({ kind: canonicalTransactions.kind })
-				.from(canonicalTransactions)
-				.where(eq(canonicalTransactions.id, trimmedTxId))
-				.limit(1);
-
-			// Load the previous revision to compute candidate fingerprint
-			const [prevRev] = await tx
-				.select({
-					occurredAt: transactionRevisions.occurredAt,
-					payload: transactionRevisions.payload,
-				})
-				.from(transactionRevisions)
-				.where(
-					and(
-						eq(transactionRevisions.transactionId, trimmedTxId),
-						eq(transactionRevisions.revisionNo, existingRev.revisionNo - 1),
-					),
-				)
-				.limit(1);
-
-			const candidateFingerprint = await calculateRevisionFingerprint({
-				operation: "VOID",
-				userId,
-				transactionId: trimmedTxId,
-				kind: parentTx?.kind ?? "",
-				occurredAt: prevRev?.occurredAt ?? new Date(),
-				payload: (prevRev?.payload as Record<string, unknown>) ?? {},
-				reasonCode: normalizedReasonCode,
-				reasonNote: normalizedReasonNote,
-				source: sourceDescriptor,
-			});
-
-			if (existingRev.revisionFingerprint !== candidateFingerprint) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with a different void reason or source",
-				);
-			}
-
-			return {
-				transactionId: trimmedTxId,
-				revisionId: existingRev.id,
-				revisionNo: existingRev.revisionNo,
-				operation: "VOID",
-				idempotentReplay: true,
-			};
-		}
-
-		// 2. Lock parent canonical transaction FOR UPDATE
-		const [parentTx] = await tx
-			.select({
-				id: canonicalTransactions.id,
-				userId: canonicalTransactions.userId,
-				kind: canonicalTransactions.kind,
-			})
-			.from(canonicalTransactions)
-			.where(eq(canonicalTransactions.id, trimmedTxId))
-			.for("update")
-			.limit(1);
-
-		if (!parentTx || parentTx.userId !== userId) {
+	if (existingRev) {
+		if (
+			existingRev.transactionId !== trimmedTxId ||
+			existingRev.operation !== "VOID"
+		) {
 			throw new CanonicalTransactionError(
-				"TRANSACTION_NOT_FOUND",
-				`Canonical transaction "${trimmedTxId}" not found for this user`,
+				"TRANSACTION_IDEMPOTENCY_CONFLICT",
+				"Idempotency key was used for a different transaction or operation",
 			);
 		}
 
-		// 3. Inspect current latest revision
-		const [trueLatest] = await tx
+		const [parentTx] = await tx
+			.select({ kind: canonicalTransactions.kind })
+			.from(canonicalTransactions)
+			.where(eq(canonicalTransactions.id, trimmedTxId))
+			.limit(1);
+
+		// Load the previous revision to compute candidate fingerprint
+		const [prevRev] = await tx
 			.select({
-				id: transactionRevisions.id,
-				revisionNo: transactionRevisions.revisionNo,
-				operation: transactionRevisions.operation,
 				occurredAt: transactionRevisions.occurredAt,
 				payload: transactionRevisions.payload,
 			})
 			.from(transactionRevisions)
-			.where(eq(transactionRevisions.transactionId, trimmedTxId))
-			.orderBy(desc(transactionRevisions.revisionNo))
+			.where(
+				and(
+					eq(transactionRevisions.transactionId, trimmedTxId),
+					eq(transactionRevisions.revisionNo, existingRev.revisionNo - 1),
+				),
+			)
 			.limit(1);
 
-		if (!trueLatest) {
-			throw new CanonicalTransactionError(
-				"TRANSACTION_INVALID_STATE",
-				"No existing revisions found for transaction",
-			);
-		}
-
-		if (trueLatest.operation === "VOID") {
-			throw new CanonicalTransactionError(
-				"TRANSACTION_ALREADY_VOIDED",
-				`Transaction "${trimmedTxId}" has already been voided`,
-			);
-		}
-
-		if (trueLatest.revisionNo !== expectedRevisionNo) {
-			throw new CanonicalTransactionError(
-				"TRANSACTION_REVISION_CONFLICT",
-				`Optimistic concurrency conflict: expected revision ${expectedRevisionNo}, but current revision is ${trueLatest.revisionNo}`,
-			);
-		}
-
-		// 4. Calculate VOID fingerprint using exact previous snapshot
-		const fingerprint = await calculateRevisionFingerprint({
+		const candidateFingerprint = await calculateRevisionFingerprint({
 			operation: "VOID",
 			userId,
 			transactionId: trimmedTxId,
-			kind: parentTx.kind,
-			occurredAt: trueLatest.occurredAt,
-			payload: trueLatest.payload as Record<string, unknown>,
+			kind: parentTx?.kind ?? "",
+			occurredAt: prevRev?.occurredAt ?? new Date(),
+			payload: (prevRev?.payload as Record<string, unknown>) ?? {},
 			reasonCode: normalizedReasonCode,
 			reasonNote: normalizedReasonNote,
 			source: sourceDescriptor,
 		});
 
-		// 5. Insert VOID revision
-		const [newRev] = await tx
-			.insert(transactionRevisions)
-			.values({
-				userId,
-				transactionId: trimmedTxId,
-				revisionNo: trueLatest.revisionNo + 1,
-				previousRevisionId: trueLatest.id,
-				operation: "VOID",
-				occurredAt: trueLatest.occurredAt,
-				payload: trueLatest.payload,
-				revisionFingerprint: fingerprint,
-				idempotencyKey: normalizedKey,
-				reasonCode: normalizedReasonCode,
-				reasonNote: normalizedReasonNote,
-			})
-			.returning();
-
-		if (!newRev) {
+		if (existingRev.revisionFingerprint !== candidateFingerprint) {
 			throw new CanonicalTransactionError(
-				"TRANSACTION_INVALID_STATE",
-				"Failed to insert void revision",
+				"TRANSACTION_IDEMPOTENCY_CONFLICT",
+				"Idempotency key already used with a different void reason or source",
 			);
-		}
-
-		// 6. Insert provenance
-		try {
-			await tx.insert(transactionSources).values({
-				userId,
-				transactionId: trimmedTxId,
-				revisionId: newRev.id,
-				sourceType: sourceDbValues.sourceType,
-				sourceRef: sourceDbValues.sourceRef,
-				sourcePayloadHash: sourceDbValues.sourcePayloadHash,
-				observedAt: sourceDbValues.observedAt,
-			});
-		} catch (sourceErr) {
-			if (isSourceConflictError(sourceErr)) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_SOURCE_CONFLICT",
-					`External source reference "${sourceDbValues.sourceRef}" is already associated with another transaction for this user`,
-				);
-			}
-			throw sourceErr;
 		}
 
 		return {
 			transactionId: trimmedTxId,
-			revisionId: newRev.id,
-			revisionNo: newRev.revisionNo,
+			revisionId: existingRev.id,
+			revisionNo: existingRev.revisionNo,
 			operation: "VOID",
-			idempotentReplay: false,
+			idempotentReplay: true,
 		};
+	}
+
+	// 2. Lock parent canonical transaction FOR UPDATE
+	const [parentTx] = await tx
+		.select({
+			id: canonicalTransactions.id,
+			userId: canonicalTransactions.userId,
+			kind: canonicalTransactions.kind,
+		})
+		.from(canonicalTransactions)
+		.where(eq(canonicalTransactions.id, trimmedTxId))
+		.for("update")
+		.limit(1);
+
+	if (!parentTx || parentTx.userId !== userId) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_NOT_FOUND",
+			`Canonical transaction "${trimmedTxId}" not found for this user`,
+		);
+	}
+
+	// 3. Inspect current latest revision
+	const [trueLatest] = await tx
+		.select({
+			id: transactionRevisions.id,
+			revisionNo: transactionRevisions.revisionNo,
+			operation: transactionRevisions.operation,
+			occurredAt: transactionRevisions.occurredAt,
+			payload: transactionRevisions.payload,
+		})
+		.from(transactionRevisions)
+		.where(eq(transactionRevisions.transactionId, trimmedTxId))
+		.orderBy(desc(transactionRevisions.revisionNo))
+		.limit(1);
+
+	if (!trueLatest) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_STATE",
+			"No existing revisions found for transaction",
+		);
+	}
+
+	if (trueLatest.operation === "VOID") {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_ALREADY_VOIDED",
+			`Transaction "${trimmedTxId}" has already been voided`,
+		);
+	}
+
+	if (trueLatest.revisionNo !== expectedRevisionNo) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_REVISION_CONFLICT",
+			`Optimistic concurrency conflict: expected revision ${expectedRevisionNo}, but current revision is ${trueLatest.revisionNo}`,
+		);
+	}
+
+	// 4. Calculate VOID fingerprint using exact previous snapshot
+	const fingerprint = await calculateRevisionFingerprint({
+		operation: "VOID",
+		userId,
+		transactionId: trimmedTxId,
+		kind: parentTx.kind,
+		occurredAt: trueLatest.occurredAt,
+		payload: trueLatest.payload as Record<string, unknown>,
+		reasonCode: normalizedReasonCode,
+		reasonNote: normalizedReasonNote,
+		source: sourceDescriptor,
+	});
+
+	// 5. Insert VOID revision
+	const [newRev] = await tx
+		.insert(transactionRevisions)
+		.values({
+			userId,
+			transactionId: trimmedTxId,
+			revisionNo: trueLatest.revisionNo + 1,
+			previousRevisionId: trueLatest.id,
+			operation: "VOID",
+			occurredAt: trueLatest.occurredAt,
+			payload: trueLatest.payload,
+			revisionFingerprint: fingerprint,
+			idempotencyKey: normalizedKey,
+			reasonCode: normalizedReasonCode,
+			reasonNote: normalizedReasonNote,
+		})
+		.returning();
+
+	if (!newRev) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_STATE",
+			"Failed to insert void revision",
+		);
+	}
+
+	// 6. Insert provenance
+	try {
+		await tx.insert(transactionSources).values({
+			userId,
+			transactionId: trimmedTxId,
+			revisionId: newRev.id,
+			sourceType: sourceDbValues.sourceType,
+			sourceRef: sourceDbValues.sourceRef,
+			sourcePayloadHash: sourceDbValues.sourcePayloadHash,
+			observedAt: sourceDbValues.observedAt,
+		});
+	} catch (sourceErr) {
+		if (isSourceConflictError(sourceErr)) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_SOURCE_CONFLICT",
+				`External source reference "${sourceDbValues.sourceRef}" is already associated with another transaction for this user`,
+			);
+		}
+		throw sourceErr;
+	}
+
+	return {
+		transactionId: trimmedTxId,
+		revisionId: newRev.id,
+		revisionNo: newRev.revisionNo,
+		operation: "VOID",
+		idempotentReplay: false,
+	};
+}
+
+/**
+ * Appends a terminal VOID revision to an existing canonical transaction.
+ * Copies the last known domain payload and occurrence timestamp exactly.
+ * Future financial domain modules must use bound ledger lifecycle orchestration.
+ * Raw canonical services do not create accounting effects.
+ */
+export async function voidCanonicalTransaction(
+	params: VoidCanonicalTransactionParams,
+): Promise<CanonicalTransactionOperationResult> {
+	if (!params.userId || params.userId.trim() === "") {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"User ID is required",
+		);
+	}
+	const trimmedTxId = params.transactionId?.trim();
+	if (!trimmedTxId) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"Transaction ID is required",
+		);
+	}
+	if (
+		!Number.isSafeInteger(params.expectedRevisionNo) ||
+		params.expectedRevisionNo < 1
+	) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_INPUT",
+			"expectedRevisionNo must be a positive integer >= 1",
+		);
+	}
+	normalizeIdempotencyKey(params.idempotencyKey);
+	normalizeReasonCode(params.reasonCode);
+	normalizeReasonNote(params.reasonNote);
+	normalizeSource(params.source);
+
+	return await params.db.transaction(async (tx) => {
+		return await voidCanonicalTransactionInTransaction({
+			tx,
+			userId: params.userId,
+			transactionId: params.transactionId,
+			expectedRevisionNo: params.expectedRevisionNo,
+			idempotencyKey: params.idempotencyKey,
+			reasonCode: params.reasonCode,
+			reasonNote: params.reasonNote,
+			source: params.source,
+		});
 	});
 }
 
@@ -1044,6 +1226,7 @@ export async function getCanonicalTransaction({
 		.where(eq(transactionRevisions.transactionId, trimmedTxId))
 		.orderBy(desc(transactionRevisions.revisionNo))
 		.limit(1);
+
 	if (!latest) {
 		throw new CanonicalTransactionError(
 			"TRANSACTION_INVALID_STATE",

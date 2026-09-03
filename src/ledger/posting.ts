@@ -1,5 +1,5 @@
 import { and, eq, inArray } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { Database, DatabaseTransaction } from "../db/client";
 import { users } from "../db/schema/auth";
 import {
 	journalEntries,
@@ -33,6 +33,16 @@ export interface PostJournalEntryParams {
 	lines: JournalLineInput[];
 }
 
+export interface PostJournalEntryInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	idempotencyKey: string;
+	occurredAt: Date;
+	memo?: string | undefined;
+	source?: JournalSourceInput | undefined;
+	lines: JournalLineInput[];
+}
+
 export interface PostJournalEntryResult {
 	entryId: string;
 	idempotentReplay: boolean;
@@ -50,56 +60,28 @@ interface NormalizedLine {
 	memo: string | null;
 }
 
-/**
- * Computes a deterministic SHA-256 posting fingerprint (64 lowercase hex)
- * using versioned structured canonical array serialization and standard Web Crypto API.
- */
-export async function calculatePostingFingerprint(params: {
-	userId: string;
-	occurredAt: Date;
-	currency: string;
-	memo: string | null;
-	source: JournalSourceInput | null;
-	lines: NormalizedLine[];
-}): Promise<string> {
-	const canonicalPayload = [
-		"ledger-posting-v1",
-		params.userId,
-		params.occurredAt.toISOString(),
-		params.currency,
-		params.memo,
-		params.source
-			? [params.source.type.trim(), params.source.ref.trim()]
-			: null,
-		params.lines.map((line) => [
-			line.accountId,
-			line.side,
-			line.amountNormalized,
-			line.memo,
-		]),
-	];
-
-	const serialized = JSON.stringify(canonicalPayload);
-	const encoded = new TextEncoder().encode(serialized);
-	const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
-	const hashArray = Array.from(new Uint8Array(hashBuffer));
-	return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/**
- * Posts a double-entry journal entry atomically.
- * Guarantees balance, account currency matching, active accounts, and race-safe idempotency.
- */
-export async function postJournalEntry({
-	db,
+function validatePostingInput({
 	userId,
 	idempotencyKey,
 	occurredAt,
 	memo,
 	source,
 	lines,
-}: PostJournalEntryParams): Promise<PostJournalEntryResult> {
-	// 1. Basic input validation
+}: {
+	userId: string;
+	idempotencyKey: string;
+	occurredAt: Date;
+	memo?: string | undefined;
+	source?: JournalSourceInput | undefined;
+	lines: JournalLineInput[];
+}): {
+	trimmedIdempotencyKey: string;
+	normalizedMemo: string | null;
+	normalizedSource: JournalSourceInput | null;
+	normalizedLines: NormalizedLine[];
+	debitCentsSum: bigint;
+	creditCentsSum: bigint;
+} {
 	if (!userId || userId.trim() === "") {
 		throw new LedgerError("LEDGER_USER_NOT_FOUND", "User ID is required");
 	}
@@ -165,7 +147,6 @@ export async function postJournalEntry({
 		);
 	}
 
-	// 2. Parse money and calculate sums
 	let debitCount = 0;
 	let creditCount = 0;
 	let debitCentsSum = 0n;
@@ -243,12 +224,217 @@ export async function postJournalEntry({
 		);
 	}
 
-	// 3. Execute in a single database transaction
-	return await db.transaction(async (tx) => {
-		// 3.1 Historical Replay Fast Path
-		// If an entry for this (userId, idempotencyKey) already exists, resolve it immediately
-		// without consulting current user currency or current account active states.
-		const [existingEarly] = await tx
+	return {
+		trimmedIdempotencyKey,
+		normalizedMemo,
+		normalizedSource,
+		normalizedLines,
+		debitCentsSum,
+		creditCentsSum,
+	};
+}
+
+/**
+ * Computes a deterministic SHA-256 posting fingerprint (64 lowercase hex)
+ * using versioned structured canonical array serialization and standard Web Crypto API.
+ */
+export async function calculatePostingFingerprint(params: {
+	userId: string;
+	occurredAt: Date;
+	currency: string;
+	memo: string | null;
+	source: JournalSourceInput | null;
+	lines: NormalizedLine[];
+}): Promise<string> {
+	const canonicalPayload = [
+		"ledger-posting-v1",
+		params.userId,
+		params.occurredAt.toISOString(),
+		params.currency,
+		params.memo,
+		params.source
+			? [params.source.type.trim(), params.source.ref.trim()]
+			: null,
+		params.lines.map((line) => [
+			line.accountId,
+			line.side,
+			line.amountNormalized,
+			line.memo,
+		]),
+	];
+
+	const serialized = JSON.stringify(canonicalPayload);
+	const encoded = new TextEncoder().encode(serialized);
+	const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
+	const hashArray = Array.from(new Uint8Array(hashBuffer));
+	return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Internal transaction-scoped helper for posting a journal entry within an existing PostgreSQL transaction.
+ * Does NOT initiate a new db.transaction().
+ */
+export async function postJournalEntryInTransaction({
+	tx,
+	userId,
+	idempotencyKey,
+	occurredAt,
+	memo,
+	source,
+	lines,
+}: PostJournalEntryInTransactionParams): Promise<PostJournalEntryResult> {
+	const {
+		trimmedIdempotencyKey,
+		normalizedMemo,
+		normalizedSource,
+		normalizedLines,
+		debitCentsSum,
+		creditCentsSum,
+	} = validatePostingInput({
+		userId,
+		idempotencyKey,
+		occurredAt,
+		memo,
+		source,
+		lines,
+	});
+
+	// 1. Historical Replay Fast Path
+	const [existingEarly] = await tx
+		.select({
+			id: journalEntries.id,
+			status: journalEntries.status,
+			currency: journalEntries.currency,
+			postingFingerprint: journalEntries.postingFingerprint,
+		})
+		.from(journalEntries)
+		.where(
+			and(
+				eq(journalEntries.userId, userId),
+				eq(journalEntries.idempotencyKey, trimmedIdempotencyKey),
+			),
+		)
+		.limit(1);
+
+	if (existingEarly) {
+		if (existingEarly.status !== "POSTED") {
+			throw new LedgerError(
+				"LEDGER_INCOMPLETE_STATE",
+				"Concurrent unfinalized draft exists for this idempotency key",
+			);
+		}
+
+		// Fingerprint must be computed with the historical journal currency
+		const candidateFingerprint = await calculatePostingFingerprint({
+			userId,
+			occurredAt,
+			currency: existingEarly.currency,
+			memo: normalizedMemo,
+			source: normalizedSource,
+			lines: normalizedLines,
+		});
+
+		if (existingEarly.postingFingerprint !== candidateFingerprint) {
+			throw new LedgerError(
+				"LEDGER_IDEMPOTENCY_CONFLICT",
+				"Idempotency key already used with different entry payload",
+			);
+		}
+
+		return {
+			entryId: existingEarly.id,
+			idempotentReplay: true,
+			currency: existingEarly.currency,
+			debitTotal: formatCentsToMoney(debitCentsSum),
+			creditTotal: formatCentsToMoney(creditCentsSum),
+			lineCount: normalizedLines.length,
+		};
+	}
+
+	// 2. New Posting Path: Resolve User and Validate Current Account States
+	const [user] = await tx
+		.select({ id: users.id, currency: users.currency })
+		.from(users)
+		.where(eq(users.id, userId))
+		.limit(1);
+
+	if (!user) {
+		throw new LedgerError("LEDGER_USER_NOT_FOUND", "User does not exist");
+	}
+
+	// Resolve all unique account IDs in one single query
+	const uniqueAccountIds = Array.from(
+		new Set(normalizedLines.map((l) => l.accountId)),
+	);
+
+	const resolvedAccounts = await tx
+		.select({
+			id: ledgerAccounts.id,
+			userId: ledgerAccounts.userId,
+			currency: ledgerAccounts.currency,
+			archivedAt: ledgerAccounts.archivedAt,
+		})
+		.from(ledgerAccounts)
+		.where(inArray(ledgerAccounts.id, uniqueAccountIds));
+
+	const accountMap = new Map(resolvedAccounts.map((a) => [a.id, a]));
+
+	for (const accId of uniqueAccountIds) {
+		const acc = accountMap.get(accId);
+		if (!acc || acc.userId !== user.id) {
+			throw new LedgerError(
+				"LEDGER_ACCOUNT_NOT_FOUND",
+				`Account "${accId}" not found for this user`,
+			);
+		}
+
+		if (acc.archivedAt !== null) {
+			throw new LedgerError(
+				"LEDGER_ACCOUNT_ARCHIVED",
+				`Account "${accId}" is archived and cannot receive new postings`,
+			);
+		}
+
+		if (acc.currency !== user.currency) {
+			throw new LedgerError(
+				"LEDGER_CURRENCY_MISMATCH",
+				`Account "${accId}" currency "${acc.currency}" does not match user currency "${user.currency}"`,
+			);
+		}
+	}
+
+	// 3. Compute Posting Fingerprint
+	const fingerprint = await calculatePostingFingerprint({
+		userId,
+		occurredAt,
+		currency: user.currency,
+		memo: normalizedMemo,
+		source: normalizedSource,
+		lines: normalizedLines,
+	});
+
+	// 4. Insert DRAFT journal entry with race-safe ON CONFLICT DO NOTHING
+	const [insertedDraft] = await tx
+		.insert(journalEntries)
+		.values({
+			userId,
+			status: "DRAFT",
+			occurredAt,
+			currency: user.currency,
+			memo: normalizedMemo,
+			sourceType: normalizedSource ? normalizedSource.type : null,
+			sourceRef: normalizedSource ? normalizedSource.ref : null,
+			idempotencyKey: trimmedIdempotencyKey,
+			postingFingerprint: fingerprint,
+		})
+		.onConflictDoNothing({
+			target: [journalEntries.userId, journalEntries.idempotencyKey],
+		})
+		.returning();
+
+	if (!insertedDraft) {
+		// Concurrent race inserted an entry for this (userId, idempotencyKey)
+		const [existingLate] = await tx
 			.select({
 				id: journalEntries.id,
 				status: journalEntries.status,
@@ -264,214 +450,104 @@ export async function postJournalEntry({
 			)
 			.limit(1);
 
-		if (existingEarly) {
-			if (existingEarly.status !== "POSTED") {
-				throw new LedgerError(
-					"LEDGER_INCOMPLETE_STATE",
-					"Concurrent unfinalized draft exists for this idempotency key",
-				);
-			}
-
-			// Fingerprint must be computed with the historical journal currency
-			const candidateFingerprint = await calculatePostingFingerprint({
-				userId,
-				occurredAt,
-				currency: existingEarly.currency,
-				memo: normalizedMemo,
-				source: normalizedSource,
-				lines: normalizedLines,
-			});
-
-			if (existingEarly.postingFingerprint !== candidateFingerprint) {
-				throw new LedgerError(
-					"LEDGER_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with different entry payload",
-				);
-			}
-
-			return {
-				entryId: existingEarly.id,
-				idempotentReplay: true,
-				currency: existingEarly.currency,
-				debitTotal: formatCentsToMoney(debitCentsSum),
-				creditTotal: formatCentsToMoney(creditCentsSum),
-				lineCount: normalizedLines.length,
-			};
+		if (!existingLate) {
+			throw new LedgerError(
+				"LEDGER_INVALID_ENTRY",
+				"Failed to retrieve journal entry after concurrent conflict",
+			);
 		}
 
-		// 3.2 New Posting Path: Resolve User and Validate Current Account States
-		const [user] = await tx
-			.select({ id: users.id, currency: users.currency })
-			.from(users)
-			.where(eq(users.id, userId))
-			.limit(1);
-
-		if (!user) {
-			throw new LedgerError("LEDGER_USER_NOT_FOUND", "User does not exist");
+		if (existingLate.status !== "POSTED") {
+			throw new LedgerError(
+				"LEDGER_INCOMPLETE_STATE",
+				"Concurrent unfinalized draft exists for this idempotency key",
+			);
 		}
 
-		// Resolve all unique account IDs in one single query
-		const uniqueAccountIds = Array.from(
-			new Set(normalizedLines.map((l) => l.accountId)),
-		);
-
-		const resolvedAccounts = await tx
-			.select({
-				id: ledgerAccounts.id,
-				userId: ledgerAccounts.userId,
-				currency: ledgerAccounts.currency,
-				archivedAt: ledgerAccounts.archivedAt,
-			})
-			.from(ledgerAccounts)
-			.where(inArray(ledgerAccounts.id, uniqueAccountIds));
-
-		const accountMap = new Map(resolvedAccounts.map((a) => [a.id, a]));
-
-		for (const accId of uniqueAccountIds) {
-			const acc = accountMap.get(accId);
-			if (!acc || acc.userId !== user.id) {
-				throw new LedgerError(
-					"LEDGER_ACCOUNT_NOT_FOUND",
-					`Account "${accId}" not found for this user`,
-				);
-			}
-
-			if (acc.archivedAt !== null) {
-				throw new LedgerError(
-					"LEDGER_ACCOUNT_ARCHIVED",
-					`Account "${accId}" is archived and cannot receive new postings`,
-				);
-			}
-
-			if (acc.currency !== user.currency) {
-				throw new LedgerError(
-					"LEDGER_CURRENCY_MISMATCH",
-					`Account "${accId}" currency "${acc.currency}" does not match user currency "${user.currency}"`,
-				);
-			}
-		}
-
-		// Calculate deterministic posting fingerprint for new posting
-		const fingerprint = await calculatePostingFingerprint({
-			userId: user.id,
+		const candidateFingerprint = await calculatePostingFingerprint({
+			userId,
 			occurredAt,
-			currency: user.currency,
+			currency: existingLate.currency,
 			memo: normalizedMemo,
 			source: normalizedSource,
 			lines: normalizedLines,
 		});
 
-		// Attempt atomic DRAFT insertion with conflict avoidance
-		const [insertedDraft] = await tx
-			.insert(journalEntries)
-			.values({
-				userId: user.id,
-				idempotencyKey: trimmedIdempotencyKey,
-				postingFingerprint: fingerprint,
-				currency: user.currency,
-				occurredAt,
-				status: "DRAFT",
-				postedAt: null,
-				memo: normalizedMemo,
-				sourceType: normalizedSource?.type ?? null,
-				sourceRef: normalizedSource?.ref ?? null,
-			})
-			.onConflictDoNothing({
-				target: [journalEntries.userId, journalEntries.idempotencyKey],
-			})
-			.returning();
-
-		// If insertion conflicted concurrently on (userId, idempotencyKey)
-		if (!insertedDraft) {
-			const [existingLate] = await tx
-				.select()
-				.from(journalEntries)
-				.where(
-					and(
-						eq(journalEntries.userId, user.id),
-						eq(journalEntries.idempotencyKey, trimmedIdempotencyKey),
-					),
-				)
-				.limit(1);
-
-			if (!existingLate) {
-				throw new LedgerError(
-					"LEDGER_INCOMPLETE_STATE",
-					"Idempotency conflict detected but record could not be retrieved",
-				);
-			}
-
-			if (existingLate.status !== "POSTED") {
-				throw new LedgerError(
-					"LEDGER_INCOMPLETE_STATE",
-					"Concurrent unfinalized draft exists for this idempotency key",
-				);
-			}
-
-			const candidateFingerprint = await calculatePostingFingerprint({
-				userId: user.id,
-				occurredAt,
-				currency: existingLate.currency,
-				memo: normalizedMemo,
-				source: normalizedSource,
-				lines: normalizedLines,
-			});
-
-			if (existingLate.postingFingerprint !== candidateFingerprint) {
-				throw new LedgerError(
-					"LEDGER_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with different entry payload",
-				);
-			}
-
-			// Same idempotency key and identical fingerprint -> Idempotent Replay
-			return {
-				entryId: existingLate.id,
-				idempotentReplay: true,
-				currency: existingLate.currency,
-				debitTotal: formatCentsToMoney(debitCentsSum),
-				creditTotal: formatCentsToMoney(creditCentsSum),
-				lineCount: normalizedLines.length,
-			};
-		}
-
-		// Newly created DRAFT: insert all lines
-		const lineValues = normalizedLines.map((line, idx) => ({
-			journalEntryId: insertedDraft.id,
-			lineNo: idx + 1,
-			accountId: line.accountId,
-			debit: line.side === "DEBIT" ? line.amountNormalized : "0.00",
-			credit: line.side === "CREDIT" ? line.amountNormalized : "0.00",
-			memo: line.memo,
-		}));
-
-		await tx.insert(journalLines).values(lineValues);
-
-		// Transition DRAFT -> POSTED (triggers database validation invariants)
-		const now = new Date();
-		const [postedEntry] = await tx
-			.update(journalEntries)
-			.set({
-				status: "POSTED",
-				postedAt: now,
-			})
-			.where(eq(journalEntries.id, insertedDraft.id))
-			.returning();
-
-		if (postedEntry?.status !== "POSTED") {
+		if (existingLate.postingFingerprint !== candidateFingerprint) {
 			throw new LedgerError(
-				"LEDGER_INVALID_ENTRY",
-				"Failed to transition journal entry to POSTED state",
+				"LEDGER_IDEMPOTENCY_CONFLICT",
+				"Idempotency key already used with different entry payload",
 			);
 		}
 
+		// Same idempotency key and identical fingerprint -> Idempotent Replay
 		return {
-			entryId: postedEntry.id,
-			idempotentReplay: false,
-			currency: user.currency,
+			entryId: existingLate.id,
+			idempotentReplay: true,
+			currency: existingLate.currency,
 			debitTotal: formatCentsToMoney(debitCentsSum),
 			creditTotal: formatCentsToMoney(creditCentsSum),
 			lineCount: normalizedLines.length,
 		};
+	}
+
+	// Newly created DRAFT: insert all lines
+	const lineValues = normalizedLines.map((line, idx) => ({
+		journalEntryId: insertedDraft.id,
+		lineNo: idx + 1,
+		accountId: line.accountId,
+		debit: line.side === "DEBIT" ? line.amountNormalized : "0.00",
+		credit: line.side === "CREDIT" ? line.amountNormalized : "0.00",
+		memo: line.memo,
+	}));
+
+	await tx.insert(journalLines).values(lineValues);
+
+	// Transition DRAFT -> POSTED (triggers database validation invariants)
+	const now = new Date();
+	const [postedEntry] = await tx
+		.update(journalEntries)
+		.set({
+			status: "POSTED",
+			postedAt: now,
+		})
+		.where(eq(journalEntries.id, insertedDraft.id))
+		.returning();
+
+	if (postedEntry?.status !== "POSTED") {
+		throw new LedgerError(
+			"LEDGER_INVALID_ENTRY",
+			"Failed to transition journal entry to POSTED state",
+		);
+	}
+
+	return {
+		entryId: postedEntry.id,
+		idempotentReplay: false,
+		currency: user.currency,
+		debitTotal: formatCentsToMoney(debitCentsSum),
+		creditTotal: formatCentsToMoney(creditCentsSum),
+		lineCount: normalizedLines.length,
+	};
+}
+
+/**
+ * Posts a double-entry journal entry atomically.
+ * Guarantees balance, account currency matching, active accounts, and race-safe idempotency.
+ */
+export async function postJournalEntry(
+	params: PostJournalEntryParams,
+): Promise<PostJournalEntryResult> {
+	validatePostingInput(params);
+	return await params.db.transaction(async (tx) => {
+		return await postJournalEntryInTransaction({
+			tx,
+			userId: params.userId,
+			idempotencyKey: params.idempotencyKey,
+			occurredAt: params.occurredAt,
+			memo: params.memo,
+			source: params.source,
+			lines: params.lines,
+		});
 	});
 }
