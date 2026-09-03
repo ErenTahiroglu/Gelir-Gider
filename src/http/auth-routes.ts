@@ -19,10 +19,8 @@ import {
 } from "../auth/session-cookie";
 import {
 	createSession,
-	findActiveSessionByToken,
 	revokeSessionByToken,
 	SESSION_COOKIE_NAME,
-	touchSessionActivity,
 } from "../auth/sessions";
 import {
 	beginAuthorizedPasskeyEnrollment,
@@ -43,6 +41,8 @@ import {
 	users,
 	webauthnCredentials,
 } from "../db/schema/auth";
+import { resolveAuthenticatedSession } from "./auth-middleware";
+import { checkAuthRateLimit, RATE_LIMITED_AUTH_PATHS } from "./auth-rate-limit";
 
 export const authRouter = new Hono<{ Bindings: AppEnv }>();
 
@@ -86,9 +86,9 @@ authRouter.use("*", async (c, next) => {
 	await next();
 });
 
-// 2. Same-Origin, Content-Type, and Body Limit enforcement for all POST routes
+// 2. Same-Origin, Rate Limiting, and Content-Type enforcement for all POST routes
 authRouter.post("*", async (c, next) => {
-	// Origin check: must run first before content-type, body parsing, auth logic
+	// Step 2a: Origin check — MUST run first before rate-limit counting, content-type checks, and auth logic
 	const origin = c.req.header("origin");
 	let expectedOrigin: string;
 	try {
@@ -103,7 +103,36 @@ authRouter.post("*", async (c, next) => {
 		return c.json(err.body, err.status as 403);
 	}
 
-	// Content-Type check: strictly enforced only on endpoints expecting JSON body
+	// Step 2b: Best-effort edge rate-limiting for public/pre-auth authentication endpoints
+	if (RATE_LIMITED_AUTH_PATHS.has(c.req.path)) {
+		const clientIp = c.req.header("cf-connecting-ip")?.trim() || "unknown";
+		const rateLimitResult = await checkAuthRateLimit(
+			c.env.AUTH_RATE_LIMITER,
+			c.req.path,
+			clientIp,
+		);
+
+		if (!rateLimitResult.allowed) {
+			if (rateLimitResult.unavailable) {
+				const err = errorResponse(
+					"AUTH_RATE_LIMIT_UNAVAILABLE",
+					"Authentication protection is temporarily unavailable",
+					503,
+				);
+				return c.json(err.body, err.status as 503);
+			}
+
+			c.header("Retry-After", "60");
+			const err = errorResponse(
+				"AUTH_RATE_LIMITED",
+				"Too many authentication requests",
+				429,
+			);
+			return c.json(err.body, err.status as 429);
+		}
+	}
+
+	// Step 2c: Content-Type check strictly enforced only on endpoints expecting a JSON body
 	if (JSON_BODY_PATHS.has(c.req.path)) {
 		const contentType = c.req.header("content-type");
 		if (!isJsonContentType(contentType)) {
@@ -618,59 +647,12 @@ authRouter.get("/session", async (c) => {
 
 	try {
 		const db = createDatabase(getDatabaseUrl(c.env));
-
-		const session = await findActiveSessionByToken({
+		const result = await resolveAuthenticatedSession({
 			db,
 			token: cookieToken,
 		});
 
-		if (!session) {
-			c.header("Set-Cookie", buildClearSessionCookie());
-			return c.json(
-				{
-					error: {
-						code: "UNAUTHENTICATED",
-						message: "Authentication required",
-					},
-				},
-				401,
-			);
-		}
-
-		// Touch activity
-		const touched = await touchSessionActivity({
-			db,
-			sessionId: session.id,
-		});
-
-		if (!touched) {
-			// Re-verify if session is still active (might have been throttled or invalidated)
-			const recheck = await findActiveSessionByToken({
-				db,
-				token: cookieToken,
-			});
-			if (!recheck) {
-				c.header("Set-Cookie", buildClearSessionCookie());
-				return c.json(
-					{
-						error: {
-							code: "UNAUTHENTICATED",
-							message: "Authentication required",
-						},
-					},
-					401,
-				);
-			}
-		}
-
-		// Resolve user
-		const [user] = await db
-			.select()
-			.from(users)
-			.where(eq(users.id, session.userId))
-			.limit(1);
-
-		if (!user || user.authInitializedAt === null) {
+		if (!result.authenticated) {
 			c.header("Set-Cookie", buildClearSessionCookie());
 			return c.json(
 				{
@@ -686,7 +668,7 @@ authRouter.get("/session", async (c) => {
 		return c.json({
 			authenticated: true,
 			user: {
-				displayName: user.displayName,
+				displayName: result.context.displayName,
 			},
 		});
 	} catch (err) {

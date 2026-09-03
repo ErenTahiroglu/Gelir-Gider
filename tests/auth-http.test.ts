@@ -40,6 +40,10 @@ interface UserResponseBody {
 	challenge?: string;
 }
 
+const createMockLimiter = (allowed = true) => ({
+	limit: vi.fn().mockResolvedValue({ success: allowed }),
+});
+
 const mockEnv = {
 	DATABASE_URL: "postgresql://user:password@example.invalid/db",
 	WEBAUTHN_RP_ID: "localhost",
@@ -47,6 +51,7 @@ const mockEnv = {
 	WEBAUTHN_ORIGIN: "http://localhost:8787",
 	BOOTSTRAP_TOKEN_HASH:
 		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	AUTH_RATE_LIMITER: createMockLimiter(true),
 };
 
 describe("HTTP Auth Surface & Secure Session Cookie Integration", () => {
@@ -54,6 +59,7 @@ describe("HTTP Auth Surface & Secure Session Cookie Integration", () => {
 
 	beforeEach(() => {
 		vi.restoreAllMocks();
+		mockEnv.AUTH_RATE_LIMITER = createMockLimiter(true);
 	});
 
 	describe("Global Auth Policies (Origin, Body Limit, Content-Type, Cache-Control, No CORS)", () => {
@@ -1007,6 +1013,355 @@ describe("HTTP Auth Surface & Secure Session Cookie Integration", () => {
 
 			// Crucial: Set-Cookie MUST NOT be sent on failure so browser does not delete the token
 			expect(res.headers.get("Set-Cookie")).toBeNull();
+		});
+	});
+
+	describe("Cloudflare Workers Rate Limiting Shield (Phase 3H)", () => {
+		it("passes through allowed requests and constructs deterministic key with app prefix, static path, and client IP without secrets", async () => {
+			const mockLimiter = {
+				limit: vi.fn().mockResolvedValue({ success: true }),
+			};
+			const envWithLimiter = {
+				...mockEnv,
+				AUTH_RATE_LIMITER: mockLimiter,
+			};
+
+			vi.spyOn(
+				bootstrapModule,
+				"authorizeBootstrapAndIssueGrant",
+			).mockResolvedValueOnce({
+				user: { id: "user-1", displayName: "Eren" },
+				enrollmentGrant: "grant-token-xyz",
+			});
+
+			const res = await app.request(
+				"/auth/bootstrap/authorize",
+				{
+					method: "POST",
+					headers: {
+						Origin: validOrigin,
+						"Content-Type": "application/json",
+						"CF-Connecting-IP": "203.0.113.195",
+					},
+					body: JSON.stringify({
+						bootstrapToken: "secret-bootstrap-token",
+						displayName: "Eren",
+					}),
+				},
+				envWithLimiter,
+			);
+
+			expect(res.status).toBe(200);
+			expect(mockLimiter.limit).toHaveBeenCalledTimes(1);
+			const limitArg = mockLimiter.limit.mock.calls[0]?.[0];
+			expect(limitArg).toBeDefined();
+			expect(limitArg?.key).toBe(
+				"gelir-gider:auth:v1:/auth/bootstrap/authorize:203.0.113.195",
+			);
+			// Verify key contains no secret tokens or display name
+			expect(limitArg?.key).not.toContain("secret-bootstrap-token");
+			expect(limitArg?.key).not.toContain("Eren");
+		});
+
+		it("falls back to client IP 'unknown' when CF-Connecting-IP header is absent", async () => {
+			const mockLimiter = {
+				limit: vi.fn().mockResolvedValue({ success: true }),
+			};
+			const envWithLimiter = {
+				...mockEnv,
+				AUTH_RATE_LIMITER: mockLimiter,
+			};
+
+			vi.spyOn(
+				bootstrapModule,
+				"authorizeBootstrapAndIssueGrant",
+			).mockResolvedValueOnce({
+				user: { id: "user-1", displayName: "Eren" },
+				enrollmentGrant: "grant-token-xyz",
+			});
+
+			const res = await app.request(
+				"/auth/bootstrap/authorize",
+				{
+					method: "POST",
+					headers: {
+						Origin: validOrigin,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({
+						bootstrapToken: "secret-token",
+						displayName: "Eren",
+					}),
+				},
+				envWithLimiter,
+			);
+
+			expect(res.status).toBe(200);
+			expect(mockLimiter.limit).toHaveBeenCalledWith({
+				key: "gelir-gider:auth:v1:/auth/bootstrap/authorize:unknown",
+			});
+		});
+
+		it("returns 429 AUTH_RATE_LIMITED with Retry-After 60 and aborts downstream execution when rate limit is exceeded", async () => {
+			const mockLimiter = {
+				limit: vi.fn().mockResolvedValue({ success: false }),
+			};
+			const envWithLimiter = {
+				...mockEnv,
+				AUTH_RATE_LIMITER: mockLimiter,
+			};
+
+			const bootstrapSpy = vi.spyOn(
+				bootstrapModule,
+				"authorizeBootstrapAndIssueGrant",
+			);
+
+			const res = await app.request(
+				"/auth/bootstrap/authorize",
+				{
+					method: "POST",
+					headers: {
+						Origin: validOrigin,
+						"Content-Type": "application/json",
+						"CF-Connecting-IP": "203.0.113.195",
+					},
+					body: JSON.stringify({
+						bootstrapToken: "token-123",
+						displayName: "Eren",
+					}),
+				},
+				envWithLimiter,
+			);
+
+			expect(res.status).toBe(429);
+			const json = (await res.json()) as ErrorResponseBody;
+			expect(json.error.code).toBe("AUTH_RATE_LIMITED");
+			expect(json.error.message).toBe("Too many authentication requests");
+			expect(res.headers.get("Retry-After")).toBe("60");
+			expect(res.headers.get("Cache-Control")).toBe("no-store");
+			expect(res.headers.get("Pragma")).toBe("no-cache");
+
+			// Downstream auth service MUST NOT be reached
+			expect(bootstrapSpy).not.toHaveBeenCalled();
+		});
+
+		it("fails closed with 503 AUTH_RATE_LIMIT_UNAVAILABLE when limiter binding throws, without leaking raw exception", async () => {
+			const mockLimiter = {
+				limit: vi.fn().mockRejectedValue(new Error("Cloudflare RPC error")),
+			};
+			const envWithLimiter = {
+				...mockEnv,
+				AUTH_RATE_LIMITER: mockLimiter,
+			};
+
+			const bootstrapSpy = vi.spyOn(
+				bootstrapModule,
+				"authorizeBootstrapAndIssueGrant",
+			);
+
+			const res = await app.request(
+				"/auth/bootstrap/authorize",
+				{
+					method: "POST",
+					headers: {
+						Origin: validOrigin,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({
+						bootstrapToken: "token-123",
+						displayName: "Eren",
+					}),
+				},
+				envWithLimiter,
+			);
+
+			expect(res.status).toBe(503);
+			const json = (await res.json()) as ErrorResponseBody;
+			expect(json.error.code).toBe("AUTH_RATE_LIMIT_UNAVAILABLE");
+			expect(json.error.message).toBe(
+				"Authentication protection is temporarily unavailable",
+			);
+			expect(res.headers.get("Cache-Control")).toBe("no-store");
+
+			// No exception leakage and no downstream call
+			expect(bootstrapSpy).not.toHaveBeenCalled();
+		});
+
+		it("fails closed with 503 AUTH_RATE_LIMIT_UNAVAILABLE on rate-limited endpoints when AUTH_RATE_LIMITER binding is missing", async () => {
+			const envWithoutLimiter = {
+				...mockEnv,
+				AUTH_RATE_LIMITER: undefined,
+			};
+
+			const bootstrapSpy = vi.spyOn(
+				bootstrapModule,
+				"authorizeBootstrapAndIssueGrant",
+			);
+
+			const res = await app.request(
+				"/auth/bootstrap/authorize",
+				{
+					method: "POST",
+					headers: {
+						Origin: validOrigin,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({
+						bootstrapToken: "token-123",
+						displayName: "Eren",
+					}),
+				},
+				envWithoutLimiter,
+			);
+
+			expect(res.status).toBe(503);
+			const json = (await res.json()) as ErrorResponseBody;
+			expect(json.error.code).toBe("AUTH_RATE_LIMIT_UNAVAILABLE");
+			expect(bootstrapSpy).not.toHaveBeenCalled();
+		});
+
+		it("enforces rate-limiting on all 6 public pre-auth POST routes", async () => {
+			const mockLimiter = {
+				limit: vi.fn().mockResolvedValue({ success: false }),
+			};
+			const envWithLimiter = {
+				...mockEnv,
+				AUTH_RATE_LIMITER: mockLimiter,
+			};
+
+			const routes = [
+				{
+					path: "/auth/bootstrap/authorize",
+					body: JSON.stringify({ bootstrapToken: "tok", displayName: "Eren" }),
+					contentType: "application/json",
+				},
+				{
+					path: "/auth/recovery/authorize",
+					body: JSON.stringify({ recoveryCode: "rec" }),
+					contentType: "application/json",
+				},
+				{
+					path: "/auth/passkey/enrollment/options",
+					body: JSON.stringify({ enrollmentGrantToken: "grant" }),
+					contentType: "application/json",
+				},
+				{
+					path: "/auth/passkey/enrollment/verify",
+					body: JSON.stringify({
+						response: { id: "1", rawId: "1", type: "public-key" },
+						deviceName: "Dev",
+					}),
+					contentType: "application/json",
+				},
+				{
+					path: "/auth/passkey/authentication/options",
+					body: undefined,
+					contentType: undefined,
+				},
+				{
+					path: "/auth/passkey/authentication/verify",
+					body: JSON.stringify({
+						response: { id: "1", rawId: "1", type: "public-key" },
+					}),
+					contentType: "application/json",
+				},
+			];
+
+			for (const r of routes) {
+				const headers: Record<string, string> = { Origin: validOrigin };
+				if (r.contentType) headers["Content-Type"] = r.contentType;
+
+				const res = await app.request(
+					r.path,
+					{
+						method: "POST",
+						headers,
+						body: r.body ?? null,
+					},
+					envWithLimiter,
+				);
+
+				expect(res.status).toBe(429);
+				const json = (await res.json()) as ErrorResponseBody;
+				expect(json.error.code).toBe("AUTH_RATE_LIMITED");
+			}
+		});
+
+		it("exempts status, session, and logout endpoints from rate limiting", async () => {
+			const mockLimiter = {
+				limit: vi.fn(),
+			};
+			const envWithLimiter = {
+				...mockEnv,
+				AUTH_RATE_LIMITER: mockLimiter,
+			};
+
+			// 1. GET /auth/status
+			const mockDb = {
+				select: vi.fn().mockReturnValue({
+					from: vi.fn().mockReturnValue({
+						limit: vi.fn().mockResolvedValue([]),
+					}),
+				}),
+			} as unknown as Database;
+			vi.spyOn(dbClientModule, "createDatabase").mockReturnValue(mockDb);
+
+			const statusRes = await app.request(
+				"/auth/status",
+				{ method: "GET" },
+				envWithLimiter,
+			);
+			expect(statusRes.status).toBe(200);
+
+			// 2. GET /auth/session (missing cookie -> 401 without limiter)
+			const sessionRes = await app.request(
+				"/auth/session",
+				{ method: "GET" },
+				envWithLimiter,
+			);
+			expect(sessionRes.status).toBe(401);
+
+			// 3. POST /auth/logout (even without limiter in env, works)
+			const logoutRes = await app.request(
+				"/auth/logout",
+				{
+					method: "POST",
+					headers: { Origin: validOrigin },
+				},
+				{ ...mockEnv, AUTH_RATE_LIMITER: undefined },
+			);
+			expect(logoutRes.status).toBe(204);
+
+			// Limiter was never called
+			expect(mockLimiter.limit).not.toHaveBeenCalled();
+		});
+
+		it("evaluates Origin BEFORE rate limiting — invalid Origin does not consume rate limiter counters", async () => {
+			const mockLimiter = {
+				limit: vi.fn().mockResolvedValue({ success: true }),
+			};
+			const envWithLimiter = {
+				...mockEnv,
+				AUTH_RATE_LIMITER: mockLimiter,
+			};
+
+			const res = await app.request(
+				"/auth/bootstrap/authorize",
+				{
+					method: "POST",
+					headers: {
+						Origin: "http://attacker.com",
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({ bootstrapToken: "tok", displayName: "Eren" }),
+				},
+				envWithLimiter,
+			);
+
+			expect(res.status).toBe(403);
+			const json = (await res.json()) as ErrorResponseBody;
+			expect(json.error.code).toBe("INVALID_ORIGIN");
+			expect(mockLimiter.limit).not.toHaveBeenCalled();
 		});
 	});
 });

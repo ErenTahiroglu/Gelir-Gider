@@ -1,9 +1,14 @@
+export interface RateLimitBinding {
+	limit(input: { key: string }): Promise<{ success: boolean }>;
+}
+
 export interface AppEnv {
 	DATABASE_URL?: string | undefined;
 	WEBAUTHN_RP_ID?: string | undefined;
 	WEBAUTHN_RP_NAME?: string | undefined;
 	WEBAUTHN_ORIGIN?: string | undefined;
 	BOOTSTRAP_TOKEN_HASH?: string | undefined;
+	AUTH_RATE_LIMITER?: RateLimitBinding | undefined;
 }
 
 export function getDatabaseUrl(env: AppEnv): string {
