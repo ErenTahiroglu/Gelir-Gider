@@ -4,39 +4,22 @@ import { webauthnChallenges } from "../db/schema/auth";
 
 export const WEBAUTHN_CHALLENGE_TTL_SECONDS = 300;
 
-export type WebAuthnPurpose = "REGISTRATION" | "AUTHENTICATION";
-
-export interface CreateChallengeParams {
+export interface CreateAuthenticationChallengeParams {
 	db: Database;
 	userId: string;
-	purpose: WebAuthnPurpose;
 	challenge: string;
-	enrollmentGrantId?: string | null | undefined;
 }
 
 /**
- * Persists a WebAuthn challenge row.
- * For REGISTRATION purpose, enrollmentGrantId is strictly required.
- * For AUTHENTICATION purpose, enrollmentGrantId must be null.
+ * Persists an AUTHENTICATION WebAuthn challenge row.
+ * Enrollment grant is strictly null for authentication.
+ * Generic registration challenge creation is prohibited here.
  */
-export async function createChallenge({
+export async function createAuthenticationChallenge({
 	db,
 	userId,
-	purpose,
 	challenge,
-	enrollmentGrantId,
-}: CreateChallengeParams) {
-	if (purpose === "REGISTRATION" && !enrollmentGrantId) {
-		throw new Error(
-			"enrollmentGrantId is required for REGISTRATION challenges",
-		);
-	}
-	if (purpose === "AUTHENTICATION" && enrollmentGrantId) {
-		throw new Error(
-			"enrollmentGrantId must be null for AUTHENTICATION challenges",
-		);
-	}
-
+}: CreateAuthenticationChallengeParams) {
 	const expiresAt = new Date(
 		Date.now() + WEBAUTHN_CHALLENGE_TTL_SECONDS * 1000,
 	);
@@ -45,10 +28,9 @@ export async function createChallenge({
 		.insert(webauthnChallenges)
 		.values({
 			userId,
-			purpose,
+			purpose: "AUTHENTICATION",
 			challenge,
-			enrollmentGrantId:
-				purpose === "REGISTRATION" ? (enrollmentGrantId ?? null) : null,
+			enrollmentGrantId: null,
 			expiresAt,
 		})
 		.returning();
@@ -59,7 +41,7 @@ export async function createChallenge({
 export interface ConsumeActiveChallengeParams {
 	db: Database;
 	userId: string;
-	purpose: WebAuthnPurpose;
+	purpose: "REGISTRATION" | "AUTHENTICATION";
 	challenge: string;
 }
 

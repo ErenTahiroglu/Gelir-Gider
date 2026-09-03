@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-	buildRegistrationOptions,
 	generateAuthenticationOptionsForUser,
 	type UserCredentialSummary,
 } from "../src/auth/webauthn";
@@ -28,68 +27,19 @@ describe("WebAuthn Options Generator", () => {
 			}),
 		}) as unknown as Database;
 
-	describe("Registration Options Policy (Module-Private Builder)", () => {
-		it("builds registration options with correct RP config, preferred residentKey, and required userVerification", async () => {
-			const user = {
-				id: "6ef82b90-3339-49da-ade7-aacf59369328",
-				displayName: "Eren",
-			};
-
-			const options = await buildRegistrationOptions({
-				config: mockConfig,
-				user,
-			});
-
-			expect(options.rp.id).toBe("localhost");
-			expect(options.rp.name).toBe("Gelir Gider");
-			expect(options.user.name).toBe("Eren");
-			expect(options.challenge).toBeDefined();
-			expect(typeof options.challenge).toBe("string");
-			expect(options.authenticatorSelection?.userVerification).toBe("required");
-			expect(options.authenticatorSelection?.residentKey).toBe("preferred");
-			expect(options.attestation).toBe("none");
+	describe("Anti-Bypass Guard: No registration builder or options issuer exports", () => {
+		it("confirms buildRegistrationOptions and generateRegistrationOptionsForUser are not exported", async () => {
+			const webauthnModule = await import("../src/auth/webauthn");
+			expect("buildRegistrationOptions" in webauthnModule).toBe(false);
+			expect("generateRegistrationOptionsForUser" in webauthnModule).toBe(
+				false,
+			);
 		});
 
-		it("excludes active credentials while excluding revoked credentials from excludeCredentials list, mapping transports", async () => {
-			const user = {
-				id: "6ef82b90-3339-49da-ade7-aacf59369328",
-				displayName: "Eren",
-			};
-
-			const existingCredentials: UserCredentialSummary[] = [
-				{
-					credentialId: "active-cred-1",
-					transports: ["internal"],
-					revokedAt: null,
-				},
-				{
-					credentialId: "revoked-cred-2",
-					transports: ["usb"],
-					revokedAt: new Date(),
-				},
-				{
-					credentialId: "active-cred-3",
-					transports: ["hybrid", "nfc"],
-					revokedAt: null,
-				},
-			];
-
-			const options = await buildRegistrationOptions({
-				config: mockConfig,
-				user,
-				existingCredentials,
-			});
-
-			const excludedIds = options.excludeCredentials?.map((c) => c.id) ?? [];
-			expect(excludedIds).toContain("active-cred-1");
-			expect(excludedIds).toContain("active-cred-3");
-			expect(excludedIds).not.toContain("revoked-cred-2");
-			expect(excludedIds.length).toBe(2);
-
-			const cred1 = options.excludeCredentials?.find(
-				(c) => c.id === "active-cred-1",
-			);
-			expect(cred1?.transports).toEqual(["internal"]);
+		it("confirms generic createChallenge is not exported from challenges module", async () => {
+			const challengesModule = await import("../src/auth/challenges");
+			expect("createChallenge" in challengesModule).toBe(false);
+			expect("createAuthenticationChallenge" in challengesModule).toBe(true);
 		});
 	});
 

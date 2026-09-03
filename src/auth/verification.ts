@@ -5,11 +5,12 @@ import type {
 	WebAuthnCredential,
 } from "@simplewebauthn/server";
 import {
+	generateRegistrationOptions,
 	verifyAuthenticationResponse,
 	verifyRegistrationResponse,
 } from "@simplewebauthn/server";
 import { decodeClientDataJSON } from "@simplewebauthn/server/helpers";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import type { WebAuthnConfig } from "../config/env";
 import type { Database } from "../db/client";
 import {
@@ -17,12 +18,13 @@ import {
 	authRecoveryCodes,
 	sessions,
 	users,
+	webauthnChallenges,
 	webauthnCredentials,
 } from "../db/schema/auth";
 import {
 	consumeActiveChallenge,
 	consumeActiveRegistrationChallenge,
-	createChallenge,
+	WEBAUTHN_CHALLENGE_TTL_SECONDS,
 } from "./challenges";
 import {
 	findActiveCredential,
@@ -30,7 +32,6 @@ import {
 } from "./credentials";
 import { hashEnrollmentGrantToken } from "./enrollment-grants";
 import { generateRecoveryCode, hashRecoveryCode } from "./recovery";
-import { buildRegistrationOptions } from "./webauthn";
 
 export type WebAuthnErrorCode =
 	| "INVALID_DEVICE_NAME"
@@ -56,6 +57,55 @@ export class WebAuthnServiceError extends Error {
 	}
 }
 
+interface BuildRegistrationOptionsInternalParams {
+	config: WebAuthnConfig;
+	user: {
+		id: string;
+		displayName: string;
+	};
+	existingCredentials?: {
+		credentialId: string;
+		transports?: AuthenticatorTransportFuture[] | null | undefined;
+		revokedAt: Date | null;
+	}[];
+}
+
+/**
+ * Module-private helper to build WebAuthn registration options.
+ * Not exported outside this file.
+ */
+async function buildRegistrationOptionsInternal({
+	config,
+	user,
+	existingCredentials = [],
+}: BuildRegistrationOptionsInternalParams) {
+	const activeCredentials = existingCredentials.filter(
+		(c) => c.revokedAt === null,
+	);
+
+	return generateRegistrationOptions({
+		rpName: config.rpName,
+		rpID: config.rpID,
+		userName: user.displayName,
+		userID: Uint8Array.from(new TextEncoder().encode(user.id)),
+		authenticatorSelection: {
+			residentKey: "preferred",
+			userVerification: "required",
+		},
+		attestationType: "none",
+		excludeCredentials: activeCredentials.map((cred) => {
+			const desc: { id: string; transports?: AuthenticatorTransportFuture[] } =
+				{
+					id: cred.credentialId,
+				};
+			if (cred.transports && cred.transports.length > 0) {
+				desc.transports = cred.transports;
+			}
+			return desc;
+		}),
+	});
+}
+
 export interface BeginAuthorizedPasskeyEnrollmentParams {
 	db: Database;
 	config: WebAuthnConfig;
@@ -64,19 +114,22 @@ export interface BeginAuthorizedPasskeyEnrollmentParams {
 
 /**
  * Begins authorized WebAuthn passkey enrollment.
- * 1. Hashes the raw enrollment grant token.
- * 2. In a transaction, locks the user row FOR UPDATE.
- * 3. Re-validates the enrollment grant:
- *    - correct token hash, unconsumed, unrevoked, unexpired.
- * 4. Re-validates purpose-specific preconditions:
- *    - BOOTSTRAP: users.auth_initialized_at IS NULL
- *    - RECOVERY: users.auth_initialized_at IS NOT NULL AND linked recovery code is unconsumed & unrevoked.
- * 5. Fetches active credentials to exclude them.
- * 6. Generates WebAuthn registration options.
- * 7. Atomically in the same transaction:
- *    - marks the enrollment grant as consumed (consumed_at = now)
- *    - inserts the REGISTRATION challenge linked to enrollment_grant_id.
- * 8. Returns registration options to caller.
+ * 1. Hashes raw enrollment grant token.
+ * 2. Pre-lock lookup solely for routing hint (grant.id and grant.user_id).
+ *    Never trusts pre-lock grant security state!
+ * 3. Inside transaction:
+ *    a. Locks user row FOR UPDATE.
+ *    b. Fresh post-lock re-read of active grant row FOR UPDATE with active predicates:
+ *       id = preLookup.id, user_id = locked user.id, token_hash = tokenHash,
+ *       consumed_at IS NULL, revoked_at IS NULL, expires_at > now.
+ *    c. Purpose-specific validation on the fresh post-lock grant row:
+ *       - BOOTSTRAP: users.auth_initialized_at IS NULL
+ *       - RECOVERY: users.auth_initialized_at IS NOT NULL AND linked recovery code is unconsumed & unrevoked.
+ *    d. Fetches active credentials to exclude them.
+ *    e. Generates registration options.
+ *    f. Conditional atomic consume on enrollment grant with RETURNING checking exactly 1 row updated.
+ *    g. Inserts REGISTRATION challenge linked to enrollment_grant_id.
+ * 4. Returns options. On any failure, transaction rolls back cleanly.
  */
 export async function beginAuthorizedPasskeyEnrollment({
 	db,
@@ -93,26 +146,29 @@ export async function beginAuthorizedPasskeyEnrollment({
 	const tokenHash = await hashEnrollmentGrantToken(enrollmentGrantToken);
 	const now = new Date();
 
+	// Step 2: Pre-lock lookup strictly for routing hint (id and userId only)
+	const [routingHint] = await db
+		.select({
+			id: authEnrollmentGrants.id,
+			userId: authEnrollmentGrants.userId,
+		})
+		.from(authEnrollmentGrants)
+		.where(eq(authEnrollmentGrants.tokenHash, tokenHash))
+		.limit(1);
+
+	if (!routingHint) {
+		throw new WebAuthnServiceError(
+			"ENROLLMENT_GRANT_INVALID",
+			"Invalid enrollment grant token",
+		);
+	}
+
 	return await db.transaction(async (tx) => {
-		// 1. Find grant by tokenHash
-		const [grant] = await tx
-			.select()
-			.from(authEnrollmentGrants)
-			.where(eq(authEnrollmentGrants.tokenHash, tokenHash))
-			.limit(1);
-
-		if (!grant) {
-			throw new WebAuthnServiceError(
-				"ENROLLMENT_GRANT_INVALID",
-				"Invalid enrollment grant token",
-			);
-		}
-
-		// 2. Lock user row FOR UPDATE
+		// Step 3a: Lock user row FOR UPDATE
 		const [user] = await tx
 			.select()
 			.from(users)
-			.where(eq(users.id, grant.userId))
+			.where(eq(users.id, routingHint.userId))
 			.for("update")
 			.limit(1);
 
@@ -123,30 +179,46 @@ export async function beginAuthorizedPasskeyEnrollment({
 			);
 		}
 
-		// 3. Revalidate grant state inside user lock
-		if (grant.consumedAt !== null || grant.revokedAt !== null) {
+		// Step 3b: Fresh post-lock re-read of the grant FOR UPDATE
+		// Check both active query and check expiry separately to distinguish error code if expired
+		const [freshGrant] = await tx
+			.select()
+			.from(authEnrollmentGrants)
+			.where(
+				and(
+					eq(authEnrollmentGrants.id, routingHint.id),
+					eq(authEnrollmentGrants.userId, user.id),
+					eq(authEnrollmentGrants.tokenHash, tokenHash),
+					isNull(authEnrollmentGrants.consumedAt),
+					isNull(authEnrollmentGrants.revokedAt),
+				),
+			)
+			.for("update")
+			.limit(1);
+
+		if (!freshGrant) {
 			throw new WebAuthnServiceError(
 				"ENROLLMENT_GRANT_INVALID",
-				"Enrollment grant has already been used or revoked",
+				"Enrollment grant has already been used, revoked, or does not exist",
 			);
 		}
 
-		if (grant.expiresAt <= now) {
+		if (freshGrant.expiresAt <= now) {
 			throw new WebAuthnServiceError(
 				"ENROLLMENT_GRANT_EXPIRED",
 				"Enrollment grant has expired",
 			);
 		}
 
-		// 4. Validate purpose-specific state
-		if (grant.purpose === "BOOTSTRAP") {
+		// Step 3c: Purpose-specific checks from fresh post-lock grant
+		if (freshGrant.purpose === "BOOTSTRAP") {
 			if (user.authInitializedAt !== null) {
 				throw new WebAuthnServiceError(
 					"BOOTSTRAP_ALREADY_COMPLETED",
 					"Instance has already been initialized",
 				);
 			}
-		} else if (grant.purpose === "RECOVERY") {
+		} else if (freshGrant.purpose === "RECOVERY") {
 			if (user.authInitializedAt === null) {
 				throw new WebAuthnServiceError(
 					"RECOVERY_NOT_INITIALIZED",
@@ -154,20 +226,20 @@ export async function beginAuthorizedPasskeyEnrollment({
 				);
 			}
 
-			if (!grant.recoveryCodeId) {
+			if (!freshGrant.recoveryCodeId) {
 				throw new WebAuthnServiceError(
 					"RECOVERY_SOURCE_INVALID",
 					"Recovery grant is not linked to a recovery code",
 				);
 			}
 
-			// Validate linked recovery code
+			// Validate linked recovery code inside transaction
 			const [recoveryCode] = await tx
 				.select()
 				.from(authRecoveryCodes)
 				.where(
 					and(
-						eq(authRecoveryCodes.id, grant.recoveryCodeId),
+						eq(authRecoveryCodes.id, freshGrant.recoveryCodeId),
 						eq(authRecoveryCodes.userId, user.id),
 						isNull(authRecoveryCodes.consumedAt),
 						isNull(authRecoveryCodes.revokedAt),
@@ -188,7 +260,7 @@ export async function beginAuthorizedPasskeyEnrollment({
 			);
 		}
 
-		// 5. Fetch active credentials to exclude
+		// Step 3d: Fetch active credentials to exclude
 		const existingCredentials = await tx
 			.select({
 				credentialId: webauthnCredentials.credentialId,
@@ -203,8 +275,8 @@ export async function beginAuthorizedPasskeyEnrollment({
 				),
 			);
 
-		// 6. Generate registration options
-		const options = await buildRegistrationOptions({
+		// Step 3e: Generate registration options
+		const options = await buildRegistrationOptionsInternal({
 			config,
 			user: {
 				id: user.id,
@@ -217,19 +289,40 @@ export async function beginAuthorizedPasskeyEnrollment({
 			})),
 		});
 
-		// 7. Consume the enrollment grant
-		await tx
+		// Step 3f: Conditional atomic consume with RETURNING
+		const [consumedGrant] = await tx
 			.update(authEnrollmentGrants)
 			.set({ consumedAt: now })
-			.where(eq(authEnrollmentGrants.id, grant.id));
+			.where(
+				and(
+					eq(authEnrollmentGrants.id, freshGrant.id),
+					eq(authEnrollmentGrants.userId, user.id),
+					eq(authEnrollmentGrants.tokenHash, tokenHash),
+					isNull(authEnrollmentGrants.consumedAt),
+					isNull(authEnrollmentGrants.revokedAt),
+					gt(authEnrollmentGrants.expiresAt, now),
+				),
+			)
+			.returning({ id: authEnrollmentGrants.id });
 
-		// 8. Insert REGISTRATION challenge linked to enrollment_grant_id
-		await createChallenge({
-			db: tx as unknown as Database,
+		if (!consumedGrant) {
+			throw new WebAuthnServiceError(
+				"ENROLLMENT_GRANT_INVALID",
+				"Failed to consume enrollment grant atomically",
+			);
+		}
+
+		// Step 3g: Insert REGISTRATION challenge directly in transaction linked to enrollment_grant_id
+		const challengeExpiresAt = new Date(
+			Date.now() + WEBAUTHN_CHALLENGE_TTL_SECONDS * 1000,
+		);
+
+		await tx.insert(webauthnChallenges).values({
 			userId: user.id,
 			purpose: "REGISTRATION",
 			challenge: options.challenge,
-			enrollmentGrantId: grant.id,
+			enrollmentGrantId: consumedGrant.id,
+			expiresAt: challengeExpiresAt,
 		});
 
 		return options;
@@ -268,11 +361,17 @@ export interface CompleteAuthorizedPasskeyEnrollmentResult {
  * 3. Atomically consumes active challenge BEFORE verification (consume-on-attempt).
  * 4. Cryptographically verifies response with SimpleWebAuthn.
  * 5. In an atomic transaction:
- *    - Locks user row FOR UPDATE.
- *    - Re-reads challenge and linked enrollment grant.
- *    - Validates BOOTSTRAP / RECOVERY preconditions.
- *    - BOOTSTRAP: sets auth_initialized_at = now(), inserts credential, inserts new recovery code hash, revokes other bootstrap grants.
- *    - RECOVERY: revalidates source recovery code, inserts credential, revokes old credentials, revokes sessions, consumes used recovery code, revokes pending recovery grants, inserts new recovery code hash.
+ *    a. Locks user row FOR UPDATE.
+ *    b. Re-reads the consumed challenge from DB to verify:
+ *       id = consumedChallenge.id, user_id = locked user.id,
+ *       purpose = 'REGISTRATION', enrollment_grant_id = consumedChallenge.enrollmentGrantId,
+ *       consumed_at IS NOT NULL.
+ *    c. Re-reads linked enrollment grant from DB:
+ *       id = challenge.enrollment_grant_id, user_id = challenge.user_id,
+ *       user_id = locked user.id, consumed_at IS NOT NULL, revoked_at IS NULL.
+ *    d. Validates BOOTSTRAP / RECOVERY preconditions.
+ *    e. BOOTSTRAP: sets auth_initialized_at = now(), inserts credential, inserts new recovery code hash, revokes other bootstrap grants.
+ *    f. RECOVERY: revalidates source recovery code, inserts credential, revokes old credentials (excluding new credential), revokes sessions, consumes used recovery code, revokes pending recovery grants, inserts new recovery code hash.
  * 6. Returns credential info and single-view new recovery code.
  */
 export async function completeAuthorizedPasskeyEnrollment({
@@ -372,17 +471,52 @@ export async function completeAuthorizedPasskeyEnrollment({
 			);
 		}
 
-		// 2. Read linked enrollment grant
+		// 2. Re-read challenge from DB inside transaction
+		const [freshChallenge] = await tx
+			.select()
+			.from(webauthnChallenges)
+			.where(
+				and(
+					eq(webauthnChallenges.id, consumedChallenge.id),
+					eq(webauthnChallenges.userId, user.id),
+					eq(webauthnChallenges.purpose, "REGISTRATION"),
+					eq(webauthnChallenges.enrollmentGrantId, enrollmentGrantId),
+				),
+			)
+			.limit(1);
+
+		if (!freshChallenge || freshChallenge.consumedAt === null) {
+			throw new WebAuthnServiceError(
+				"WEBAUTHN_CHALLENGE_INVALID",
+				"Challenge verification in database failed or challenge was not properly consumed",
+			);
+		}
+
+		const linkedGrantId = freshChallenge.enrollmentGrantId;
+		if (!linkedGrantId) {
+			throw new WebAuthnServiceError(
+				"ENROLLMENT_GRANT_INVALID",
+				"Challenge is missing linked enrollment grant",
+			);
+		}
+
+		// 3. Re-read linked enrollment grant and verify challenge <-> grant <-> user binding
 		const [grant] = await tx
 			.select()
 			.from(authEnrollmentGrants)
-			.where(eq(authEnrollmentGrants.id, enrollmentGrantId))
+			.where(
+				and(
+					eq(authEnrollmentGrants.id, linkedGrantId),
+					eq(authEnrollmentGrants.userId, freshChallenge.userId),
+					eq(authEnrollmentGrants.userId, user.id),
+				),
+			)
 			.limit(1);
 
 		if (!grant || grant.revokedAt !== null || grant.consumedAt === null) {
 			throw new WebAuthnServiceError(
 				"ENROLLMENT_GRANT_INVALID",
-				"Linked enrollment grant is invalid or revoked",
+				"Linked enrollment grant is invalid, not consumed, or revoked",
 			);
 		}
 

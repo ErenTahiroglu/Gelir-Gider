@@ -34,21 +34,16 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			});
 		});
 
-		it("rejects non-existent enrollment grant token", async () => {
-			const mockTx = {
+		it("rejects non-existent enrollment grant token on pre-lock lookup", async () => {
+			const mockDb = {
 				select: vi.fn().mockReturnValue({
 					from: vi.fn().mockReturnValue({
 						where: vi.fn().mockReturnValue({
-							limit: vi.fn().mockResolvedValue([]), // Grant not found
+							limit: vi.fn().mockResolvedValue([]), // Pre-lock grant not found
 						}),
 					}),
 				}),
-			};
-
-			const mockDb = {
-				transaction: vi.fn().mockImplementation(async (cb) => {
-					return await cb(mockTx);
-				}),
+				transaction: vi.fn(),
 			} as unknown as Database;
 
 			await expect(
@@ -60,30 +55,20 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			).rejects.toMatchObject({
 				code: "ENROLLMENT_GRANT_INVALID" as WebAuthnErrorCode,
 			});
+
+			expect(mockDb.transaction).not.toHaveBeenCalled();
 		});
 
-		it("rejects already consumed or revoked enrollment grant token", async () => {
-			const mockGrant = {
+		it("rejects when fresh post-lock read finds grant already consumed or revoked", async () => {
+			const mockRoutingHint = {
 				id: "grant-1",
 				userId: "user-1",
-				purpose: "BOOTSTRAP",
-				consumedAt: new Date(),
-				revokedAt: null,
-				expiresAt: new Date(Date.now() + 600000),
 			};
 
 			const mockTx = {
 				select: vi
 					.fn()
-					// 1st select: grant
-					.mockReturnValueOnce({
-						from: vi.fn().mockReturnValue({
-							where: vi.fn().mockReturnValue({
-								limit: vi.fn().mockResolvedValue([mockGrant]),
-							}),
-						}),
-					})
-					// 2nd select: user lock
+					// 1st: user lock FOR UPDATE
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -98,10 +83,27 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 								}),
 							}),
 						}),
+					})
+					// 2nd: fresh post-lock grant query (already consumed/revoked, so empty result)
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([]),
+								}),
+							}),
+						}),
 					}),
 			};
 
 			const mockDb = {
+				select: vi.fn().mockReturnValue({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([mockRoutingHint]),
+						}),
+					}),
+				}),
 				transaction: vi.fn().mockImplementation(async (cb) => {
 					return await cb(mockTx);
 				}),
@@ -118,8 +120,13 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			});
 		});
 
-		it("rejects expired enrollment grant token", async () => {
-			const mockGrant = {
+		it("rejects expired enrollment grant token on post-lock check", async () => {
+			const mockRoutingHint = {
+				id: "grant-1",
+				userId: "user-1",
+			};
+
+			const mockFreshGrant = {
 				id: "grant-1",
 				userId: "user-1",
 				purpose: "BOOTSTRAP",
@@ -131,13 +138,7 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			const mockTx = {
 				select: vi
 					.fn()
-					.mockReturnValueOnce({
-						from: vi.fn().mockReturnValue({
-							where: vi.fn().mockReturnValue({
-								limit: vi.fn().mockResolvedValue([mockGrant]),
-							}),
-						}),
-					})
+					// 1st: user lock
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -152,10 +153,27 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 								}),
 							}),
 						}),
+					})
+					// 2nd: fresh post-lock grant
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([mockFreshGrant]),
+								}),
+							}),
+						}),
 					}),
 			};
 
 			const mockDb = {
+				select: vi.fn().mockReturnValue({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([mockRoutingHint]),
+						}),
+					}),
+				}),
 				transaction: vi.fn().mockImplementation(async (cb) => {
 					return await cb(mockTx);
 				}),
@@ -173,7 +191,12 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 		});
 
 		it("rejects BOOTSTRAP grant if user is already initialized", async () => {
-			const mockGrant = {
+			const mockRoutingHint = {
+				id: "grant-1",
+				userId: "user-1",
+			};
+
+			const mockFreshGrant = {
 				id: "grant-1",
 				userId: "user-1",
 				purpose: "BOOTSTRAP",
@@ -185,13 +208,7 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			const mockTx = {
 				select: vi
 					.fn()
-					.mockReturnValueOnce({
-						from: vi.fn().mockReturnValue({
-							where: vi.fn().mockReturnValue({
-								limit: vi.fn().mockResolvedValue([mockGrant]),
-							}),
-						}),
-					})
+					// 1st: user lock (already initialized!)
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -200,9 +217,19 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 										{
 											id: "user-1",
 											displayName: "Eren",
-											authInitializedAt: new Date(), // Already initialized!
+											authInitializedAt: new Date(),
 										},
 									]),
+								}),
+							}),
+						}),
+					})
+					// 2nd: fresh post-lock grant
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([mockFreshGrant]),
 								}),
 							}),
 						}),
@@ -210,6 +237,13 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			};
 
 			const mockDb = {
+				select: vi.fn().mockReturnValue({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([mockRoutingHint]),
+						}),
+					}),
+				}),
 				transaction: vi.fn().mockImplementation(async (cb) => {
 					return await cb(mockTx);
 				}),
@@ -227,7 +261,12 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 		});
 
 		it("rejects RECOVERY grant if linked recovery code was revoked", async () => {
-			const mockGrant = {
+			const mockRoutingHint = {
+				id: "grant-1",
+				userId: "user-1",
+			};
+
+			const mockFreshGrant = {
 				id: "grant-1",
 				userId: "user-1",
 				purpose: "RECOVERY",
@@ -240,15 +279,7 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			const mockTx = {
 				select: vi
 					.fn()
-					// 1st select: grant
-					.mockReturnValueOnce({
-						from: vi.fn().mockReturnValue({
-							where: vi.fn().mockReturnValue({
-								limit: vi.fn().mockResolvedValue([mockGrant]),
-							}),
-						}),
-					})
-					// 2nd select: user lock
+					// 1st: user lock
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -264,7 +295,17 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 							}),
 						}),
 					})
-					// 3rd select: recovery code revalidation (revoked!)
+					// 2nd: fresh post-lock grant
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([mockFreshGrant]),
+								}),
+							}),
+						}),
+					})
+					// 3rd: recovery code revalidation (revoked!)
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -275,6 +316,13 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			};
 
 			const mockDb = {
+				select: vi.fn().mockReturnValue({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([mockRoutingHint]),
+						}),
+					}),
+				}),
 				transaction: vi.fn().mockImplementation(async (cb) => {
 					return await cb(mockTx);
 				}),
@@ -291,8 +339,13 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			});
 		});
 
-		it("successfully begins enrollment: consumes grant and inserts challenge with enrollment_grant_id atomically", async () => {
-			const mockGrant = {
+		it("fails closed when conditional atomic consume returns 0 rows (race loser) and does not insert challenge", async () => {
+			const mockRoutingHint = {
+				id: "grant-1",
+				userId: "user-1",
+			};
+
+			const mockFreshGrant = {
 				id: "grant-1",
 				userId: "user-1",
 				purpose: "BOOTSTRAP",
@@ -301,21 +354,12 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 				expiresAt: new Date(Date.now() + 600000),
 			};
 
-			let capturedGrantUpdate: unknown;
-			let capturedChallengeInsert: unknown;
+			const insertSpy = vi.fn();
 
 			const mockTx = {
 				select: vi
 					.fn()
-					// 1st: grant
-					.mockReturnValueOnce({
-						from: vi.fn().mockReturnValue({
-							where: vi.fn().mockReturnValue({
-								limit: vi.fn().mockResolvedValue([mockGrant]),
-							}),
-						}),
-					})
-					// 2nd: user lock
+					// 1st: user lock
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -331,6 +375,105 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 							}),
 						}),
 					})
+					// 2nd: fresh post-lock grant
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([mockFreshGrant]),
+								}),
+							}),
+						}),
+					})
+					// 3rd: active credentials
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockResolvedValue([]),
+						}),
+					}),
+				update: vi.fn().mockReturnValue({
+					set: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							returning: vi.fn().mockResolvedValue([]), // Conditional consume returned 0 rows!
+						}),
+					}),
+				}),
+				insert: insertSpy,
+			};
+
+			const mockDb = {
+				select: vi.fn().mockReturnValue({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([mockRoutingHint]),
+						}),
+					}),
+				}),
+				transaction: vi.fn().mockImplementation(async (cb) => {
+					return await cb(mockTx);
+				}),
+			} as unknown as Database;
+
+			await expect(
+				beginAuthorizedPasskeyEnrollment({
+					db: mockDb,
+					config: mockConfig,
+					enrollmentGrantToken: "valid-grant-token-1234567890",
+				}),
+			).rejects.toMatchObject({
+				code: "ENROLLMENT_GRANT_INVALID" as WebAuthnErrorCode,
+			});
+
+			expect(insertSpy).not.toHaveBeenCalled();
+		});
+
+		it("successfully begins enrollment: consumes grant conditionally and inserts challenge with enrollment_grant_id atomically", async () => {
+			const mockRoutingHint = {
+				id: "grant-1",
+				userId: "user-1",
+			};
+
+			const mockFreshGrant = {
+				id: "grant-1",
+				userId: "user-1",
+				purpose: "BOOTSTRAP",
+				consumedAt: null,
+				revokedAt: null,
+				expiresAt: new Date(Date.now() + 600000),
+			};
+
+			let capturedGrantUpdate: unknown;
+			let capturedChallengeInsert: unknown;
+
+			const mockTx = {
+				select: vi
+					.fn()
+					// 1st: user lock
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: "user-1",
+											displayName: "Eren",
+											authInitializedAt: null,
+										},
+									]),
+								}),
+							}),
+						}),
+					})
+					// 2nd: fresh post-lock grant
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([mockFreshGrant]),
+								}),
+							}),
+						}),
+					})
 					// 3rd: active credentials
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
@@ -341,26 +484,28 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 					set: vi.fn().mockImplementation((vals) => {
 						capturedGrantUpdate = vals;
 						return {
-							where: vi.fn().mockResolvedValue([]),
+							where: vi.fn().mockReturnValue({
+								returning: vi.fn().mockResolvedValue([{ id: "grant-1" }]),
+							}),
 						};
 					}),
 				}),
 				insert: vi.fn().mockReturnValue({
 					values: vi.fn().mockImplementation((vals) => {
 						capturedChallengeInsert = vals;
-						return {
-							returning: vi.fn().mockResolvedValue([
-								{
-									id: "chal-1",
-									...vals,
-								},
-							]),
-						};
+						return Promise.resolve();
 					}),
 				}),
 			};
 
 			const mockDb = {
+				select: vi.fn().mockReturnValue({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([mockRoutingHint]),
+						}),
+					}),
+				}),
 				transaction: vi.fn().mockImplementation(async (cb) => {
 					return await cb(mockTx);
 				}),
@@ -485,12 +630,210 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			expect(mockDb.transaction).not.toHaveBeenCalled();
 		});
 
+		it("rejects finalization if fresh challenge re-read from DB inside transaction fails or is unconsumed", async () => {
+			const mockConsumedChallenge = {
+				id: "chal-1",
+				userId: "user-1",
+				purpose: "REGISTRATION",
+				challenge: "test-challenge-reg",
+				enrollmentGrantId: "grant-1",
+				consumedAt: new Date(),
+			};
+
+			const mockUser = {
+				id: "user-1",
+				displayName: "Eren",
+				authInitializedAt: null,
+			};
+
+			const mockTx = {
+				select: vi
+					.fn()
+					// 1st: lock user
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([mockUser]),
+								}),
+							}),
+						}),
+					})
+					// 2nd: fresh challenge re-read fails (not found or invalid)
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([]),
+							}),
+						}),
+					}),
+			};
+
+			const mockDb = {
+				update: vi.fn().mockReturnValue({
+					set: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							returning: vi.fn().mockResolvedValue([mockConsumedChallenge]),
+						}),
+					}),
+				}),
+				transaction: vi.fn().mockImplementation(async (cb) => {
+					return await cb(mockTx);
+				}),
+			} as unknown as Database;
+
+			vi.spyOn(
+				SimpleWebAuthnServer,
+				"verifyRegistrationResponse",
+			).mockResolvedValue({
+				verified: true,
+				registrationInfo: {
+					fmt: "none",
+					aaguid: "00000000-0000-0000-0000-000000000000",
+					credential: {
+						id: "cred-abc-123",
+						publicKey: new Uint8Array([1, 2, 3]),
+						counter: 0,
+						transports: ["internal"],
+					},
+					credentialType: "public-key",
+					attestationObject: new Uint8Array(),
+					userVerified: true,
+					credentialDeviceType: "singleDevice",
+					credentialBackedUp: false,
+					origin: "http://localhost:8787",
+				},
+			});
+
+			await expect(
+				completeAuthorizedPasskeyEnrollment({
+					db: mockDb,
+					config: mockConfig,
+					response: validRegistrationResponse,
+					deviceName: "MacBook Pro",
+				}),
+			).rejects.toMatchObject({
+				code: "WEBAUTHN_CHALLENGE_INVALID" as WebAuthnErrorCode,
+			});
+		});
+
+		it("rejects finalization if challenge <-> grant <-> user binding verification fails or grant revoked", async () => {
+			const mockConsumedChallenge = {
+				id: "chal-1",
+				userId: "user-1",
+				purpose: "REGISTRATION",
+				challenge: "test-challenge-reg",
+				enrollmentGrantId: "grant-1",
+				consumedAt: new Date(),
+			};
+
+			const mockUser = {
+				id: "user-1",
+				displayName: "Eren",
+				authInitializedAt: null,
+			};
+
+			const mockFreshChallenge = {
+				id: "chal-1",
+				userId: "user-1",
+				purpose: "REGISTRATION",
+				enrollmentGrantId: "grant-1",
+				consumedAt: new Date(),
+			};
+
+			const mockTx = {
+				select: vi
+					.fn()
+					// 1st: lock user
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([mockUser]),
+								}),
+							}),
+						}),
+					})
+					// 2nd: fresh challenge re-read
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([mockFreshChallenge]),
+							}),
+						}),
+					})
+					// 3rd: grant re-read fails binding (user mismatch or revoked)
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([]),
+							}),
+						}),
+					}),
+			};
+
+			const mockDb = {
+				update: vi.fn().mockReturnValue({
+					set: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							returning: vi.fn().mockResolvedValue([mockConsumedChallenge]),
+						}),
+					}),
+				}),
+				transaction: vi.fn().mockImplementation(async (cb) => {
+					return await cb(mockTx);
+				}),
+			} as unknown as Database;
+
+			vi.spyOn(
+				SimpleWebAuthnServer,
+				"verifyRegistrationResponse",
+			).mockResolvedValue({
+				verified: true,
+				registrationInfo: {
+					fmt: "none",
+					aaguid: "00000000-0000-0000-0000-000000000000",
+					credential: {
+						id: "cred-abc-123",
+						publicKey: new Uint8Array([1, 2, 3]),
+						counter: 0,
+						transports: ["internal"],
+					},
+					credentialType: "public-key",
+					attestationObject: new Uint8Array(),
+					userVerified: true,
+					credentialDeviceType: "singleDevice",
+					credentialBackedUp: false,
+					origin: "http://localhost:8787",
+				},
+			});
+
+			await expect(
+				completeAuthorizedPasskeyEnrollment({
+					db: mockDb,
+					config: mockConfig,
+					response: validRegistrationResponse,
+					deviceName: "MacBook Pro",
+				}),
+			).rejects.toMatchObject({
+				code: "ENROLLMENT_GRANT_INVALID" as WebAuthnErrorCode,
+			});
+		});
+
 		it("completes BOOTSTRAP finalization atomically: creates credential, sets auth_initialized_at, inserts recovery code hash, returns one-time code", async () => {
 			const mockConsumedChallenge = {
 				id: "chal-1",
 				userId: "user-1",
 				purpose: "REGISTRATION",
 				challenge: "test-challenge-reg",
+				enrollmentGrantId: "grant-1",
+				consumedAt: new Date(),
+			};
+
+			const mockFreshChallenge = {
+				id: "chal-1",
+				userId: "user-1",
+				purpose: "REGISTRATION",
 				enrollmentGrantId: "grant-1",
 				consumedAt: new Date(),
 			};
@@ -526,7 +869,15 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 							}),
 						}),
 					})
-					// 2nd: linked grant
+					// 2nd: fresh challenge re-read
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([mockFreshChallenge]),
+							}),
+						}),
+					})
+					// 3rd: linked grant
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -632,6 +983,14 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 				consumedAt: new Date(),
 			};
 
+			const mockFreshChallenge = {
+				id: "chal-rec",
+				userId: "user-1",
+				purpose: "REGISTRATION",
+				enrollmentGrantId: "grant-rec",
+				consumedAt: new Date(),
+			};
+
 			const mockGrant = {
 				id: "grant-rec",
 				userId: "user-1",
@@ -672,7 +1031,15 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 							}),
 						}),
 					})
-					// 2nd: linked grant
+					// 2nd: fresh challenge re-read
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([mockFreshChallenge]),
+							}),
+						}),
+					})
+					// 3rd: linked grant
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -680,7 +1047,7 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 							}),
 						}),
 					})
-					// 3rd: source recovery code revalidation inside finalization tx
+					// 4th: source recovery code revalidation inside finalization tx
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -790,6 +1157,14 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 				consumedAt: new Date(),
 			};
 
+			const mockFreshChallenge = {
+				id: "chal-rec",
+				userId: "user-1",
+				purpose: "REGISTRATION",
+				enrollmentGrantId: "grant-rec",
+				consumedAt: new Date(),
+			};
+
 			const mockGrant = {
 				id: "grant-rec",
 				userId: "user-1",
@@ -818,7 +1193,15 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 							}),
 						}),
 					})
-					// 2nd: linked grant
+					// 2nd: fresh challenge re-read
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([mockFreshChallenge]),
+							}),
+						}),
+					})
+					// 3rd: linked grant
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -826,7 +1209,7 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 							}),
 						}),
 					})
-					// 3rd: source recovery code revalidation FAILS (code was rotated!)
+					// 4th: source recovery code revalidation FAILS (code was rotated!)
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
