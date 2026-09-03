@@ -2,6 +2,8 @@ import { getTableName } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { WEBAUTHN_CHALLENGE_TTL_SECONDS } from "../src/auth/challenges";
 import {
+	authEnrollmentGrants,
+	authRecoveryCodes,
 	sessions,
 	users,
 	webauthnChallenges,
@@ -14,15 +16,18 @@ describe("Single-User Identity Schema Contract", () => {
 		expect(getTableName(webauthnCredentials)).toBe("webauthn_credentials");
 		expect(getTableName(sessions)).toBe("sessions");
 		expect(getTableName(webauthnChallenges)).toBe("webauthn_challenges");
+		expect(getTableName(authRecoveryCodes)).toBe("auth_recovery_codes");
+		expect(getTableName(authEnrollmentGrants)).toBe("auth_enrollment_grants");
 	});
 
-	it("verifies users table structure and critical columns", () => {
+	it("verifies users table structure and critical columns including authInitializedAt", () => {
 		const cols = users;
 		expect(cols.id).toBeDefined();
 		expect(cols.singletonKey).toBeDefined();
 		expect(cols.displayName).toBeDefined();
 		expect(cols.timezone).toBeDefined();
 		expect(cols.currency).toBeDefined();
+		expect(cols.authInitializedAt).toBeDefined();
 		expect(cols.createdAt).toBeDefined();
 		expect(cols.updatedAt).toBeDefined();
 
@@ -86,6 +91,39 @@ describe("Single-User Identity Schema Contract", () => {
 
 		// Security: challenge table does not store password or credential secrets
 		expect("secret" in cols).toBe(false);
+		expect("password" in cols).toBe(false);
+	});
+
+	it("verifies auth_recovery_codes table structure and security constraints", () => {
+		const cols = authRecoveryCodes;
+		expect(cols.id).toBeDefined();
+		expect(cols.userId).toBeDefined();
+		expect(cols.codeHash).toBeDefined();
+		expect(cols.createdAt).toBeDefined();
+		expect(cols.consumedAt).toBeDefined();
+		expect(cols.revokedAt).toBeDefined();
+
+		// Security: no raw code or plaintext secrets
+		expect("code" in cols).toBe(false);
+		expect("rawCode" in cols).toBe(false);
+		expect("password" in cols).toBe(false);
+	});
+
+	it("verifies auth_enrollment_grants table structure and security constraints", () => {
+		const cols = authEnrollmentGrants;
+		expect(cols.id).toBeDefined();
+		expect(cols.userId).toBeDefined();
+		expect(cols.purpose).toBeDefined();
+		expect(cols.tokenHash).toBeDefined();
+		expect(cols.recoveryCodeId).toBeDefined();
+		expect(cols.createdAt).toBeDefined();
+		expect(cols.expiresAt).toBeDefined();
+		expect(cols.consumedAt).toBeDefined();
+		expect(cols.revokedAt).toBeDefined();
+
+		// Security: no raw token stored
+		expect("token" in cols).toBe(false);
+		expect("rawToken" in cols).toBe(false);
 		expect("password" in cols).toBe(false);
 	});
 });

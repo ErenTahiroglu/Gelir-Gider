@@ -36,6 +36,13 @@
       "when": 1788421161894,
       "tag": "0004_bent_madripoor",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1788422902919,
+      "tag": "0005_purple_vision",
+      "breakpoints": true
     }
   ]
 }

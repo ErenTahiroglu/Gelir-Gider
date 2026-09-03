@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	type AppEnv,
+	getBootstrapTokenHash,
 	getDatabaseUrl,
 	getWebAuthnConfig,
 } from "../src/config/env";
@@ -106,5 +107,55 @@ describe("WebAuthn Environment Contract", () => {
 			rpName: "Gelir Gider",
 			origin: "http://localhost:8787",
 		});
+	});
+});
+
+describe("Bootstrap Environment Contract", () => {
+	it("throws BOOTSTRAP_TOKEN_HASH is required when missing, empty or whitespace", () => {
+		expect(() => getBootstrapTokenHash({})).toThrow(
+			"BOOTSTRAP_TOKEN_HASH is required",
+		);
+		expect(() => getBootstrapTokenHash({ BOOTSTRAP_TOKEN_HASH: "" })).toThrow(
+			"BOOTSTRAP_TOKEN_HASH is required",
+		);
+		expect(() =>
+			getBootstrapTokenHash({ BOOTSTRAP_TOKEN_HASH: "   " }),
+		).toThrow("BOOTSTRAP_TOKEN_HASH is required");
+	});
+
+	it("throws validation error when hash is not 64 lowercase hex characters", () => {
+		expect(() =>
+			getBootstrapTokenHash({
+				BOOTSTRAP_TOKEN_HASH: "0123456789abcdef", // too short
+			}),
+		).toThrow(
+			"BOOTSTRAP_TOKEN_HASH must be exactly 64 lowercase hexadecimal characters",
+		);
+
+		expect(() =>
+			getBootstrapTokenHash({
+				BOOTSTRAP_TOKEN_HASH: "G".repeat(64), // invalid hex
+			}),
+		).toThrow(
+			"BOOTSTRAP_TOKEN_HASH must be exactly 64 lowercase hexadecimal characters",
+		);
+
+		expect(() =>
+			getBootstrapTokenHash({
+				BOOTSTRAP_TOKEN_HASH: "A".repeat(64), // uppercase
+			}),
+		).toThrow(
+			"BOOTSTRAP_TOKEN_HASH must be exactly 64 lowercase hexadecimal characters",
+		);
+	});
+
+	it("returns trimmed valid 64-char lowercase hex hash", () => {
+		const validHash =
+			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+		expect(
+			getBootstrapTokenHash({
+				BOOTSTRAP_TOKEN_HASH: `  ${validHash}  \n`,
+			}),
+		).toBe(validHash);
 	});
 });

@@ -3,6 +3,7 @@ export interface AppEnv {
 	WEBAUTHN_RP_ID?: string | undefined;
 	WEBAUTHN_RP_NAME?: string | undefined;
 	WEBAUTHN_ORIGIN?: string | undefined;
+	BOOTSTRAP_TOKEN_HASH?: string | undefined;
 }
 
 export function getDatabaseUrl(env: AppEnv): string {
@@ -41,4 +42,22 @@ export function getWebAuthnConfig(env: AppEnv): WebAuthnConfig {
 		rpName: rpName.trim(),
 		origin: origin.trim(),
 	};
+}
+
+const HEX_64_PATTERN = /^[0-9a-f]{64}$/;
+
+export function getBootstrapTokenHash(env: AppEnv): string {
+	const rawHash = env.BOOTSTRAP_TOKEN_HASH;
+	if (!rawHash || rawHash.trim() === "") {
+		throw new Error("BOOTSTRAP_TOKEN_HASH is required");
+	}
+
+	const trimmed = rawHash.trim();
+	if (!HEX_64_PATTERN.test(trimmed)) {
+		throw new Error(
+			"BOOTSTRAP_TOKEN_HASH must be exactly 64 lowercase hexadecimal characters",
+		);
+	}
+
+	return trimmed;
 }
