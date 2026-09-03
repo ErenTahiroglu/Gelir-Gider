@@ -641,7 +641,6 @@ export async function voidCanonicalTransactionWithLedger({
 		if (canonicalRes.idempotentReplay) {
 			const [existingBinding] = await tx
 				.select({
-					id: transactionLedgerBindings.id,
 					reversalJournalEntryId:
 						transactionLedgerBindings.reversalJournalEntryId,
 					appliedJournalEntryId:
@@ -660,6 +659,99 @@ export async function voidCanonicalTransactionWithLedger({
 				throw new CanonicalTransactionError(
 					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
 					"Canonical void revision replayed but matching ledger binding is missing or malformed",
+				);
+			}
+
+			// Load current VOID revision's previousRevisionId
+			const [currentRev] = await tx
+				.select({
+					previousRevisionId: transactionRevisions.previousRevisionId,
+				})
+				.from(transactionRevisions)
+				.where(eq(transactionRevisions.id, canonicalRes.revisionId))
+				.limit(1);
+
+			if (!currentRev?.previousRevisionId) {
+				throw new CanonicalTransactionError(
+					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+					"VOID revision missing previous revision reference on replay",
+				);
+			}
+
+			// Resolve previous revision binding
+			const [prevBinding] = await tx
+				.select({
+					appliedJournalEntryId:
+						transactionLedgerBindings.appliedJournalEntryId,
+				})
+				.from(transactionLedgerBindings)
+				.where(
+					eq(
+						transactionLedgerBindings.revisionId,
+						currentRev.previousRevisionId,
+					),
+				)
+				.limit(1);
+
+			if (!prevBinding?.appliedJournalEntryId) {
+				throw new CanonicalTransactionError(
+					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+					"Previous revision has no active applied journal entry on replay",
+				);
+			}
+
+			// Load previous applied journal's occurred_at
+			const [prevJournal] = await tx
+				.select({ occurredAt: journalEntries.occurredAt })
+				.from(journalEntries)
+				.where(eq(journalEntries.id, prevBinding.appliedJournalEntryId))
+				.limit(1);
+
+			if (!prevJournal) {
+				throw new CanonicalTransactionError(
+					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+					"Previous applied journal entry could not be found on replay",
+				);
+			}
+
+			// Verify deterministic reversal replay
+			let revRes: ReverseJournalEntryResult;
+			try {
+				revRes = await reverseJournalEntryInTransaction({
+					tx,
+					userId,
+					originalEntryId: prevBinding.appliedJournalEntryId,
+					idempotencyKey: `txrev:${canonicalRes.revisionId}:reverse`,
+					occurredAt: prevJournal.occurredAt,
+					memo: null,
+				});
+			} catch (err) {
+				if (err instanceof CanonicalTransactionError) throw err;
+				if (
+					err instanceof LedgerError &&
+					err.code === "LEDGER_IDEMPOTENCY_CONFLICT"
+				) {
+					throw new CanonicalTransactionError(
+						"TRANSACTION_LEDGER_EFFECT_CONFLICT",
+						err.message,
+					);
+				}
+				if (err instanceof LedgerError) {
+					throw new CanonicalTransactionError(
+						"TRANSACTION_LEDGER_EFFECT_INVALID",
+						err.message,
+					);
+				}
+				throw err;
+			}
+
+			if (
+				!revRes.idempotentReplay ||
+				revRes.entryId !== existingBinding.reversalJournalEntryId
+			) {
+				throw new CanonicalTransactionError(
+					"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+					"Reversal replay mismatch with existing binding",
 				);
 			}
 
@@ -752,7 +844,7 @@ export async function voidCanonicalTransactionWithLedger({
 			throw err;
 		}
 
-		const [binding] = await tx
+		const [insertedBinding] = await tx
 			.insert(transactionLedgerBindings)
 			.values({
 				userId,
@@ -764,7 +856,7 @@ export async function voidCanonicalTransactionWithLedger({
 			})
 			.returning();
 
-		if (!binding) {
+		if (!insertedBinding) {
 			throw new CanonicalTransactionError(
 				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
 				"Failed to insert transaction ledger binding for VOID",
@@ -779,7 +871,7 @@ export async function voidCanonicalTransactionWithLedger({
 			idempotentReplay: false,
 			ledger: {
 				appliedJournalEntryId: null,
-				reversalJournalEntryId: revRes.entryId,
+				reversalJournalEntryId: insertedBinding.reversalJournalEntryId,
 			},
 		};
 	});
@@ -839,7 +931,12 @@ export async function getCanonicalTransactionLedgerBinding({
 		const [latestRev] = await db
 			.select({ id: transactionRevisions.id })
 			.from(transactionRevisions)
-			.where(eq(transactionRevisions.transactionId, trimmedTxId))
+			.where(
+				and(
+					eq(transactionRevisions.transactionId, trimmedTxId),
+					eq(transactionRevisions.userId, userId),
+				),
+			)
 			.orderBy(desc(transactionRevisions.revisionNo))
 			.limit(1);
 
@@ -850,6 +947,26 @@ export async function getCanonicalTransactionLedgerBinding({
 			);
 		}
 		targetRevisionId = latestRev.id;
+	} else {
+		// Defense-in-depth: Validate that explicit revisionId belongs to this user and transactionId
+		const [revRow] = await db
+			.select({ id: transactionRevisions.id })
+			.from(transactionRevisions)
+			.where(
+				and(
+					eq(transactionRevisions.id, targetRevisionId),
+					eq(transactionRevisions.transactionId, trimmedTxId),
+					eq(transactionRevisions.userId, userId),
+				),
+			)
+			.limit(1);
+
+		if (!revRow) {
+			throw new CanonicalTransactionError(
+				"TRANSACTION_LEDGER_INCOMPLETE_STATE",
+				`Revision "${targetRevisionId}" does not belong to transaction "${trimmedTxId}"`,
+			);
+		}
 	}
 
 	const [binding] = await db
@@ -866,6 +983,7 @@ export async function getCanonicalTransactionLedgerBinding({
 		.where(
 			and(
 				eq(transactionLedgerBindings.userId, userId),
+				eq(transactionLedgerBindings.transactionId, trimmedTxId),
 				eq(transactionLedgerBindings.revisionId, targetRevisionId),
 			),
 		)
