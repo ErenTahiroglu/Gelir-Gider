@@ -606,4 +606,202 @@ describe("Income Receipts Service", () => {
 
 		boundSpy.mockRestore();
 	});
+
+	it("rejects reviseIncomeReceipt amount < active settlement allocation with INCOME_SETTLEMENT_CONFLICT", async () => {
+		const mockTx = {
+			select: vi.fn().mockImplementation(() => ({
+				from: vi.fn().mockImplementation((table) => ({
+					where: vi.fn().mockImplementation(() => ({
+						limit: vi.fn().mockImplementation(() => {
+							if (table === users)
+								return Promise.resolve([{ currency: "TRY" }]);
+							if (table === incomeReceipts) {
+								return Promise.resolve([
+									{
+										id: "receipt-1",
+										userId: "user-1",
+										sourceId: "source-1",
+										canonicalTransactionId: "canon-tx-1",
+									},
+								]);
+							}
+							if (table === incomeSources) {
+								return Promise.resolve([
+									{
+										id: "source-1",
+										userId: "user-1",
+										code: "KYK",
+										name: "KYK Bursu",
+										incomeLedgerAccountId: "income-acc-1",
+										activeFrom: "2026-01-01",
+										activeUntil: null,
+										archivedAt: null,
+									},
+								]);
+							}
+							if (table === ledgerAccounts) {
+								return Promise.resolve([
+									{
+										id: "dest-acc-1",
+										userId: "user-1",
+										accountType: "ASSET",
+										normalBalance: "DEBIT",
+										currency: "TRY",
+										archivedAt: null,
+									},
+								]);
+							}
+							if (table === incomeReceiptRevisions) {
+								return Promise.resolve([
+									{
+										id: "receipt-rev-1",
+										userId: "user-1",
+										incomeReceiptId: "receipt-1",
+										revisionNo: 1,
+										operation: "CREATE",
+										amount: "4000.00",
+									},
+								]);
+							}
+							// Settlement batch
+							return Promise.resolve([
+								{
+									id: "batch-1",
+								},
+							]);
+						}),
+						orderBy: vi.fn().mockImplementation(() => ({
+							limit: vi.fn().mockResolvedValue([
+								{
+									allocations: [
+										{
+											entitlementId: "ent-1",
+											amount: "3000.00", // 3000.00 allocated!
+										},
+									],
+								},
+							]),
+						})),
+					})),
+				})),
+			})),
+		} as unknown as DatabaseTransaction;
+
+		const mockDb = {
+			transaction: vi.fn(
+				async (cb: (tx: DatabaseTransaction) => Promise<unknown>) =>
+					await cb(mockTx),
+			),
+		} as unknown as Database;
+
+		// Attempting to revise amount to 2500.00 (< 3000.00 allocated) MUST throw INCOME_SETTLEMENT_CONFLICT
+		await expect(
+			reviseIncomeReceipt({
+				db: mockDb,
+				userId: "user-1",
+				incomeReceiptId: "receipt-1",
+				expectedRevisionNo: 1,
+				idempotencyKey: "rev-rx-less-than-alloc",
+				receivedAt: new Date("2026-09-05T10:00:00Z"),
+				amount: "2500.00",
+				destinationAccountId: "dest-acc-1",
+				reasonCode: "CORRECTION",
+				provenance: { type: "MANUAL" },
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof IncomeError && e.code === "INCOME_SETTLEMENT_CONFLICT",
+		);
+	});
+
+	it("rejects voidIncomeReceipt when receipt has active settlement allocations with INCOME_SETTLEMENT_CONFLICT", async () => {
+		const mockTx = {
+			select: vi.fn().mockImplementation(() => ({
+				from: vi.fn().mockImplementation((table) => ({
+					where: vi.fn().mockImplementation(() => ({
+						limit: vi.fn().mockImplementation(() => {
+							if (table === users)
+								return Promise.resolve([{ currency: "TRY" }]);
+							if (table === incomeReceipts) {
+								return Promise.resolve([
+									{
+										id: "receipt-1",
+										userId: "user-1",
+										sourceId: "source-1",
+										canonicalTransactionId: "canon-tx-1",
+									},
+								]);
+							}
+							if (table === incomeSources) {
+								return Promise.resolve([
+									{
+										id: "source-1",
+										userId: "user-1",
+										code: "KYK",
+										name: "KYK Bursu",
+										incomeLedgerAccountId: "income-acc-1",
+										activeFrom: "2026-01-01",
+										activeUntil: null,
+										archivedAt: null,
+									},
+								]);
+							}
+							if (table === incomeReceiptRevisions) {
+								return Promise.resolve([
+									{
+										id: "receipt-rev-1",
+										userId: "user-1",
+										incomeReceiptId: "receipt-1",
+										revisionNo: 1,
+										operation: "CREATE",
+										amount: "4000.00",
+									},
+								]);
+							}
+							// Settlement batch exists
+							return Promise.resolve([
+								{
+									id: "batch-1",
+								},
+							]);
+						}),
+						orderBy: vi.fn().mockImplementation(() => ({
+							limit: vi.fn().mockResolvedValue([
+								{
+									allocations: [
+										{
+											entitlementId: "ent-1",
+											amount: "1500.00", // active allocation exists!
+										},
+									],
+								},
+							]),
+						})),
+					})),
+				})),
+			})),
+		} as unknown as DatabaseTransaction;
+
+		const mockDb = {
+			transaction: vi.fn(
+				async (cb: (tx: DatabaseTransaction) => Promise<unknown>) =>
+					await cb(mockTx),
+			),
+		} as unknown as Database;
+
+		await expect(
+			voidIncomeReceipt({
+				db: mockDb,
+				userId: "user-1",
+				incomeReceiptId: "receipt-1",
+				expectedRevisionNo: 1,
+				idempotencyKey: "void-rx-with-alloc",
+				reasonCode: "VOID_MISTAKE",
+				provenance: { type: "MANUAL" },
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof IncomeError && e.code === "INCOME_SETTLEMENT_CONFLICT",
+		);
+	});
 });

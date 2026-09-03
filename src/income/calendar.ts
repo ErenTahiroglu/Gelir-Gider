@@ -113,3 +113,54 @@ export function getIstanbulCalendarDate(date: Date): string {
 
 	return `${year.padStart(4, "0")}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
 }
+
+/**
+ * Validates that an input string is a valid periodMonth (YYYY-MM-01),
+ * strictly representing the first calendar day of a month.
+ */
+export function validatePeriodMonth(value: string): string {
+	const validDate = validateIsoCalendarDate(value);
+	if (!validDate.endsWith("-01")) {
+		throw new IncomeError(
+			"INCOME_INVALID_INPUT",
+			`periodMonth must be the first day of a month (YYYY-MM-01), got "${value}"`,
+		);
+	}
+	return validDate;
+}
+
+/**
+ * Checks whether a given monthly period (YYYY-MM-01) overlaps with
+ * an income source's active window [activeFrom, activeUntil].
+ */
+export function doesMonthOverlapWindow(
+	periodMonth: string,
+	activeFrom: string,
+	activeUntil: string | null,
+): boolean {
+	const validPeriod = validatePeriodMonth(periodMonth);
+	const [yearStr, monthStr] = validPeriod.split("-");
+	const year = Number.parseInt(yearStr ?? "", 10);
+	const month = Number.parseInt(monthStr ?? "", 10);
+	const maxDays = getDaysInMonth(year, month);
+
+	const monthStart = validPeriod;
+	const monthEnd = `${yearStr}-${monthStr}-${maxDays.toString().padStart(2, "0")}`;
+
+	if (monthEnd < activeFrom) {
+		return false;
+	}
+	if (activeUntil !== null && monthStart > activeUntil) {
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Returns a Date representing 00:00:00 in Europe/Istanbul for a given periodMonth (YYYY-MM-01).
+ * Europe/Istanbul is UTC+03:00.
+ */
+export function getIstanbulDateAtMidnightUtc(periodMonth: string): Date {
+	const validPeriod = validatePeriodMonth(periodMonth);
+	return new Date(`${validPeriod}T00:00:00+03:00`);
+}

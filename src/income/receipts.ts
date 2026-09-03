@@ -7,7 +7,11 @@ import {
 	incomeSources,
 } from "../db/schema/income";
 import { ledgerAccounts } from "../db/schema/ledger";
-import { type ParsedMoney, parseMoneyString } from "../ledger/money";
+import {
+	formatCentsToMoney,
+	type ParsedMoney,
+	parseMoneyString,
+} from "../ledger/money";
 import { CanonicalTransactionError } from "../transactions/errors";
 import {
 	type BoundCanonicalTransactionResult,
@@ -18,6 +22,7 @@ import {
 import type { TransactionSourceInput } from "../transactions/service";
 import { getIstanbulCalendarDate } from "./calendar";
 import { IncomeError } from "./errors";
+import { getActiveReceiptAllocatedCentsInTransaction } from "./settlement-state";
 
 export interface IncomeReceiptItem {
 	incomeReceiptId: string;
@@ -648,6 +653,16 @@ export async function reviseIncomeReceipt(
 			);
 		}
 
+		// Phase 6B: Check that new receipt amount is not less than active settlement allocations
+		const currentAllocatedCents =
+			await getActiveReceiptAllocatedCentsInTransaction(tx, userId, receipt.id);
+		if (parsedAmount.cents < currentAllocatedCents) {
+			throw new IncomeError(
+				"INCOME_SETTLEMENT_CONFLICT",
+				`Cannot revise income receipt amount to ${parsedAmount.normalized}: current allocated amount is ${formatCentsToMoney(currentAllocatedCents)}`,
+			);
+		}
+
 		const canonicalPayload: Record<string, unknown> = {
 			incomeSourceId: source.id,
 			amount: parsedAmount.normalized,
@@ -883,6 +898,16 @@ export async function voidIncomeReceipt(
 			throw new IncomeError(
 				"INCOME_RECEIPT_INVALID_STATE",
 				`Expected revision ${expectedRevisionNo} not found for income receipt`,
+			);
+		}
+
+		// Phase 6B: Check that receipt does not have active settlement allocations
+		const currentAllocatedCents =
+			await getActiveReceiptAllocatedCentsInTransaction(tx, userId, receipt.id);
+		if (currentAllocatedCents > 0n) {
+			throw new IncomeError(
+				"INCOME_SETTLEMENT_CONFLICT",
+				`Cannot void income receipt with active settlement allocations (${formatCentsToMoney(currentAllocatedCents)} allocated). Clear allocations first.`,
 			);
 		}
 
