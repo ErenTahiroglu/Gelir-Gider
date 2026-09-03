@@ -13,7 +13,7 @@ export interface UserCredentialSummary {
 	revokedAt: Date | null;
 }
 
-export interface BuildRegistrationOptionsParams {
+interface BuildRegistrationOptionsParams {
 	config: WebAuthnConfig;
 	user: {
 		id: string;
@@ -22,7 +22,7 @@ export interface BuildRegistrationOptionsParams {
 	existingCredentials?: UserCredentialSummary[] | undefined;
 }
 
-export async function buildRegistrationOptions({
+async function buildRegistrationOptions({
 	config,
 	user,
 	existingCredentials = [],
@@ -87,12 +87,12 @@ export async function generateRegistrationOptionsForUser({
 	return options;
 }
 
-export interface BuildAuthenticationOptionsParams {
+interface BuildAuthenticationOptionsParams {
 	config: WebAuthnConfig;
 	existingCredentials?: UserCredentialSummary[] | undefined;
 }
 
-export async function buildAuthenticationOptions({
+async function buildAuthenticationOptions({
 	config,
 	existingCredentials = [],
 }: BuildAuthenticationOptionsParams) {

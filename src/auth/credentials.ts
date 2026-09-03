@@ -1,5 +1,5 @@
 import type { AuthenticatorTransportFuture } from "@simplewebauthn/server";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Database } from "../db/client";
 import { webauthnCredentials } from "../db/schema/auth";
 
@@ -13,6 +13,7 @@ export interface ActiveCredentialRecord {
 	deviceType: string | null;
 	transports: AuthenticatorTransportFuture[] | null;
 	backedUp: boolean;
+	stateVersion: number;
 	createdAt: Date;
 	lastUsedAt: Date | null;
 	revokedAt: Date | null;
@@ -97,6 +98,7 @@ export interface UpdateCredentialAfterAuthenticationParams {
 	credentialDbId: string;
 	userId: string;
 	previouslyReadCounter: number;
+	previousStateVersion: number;
 	newCounter: number;
 }
 
@@ -105,22 +107,25 @@ export async function updateCredentialAfterAuthentication({
 	credentialDbId,
 	userId,
 	previouslyReadCounter,
+	previousStateVersion,
 	newCounter,
 }: UpdateCredentialAfterAuthenticationParams) {
 	const now = new Date();
 
-	// Atomic update preventing lost updates and race conditions
+	// Atomic update using state_version optimistic concurrency token and atomic DB increment
 	const [updated] = await db
 		.update(webauthnCredentials)
 		.set({
 			signCount: newCounter,
 			lastUsedAt: now,
+			stateVersion: sql`${webauthnCredentials.stateVersion} + 1`,
 		})
 		.where(
 			and(
 				eq(webauthnCredentials.id, credentialDbId),
 				eq(webauthnCredentials.userId, userId),
 				isNull(webauthnCredentials.revokedAt),
+				eq(webauthnCredentials.stateVersion, previousStateVersion),
 				eq(webauthnCredentials.signCount, previouslyReadCounter),
 			),
 		)

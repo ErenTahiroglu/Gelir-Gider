@@ -29,6 +29,13 @@
       "when": 1788420669081,
       "tag": "0003_curvy_deathbird",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1788421161894,
+      "tag": "0004_bent_madripoor",
+      "breakpoints": true
     }
   ]
 }

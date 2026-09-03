@@ -1,7 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-	buildAuthenticationOptions,
-	buildRegistrationOptions,
 	generateAuthenticationOptionsForUser,
 	generateRegistrationOptionsForUser,
 	type UserCredentialSummary,
@@ -15,15 +13,31 @@ const mockConfig: WebAuthnConfig = {
 	origin: "http://localhost:8787",
 };
 
-describe("WebAuthn Options Generator", () => {
-	describe("Registration Options Builder", () => {
-		it("generates registration options with correct RP config, required userVerification, and challenge", async () => {
+describe("WebAuthn Options Generator (Public API)", () => {
+	const createMockDb = () =>
+		({
+			insert: vi.fn().mockReturnValue({
+				values: vi.fn().mockReturnValue({
+					returning: vi.fn().mockResolvedValue([
+						{
+							id: "mock-chal-id",
+							challenge: "persisted-challenge",
+						},
+					]),
+				}),
+			}),
+		}) as unknown as Database;
+
+	describe("Registration Options Issuer", () => {
+		it("generates and persists registration options with correct RP config and required userVerification", async () => {
 			const user = {
 				id: "6ef82b90-3339-49da-ade7-aacf59369328",
 				displayName: "Eren",
 			};
+			const mockDb = createMockDb();
 
-			const options = await buildRegistrationOptions({
+			const options = await generateRegistrationOptionsForUser({
+				db: mockDb,
 				config: mockConfig,
 				user,
 			});
@@ -36,6 +50,9 @@ describe("WebAuthn Options Generator", () => {
 			expect(options.authenticatorSelection?.userVerification).toBe("required");
 			expect(options.authenticatorSelection?.residentKey).toBe("preferred");
 			expect(options.attestation).toBe("none");
+
+			// Verify challenge persistence was called
+			expect(mockDb.insert).toHaveBeenCalled();
 		});
 
 		it("excludes active credentials while excluding revoked credentials from excludeCredentials list, mapping transports", async () => {
@@ -61,8 +78,10 @@ describe("WebAuthn Options Generator", () => {
 					revokedAt: null,
 				},
 			];
+			const mockDb = createMockDb();
 
-			const options = await buildRegistrationOptions({
+			const options = await generateRegistrationOptionsForUser({
+				db: mockDb,
 				config: mockConfig,
 				user,
 				existingCredentials,
@@ -87,8 +106,12 @@ describe("WebAuthn Options Generator", () => {
 			};
 
 			const mockDb = {
-				insert: vi.fn().mockImplementation(() => {
-					throw new Error("DB connection failure");
+				insert: vi.fn().mockReturnValue({
+					values: vi.fn().mockReturnValue({
+						returning: vi
+							.fn()
+							.mockRejectedValue(new Error("DB insert failure")),
+					}),
 				}),
 			} as unknown as Database;
 
@@ -98,23 +121,36 @@ describe("WebAuthn Options Generator", () => {
 					config: mockConfig,
 					user,
 				}),
-			).rejects.toThrow("DB connection failure");
+			).rejects.toThrow("DB insert failure");
 		});
 	});
 
-	describe("Authentication Options Builder", () => {
-		it("generates authentication options with correct RP ID and required userVerification", async () => {
-			const options = await buildAuthenticationOptions({
+	describe("Authentication Options Issuer", () => {
+		it("generates and persists authentication options with correct RP ID and required userVerification", async () => {
+			const user = {
+				id: "6ef82b90-3339-49da-ade7-aacf59369328",
+			};
+			const mockDb = createMockDb();
+
+			const options = await generateAuthenticationOptionsForUser({
+				db: mockDb,
 				config: mockConfig,
+				user,
 			});
 
 			expect(options.rpId).toBe("localhost");
 			expect(options.userVerification).toBe("required");
 			expect(options.challenge).toBeDefined();
 			expect(typeof options.challenge).toBe("string");
+
+			// Verify challenge persistence was called
+			expect(mockDb.insert).toHaveBeenCalled();
 		});
 
 		it("includes only active credentials in allowCredentials while omitting revoked ones, with transports", async () => {
+			const user = {
+				id: "6ef82b90-3339-49da-ade7-aacf59369328",
+			};
 			const existingCredentials: UserCredentialSummary[] = [
 				{
 					credentialId: "active-cred-1",
@@ -127,9 +163,12 @@ describe("WebAuthn Options Generator", () => {
 					revokedAt: new Date(),
 				},
 			];
+			const mockDb = createMockDb();
 
-			const options = await buildAuthenticationOptions({
+			const options = await generateAuthenticationOptionsForUser({
+				db: mockDb,
 				config: mockConfig,
+				user,
 				existingCredentials,
 			});
 
@@ -150,8 +189,12 @@ describe("WebAuthn Options Generator", () => {
 			};
 
 			const mockDb = {
-				insert: vi.fn().mockImplementation(() => {
-					throw new Error("DB connection failure");
+				insert: vi.fn().mockReturnValue({
+					values: vi.fn().mockReturnValue({
+						returning: vi
+							.fn()
+							.mockRejectedValue(new Error("DB insert failure")),
+					}),
 				}),
 			} as unknown as Database;
 
@@ -161,7 +204,7 @@ describe("WebAuthn Options Generator", () => {
 					config: mockConfig,
 					user,
 				}),
-			).rejects.toThrow("DB connection failure");
+			).rejects.toThrow("DB insert failure");
 		});
 	});
 });

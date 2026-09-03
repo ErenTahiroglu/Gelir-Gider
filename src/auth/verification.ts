@@ -253,12 +253,13 @@ export async function verifyAuthenticationForUser({
 		);
 	}
 
-	// 5. Update signature counter and lastUsedAt race-safely
+	// 5. Update signature counter, state_version and lastUsedAt race-safely
 	const updated = await updateCredentialAfterAuthentication({
 		db,
 		credentialDbId: credentialRecord.id,
 		userId: user.id,
 		previouslyReadCounter: credentialRecord.signCount,
+		previousStateVersion: credentialRecord.stateVersion,
 		newCounter: verificationResult.authenticationInfo.newCounter,
 	});
 

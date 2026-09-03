@@ -1,5 +1,6 @@
 import * as SimpleWebAuthnServer from "@simplewebauthn/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { updateCredentialAfterAuthentication } from "../src/auth/credentials";
 import {
 	verifyAuthenticationForUser,
 	verifyRegistrationForUser,
@@ -155,6 +156,7 @@ describe("WebAuthn Verification Service", () => {
 				deviceType: "singleDevice",
 				transports: ["internal"],
 				backedUp: false,
+				stateVersion: 0,
 				createdAt: new Date(),
 				lastUsedAt: null,
 				revokedAt: null,
@@ -375,7 +377,7 @@ describe("WebAuthn Verification Service", () => {
 			expect(verifierSpy).not.toHaveBeenCalled();
 		});
 
-		it("updates counter race-safely on successful authentication", async () => {
+		it("updates counter and state_version race-safely on successful authentication", async () => {
 			const mockConsumedChallenge = {
 				id: "chal-auth-1",
 				userId: "user-1",
@@ -396,6 +398,7 @@ describe("WebAuthn Verification Service", () => {
 				deviceType: "singleDevice",
 				transports: ["internal"],
 				backedUp: false,
+				stateVersion: 5,
 				createdAt: new Date(),
 				lastUsedAt: null,
 				revokedAt: null,
@@ -404,6 +407,7 @@ describe("WebAuthn Verification Service", () => {
 			const mockUpdatedCredential = {
 				...mockStoredCredential,
 				signCount: 2,
+				stateVersion: 6,
 				lastUsedAt: new Date(),
 			};
 
@@ -418,7 +422,7 @@ describe("WebAuthn Verification Service", () => {
 							}),
 						}),
 					})
-					// 2nd update: counter update
+					// 2nd update: counter & state_version update
 					.mockReturnValueOnce({
 						set: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -459,6 +463,7 @@ describe("WebAuthn Verification Service", () => {
 
 			expect(result.verified).toBe(true);
 			expect(result.credential.signCount).toBe(2);
+			expect(result.credential.stateVersion).toBe(6);
 			expect(verifierSpy).toHaveBeenCalledWith(
 				expect.objectContaining({
 					expectedChallenge: "test-challenge-auth",
@@ -469,7 +474,7 @@ describe("WebAuthn Verification Service", () => {
 			);
 		});
 
-		it("fails when counter update encounters concurrent race or state change", async () => {
+		it("fails when counter update encounters concurrent race or stale state_version", async () => {
 			const mockConsumedChallenge = {
 				id: "chal-auth-1",
 				userId: "user-1",
@@ -490,6 +495,7 @@ describe("WebAuthn Verification Service", () => {
 				deviceType: "singleDevice",
 				transports: ["internal"],
 				backedUp: false,
+				stateVersion: 5,
 				createdAt: new Date(),
 				lastUsedAt: null,
 				revokedAt: null,
@@ -506,7 +512,7 @@ describe("WebAuthn Verification Service", () => {
 							}),
 						}),
 					})
-					// 2nd update: counter update returns 0 rows due to race
+					// 2nd update: counter update returns 0 rows due to race on state_version
 					.mockReturnValueOnce({
 						set: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
@@ -549,6 +555,29 @@ describe("WebAuthn Verification Service", () => {
 			).rejects.toMatchObject({
 				code: "WEBAUTHN_CREDENTIAL_STATE_CHANGED" as WebAuthnErrorCode,
 			});
+		});
+
+		it("fails when zero-to-zero counter update encounters stale state_version in updateCredentialAfterAuthentication", async () => {
+			const mockDb = {
+				update: vi.fn().mockReturnValue({
+					set: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							returning: vi.fn().mockResolvedValue([]), // stale stateVersion returns 0 rows
+						}),
+					}),
+				}),
+			} as unknown as Database;
+
+			const result = await updateCredentialAfterAuthentication({
+				db: mockDb,
+				credentialDbId: "cred-1",
+				userId: "user-1",
+				previouslyReadCounter: 0,
+				previousStateVersion: 3,
+				newCounter: 0,
+			});
+
+			expect(result).toBeNull();
 		});
 	});
 });

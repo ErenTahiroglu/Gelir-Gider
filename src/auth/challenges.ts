@@ -36,61 +36,6 @@ export async function createChallenge({
 	return created;
 }
 
-export interface GetActiveChallengeParams {
-	db: Database;
-	userId: string;
-	purpose: WebAuthnPurpose;
-	challenge: string;
-}
-
-export async function getActiveChallenge({
-	db,
-	userId,
-	purpose,
-	challenge,
-}: GetActiveChallengeParams) {
-	const now = new Date();
-
-	const [active] = await db
-		.select()
-		.from(webauthnChallenges)
-		.where(
-			and(
-				eq(webauthnChallenges.userId, userId),
-				eq(webauthnChallenges.purpose, purpose),
-				eq(webauthnChallenges.challenge, challenge),
-				isNull(webauthnChallenges.consumedAt),
-				gt(webauthnChallenges.expiresAt, now),
-			),
-		)
-		.limit(1);
-
-	return active ?? null;
-}
-
-export interface ConsumeChallengeParams {
-	db: Database;
-	id: string;
-}
-
-export async function consumeChallenge({ db, id }: ConsumeChallengeParams) {
-	const now = new Date();
-
-	const [consumed] = await db
-		.update(webauthnChallenges)
-		.set({ consumedAt: now })
-		.where(
-			and(
-				eq(webauthnChallenges.id, id),
-				isNull(webauthnChallenges.consumedAt),
-				gt(webauthnChallenges.expiresAt, now),
-			),
-		)
-		.returning();
-
-	return consumed ?? null;
-}
-
 export interface ConsumeActiveChallengeParams {
 	db: Database;
 	userId: string;

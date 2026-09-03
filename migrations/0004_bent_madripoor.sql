@@ -1,0 +1,2 @@
+ALTER TABLE "webauthn_credentials" ADD COLUMN "state_version" bigint DEFAULT 0 NOT NULL;--> statement-breakpoint
+ALTER TABLE "webauthn_credentials" ADD CONSTRAINT "webauthn_credentials_state_version_check" CHECK ("webauthn_credentials"."state_version" >= 0);

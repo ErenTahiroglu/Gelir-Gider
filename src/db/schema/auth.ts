@@ -53,6 +53,9 @@ export const webauthnCredentials = pgTable(
 		deviceType: text("device_type"),
 		transports: text("transports").array(),
 		backedUp: boolean("backed_up").default(false).notNull(),
+		stateVersion: bigint("state_version", { mode: "number" })
+			.default(0)
+			.notNull(),
 		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
 			.defaultNow()
 			.notNull(),
@@ -63,6 +66,10 @@ export const webauthnCredentials = pgTable(
 		check(
 			"webauthn_credentials_sign_count_check",
 			sql`${table.signCount} >= 0`,
+		),
+		check(
+			"webauthn_credentials_state_version_check",
+			sql`${table.stateVersion} >= 0`,
 		),
 		check(
 			"webauthn_credentials_revoked_at_check",
