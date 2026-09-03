@@ -6,7 +6,7 @@ import {
 	ledgerAccounts,
 } from "../db/schema/ledger";
 import { LedgerError } from "./errors";
-import { formatSignedCentsToMoney, parseMoneyString } from "./money";
+import { formatSignedCentsToMoney, parseAggregateMoneyString } from "./money";
 
 export interface GetLedgerAccountBalanceParams {
 	db: Database;
@@ -113,8 +113,10 @@ export async function getLedgerAccountBalance({
 		)
 		.where(and(...conditions));
 
-	const debitParsed = parseMoneyString(aggregate?.debitSum ?? "0.00");
-	const creditParsed = parseMoneyString(aggregate?.creditSum ?? "0.00");
+	const debitParsed = parseAggregateMoneyString(aggregate?.debitSum ?? "0.00");
+	const creditParsed = parseAggregateMoneyString(
+		aggregate?.creditSum ?? "0.00",
+	);
 
 	const normalBalance = account.normalBalance as "DEBIT" | "CREDIT";
 
@@ -207,8 +209,8 @@ export async function listLedgerAccountBalances({
 		aggregatedLines.map((row) => [
 			row.accountId,
 			{
-				debitCents: parseMoneyString(row.debitSum).cents,
-				creditCents: parseMoneyString(row.creditSum).cents,
+				debitCents: parseAggregateMoneyString(row.debitSum).cents,
+				creditCents: parseAggregateMoneyString(row.creditSum).cents,
 			},
 		]),
 	);

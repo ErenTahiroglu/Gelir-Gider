@@ -6,7 +6,7 @@ import {
 	listLedgerAccountBalances,
 } from "../src/ledger/balances";
 
-describe("Ledger Balances Read Model (Phase 4B)", () => {
+describe("Ledger Balances Read Model (Phase 4B & 4B-R1)", () => {
 	describe("getLedgerAccountBalance", () => {
 		function createMockBalanceDb({
 			account = {
@@ -123,6 +123,75 @@ describe("Ledger Balances Read Model (Phase 4B)", () => {
 			});
 		});
 
+		it("correctly parses and computes large multi-line DEBIT-normal aggregate (> 16 integer digits)", async () => {
+			const mockDb = createMockBalanceDb({
+				account: {
+					id: "acc-asset-1",
+					userId: "user-1",
+					normalBalance: "DEBIT",
+					currency: "TRY",
+				},
+				aggregate: {
+					debitSum: "19999999999999999.98",
+					creditSum: "0.00",
+				},
+			});
+
+			const result = await getLedgerAccountBalance({
+				db: mockDb,
+				userId: "user-1",
+				accountId: "acc-asset-1",
+			});
+
+			expect(result.balance).toBe("19999999999999999.98");
+		});
+
+		it("correctly parses and computes large multi-line CREDIT-normal aggregate (> 16 integer digits)", async () => {
+			const mockDb = createMockBalanceDb({
+				account: {
+					id: "acc-liab-1",
+					userId: "user-1",
+					normalBalance: "CREDIT",
+					currency: "TRY",
+				},
+				aggregate: {
+					debitSum: "0.00",
+					creditSum: "19999999999999999.98",
+				},
+			});
+
+			const result = await getLedgerAccountBalance({
+				db: mockDb,
+				userId: "user-1",
+				accountId: "acc-liab-1",
+			});
+
+			expect(result.balance).toBe("19999999999999999.98");
+		});
+
+		it("formats large negative contra-balance without precision loss", async () => {
+			const mockDb = createMockBalanceDb({
+				account: {
+					id: "acc-asset-1",
+					userId: "user-1",
+					normalBalance: "DEBIT",
+					currency: "TRY",
+				},
+				aggregate: {
+					debitSum: "9999999999999999.99",
+					creditSum: "19999999999999999.98",
+				},
+			});
+
+			const result = await getLedgerAccountBalance({
+				db: mockDb,
+				userId: "user-1",
+				accountId: "acc-asset-1",
+			});
+
+			expect(result.balance).toBe("-9999999999999999.99");
+		});
+
 		it("formats negative contra-balance correctly (e.g. overdrawn asset)", async () => {
 			const mockDb = createMockBalanceDb({
 				account: {
@@ -162,7 +231,7 @@ describe("Ledger Balances Read Model (Phase 4B)", () => {
 	});
 
 	describe("listLedgerAccountBalances", () => {
-		it("lists balances for multiple accounts ordered by code", async () => {
+		it("lists balances for multiple accounts ordered by code including large aggregates", async () => {
 			const mockAccounts = [
 				{
 					id: "acc-1",
@@ -179,6 +248,15 @@ describe("Ledger Balances Read Model (Phase 4B)", () => {
 					name: "Food",
 					accountType: "EXPENSE",
 					normalBalance: "DEBIT",
+					currency: "TRY",
+					archivedAt: null,
+				},
+				{
+					id: "acc-3",
+					code: "LIABILITY_LOAN",
+					name: "Loan",
+					accountType: "LIABILITY",
+					normalBalance: "CREDIT",
 					currency: "TRY",
 					archivedAt: null,
 				},
@@ -201,13 +279,18 @@ describe("Ledger Balances Read Model (Phase 4B)", () => {
 									groupBy: vi.fn().mockResolvedValue([
 										{
 											accountId: "acc-1",
-											debitSum: "1000.00",
-											creditSum: "200.00",
+											debitSum: "19999999999999999.98",
+											creditSum: "0.00",
 										},
 										{
 											accountId: "acc-2",
 											debitSum: "200.00",
 											creditSum: "0.00",
+										},
+										{
+											accountId: "acc-3",
+											debitSum: "0.00",
+											creditSum: "19999999999999999.98",
 										},
 									]),
 								}),
@@ -222,7 +305,7 @@ describe("Ledger Balances Read Model (Phase 4B)", () => {
 				userId: "user-1",
 			});
 
-			expect(result).toHaveLength(2);
+			expect(result).toHaveLength(3);
 			expect(result[0]).toEqual({
 				accountId: "acc-1",
 				code: "ASSET_BANK",
@@ -231,7 +314,7 @@ describe("Ledger Balances Read Model (Phase 4B)", () => {
 				normalBalance: "DEBIT",
 				currency: "TRY",
 				archived: false,
-				balance: "800.00",
+				balance: "19999999999999999.98",
 			});
 			expect(result[1]).toEqual({
 				accountId: "acc-2",
@@ -242,6 +325,16 @@ describe("Ledger Balances Read Model (Phase 4B)", () => {
 				currency: "TRY",
 				archived: false,
 				balance: "200.00",
+			});
+			expect(result[2]).toEqual({
+				accountId: "acc-3",
+				code: "LIABILITY_LOAN",
+				name: "Loan",
+				accountType: "LIABILITY",
+				normalBalance: "CREDIT",
+				currency: "TRY",
+				archived: false,
+				balance: "19999999999999999.98",
 			});
 		});
 	});

@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
 	formatCentsToMoney,
 	formatSignedCentsToMoney,
+	parseAggregateMoneyString,
 	parseMoneyString,
 	parsePositiveMoneyString,
 } from "../src/ledger/money";
 
-describe("Exact-Decimal Money Engine (Phase 4A)", () => {
-	describe("parseMoneyString & Normalization", () => {
+describe("Exact-Decimal Money Engine (Phase 4A & 4B-R1)", () => {
+	describe("parseMoneyString & Normalization (Single-Line Contract)", () => {
 		it("correctly parses and normalizes integer money strings", () => {
 			expect(parseMoneyString("0")).toEqual({
 				normalized: "0.00",
@@ -62,6 +63,15 @@ describe("Exact-Decimal Money Engine (Phase 4A)", () => {
 			const result = parseMoneyString(maxStr);
 			expect(result.normalized).toBe("9999999999999999.99");
 			expect(result.cents).toBe(999999999999999999n);
+		});
+
+		it("strictly rejects single-line amounts exceeding 16 integer digits (NUMERIC(18,2) overflow)", () => {
+			expect(() => parseMoneyString("19999999999999999.98")).toThrow(
+				"Invalid money string format",
+			);
+			expect(() => parseMoneyString("99999999999999999.00")).toThrow(
+				"Invalid money string format",
+			);
 		});
 
 		it("allows leading and trailing whitespace around valid money strings", () => {
@@ -124,7 +134,6 @@ describe("Exact-Decimal Money Engine (Phase 4A)", () => {
 				"1.234", // > 2 decimal places
 				"0.001",
 				"100.000",
-				"99999999999999999.00", // 17 integer digits -> overflow
 			];
 
 			for (const val of invalidValues) {
@@ -158,6 +167,79 @@ describe("Exact-Decimal Money Engine (Phase 4A)", () => {
 		});
 	});
 
+	describe("parseAggregateMoneyString (Unbounded Exact Aggregate Contract)", () => {
+		it("parses multi-line aggregates exceeding 16 integer digits without precision loss", () => {
+			const res1 = parseAggregateMoneyString("19999999999999999.98");
+			expect(res1).toEqual({
+				normalized: "19999999999999999.98",
+				cents: 1999999999999999998n,
+			});
+
+			const veryLargeStr = "123456789012345678901234567890.12";
+			const res2 = parseAggregateMoneyString(veryLargeStr);
+			expect(res2).toEqual({
+				normalized: "123456789012345678901234567890.12",
+				cents: 12345678901234567890123456789012n,
+			});
+
+			const maxNumericAggregate = "999999999999999999999999999999999999.99";
+			const res3 = parseAggregateMoneyString(maxNumericAggregate);
+			expect(res3.normalized).toBe(maxNumericAggregate);
+			expect(res3.cents).toBe(99999999999999999999999999999999999999n);
+		});
+
+		it("normalizes small and standard aggregate amounts correctly", () => {
+			expect(parseAggregateMoneyString("0")).toEqual({
+				normalized: "0.00",
+				cents: 0n,
+			});
+			expect(parseAggregateMoneyString("0.0")).toEqual({
+				normalized: "0.00",
+				cents: 0n,
+			});
+			expect(parseAggregateMoneyString("0.00")).toEqual({
+				normalized: "0.00",
+				cents: 0n,
+			});
+			expect(parseAggregateMoneyString("1")).toEqual({
+				normalized: "1.00",
+				cents: 100n,
+			});
+			expect(parseAggregateMoneyString("1.2")).toEqual({
+				normalized: "1.20",
+				cents: 120n,
+			});
+			expect(parseAggregateMoneyString("1.23")).toEqual({
+				normalized: "1.23",
+				cents: 123n,
+			});
+		});
+
+		it("rejects invalid aggregate inputs (negative, comma, scientific, > 2 decimals, leading zero)", () => {
+			const invalid = [
+				"",
+				"   ",
+				"-1.00",
+				"+1.00",
+				"1,00",
+				"1e5",
+				"NaN",
+				"Infinity",
+				".50",
+				"1.",
+				"1.234",
+				"01",
+				"001.50",
+				123 as unknown as string,
+				null as unknown as string,
+			];
+
+			for (const val of invalid) {
+				expect(() => parseAggregateMoneyString(val)).toThrow();
+			}
+		});
+	});
+
 	describe("formatCentsToMoney", () => {
 		it("formats BigInt cents to exact decimal string", () => {
 			expect(formatCentsToMoney(0n)).toBe("0.00");
@@ -186,6 +268,9 @@ describe("Exact-Decimal Money Engine (Phase 4A)", () => {
 			expect(formatSignedCentsToMoney(100n)).toBe("1.00");
 			expect(formatSignedCentsToMoney(123n)).toBe("1.23");
 			expect(formatSignedCentsToMoney(125000n)).toBe("1250.00");
+			expect(formatSignedCentsToMoney(1999999999999999998n)).toBe(
+				"19999999999999999.98",
+			);
 		});
 
 		it("formats negative cents with exact minus sign prefix", () => {
@@ -194,6 +279,9 @@ describe("Exact-Decimal Money Engine (Phase 4A)", () => {
 			expect(formatSignedCentsToMoney(-100n)).toBe("-1.00");
 			expect(formatSignedCentsToMoney(-123n)).toBe("-1.23");
 			expect(formatSignedCentsToMoney(-125000n)).toBe("-1250.00");
+			expect(formatSignedCentsToMoney(-999999999999999999n)).toBe(
+				"-9999999999999999.99",
+			);
 		});
 	});
 });
