@@ -6,7 +6,6 @@ import type {
 import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { Hono } from "hono";
-
 import { bodyLimit } from "hono/body-limit";
 import { getCookie } from "hono/cookie";
 import {
@@ -49,6 +48,24 @@ export const authRouter = new Hono<{ Bindings: AppEnv }>();
 
 const BODY_LIMIT_BYTES = 256 * 1024; // 256 KiB
 
+// Strict JSON Media Type Parser
+function isJsonContentType(value: string | undefined): boolean {
+	if (!value) return false;
+
+	const mediaType = value.split(";", 1)[0]?.trim().toLowerCase();
+
+	return mediaType === "application/json";
+}
+
+// Endpoints that explicitly require a JSON request body
+const JSON_BODY_PATHS = new Set([
+	"/auth/bootstrap/authorize",
+	"/auth/recovery/authorize",
+	"/auth/passkey/enrollment/options",
+	"/auth/passkey/enrollment/verify",
+	"/auth/passkey/authentication/verify",
+]);
+
 // Helper to create sanitized error response
 function errorResponse(code: string, message: string, status: number) {
 	return {
@@ -62,16 +79,16 @@ function errorResponse(code: string, message: string, status: number) {
 	};
 }
 
-// 1. Global Cache-Control header for all /auth/* routes
+// 1. Global Cache-Control header for all /auth/* routes (set before downstream execution)
 authRouter.use("*", async (c, next) => {
-	await next();
 	c.header("Cache-Control", "no-store");
 	c.header("Pragma", "no-cache");
+	await next();
 });
 
 // 2. Same-Origin, Content-Type, and Body Limit enforcement for all POST routes
 authRouter.post("*", async (c, next) => {
-	// Origin check
+	// Origin check: must run first before content-type, body parsing, auth logic
 	const origin = c.req.header("origin");
 	let expectedOrigin: string;
 	try {
@@ -86,21 +103,23 @@ authRouter.post("*", async (c, next) => {
 		return c.json(err.body, err.status as 403);
 	}
 
-	// Content-Type check
-	const contentType = c.req.header("content-type");
-	if (!contentType?.toLowerCase().includes("application/json")) {
-		const err = errorResponse(
-			"UNSUPPORTED_MEDIA_TYPE",
-			"Content-Type must be application/json",
-			415,
-		);
-		return c.json(err.body, err.status as 415);
+	// Content-Type check: strictly enforced only on endpoints expecting JSON body
+	if (JSON_BODY_PATHS.has(c.req.path)) {
+		const contentType = c.req.header("content-type");
+		if (!isJsonContentType(contentType)) {
+			const err = errorResponse(
+				"UNSUPPORTED_MEDIA_TYPE",
+				"Content-Type must be application/json",
+				415,
+			);
+			return c.json(err.body, err.status as 415);
+		}
 	}
 
 	return next();
 });
 
-// Apply Hono bodyLimit to POST routes
+// Apply Hono bodyLimit to all POST routes (256 KiB)
 authRouter.post(
 	"*",
 	bodyLimit({
@@ -588,7 +607,10 @@ authRouter.get("/session", async (c) => {
 	if (!cookieToken || cookieToken.trim() === "") {
 		return c.json(
 			{
-				error: { code: "UNAUTHENTICATED", message: "Authentication required" },
+				error: {
+					code: "UNAUTHENTICATED",
+					message: "Authentication required",
+				},
 			},
 			401,
 		);
@@ -684,7 +706,16 @@ authRouter.post("/logout", async (c) => {
 				token: cookieToken,
 			});
 		} catch {
-			// Idempotent: ignore revocation failure
+			// Operational / DB failure -> FAIL-CLOSED: 503 and DO NOT clear cookie!
+			return c.json(
+				{
+					error: {
+						code: "SESSION_REVOCATION_FAILED",
+						message: "Session could not be revoked",
+					},
+				},
+				503,
+			);
 		}
 	}
 

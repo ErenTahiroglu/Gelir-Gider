@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as bootstrapModule from "../src/auth/bootstrap";
 import * as sessionsModule from "../src/auth/sessions";
 import * as verificationModule from "../src/auth/verification";
@@ -52,52 +52,129 @@ const mockEnv = {
 describe("HTTP Auth Surface & Secure Session Cookie Integration", () => {
 	const validOrigin = "http://localhost:8787";
 
+	beforeEach(() => {
+		vi.restoreAllMocks();
+	});
+
 	describe("Global Auth Policies (Origin, Body Limit, Content-Type, Cache-Control, No CORS)", () => {
-		it("enforces Cache-Control: no-store and Pragma: no-cache on all /auth/* routes", async () => {
+		it("enforces Cache-Control: no-store and Pragma: no-cache on all /auth/* routes including error responses", async () => {
 			const res = await app.request("/auth/status", { method: "GET" }, mockEnv);
 			expect(res.headers.get("Cache-Control")).toBe("no-store");
 			expect(res.headers.get("Pragma")).toBe("no-cache");
 			expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
+
+			// Also verify error responses receive Cache-Control: no-store
+			const errRes = await app.request(
+				"/auth/bootstrap/authorize",
+				{
+					method: "POST",
+					headers: { Origin: "http://attacker.com" },
+				},
+				mockEnv,
+			);
+			expect(errRes.status).toBe(403);
+			expect(errRes.headers.get("Cache-Control")).toBe("no-store");
+			expect(errRes.headers.get("Pragma")).toBe("no-cache");
 		});
 
-		it("rejects POST /auth/* with wrong Origin header (403 INVALID_ORIGIN)", async () => {
+		it("evaluates Origin BEFORE Content-Type and rejects with 403 INVALID_ORIGIN even if Content-Type is invalid/absent", async () => {
+			const bootstrapSpy = vi.spyOn(
+				bootstrapModule,
+				"authorizeBootstrapAndIssueGrant",
+			);
+
 			const res = await app.request(
 				"/auth/bootstrap/authorize",
 				{
 					method: "POST",
 					headers: {
 						Origin: "http://attacker.com",
-						"Content-Type": "application/json",
-					},
-					body: JSON.stringify({ bootstrapToken: "abc", displayName: "Eren" }),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(403);
-			const json = (await res.json()) as ErrorResponseBody;
-
-			expect(json.error.code).toBe("INVALID_ORIGIN");
-		});
-
-		it("rejects POST /auth/* missing Content-Type application/json (415 UNSUPPORTED_MEDIA_TYPE)", async () => {
-			const res = await app.request(
-				"/auth/bootstrap/authorize",
-				{
-					method: "POST",
-					headers: {
-						Origin: validOrigin,
-						"Content-Type": "text/plain",
+						"Content-Type": "text/plain", // Even with bad content-type, Origin check must fire first
 					},
 					body: "bootstrapToken=abc",
 				},
 				mockEnv,
 			);
 
-			expect(res.status).toBe(415);
+			expect(res.status).toBe(403);
 			const json = (await res.json()) as ErrorResponseBody;
+			expect(json.error.code).toBe("INVALID_ORIGIN");
+			expect(bootstrapSpy).not.toHaveBeenCalled();
+		});
 
-			expect(json.error.code).toBe("UNSUPPORTED_MEDIA_TYPE");
+		it("strictly validates application/json media type — accepts application/json, application/json; charset=utf-8, and APPLICATION/JSON", async () => {
+			vi.spyOn(
+				bootstrapModule,
+				"authorizeBootstrapAndIssueGrant",
+			).mockResolvedValue({
+				user: { id: "user-1", displayName: "Eren" },
+				enrollmentGrant: "grant-token-123",
+			});
+
+			const validTypes = [
+				"application/json",
+				"application/json; charset=utf-8",
+				"APPLICATION/JSON",
+			];
+
+			for (const ct of validTypes) {
+				const res = await app.request(
+					"/auth/bootstrap/authorize",
+					{
+						method: "POST",
+						headers: {
+							Origin: validOrigin,
+							"Content-Type": ct,
+						},
+						body: JSON.stringify({
+							bootstrapToken: "secret-token",
+							displayName: "Eren",
+						}),
+					},
+					mockEnv,
+				);
+
+				expect(res.status).toBe(200);
+			}
+		});
+
+		it("strictly rejects non-exact media types: application/jsonp, text/plain, text/plain; foo=application/json, x-application/json, application/problem+json (415 UNSUPPORTED_MEDIA_TYPE)", async () => {
+			const bootstrapSpy = vi.spyOn(
+				bootstrapModule,
+				"authorizeBootstrapAndIssueGrant",
+			);
+
+			const invalidTypes = [
+				"application/jsonp",
+				"text/plain",
+				"text/plain; foo=application/json",
+				"x-application/json",
+				"application/problem+json",
+			];
+
+			for (const ct of invalidTypes) {
+				const res = await app.request(
+					"/auth/bootstrap/authorize",
+					{
+						method: "POST",
+						headers: {
+							Origin: validOrigin,
+							"Content-Type": ct,
+						},
+						body: JSON.stringify({
+							bootstrapToken: "secret-token",
+							displayName: "Eren",
+						}),
+					},
+					mockEnv,
+				);
+
+				expect(res.status).toBe(415);
+				const json = (await res.json()) as ErrorResponseBody;
+				expect(json.error.code).toBe("UNSUPPORTED_MEDIA_TYPE");
+			}
+
+			expect(bootstrapSpy).not.toHaveBeenCalled();
 		});
 
 		it("rejects POST /auth/* with malformed JSON body (400 INVALID_REQUEST)", async () => {
@@ -519,7 +596,7 @@ describe("HTTP Auth Surface & Secure Session Cookie Integration", () => {
 			expect(json.error.code).toBe("AUTH_NOT_INITIALIZED");
 		});
 
-		it("generates authentication options server-side resolving singleton user without client userId", async () => {
+		it("generates authentication options server-side resolving singleton user without client userId, body or Content-Type", async () => {
 			const mockDb = {
 				select: vi.fn().mockImplementation(() => ({
 					from: vi.fn().mockImplementation(() => ({
@@ -549,15 +626,14 @@ describe("HTTP Auth Surface & Secure Session Cookie Integration", () => {
 				ReturnType<typeof webauthnModule.generateAuthenticationOptionsForUser>
 			>);
 
+			// Bodyless request without Content-Type header
 			const res = await app.request(
 				"/auth/passkey/authentication/options",
 				{
 					method: "POST",
 					headers: {
 						Origin: validOrigin,
-						"Content-Type": "application/json",
 					},
-					body: JSON.stringify({}),
 				},
 				mockEnv,
 			);
@@ -831,7 +907,7 @@ describe("HTTP Auth Surface & Secure Session Cookie Integration", () => {
 			expect(json.user?.displayName).toBe("Eren");
 		});
 
-		it("performs idempotent logout, revokes session, and returns clear cookie (204 No Content)", async () => {
+		it("performs idempotent logout without body or Content-Type header, revokes session, and returns clear cookie (204 No Content)", async () => {
 			const revokeSpy = vi
 				.spyOn(sessionsModule, "revokeSessionByToken")
 				.mockResolvedValueOnce(true);
@@ -842,7 +918,6 @@ describe("HTTP Auth Surface & Secure Session Cookie Integration", () => {
 					method: "POST",
 					headers: {
 						Origin: validOrigin,
-						"Content-Type": "application/json",
 						Cookie: "__Host-gg_session=token-to-logout",
 					},
 				},
@@ -859,6 +934,79 @@ describe("HTTP Auth Surface & Secure Session Cookie Integration", () => {
 			expect(cookie).toContain("HttpOnly");
 			expect(cookie).toContain("SameSite=Strict");
 			expect(cookie).toContain("Path=/");
+		});
+
+		it("handles logout when no session cookie is present (idempotent 204 + clear cookie)", async () => {
+			const revokeSpy = vi.spyOn(sessionsModule, "revokeSessionByToken");
+
+			const res = await app.request(
+				"/auth/logout",
+				{
+					method: "POST",
+					headers: {
+						Origin: validOrigin,
+					},
+				},
+				mockEnv,
+			);
+
+			expect(res.status).toBe(204);
+			expect(revokeSpy).not.toHaveBeenCalled();
+
+			const cookie = res.headers.get("Set-Cookie");
+			expect(cookie).toContain("__Host-gg_session=");
+			expect(cookie).toContain("Max-Age=0");
+		});
+
+		it("handles logout when token is unknown or already revoked (revokeSessionByToken returns false -> 204 + clear cookie)", async () => {
+			const revokeSpy = vi
+				.spyOn(sessionsModule, "revokeSessionByToken")
+				.mockResolvedValueOnce(false);
+
+			const res = await app.request(
+				"/auth/logout",
+				{
+					method: "POST",
+					headers: {
+						Origin: validOrigin,
+						Cookie: "__Host-gg_session=already-revoked-token",
+					},
+				},
+				mockEnv,
+			);
+
+			expect(res.status).toBe(204);
+			expect(revokeSpy).toHaveBeenCalled();
+
+			const cookie = res.headers.get("Set-Cookie");
+			expect(cookie).toContain("__Host-gg_session=");
+			expect(cookie).toContain("Max-Age=0");
+		});
+
+		it("fails closed on logout database/operational error — returns 503 SESSION_REVOCATION_FAILED and does NOT clear cookie", async () => {
+			vi.spyOn(sessionsModule, "revokeSessionByToken").mockRejectedValueOnce(
+				new Error("Database connection timeout"),
+			);
+
+			const res = await app.request(
+				"/auth/logout",
+				{
+					method: "POST",
+					headers: {
+						Origin: validOrigin,
+						Cookie: "__Host-gg_session=active-session-token",
+					},
+				},
+				mockEnv,
+			);
+
+			expect(res.status).toBe(503);
+			const json = (await res.json()) as ErrorResponseBody;
+			expect(json.error.code).toBe("SESSION_REVOCATION_FAILED");
+			expect(json.error.message).toBe("Session could not be revoked");
+
+			// Crucial: Set-Cookie MUST NOT be sent on failure so browser does not delete the token
+			expect(res.headers.get("Set-Cookie")).toBeNull();
 		});
 	});
 });
