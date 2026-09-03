@@ -229,6 +229,45 @@ function normalizeSource(source: TransactionSourceInput): {
 	};
 }
 
+function validateInitialRevisionReplay({
+	rev1,
+	expectedNormalizedKey,
+	expectedFingerprint,
+}: {
+	rev1:
+		| {
+				id: string;
+				revisionNo: number;
+				operation: string;
+				idempotencyKey: string;
+				revisionFingerprint: string;
+		  }
+		| undefined;
+	expectedNormalizedKey: string;
+	expectedFingerprint: string;
+}): { id: string; revisionNo: number } {
+	if (!rev1) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_STATE",
+			"Canonical transaction exists but revision #1 is missing",
+		);
+	}
+
+	if (
+		rev1.revisionNo !== 1 ||
+		rev1.operation !== "CREATE" ||
+		rev1.idempotencyKey !== expectedNormalizedKey ||
+		rev1.revisionFingerprint !== expectedFingerprint
+	) {
+		throw new CanonicalTransactionError(
+			"TRANSACTION_INVALID_STATE",
+			"Canonical transaction revision #1 state or cryptographic fingerprint is inconsistent with canonical creation identity",
+		);
+	}
+
+	return { id: rev1.id, revisionNo: rev1.revisionNo };
+}
+
 /**
  * Creates a new canonical transaction with initial revision #1 (CREATE) and source provenance record.
  */
@@ -300,6 +339,8 @@ export async function createCanonicalTransaction({
 					id: transactionRevisions.id,
 					revisionNo: transactionRevisions.revisionNo,
 					operation: transactionRevisions.operation,
+					idempotencyKey: transactionRevisions.idempotencyKey,
+					revisionFingerprint: transactionRevisions.revisionFingerprint,
 				})
 				.from(transactionRevisions)
 				.where(
@@ -310,16 +351,15 @@ export async function createCanonicalTransaction({
 				)
 				.limit(1);
 
-			if (!rev1) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_INVALID_STATE",
-					"Canonical transaction exists but revision #1 is missing",
-				);
-			}
+			const validatedRev1 = validateInitialRevisionReplay({
+				rev1,
+				expectedNormalizedKey: normalizedKey,
+				expectedFingerprint: existingTx.creationFingerprint,
+			});
 
 			return {
 				transactionId: existingTx.id,
-				revisionId: rev1.id,
+				revisionId: validatedRev1.id,
 				revisionNo: 1,
 				operation: "CREATE",
 				idempotentReplay: true,
@@ -377,6 +417,9 @@ export async function createCanonicalTransaction({
 				.select({
 					id: transactionRevisions.id,
 					revisionNo: transactionRevisions.revisionNo,
+					operation: transactionRevisions.operation,
+					idempotencyKey: transactionRevisions.idempotencyKey,
+					revisionFingerprint: transactionRevisions.revisionFingerprint,
 				})
 				.from(transactionRevisions)
 				.where(
@@ -387,16 +430,15 @@ export async function createCanonicalTransaction({
 				)
 				.limit(1);
 
-			if (!rev1) {
-				throw new CanonicalTransactionError(
-					"TRANSACTION_INVALID_STATE",
-					"Canonical transaction exists but revision #1 is missing",
-				);
-			}
+			const validatedRev1 = validateInitialRevisionReplay({
+				rev1,
+				expectedNormalizedKey: normalizedKey,
+				expectedFingerprint: existingLateTx.creationFingerprint,
+			});
 
 			return {
 				transactionId: existingLateTx.id,
-				revisionId: rev1.id,
+				revisionId: validatedRev1.id,
 				revisionNo: 1,
 				operation: "CREATE",
 				idempotentReplay: true,

@@ -46,7 +46,7 @@ export const canonicalTransactions = pgTable(
 		),
 		check(
 			"canonical_transactions_idempotency_check",
-			sql`length(trim(${table.creationIdempotencyKey})) >= 1 AND length(${table.creationIdempotencyKey}) <= 128`,
+			sql`${table.creationIdempotencyKey} = btrim(${table.creationIdempotencyKey}) AND length(${table.creationIdempotencyKey}) BETWEEN 1 AND 128`,
 		),
 		check(
 			"canonical_transactions_fingerprint_check",
@@ -117,7 +117,7 @@ export const transactionRevisions = pgTable(
 		),
 		check(
 			"transaction_revisions_idempotency_check",
-			sql`length(trim(${table.idempotencyKey})) >= 1 AND length(${table.idempotencyKey}) <= 128`,
+			sql`${table.idempotencyKey} = btrim(${table.idempotencyKey}) AND length(${table.idempotencyKey}) BETWEEN 1 AND 128`,
 		),
 		check(
 			"transaction_revisions_reason_code_check",
@@ -125,7 +125,7 @@ export const transactionRevisions = pgTable(
 		),
 		check(
 			"transaction_revisions_reason_note_check",
-			sql`${table.reasonNote} IS NULL OR length(${table.reasonNote}) <= 500`,
+			sql`${table.reasonNote} IS NULL OR (${table.reasonNote} = btrim(${table.reasonNote}) AND length(${table.reasonNote}) BETWEEN 1 AND 500)`,
 		),
 		check(
 			"transaction_revisions_payload_size_check",
@@ -170,7 +170,7 @@ export const transactionSources = pgTable(
 		),
 		check(
 			"transaction_sources_ref_check",
-			sql`${table.sourceRef} IS NULL OR (length(trim(${table.sourceRef})) >= 1 AND length(${table.sourceRef}) <= 256)`,
+			sql`${table.sourceRef} IS NULL OR (${table.sourceRef} = btrim(${table.sourceRef}) AND length(${table.sourceRef}) BETWEEN 1 AND 256)`,
 		),
 		check(
 			"transaction_sources_hash_check",

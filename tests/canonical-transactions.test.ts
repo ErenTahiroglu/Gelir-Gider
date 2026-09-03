@@ -172,6 +172,10 @@ describe("Canonical Transaction Audit Services (Phase 5A)", () => {
 				rev1: {
 					id: "existing-rev-1-id",
 					revisionNo: 1,
+					operation: "CREATE",
+					idempotencyKey: "create-key-1",
+					revisionFingerprint:
+						"0000000000000000000000000000000000000000000000000000000000000000",
 				},
 			});
 			const mockDb = { transaction } as unknown as Database;
@@ -188,6 +192,235 @@ describe("Canonical Transaction Audit Services (Phase 5A)", () => {
 				}),
 			).rejects.toThrow(
 				"Creation idempotency key was already used with a different transaction payload or source",
+			);
+		});
+
+		it("throws TRANSACTION_INVALID_STATE when existing canonical rev1 has inconsistent fingerprint", async () => {
+			let creationFp = "";
+			const mockTx = {
+				select: vi.fn().mockImplementation(() => ({
+					from: vi.fn().mockImplementation((table) => {
+						const execute = async () => {
+							if (table === canonicalTransactions) {
+								return [
+									{ id: "existing-tx-id", creationFingerprint: creationFp },
+								];
+							}
+							if (table === transactionRevisions) {
+								return [
+									{
+										id: "existing-rev-1-id",
+										revisionNo: 1,
+										operation: "CREATE",
+										idempotencyKey: "create-key-1",
+										revisionFingerprint:
+											"inconsistent-fingerprint-0000000000000000000000000000000000000",
+									},
+								];
+							}
+							return [];
+						};
+						return {
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockImplementation(execute),
+							}),
+							limit: vi.fn().mockImplementation(execute),
+						};
+					}),
+				})),
+				insert: vi.fn().mockReturnValue({
+					values: vi.fn().mockImplementation((vals) => {
+						creationFp = vals.creationFingerprint;
+						return {
+							onConflictDoNothing: vi.fn().mockReturnValue({
+								returning: vi.fn().mockResolvedValue([]),
+							}),
+						};
+					}),
+				}),
+			};
+
+			const mockDb = {
+				transaction: vi.fn().mockImplementation(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			// First calculate candidate fingerprint by calling calculateRevisionFingerprint or running once
+			const candidatePayload = { amount: "100.00" };
+			const candidateOccurred = new Date("2026-09-03T12:00:00Z");
+
+			// We dynamically grab the calculated fingerprint
+			mockTx.select = vi.fn().mockImplementation(() => ({
+				from: vi.fn().mockImplementation((table) => {
+					const execute = async () => {
+						if (table === canonicalTransactions) {
+							// Return a matching fingerprint so early check passes, leading to rev1 check
+							return [
+								{
+									id: "existing-tx-id",
+									creationFingerprint:
+										"9895c102c91834246949ae7c8d92976b92a2a781b0a9dafe51794b1a45749ba5",
+								},
+							];
+						}
+						if (table === transactionRevisions) {
+							return [
+								{
+									id: "existing-rev-1-id",
+									revisionNo: 1,
+									operation: "CREATE",
+									idempotencyKey: "create-key-1",
+									revisionFingerprint:
+										"corrupted-different-fingerprint-00000000000000000000000000000000",
+								},
+							];
+						}
+						return [];
+					};
+					return {
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockImplementation(execute),
+						}),
+						limit: vi.fn().mockImplementation(execute),
+					};
+				}),
+			}));
+
+			// Calculate fingerprint dynamically:
+			const { calculateRevisionFingerprint } = await import(
+				"../src/transactions/fingerprint"
+			);
+			const expectedFp = await calculateRevisionFingerprint({
+				operation: "CREATE",
+				userId: "user-1",
+				kind: "EXPENSE",
+				occurredAt: candidateOccurred,
+				payload: candidatePayload,
+				source: {
+					type: "MANUAL",
+					ref: null,
+					payloadHash: null,
+					observedAt: null,
+				},
+			});
+
+			mockTx.select = vi.fn().mockImplementation(() => ({
+				from: vi.fn().mockImplementation((table) => {
+					const execute = async () => {
+						if (table === canonicalTransactions) {
+							return [
+								{
+									id: "existing-tx-id",
+									creationFingerprint: expectedFp,
+								},
+							];
+						}
+						if (table === transactionRevisions) {
+							return [
+								{
+									id: "existing-rev-1-id",
+									revisionNo: 1,
+									operation: "CREATE",
+									idempotencyKey: "create-key-1",
+									revisionFingerprint:
+										"corrupted-different-fingerprint-00000000000000000000000000000000",
+								},
+							];
+						}
+						return [];
+					};
+					return {
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockImplementation(execute),
+						}),
+						limit: vi.fn().mockImplementation(execute),
+					};
+				}),
+			}));
+
+			await expect(
+				createCanonicalTransaction({
+					db: mockDb,
+					userId: "user-1",
+					kind: "EXPENSE",
+					idempotencyKey: "create-key-1",
+					occurredAt: candidateOccurred,
+					payload: candidatePayload,
+					source: { type: "MANUAL" },
+				}),
+			).rejects.toThrow(
+				"Canonical transaction revision #1 state or cryptographic fingerprint is inconsistent",
+			);
+		});
+
+		it("throws TRANSACTION_INVALID_STATE when rev1 has inconsistent idempotencyKey or operation", async () => {
+			const candidatePayload = { amount: "100.00" };
+			const candidateOccurred = new Date("2026-09-03T12:00:00Z");
+
+			const { calculateRevisionFingerprint } = await import(
+				"../src/transactions/fingerprint"
+			);
+			const expectedFp = await calculateRevisionFingerprint({
+				operation: "CREATE",
+				userId: "user-1",
+				kind: "EXPENSE",
+				occurredAt: candidateOccurred,
+				payload: candidatePayload,
+				source: {
+					type: "MANUAL",
+					ref: null,
+					payloadHash: null,
+					observedAt: null,
+				},
+			});
+
+			const mockTx = {
+				select: vi.fn().mockImplementation(() => ({
+					from: vi.fn().mockImplementation((table) => {
+						const execute = async () => {
+							if (table === canonicalTransactions) {
+								return [
+									{ id: "existing-tx-id", creationFingerprint: expectedFp },
+								];
+							}
+							if (table === transactionRevisions) {
+								return [
+									{
+										id: "existing-rev-1-id",
+										revisionNo: 1,
+										operation: "CREATE",
+										idempotencyKey: "different-idempotency-key",
+										revisionFingerprint: expectedFp,
+									},
+								];
+							}
+							return [];
+						};
+						return {
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockImplementation(execute),
+							}),
+							limit: vi.fn().mockImplementation(execute),
+						};
+					}),
+				})),
+			};
+
+			const mockDb = {
+				transaction: vi.fn().mockImplementation(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			await expect(
+				createCanonicalTransaction({
+					db: mockDb,
+					userId: "user-1",
+					kind: "EXPENSE",
+					idempotencyKey: "create-key-1",
+					occurredAt: candidateOccurred,
+					payload: candidatePayload,
+					source: { type: "MANUAL" },
+				}),
+			).rejects.toThrow(
+				"Canonical transaction revision #1 state or cryptographic fingerprint is inconsistent",
 			);
 		});
 	});
