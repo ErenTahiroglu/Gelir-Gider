@@ -8,7 +8,10 @@ export type LedgerErrorCode =
 	| "LEDGER_IDEMPOTENCY_CONFLICT"
 	| "LEDGER_INCOMPLETE_STATE"
 	| "LEDGER_USER_NOT_FOUND"
-	| "LEDGER_CURRENCY_MISMATCH";
+	| "LEDGER_CURRENCY_MISMATCH"
+	| "LEDGER_ENTRY_NOT_FOUND"
+	| "LEDGER_ALREADY_REVERSED"
+	| "LEDGER_INVALID_REVERSAL";
 
 export class LedgerError extends Error {
 	readonly code: LedgerErrorCode;

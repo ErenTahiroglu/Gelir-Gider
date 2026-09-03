@@ -78,3 +78,21 @@ export function formatCentsToMoney(cents: bigint): string {
 
 	return `${intPart.toString()}.${fracPart}`;
 }
+
+/**
+ * Formats signed integer cents into an exact decimal string for balance queries.
+ * Examples: 0n -> "0.00", 100n -> "1.00", -100n -> "-1.00", -1n -> "-0.01"
+ */
+export function formatSignedCentsToMoney(cents: bigint): string {
+	if (cents === 0n) {
+		return "0.00";
+	}
+
+	const isNegative = cents < 0n;
+	const absCents = isNegative ? -cents : cents;
+	const intPart = absCents / 100n;
+	const frac = absCents % 100n;
+	const fracPart = frac < 10n ? `0${frac.toString()}` : frac.toString();
+
+	return `${isNegative ? "-" : ""}${intPart.toString()}.${fracPart}`;
+}

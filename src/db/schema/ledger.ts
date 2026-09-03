@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+	type AnyPgColumn,
 	check,
 	index,
 	integer,
@@ -76,6 +77,10 @@ export const journalEntries = pgTable(
 		}).notNull(),
 		status: varchar("status", { length: 10 }).default("DRAFT").notNull(),
 		postedAt: timestamp("posted_at", { withTimezone: true, mode: "date" }),
+		reversalOfEntryId: uuid("reversal_of_entry_id").references(
+			(): AnyPgColumn => journalEntries.id,
+			{ onDelete: "restrict" },
+		),
 		memo: varchar("memo", { length: 500 }),
 		sourceType: varchar("source_type", { length: 64 }),
 		sourceRef: varchar("source_ref", { length: 128 }),
@@ -88,6 +93,9 @@ export const journalEntries = pgTable(
 			table.userId,
 			table.idempotencyKey,
 		),
+		uniqueIndex("journal_entries_reversal_of_entry_idx")
+			.on(table.reversalOfEntryId)
+			.where(sql`${table.reversalOfEntryId} IS NOT NULL`),
 		index("journal_entries_user_occurred_idx").on(
 			table.userId,
 			table.occurredAt,

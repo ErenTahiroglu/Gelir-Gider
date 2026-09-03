@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	formatCentsToMoney,
+	formatSignedCentsToMoney,
 	parseMoneyString,
 	parsePositiveMoneyString,
 } from "../src/ledger/money";
@@ -170,6 +171,29 @@ describe("Exact-Decimal Money Engine (Phase 4A)", () => {
 			expect(() => formatCentsToMoney(-1n)).toThrow(
 				"Negative cents formatting",
 			);
+		});
+	});
+
+	describe("formatSignedCentsToMoney", () => {
+		it("formats zero cents as '0.00' (never '-0.00')", () => {
+			expect(formatSignedCentsToMoney(0n)).toBe("0.00");
+			expect(formatSignedCentsToMoney(-0n)).toBe("0.00");
+		});
+
+		it("formats positive cents correctly", () => {
+			expect(formatSignedCentsToMoney(1n)).toBe("0.01");
+			expect(formatSignedCentsToMoney(50n)).toBe("0.50");
+			expect(formatSignedCentsToMoney(100n)).toBe("1.00");
+			expect(formatSignedCentsToMoney(123n)).toBe("1.23");
+			expect(formatSignedCentsToMoney(125000n)).toBe("1250.00");
+		});
+
+		it("formats negative cents with exact minus sign prefix", () => {
+			expect(formatSignedCentsToMoney(-1n)).toBe("-0.01");
+			expect(formatSignedCentsToMoney(-50n)).toBe("-0.50");
+			expect(formatSignedCentsToMoney(-100n)).toBe("-1.00");
+			expect(formatSignedCentsToMoney(-123n)).toBe("-1.23");
+			expect(formatSignedCentsToMoney(-125000n)).toBe("-1250.00");
 		});
 	});
 });
