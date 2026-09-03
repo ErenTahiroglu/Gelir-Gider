@@ -50,6 +50,13 @@
       "when": 1788424977733,
       "tag": "0006_fluffy_giant_girl",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1788442429668,
+      "tag": "0007_magical_deadpool",
+      "breakpoints": true
     }
   ]
 }
