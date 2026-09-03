@@ -144,7 +144,6 @@ export async function beginAuthorizedPasskeyEnrollment({
 	}
 
 	const tokenHash = await hashEnrollmentGrantToken(enrollmentGrantToken);
-	const now = new Date();
 
 	// Step 2: Pre-lock lookup strictly for routing hint (id and userId only)
 	const [routingHint] = await db
@@ -179,8 +178,14 @@ export async function beginAuthorizedPasskeyEnrollment({
 			);
 		}
 
-		// Step 3b: Fresh post-lock re-read of the grant FOR UPDATE
-		// Check both active query and check expiry separately to distinguish error code if expired
+		// Step 3b: Fresh post-lock clock — computed AFTER user FOR UPDATE is acquired.
+		// Using a pre-lock timestamp here would allow a grant that expired during lock
+		// wait to be incorrectly accepted.
+		const postLockNow = new Date();
+
+		// Fresh post-lock re-read of the grant FOR UPDATE.
+		// expires_at > postLockNow is folded directly into the query predicate so that
+		// a grant expiring while waiting for the lock is rejected fail-closed.
 		const [freshGrant] = await tx
 			.select()
 			.from(authEnrollmentGrants)
@@ -191,6 +196,7 @@ export async function beginAuthorizedPasskeyEnrollment({
 					eq(authEnrollmentGrants.tokenHash, tokenHash),
 					isNull(authEnrollmentGrants.consumedAt),
 					isNull(authEnrollmentGrants.revokedAt),
+					gt(authEnrollmentGrants.expiresAt, postLockNow),
 				),
 			)
 			.for("update")
@@ -199,14 +205,7 @@ export async function beginAuthorizedPasskeyEnrollment({
 		if (!freshGrant) {
 			throw new WebAuthnServiceError(
 				"ENROLLMENT_GRANT_INVALID",
-				"Enrollment grant has already been used, revoked, or does not exist",
-			);
-		}
-
-		if (freshGrant.expiresAt <= now) {
-			throw new WebAuthnServiceError(
-				"ENROLLMENT_GRANT_EXPIRED",
-				"Enrollment grant has expired",
+				"Enrollment grant is invalid, already used, revoked, or has expired",
 			);
 		}
 
@@ -289,10 +288,14 @@ export async function beginAuthorizedPasskeyEnrollment({
 			})),
 		});
 
-		// Step 3f: Conditional atomic consume with RETURNING
+		// Step 3f: Conditional atomic consume with RETURNING.
+		// consumeNow is computed immediately before the UPDATE so that a grant that
+		// expires during options generation is rejected (RETURNING []) and no challenge
+		// is inserted. This is the latest defensible clock for this operation.
+		const consumeNow = new Date();
 		const [consumedGrant] = await tx
 			.update(authEnrollmentGrants)
-			.set({ consumedAt: now })
+			.set({ consumedAt: consumeNow })
 			.where(
 				and(
 					eq(authEnrollmentGrants.id, freshGrant.id),
@@ -300,7 +303,7 @@ export async function beginAuthorizedPasskeyEnrollment({
 					eq(authEnrollmentGrants.tokenHash, tokenHash),
 					isNull(authEnrollmentGrants.consumedAt),
 					isNull(authEnrollmentGrants.revokedAt),
-					gt(authEnrollmentGrants.expiresAt, now),
+					gt(authEnrollmentGrants.expiresAt, consumeNow),
 				),
 			)
 			.returning({ id: authEnrollmentGrants.id });
@@ -308,7 +311,7 @@ export async function beginAuthorizedPasskeyEnrollment({
 		if (!consumedGrant) {
 			throw new WebAuthnServiceError(
 				"ENROLLMENT_GRANT_INVALID",
-				"Failed to consume enrollment grant atomically",
+				"Enrollment grant expired or was invalidated during options generation",
 			);
 		}
 

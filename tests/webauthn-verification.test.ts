@@ -120,19 +120,12 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			});
 		});
 
-		it("rejects expired enrollment grant token on post-lock check", async () => {
+		it("rejects expired enrollment grant token because post-lock query folds expiry predicate — returns ENROLLMENT_GRANT_INVALID", async () => {
+			// Since expires_at > postLockNow is now baked into the fresh grant query,
+			// an expired grant returns no row, which maps to ENROLLMENT_GRANT_INVALID.
 			const mockRoutingHint = {
 				id: "grant-1",
 				userId: "user-1",
-			};
-
-			const mockFreshGrant = {
-				id: "grant-1",
-				userId: "user-1",
-				purpose: "BOOTSTRAP",
-				consumedAt: null,
-				revokedAt: null,
-				expiresAt: new Date(Date.now() - 5000), // Expired!
 			};
 
 			const mockTx = {
@@ -154,12 +147,12 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 							}),
 						}),
 					})
-					// 2nd: fresh post-lock grant
+					// 2nd: fresh post-lock grant — NOT FOUND because expires_at predicate filters it out
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
 								for: vi.fn().mockReturnValue({
-									limit: vi.fn().mockResolvedValue([mockFreshGrant]),
+									limit: vi.fn().mockResolvedValue([]),
 								}),
 							}),
 						}),
@@ -186,8 +179,176 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 					enrollmentGrantToken: "valid-looking-grant-token-1234567890",
 				}),
 			).rejects.toMatchObject({
-				code: "ENROLLMENT_GRANT_EXPIRED" as WebAuthnErrorCode,
+				// Expiry is now folded into query: no row found -> ENROLLMENT_GRANT_INVALID
+				code: "ENROLLMENT_GRANT_INVALID" as WebAuthnErrorCode,
 			});
+		});
+
+		it("rejects grant that expires while waiting for user lock (post-lock clock simulation)", async () => {
+			// Simulates scenario: routing lookup succeeds, but user FOR UPDATE wait was long
+			// enough that the grant is now expired by the time postLockNow is computed.
+			// The fresh grant FOR UPDATE query includes expires_at > postLockNow so it
+			// returns nothing, and begin fails without consuming the grant or inserting a challenge.
+			const mockRoutingHint = {
+				id: "grant-1",
+				userId: "user-1",
+			};
+
+			const insertSpy = vi.fn();
+
+			const mockTx = {
+				select: vi
+					.fn()
+					// 1st: user lock (acquired after simulated delay)
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: "user-1",
+											displayName: "Eren",
+											authInitializedAt: null,
+										},
+									]),
+								}),
+							}),
+						}),
+					})
+					// 2nd: fresh post-lock grant query with postLockNow — grant is now expired
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									// Empty because expires_at > postLockNow rejects it
+									limit: vi.fn().mockResolvedValue([]),
+								}),
+							}),
+						}),
+					}),
+				insert: insertSpy,
+				update: vi.fn(),
+			};
+
+			const mockDb = {
+				select: vi.fn().mockReturnValue({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([mockRoutingHint]),
+						}),
+					}),
+				}),
+				transaction: vi.fn().mockImplementation(async (cb) => {
+					return await cb(mockTx);
+				}),
+			} as unknown as Database;
+
+			await expect(
+				beginAuthorizedPasskeyEnrollment({
+					db: mockDb,
+					config: mockConfig,
+					enrollmentGrantToken: "valid-grant-token-1234567890",
+				}),
+			).rejects.toMatchObject({
+				code: "ENROLLMENT_GRANT_INVALID" as WebAuthnErrorCode,
+			});
+
+			// Grant must NOT be consumed and challenge must NOT be inserted
+			expect(insertSpy).not.toHaveBeenCalled();
+			expect(mockTx.update).not.toHaveBeenCalled();
+		});
+
+		it("rejects grant that expires during options generation — consumeNow conditional UPDATE returns empty, challenge not inserted", async () => {
+			// Simulates: post-lock grant read passes, options generated, but between
+			// options generation and the consume UPDATE the grant expired.
+			// consumeNow > expiresAt so the conditional UPDATE RETURNING returns [].
+			const mockRoutingHint = {
+				id: "grant-1",
+				userId: "user-1",
+			};
+
+			const mockFreshGrant = {
+				id: "grant-1",
+				userId: "user-1",
+				purpose: "BOOTSTRAP",
+				consumedAt: null,
+				revokedAt: null,
+				expiresAt: new Date(Date.now() + 600000), // Active at fresh-read time
+			};
+
+			const insertSpy = vi.fn();
+
+			const mockTx = {
+				select: vi
+					.fn()
+					// 1st: user lock
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: "user-1",
+											displayName: "Eren",
+											authInitializedAt: null,
+										},
+									]),
+								}),
+							}),
+						}),
+					})
+					// 2nd: fresh post-lock grant — still active at this point
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								for: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([mockFreshGrant]),
+								}),
+							}),
+						}),
+					})
+					// 3rd: active credentials
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockResolvedValue([]),
+						}),
+					}),
+				// Conditional consume with consumeNow: grant expired during options generation
+				update: vi.fn().mockReturnValue({
+					set: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							returning: vi.fn().mockResolvedValue([]), // consumeNow > expiresAt → 0 rows
+						}),
+					}),
+				}),
+				insert: insertSpy,
+			};
+
+			const mockDb = {
+				select: vi.fn().mockReturnValue({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([mockRoutingHint]),
+						}),
+					}),
+				}),
+				transaction: vi.fn().mockImplementation(async (cb) => {
+					return await cb(mockTx);
+				}),
+			} as unknown as Database;
+
+			await expect(
+				beginAuthorizedPasskeyEnrollment({
+					db: mockDb,
+					config: mockConfig,
+					enrollmentGrantToken: "valid-grant-token-1234567890",
+				}),
+			).rejects.toMatchObject({
+				code: "ENROLLMENT_GRANT_INVALID" as WebAuthnErrorCode,
+			});
+
+			// Challenge must NOT be inserted when grant expires during options generation
+			expect(insertSpy).not.toHaveBeenCalled();
 		});
 
 		it("rejects BOOTSTRAP grant if user is already initialized", async () => {
