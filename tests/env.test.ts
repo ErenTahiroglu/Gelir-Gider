@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { type AppEnv, getDatabaseUrl } from "../src/config/env";
+import {
+	type AppEnv,
+	getDatabaseUrl,
+	getWebAuthnConfig,
+} from "../src/config/env";
 
 describe("Database Environment Contract", () => {
 	it("throws DATABASE_URL is required when DATABASE_URL is empty", () => {
@@ -35,5 +39,72 @@ describe("Database Environment Contract", () => {
 			expect(error.message).not.toContain("postgresql://");
 			expect(error.message).not.toContain("example.invalid");
 		}
+	});
+});
+
+describe("WebAuthn Environment Contract", () => {
+	it("throws WEBAUTHN_RP_ID is required when rpID is missing, empty or whitespace", () => {
+		expect(() =>
+			getWebAuthnConfig({
+				WEBAUTHN_RP_NAME: "Gelir Gider",
+				WEBAUTHN_ORIGIN: "http://localhost:8787",
+			}),
+		).toThrow("WEBAUTHN_RP_ID is required");
+
+		expect(() =>
+			getWebAuthnConfig({
+				WEBAUTHN_RP_ID: "   ",
+				WEBAUTHN_RP_NAME: "Gelir Gider",
+				WEBAUTHN_ORIGIN: "http://localhost:8787",
+			}),
+		).toThrow("WEBAUTHN_RP_ID is required");
+	});
+
+	it("throws WEBAUTHN_RP_NAME is required when rpName is missing, empty or whitespace", () => {
+		expect(() =>
+			getWebAuthnConfig({
+				WEBAUTHN_RP_ID: "localhost",
+				WEBAUTHN_ORIGIN: "http://localhost:8787",
+			}),
+		).toThrow("WEBAUTHN_RP_NAME is required");
+
+		expect(() =>
+			getWebAuthnConfig({
+				WEBAUTHN_RP_ID: "localhost",
+				WEBAUTHN_RP_NAME: "",
+				WEBAUTHN_ORIGIN: "http://localhost:8787",
+			}),
+		).toThrow("WEBAUTHN_RP_NAME is required");
+	});
+
+	it("throws WEBAUTHN_ORIGIN is required when origin is missing, empty or whitespace", () => {
+		expect(() =>
+			getWebAuthnConfig({
+				WEBAUTHN_RP_ID: "localhost",
+				WEBAUTHN_RP_NAME: "Gelir Gider",
+			}),
+		).toThrow("WEBAUTHN_ORIGIN is required");
+
+		expect(() =>
+			getWebAuthnConfig({
+				WEBAUTHN_RP_ID: "localhost",
+				WEBAUTHN_RP_NAME: "Gelir Gider",
+				WEBAUTHN_ORIGIN: "  ",
+			}),
+		).toThrow("WEBAUTHN_ORIGIN is required");
+	});
+
+	it("returns valid trimmed WebAuthnConfig when valid env provided", () => {
+		const config = getWebAuthnConfig({
+			WEBAUTHN_RP_ID: "  localhost  ",
+			WEBAUTHN_RP_NAME: " Gelir Gider ",
+			WEBAUTHN_ORIGIN: " http://localhost:8787 \n",
+		});
+
+		expect(config).toEqual({
+			rpID: "localhost",
+			rpName: "Gelir Gider",
+			origin: "http://localhost:8787",
+		});
 	});
 });

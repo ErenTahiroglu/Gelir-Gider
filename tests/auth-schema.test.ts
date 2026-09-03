@@ -1,12 +1,19 @@
 import { getTableName } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
-import { sessions, users, webauthnCredentials } from "../src/db/schema/auth";
+import { WEBAUTHN_CHALLENGE_TTL_SECONDS } from "../src/auth/challenges";
+import {
+	sessions,
+	users,
+	webauthnChallenges,
+	webauthnCredentials,
+} from "../src/db/schema/auth";
 
 describe("Single-User Identity Schema Contract", () => {
-	it("exports the three required identity tables with exact names", () => {
+	it("exports the required identity tables with exact names", () => {
 		expect(getTableName(users)).toBe("users");
 		expect(getTableName(webauthnCredentials)).toBe("webauthn_credentials");
 		expect(getTableName(sessions)).toBe("sessions");
+		expect(getTableName(webauthnChallenges)).toBe("webauthn_challenges");
 	});
 
 	it("verifies users table structure and critical columns", () => {
@@ -57,5 +64,23 @@ describe("Single-User Identity Schema Contract", () => {
 		expect("token" in cols).toBe(false);
 		expect("rawToken" in cols).toBe(false);
 		expect("sessionToken" in cols).toBe(false);
+	});
+
+	it("verifies webauthn_challenges table structure, critical columns, and TTL constant", () => {
+		const cols = webauthnChallenges;
+		expect(cols.id).toBeDefined();
+		expect(cols.userId).toBeDefined();
+		expect(cols.purpose).toBeDefined();
+		expect(cols.challenge).toBeDefined();
+		expect(cols.createdAt).toBeDefined();
+		expect(cols.expiresAt).toBeDefined();
+		expect(cols.consumedAt).toBeDefined();
+
+		// TTL is 300 seconds (5 minutes)
+		expect(WEBAUTHN_CHALLENGE_TTL_SECONDS).toBe(300);
+
+		// Security: challenge table does not store password or credential secrets
+		expect("secret" in cols).toBe(false);
+		expect("password" in cols).toBe(false);
 	});
 });

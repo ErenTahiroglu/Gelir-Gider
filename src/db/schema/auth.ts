@@ -101,3 +101,42 @@ export const sessions = pgTable(
 		index("sessions_expires_at_idx").on(table.expiresAt),
 	],
 );
+
+export const webauthnChallenges = pgTable(
+	"webauthn_challenges",
+	{
+		id: uuid("id").defaultRandom().primaryKey().notNull(),
+		userId: uuid("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		purpose: text("purpose").notNull(),
+		challenge: text("challenge").notNull().unique(),
+		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+			.defaultNow()
+			.notNull(),
+		expiresAt: timestamp("expires_at", {
+			withTimezone: true,
+			mode: "date",
+		}).notNull(),
+		consumedAt: timestamp("consumed_at", { withTimezone: true, mode: "date" }),
+	},
+	(table) => [
+		check(
+			"webauthn_challenges_purpose_check",
+			sql`${table.purpose} IN ('REGISTRATION', 'AUTHENTICATION')`,
+		),
+		check(
+			"webauthn_challenges_expires_at_check",
+			sql`${table.expiresAt} > ${table.createdAt}`,
+		),
+		check(
+			"webauthn_challenges_consumed_at_check",
+			sql`${table.consumedAt} IS NULL OR ${table.consumedAt} >= ${table.createdAt}`,
+		),
+		index("webauthn_challenges_user_purpose_idx").on(
+			table.userId,
+			table.purpose,
+		),
+		index("webauthn_challenges_expires_at_idx").on(table.expiresAt),
+	],
+);
