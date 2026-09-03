@@ -51,6 +51,8 @@ export const webauthnCredentials = pgTable(
 		signCount: bigint("sign_count", { mode: "number" }).default(0).notNull(),
 		deviceName: text("device_name").notNull(),
 		deviceType: text("device_type"),
+		transports: text("transports").array(),
+		backedUp: boolean("backed_up").default(false).notNull(),
 		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
 			.defaultNow()
 			.notNull(),

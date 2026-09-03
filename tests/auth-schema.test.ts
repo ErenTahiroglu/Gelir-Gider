@@ -32,7 +32,7 @@ describe("Single-User Identity Schema Contract", () => {
 		expect("passwordHash" in cols).toBe(false);
 	});
 
-	it("verifies webauthn_credentials table structure and critical columns", () => {
+	it("verifies webauthn_credentials table structure and critical columns including transports and backedUp", () => {
 		const cols = webauthnCredentials;
 		expect(cols.id).toBeDefined();
 		expect(cols.userId).toBeDefined();
@@ -41,13 +41,17 @@ describe("Single-User Identity Schema Contract", () => {
 		expect(cols.signCount).toBeDefined();
 		expect(cols.deviceName).toBeDefined();
 		expect(cols.deviceType).toBeDefined();
+		expect(cols.transports).toBeDefined();
+		expect(cols.backedUp).toBeDefined();
 		expect(cols.createdAt).toBeDefined();
 		expect(cols.lastUsedAt).toBeDefined();
 		expect(cols.revokedAt).toBeDefined();
 
-		// Security: must not contain password fields
+		// Security: must not contain password or private key fields
 		expect("password" in cols).toBe(false);
 		expect("secret" in cols).toBe(false);
+		expect("private_key" in cols).toBe(false);
+		expect("privateKey" in cols).toBe(false);
 	});
 
 	it("verifies sessions table structure and critical columns", () => {

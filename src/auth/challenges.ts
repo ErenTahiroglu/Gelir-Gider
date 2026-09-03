@@ -90,3 +90,35 @@ export async function consumeChallenge({ db, id }: ConsumeChallengeParams) {
 
 	return consumed ?? null;
 }
+
+export interface ConsumeActiveChallengeParams {
+	db: Database;
+	userId: string;
+	purpose: WebAuthnPurpose;
+	challenge: string;
+}
+
+export async function consumeActiveChallenge({
+	db,
+	userId,
+	purpose,
+	challenge,
+}: ConsumeActiveChallengeParams) {
+	const now = new Date();
+
+	const [consumed] = await db
+		.update(webauthnChallenges)
+		.set({ consumedAt: now })
+		.where(
+			and(
+				eq(webauthnChallenges.userId, userId),
+				eq(webauthnChallenges.purpose, purpose),
+				eq(webauthnChallenges.challenge, challenge),
+				isNull(webauthnChallenges.consumedAt),
+				gt(webauthnChallenges.expiresAt, now),
+			),
+		)
+		.returning();
+
+	return consumed ?? null;
+}

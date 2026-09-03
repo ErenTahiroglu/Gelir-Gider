@@ -1,4 +1,5 @@
 import {
+	type AuthenticatorTransportFuture,
 	generateAuthenticationOptions,
 	generateRegistrationOptions,
 } from "@simplewebauthn/server";
@@ -8,11 +9,53 @@ import { createChallenge } from "./challenges";
 
 export interface UserCredentialSummary {
 	credentialId: string;
+	transports?: AuthenticatorTransportFuture[] | null | undefined;
 	revokedAt: Date | null;
 }
 
+export interface BuildRegistrationOptionsParams {
+	config: WebAuthnConfig;
+	user: {
+		id: string;
+		displayName: string;
+	};
+	existingCredentials?: UserCredentialSummary[] | undefined;
+}
+
+export async function buildRegistrationOptions({
+	config,
+	user,
+	existingCredentials = [],
+}: BuildRegistrationOptionsParams) {
+	const activeCredentials = existingCredentials.filter(
+		(c) => c.revokedAt === null,
+	);
+
+	return generateRegistrationOptions({
+		rpName: config.rpName,
+		rpID: config.rpID,
+		userName: user.displayName,
+		userID: Uint8Array.from(new TextEncoder().encode(user.id)),
+		authenticatorSelection: {
+			residentKey: "preferred",
+			userVerification: "required",
+		},
+		attestationType: "none",
+		excludeCredentials: activeCredentials.map((cred) => {
+			const desc: { id: string; transports?: AuthenticatorTransportFuture[] } =
+				{
+					id: cred.credentialId,
+				};
+			if (cred.transports && cred.transports.length > 0) {
+				desc.transports = cred.transports;
+			}
+			return desc;
+		}),
+	});
+}
+
 export interface GenerateRegistrationOptionsParams {
-	db?: Database | undefined;
+	db: Database;
 	config: WebAuthnConfig;
 	user: {
 		id: string;
@@ -27,40 +70,54 @@ export async function generateRegistrationOptionsForUser({
 	user,
 	existingCredentials = [],
 }: GenerateRegistrationOptionsParams) {
-	// Only active (non-revoked) credentials should be excluded to prevent re-registering the same authenticator
-	const activeCredentials = existingCredentials.filter(
-		(c) => c.revokedAt === null,
-	);
-
-	const options = await generateRegistrationOptions({
-		rpName: config.rpName,
-		rpID: config.rpID,
-		userName: user.displayName,
-		userID: Uint8Array.from(new TextEncoder().encode(user.id)),
-		authenticatorSelection: {
-			residentKey: "preferred",
-			userVerification: "required",
-		},
-		attestationType: "none",
-		excludeCredentials: activeCredentials.map((cred) => ({
-			id: cred.credentialId,
-		})),
+	const options = await buildRegistrationOptions({
+		config,
+		user,
+		existingCredentials,
 	});
 
-	if (db) {
-		await createChallenge({
-			db,
-			userId: user.id,
-			purpose: "REGISTRATION",
-			challenge: options.challenge,
-		});
-	}
+	// Fail-closed: Challenge MUST be persisted before returning options
+	await createChallenge({
+		db,
+		userId: user.id,
+		purpose: "REGISTRATION",
+		challenge: options.challenge,
+	});
 
 	return options;
 }
 
+export interface BuildAuthenticationOptionsParams {
+	config: WebAuthnConfig;
+	existingCredentials?: UserCredentialSummary[] | undefined;
+}
+
+export async function buildAuthenticationOptions({
+	config,
+	existingCredentials = [],
+}: BuildAuthenticationOptionsParams) {
+	const activeCredentials = existingCredentials.filter(
+		(c) => c.revokedAt === null,
+	);
+
+	return generateAuthenticationOptions({
+		rpID: config.rpID,
+		userVerification: "required",
+		allowCredentials: activeCredentials.map((cred) => {
+			const desc: { id: string; transports?: AuthenticatorTransportFuture[] } =
+				{
+					id: cred.credentialId,
+				};
+			if (cred.transports && cred.transports.length > 0) {
+				desc.transports = cred.transports;
+			}
+			return desc;
+		}),
+	});
+}
+
 export interface GenerateAuthenticationOptionsParams {
-	db?: Database | undefined;
+	db: Database;
 	config: WebAuthnConfig;
 	user: {
 		id: string;
@@ -74,27 +131,18 @@ export async function generateAuthenticationOptionsForUser({
 	user,
 	existingCredentials = [],
 }: GenerateAuthenticationOptionsParams) {
-	// Only active credentials are allowed for authentication
-	const activeCredentials = existingCredentials.filter(
-		(c) => c.revokedAt === null,
-	);
-
-	const options = await generateAuthenticationOptions({
-		rpID: config.rpID,
-		userVerification: "required",
-		allowCredentials: activeCredentials.map((cred) => ({
-			id: cred.credentialId,
-		})),
+	const options = await buildAuthenticationOptions({
+		config,
+		existingCredentials,
 	});
 
-	if (db) {
-		await createChallenge({
-			db,
-			userId: user.id,
-			purpose: "AUTHENTICATION",
-			challenge: options.challenge,
-		});
-	}
+	// Fail-closed: Challenge MUST be persisted before returning options
+	await createChallenge({
+		db,
+		userId: user.id,
+		purpose: "AUTHENTICATION",
+		challenge: options.challenge,
+	});
 
 	return options;
 }
