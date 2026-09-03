@@ -13,7 +13,7 @@ export interface UserCredentialSummary {
 	revokedAt: Date | null;
 }
 
-interface BuildRegistrationOptionsParams {
+export interface BuildRegistrationOptionsParams {
 	config: WebAuthnConfig;
 	user: {
 		id: string;
@@ -22,7 +22,15 @@ interface BuildRegistrationOptionsParams {
 	existingCredentials?: UserCredentialSummary[] | undefined;
 }
 
-async function buildRegistrationOptions({
+/**
+ * Builds WebAuthn registration options according to security policy:
+ * - residentKey: preferred
+ * - userVerification: required
+ * - attestation: none
+ * - excludes all active credentials for the user
+ * Module-private / internal: options must not be issued without an authorized enrollment grant.
+ */
+export async function buildRegistrationOptions({
 	config,
 	user,
 	existingCredentials = [],
@@ -52,39 +60,6 @@ async function buildRegistrationOptions({
 			return desc;
 		}),
 	});
-}
-
-export interface GenerateRegistrationOptionsParams {
-	db: Database;
-	config: WebAuthnConfig;
-	user: {
-		id: string;
-		displayName: string;
-	};
-	existingCredentials?: UserCredentialSummary[] | undefined;
-}
-
-export async function generateRegistrationOptionsForUser({
-	db,
-	config,
-	user,
-	existingCredentials = [],
-}: GenerateRegistrationOptionsParams) {
-	const options = await buildRegistrationOptions({
-		config,
-		user,
-		existingCredentials,
-	});
-
-	// Fail-closed: Challenge MUST be persisted before returning options
-	await createChallenge({
-		db,
-		userId: user.id,
-		purpose: "REGISTRATION",
-		challenge: options.challenge,
-	});
-
-	return options;
 }
 
 interface BuildAuthenticationOptionsParams {

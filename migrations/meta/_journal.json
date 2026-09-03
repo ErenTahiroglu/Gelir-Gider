@@ -43,6 +43,13 @@
       "when": 1788422902919,
       "tag": "0005_purple_vision",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1788424977733,
+      "tag": "0006_fluffy_giant_girl",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,4 @@
+ALTER TABLE "webauthn_challenges" ADD COLUMN "enrollment_grant_id" uuid;--> statement-breakpoint
+ALTER TABLE "webauthn_challenges" ADD CONSTRAINT "webauthn_challenges_enrollment_grant_id_auth_enrollment_grants_id_fk" FOREIGN KEY ("enrollment_grant_id") REFERENCES "public"."auth_enrollment_grants"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "webauthn_challenges" ADD CONSTRAINT "webauthn_challenges_enrollment_grant_id_unique" UNIQUE("enrollment_grant_id");--> statement-breakpoint
+ALTER TABLE "webauthn_challenges" ADD CONSTRAINT "webauthn_challenges_purpose_enrollment_grant_relation_check" CHECK (("webauthn_challenges"."purpose" = 'REGISTRATION' AND "webauthn_challenges"."enrollment_grant_id" IS NOT NULL) OR ("webauthn_challenges"."purpose" = 'AUTHENTICATION' AND "webauthn_challenges"."enrollment_grant_id" IS NULL));

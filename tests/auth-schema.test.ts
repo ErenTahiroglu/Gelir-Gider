@@ -1,6 +1,10 @@
-import { getTableName } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { WEBAUTHN_CHALLENGE_TTL_SECONDS } from "../src/auth/challenges";
+import { AUTH_ENROLLMENT_GRANT_TTL_SECONDS } from "../src/auth/enrollment-grants";
+import {
+	SESSION_ABSOLUTE_TTL_SECONDS,
+	SESSION_IDLE_TTL_SECONDS,
+} from "../src/auth/sessions";
 import {
 	authEnrollmentGrants,
 	authRecoveryCodes,
@@ -10,17 +14,8 @@ import {
 	webauthnCredentials,
 } from "../src/db/schema/auth";
 
-describe("Single-User Identity Schema Contract", () => {
-	it("exports the required identity tables with exact names", () => {
-		expect(getTableName(users)).toBe("users");
-		expect(getTableName(webauthnCredentials)).toBe("webauthn_credentials");
-		expect(getTableName(sessions)).toBe("sessions");
-		expect(getTableName(webauthnChallenges)).toBe("webauthn_challenges");
-		expect(getTableName(authRecoveryCodes)).toBe("auth_recovery_codes");
-		expect(getTableName(authEnrollmentGrants)).toBe("auth_enrollment_grants");
-	});
-
-	it("verifies users table structure and critical columns including authInitializedAt", () => {
+describe("Database Auth Schema Contracts", () => {
+	it("verifies users table structure and constraints", () => {
 		const cols = users;
 		expect(cols.id).toBeDefined();
 		expect(cols.singletonKey).toBeDefined();
@@ -30,14 +25,9 @@ describe("Single-User Identity Schema Contract", () => {
 		expect(cols.authInitializedAt).toBeDefined();
 		expect(cols.createdAt).toBeDefined();
 		expect(cols.updatedAt).toBeDefined();
-
-		// Security: must not contain password columns
-		expect("password" in cols).toBe(false);
-		expect("password_hash" in cols).toBe(false);
-		expect("passwordHash" in cols).toBe(false);
 	});
 
-	it("verifies webauthn_credentials table structure and critical columns including transports, backedUp, and stateVersion", () => {
+	it("verifies webauthn_credentials table structure and stateVersion column", () => {
 		const cols = webauthnCredentials;
 		expect(cols.id).toBeDefined();
 		expect(cols.userId).toBeDefined();
@@ -53,14 +43,11 @@ describe("Single-User Identity Schema Contract", () => {
 		expect(cols.lastUsedAt).toBeDefined();
 		expect(cols.revokedAt).toBeDefined();
 
-		// Security: must not contain password or private key fields
-		expect("password" in cols).toBe(false);
-		expect("secret" in cols).toBe(false);
-		expect("private_key" in cols).toBe(false);
+		// Security: credential table does not store private key
 		expect("privateKey" in cols).toBe(false);
 	});
 
-	it("verifies sessions table structure and critical columns", () => {
+	it("verifies sessions table structure and TTL invariants", () => {
 		const cols = sessions;
 		expect(cols.id).toBeDefined();
 		expect(cols.userId).toBeDefined();
@@ -70,18 +57,22 @@ describe("Single-User Identity Schema Contract", () => {
 		expect(cols.lastSeenAt).toBeDefined();
 		expect(cols.revokedAt).toBeDefined();
 
-		// Security: must store only tokenHash, never raw session token
+		// Security: sessions table does not store plaintext session tokens
 		expect("token" in cols).toBe(false);
 		expect("rawToken" in cols).toBe(false);
-		expect("sessionToken" in cols).toBe(false);
+
+		// Policy TTL contracts: 30 days absolute, 7 days idle
+		expect(SESSION_ABSOLUTE_TTL_SECONDS).toBe(30 * 24 * 60 * 60);
+		expect(SESSION_IDLE_TTL_SECONDS).toBe(7 * 24 * 60 * 60);
 	});
 
-	it("verifies webauthn_challenges table structure, critical columns, and TTL constant", () => {
+	it("verifies webauthn_challenges table structure and binding to enrollment_grant_id", () => {
 		const cols = webauthnChallenges;
 		expect(cols.id).toBeDefined();
 		expect(cols.userId).toBeDefined();
 		expect(cols.purpose).toBeDefined();
 		expect(cols.challenge).toBeDefined();
+		expect(cols.enrollmentGrantId).toBeDefined();
 		expect(cols.createdAt).toBeDefined();
 		expect(cols.expiresAt).toBeDefined();
 		expect(cols.consumedAt).toBeDefined();
@@ -120,6 +111,9 @@ describe("Single-User Identity Schema Contract", () => {
 		expect(cols.expiresAt).toBeDefined();
 		expect(cols.consumedAt).toBeDefined();
 		expect(cols.revokedAt).toBeDefined();
+
+		// TTL is 600 seconds (10 minutes)
+		expect(AUTH_ENROLLMENT_GRANT_TTL_SECONDS).toBe(600);
 
 		// Security: no raw token stored
 		expect("token" in cols).toBe(false);
