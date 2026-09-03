@@ -6,6 +6,7 @@ import {
 	incomeReceipts,
 	incomeSources,
 } from "../src/db/schema/income";
+import { IncomeError } from "../src/income/errors";
 import { getMonthlyReferenceIncome } from "../src/income/reference";
 
 describe("Income Reference Engine", () => {
@@ -274,5 +275,92 @@ describe("Income Reference Engine", () => {
 		expect(res.total).toBe("0.00");
 		expect(res.sources[0]?.referenceAmount).toBe("0.00");
 		expect(res.sources[1]?.referenceAmount).toBe("0.00");
+	});
+
+	it("strictly handles asOf Date vs archivedAt timestamp boundary semantics", async () => {
+		const asOfDate = new Date("2026-09-15T12:00:00Z");
+
+		const mockDb = {
+			select: vi.fn().mockImplementation(() => ({
+				from: vi.fn().mockImplementation((table) => ({
+					where: vi.fn().mockImplementation(() => ({
+						limit: vi.fn().mockImplementation(() => {
+							if (table === users) {
+								return Promise.resolve([{ currency: "TRY" }]);
+							}
+							return Promise.resolve([]);
+						}),
+						orderBy: vi.fn().mockImplementation(() => {
+							if (table === incomeSources) {
+								return Promise.resolve([
+									{
+										id: "source-archived-prior",
+										userId: "user-1",
+										code: "ARCH_PRIOR",
+										name: "Archived Prior to asOf",
+										nature: "REGULAR",
+										referenceMethod: "FIXED_MONTHLY",
+										expectedMonthlyAmount: "1000.00",
+										seasonalMonthsPerYear: null,
+										rollingMedianMonths: null,
+										activeFrom: "2026-01-01",
+										activeUntil: null,
+										archivedAt: new Date("2026-09-15T12:00:00Z"), // <= asOfDate -> excluded
+									},
+									{
+										id: "source-archived-later",
+										userId: "user-1",
+										code: "ARCH_LATER",
+										name: "Archived After asOf",
+										nature: "REGULAR",
+										referenceMethod: "FIXED_MONTHLY",
+										expectedMonthlyAmount: "2000.00",
+										seasonalMonthsPerYear: null,
+										rollingMedianMonths: null,
+										activeFrom: "2026-01-01",
+										activeUntil: null,
+										archivedAt: new Date("2026-09-15T12:00:01Z"), // > asOfDate -> included
+									},
+								]);
+							}
+							return Promise.resolve([]);
+						}),
+					})),
+				})),
+			})),
+		} as unknown as Database;
+
+		const res = await getMonthlyReferenceIncome({
+			db: mockDb,
+			userId: "user-1",
+			asOf: asOfDate,
+		});
+
+		expect(res.sources).toHaveLength(1);
+		expect(res.sources[0]?.code).toBe("ARCH_LATER");
+		expect(res.total).toBe("2000.00");
+	});
+
+	it("rejects invalid asOf calendar date strings", async () => {
+		const mockDb = {
+			select: vi.fn().mockImplementation(() => ({
+				from: vi.fn().mockImplementation(() => ({
+					where: vi.fn().mockImplementation(() => ({
+						limit: vi.fn().mockResolvedValue([{ currency: "TRY" }]),
+					})),
+				})),
+			})),
+		} as unknown as Database;
+
+		await expect(
+			getMonthlyReferenceIncome({
+				db: mockDb,
+				userId: "user-1",
+				asOf: "2026-02-30",
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof IncomeError && e.code === "INCOME_INVALID_INPUT",
+		);
 	});
 });

@@ -7,6 +7,7 @@ import {
 	incomeSources,
 } from "../db/schema/income";
 import { formatCentsToMoney, parseMoneyString } from "../ledger/money";
+import { validateIsoCalendarDate } from "./calendar";
 import { IncomeError } from "./errors";
 import type { IncomeNature, IncomeReferenceMethod } from "./sources";
 
@@ -72,9 +73,6 @@ function getIstanbulDateParts(date: Date): {
 	};
 }
 
-/**
- * Decrements a year-month by `k` months.
- */
 function subtractMonths(
 	year: number,
 	month: number,
@@ -92,7 +90,7 @@ function subtractMonths(
 }
 
 /**
- * Computes the reference monthly income for a user as of a given date.
+ * Computes the aggregate and per-source monthly reference income as of a specific date/time.
  */
 export async function getMonthlyReferenceIncome(
 	params: GetMonthlyReferenceIncomeParams,
@@ -108,12 +106,7 @@ export async function getMonthlyReferenceIncome(
 
 	if (typeof asOf === "string") {
 		const trimmed = asOf.trim();
-		if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-			throw new IncomeError(
-				"INCOME_INVALID_INPUT",
-				"asOf string must be formatted as YYYY-MM-DD",
-			);
-		}
+		validateIsoCalendarDate(trimmed);
 		asOfDate = new Date(`${trimmed}T12:00:00Z`);
 		asOfDateStr = trimmed;
 	} else if (asOf instanceof Date && !Number.isNaN(asOf.getTime())) {

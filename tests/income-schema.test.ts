@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import migration0015Sql from "../migrations/0015_harden_income_projection_integrity.sql?raw";
 import {
 	incomeReceiptRevisions,
 	incomeReceipts,
@@ -47,5 +48,32 @@ describe("Income Schema Definitions", () => {
 		expect(incomeReceiptRevisions.destinationAccountId).toBeDefined();
 		expect(incomeReceiptRevisions.note).toBeDefined();
 		expect(incomeReceiptRevisions.createdAt).toBeDefined();
+	});
+
+	it("verifies migration 0015 contains hardened trigger checks", () => {
+		const sql = migration0015Sql;
+
+		// Required payload keys check
+		expect(sql).toContain("v_rev.payload ? 'incomeSourceId'");
+		expect(sql).toContain("v_rev.payload ? 'amount'");
+		expect(sql).toContain("v_rev.payload ? 'destinationAccountId'");
+		expect(sql).toContain("v_rev.payload ? 'note'");
+
+		// Exact textual string equality
+		expect(sql).toContain("(v_rev.payload->>'amount') != (NEW.amount::text)");
+		expect(sql).toContain(
+			"(v_rev.payload->>'incomeSourceId') != (v_receipt.source_id::text)",
+		);
+		expect(sql).toContain(
+			"(v_rev.payload->>'destinationAccountId') != (NEW.destination_account_id::text)",
+		);
+
+		// Source ownership checks
+		expect(sql).toContain("v_source.user_id != NEW.user_id");
+		expect(sql).toContain("v_source.user_id != v_receipt.user_id");
+
+		// Note type and exact matching checks
+		expect(sql).toContain("jsonb_typeof(v_rev.payload->'note') = 'null'");
+		expect(sql).toContain("jsonb_typeof(v_rev.payload->'note') = 'string'");
 	});
 });

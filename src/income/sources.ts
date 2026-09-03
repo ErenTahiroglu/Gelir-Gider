@@ -3,7 +3,8 @@ import type { Database } from "../db/client";
 import { users } from "../db/schema/auth";
 import { incomeSources } from "../db/schema/income";
 import { ledgerAccounts } from "../db/schema/ledger";
-import { parseMoneyString } from "../ledger/money";
+import { type ParsedMoney, parseMoneyString } from "../ledger/money";
+import { validateIsoCalendarDate } from "./calendar";
 import { IncomeError } from "./errors";
 
 export type IncomeNature = "REGULAR" | "EXTRA" | "SUPPORT";
@@ -64,7 +65,6 @@ export interface ListIncomeSourcesParams {
 }
 
 const SOURCE_CODE_REGEX = /^[A-Z][A-Z0-9_]{1,63}$/;
-const DATE_FORMAT_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
  * Creates an immutable income source definition.
@@ -135,7 +135,15 @@ export async function createIncomeSource(
 				"expectedMonthlyAmount is required for FIXED_MONTHLY reference method",
 			);
 		}
-		const parsed = parseMoneyString(params.expectedMonthlyAmount);
+		let parsed: ParsedMoney;
+		try {
+			parsed = parseMoneyString(params.expectedMonthlyAmount);
+		} catch (e) {
+			throw new IncomeError(
+				"INCOME_INVALID_INPUT",
+				`Invalid expectedMonthlyAmount: ${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
 		if (parsed.cents <= 0n) {
 			throw new IncomeError(
 				"INCOME_INVALID_INPUT",
@@ -160,7 +168,15 @@ export async function createIncomeSource(
 				"expectedMonthlyAmount is required for SEASONAL_ANNUALIZED reference method",
 			);
 		}
-		const parsed = parseMoneyString(params.expectedMonthlyAmount);
+		let parsed: ParsedMoney;
+		try {
+			parsed = parseMoneyString(params.expectedMonthlyAmount);
+		} catch (e) {
+			throw new IncomeError(
+				"INCOME_INVALID_INPUT",
+				`Invalid expectedMonthlyAmount: ${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
 		if (parsed.cents <= 0n) {
 			throw new IncomeError(
 				"INCOME_INVALID_INPUT",
@@ -219,29 +235,31 @@ export async function createIncomeSource(
 			);
 		}
 		if (params.expectedMonthlyAmount) {
-			const parsed = parseMoneyString(params.expectedMonthlyAmount);
+			let parsed: ParsedMoney;
+			try {
+				parsed = parseMoneyString(params.expectedMonthlyAmount);
+			} catch (e) {
+				throw new IncomeError(
+					"INCOME_INVALID_INPUT",
+					`Invalid expectedMonthlyAmount: ${e instanceof Error ? e.message : String(e)}`,
+				);
+			}
 			normalizedExpectedMonthlyAmount = parsed.normalized;
 		}
 	}
 
 	// Active date range validation
-	const activeFrom = params.activeFrom?.trim();
-	if (!activeFrom || !DATE_FORMAT_REGEX.test(activeFrom)) {
+	if (!params.activeFrom) {
 		throw new IncomeError(
 			"INCOME_INVALID_INPUT",
-			"activeFrom must be a valid date formatted as YYYY-MM-DD",
+			"activeFrom is required and must be a valid date formatted as YYYY-MM-DD",
 		);
 	}
+	const activeFrom = validateIsoCalendarDate(params.activeFrom);
 
 	let activeUntil: string | null = null;
 	if (params.activeUntil) {
-		activeUntil = params.activeUntil.trim();
-		if (!DATE_FORMAT_REGEX.test(activeUntil)) {
-			throw new IncomeError(
-				"INCOME_INVALID_INPUT",
-				"activeUntil must be a valid date formatted as YYYY-MM-DD",
-			);
-		}
+		activeUntil = validateIsoCalendarDate(params.activeUntil);
 		if (activeUntil < activeFrom) {
 			throw new IncomeError(
 				"INCOME_INVALID_INPUT",

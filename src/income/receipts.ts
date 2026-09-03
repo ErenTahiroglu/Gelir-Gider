@@ -7,7 +7,7 @@ import {
 	incomeSources,
 } from "../db/schema/income";
 import { ledgerAccounts } from "../db/schema/ledger";
-import { parseMoneyString } from "../ledger/money";
+import { type ParsedMoney, parseMoneyString } from "../ledger/money";
 import { CanonicalTransactionError } from "../transactions/errors";
 import {
 	type BoundCanonicalTransactionResult,
@@ -16,6 +16,7 @@ import {
 	voidCanonicalTransactionWithLedgerInTransaction,
 } from "../transactions/ledger-lifecycle";
 import type { TransactionSourceInput } from "../transactions/service";
+import { getIstanbulCalendarDate } from "./calendar";
 import { IncomeError } from "./errors";
 
 export interface IncomeReceiptItem {
@@ -86,10 +87,6 @@ export interface ListIncomeReceiptsParams {
 	includeVoided?: boolean | undefined;
 }
 
-function formatDateToIsoDay(d: Date): string {
-	return d.toISOString().slice(0, 10);
-}
-
 /**
  * Creates an actual cash income receipt with canonical revision, double-entry ledger posting, and domain projection in ONE transaction.
  */
@@ -135,7 +132,15 @@ export async function createIncomeReceipt(
 		);
 	}
 
-	const parsedAmount = parseMoneyString(amount);
+	let parsedAmount: ParsedMoney;
+	try {
+		parsedAmount = parseMoneyString(amount);
+	} catch (e) {
+		throw new IncomeError(
+			"INCOME_INVALID_INPUT",
+			`Invalid income receipt amount: ${e instanceof Error ? e.message : String(e)}`,
+		);
+	}
 	if (parsedAmount.cents <= 0n) {
 		throw new IncomeError(
 			"INCOME_INVALID_INPUT",
@@ -194,8 +199,8 @@ export async function createIncomeReceipt(
 			);
 		}
 
-		// Check active window
-		const receivedDay = formatDateToIsoDay(receivedAt);
+		// Check active window in Europe/Istanbul
+		const receivedDay = getIstanbulCalendarDate(receivedAt);
 		if (
 			receivedDay < source.activeFrom ||
 			(source.activeUntil !== null && receivedDay > source.activeUntil)
@@ -206,7 +211,7 @@ export async function createIncomeReceipt(
 			);
 		}
 
-		// 3. Fetch and validate destination ledger account
+		// 3. Fetch and validate destination ledger account (immutable attributes)
 		const [destAccount] = await tx
 			.select()
 			.from(ledgerAccounts)
@@ -242,12 +247,8 @@ export async function createIncomeReceipt(
 			);
 		}
 
-		if (destAccount.archivedAt !== null) {
-			throw new IncomeError(
-				"INCOME_DESTINATION_ACCOUNT_INVALID",
-				"Cannot post income receipt to an archived destination account",
-			);
-		}
+		// Note: We do NOT reject destAccount.archivedAt !== null here so historical replays succeed.
+		// Fresh postings to an archived destination will be rejected by postJournalEntryInTransaction.
 
 		// 4. Construct canonical payload and bound ledger lines
 		const canonicalPayload: Record<string, unknown> = {
@@ -288,7 +289,8 @@ export async function createIncomeReceipt(
 		} catch (err) {
 			if (
 				err instanceof CanonicalTransactionError &&
-				err.code === "TRANSACTION_LEDGER_EFFECT_CONFLICT"
+				(err.code === "TRANSACTION_IDEMPOTENCY_CONFLICT" ||
+					err.code === "TRANSACTION_LEDGER_EFFECT_CONFLICT")
 			) {
 				throw new IncomeError(
 					"INCOME_IDEMPOTENCY_CONFLICT",
@@ -299,7 +301,10 @@ export async function createIncomeReceipt(
 				err instanceof CanonicalTransactionError &&
 				err.code === "TRANSACTION_LEDGER_EFFECT_INVALID"
 			) {
-				throw new IncomeError("INCOME_INVALID_INPUT", err.message);
+				throw new IncomeError(
+					"INCOME_DESTINATION_ACCOUNT_INVALID",
+					err.message,
+				);
 			}
 			throw err;
 		}
@@ -487,7 +492,15 @@ export async function reviseIncomeReceipt(
 		);
 	}
 
-	const parsedAmount = parseMoneyString(amount);
+	let parsedAmount: ParsedMoney;
+	try {
+		parsedAmount = parseMoneyString(amount);
+	} catch (e) {
+		throw new IncomeError(
+			"INCOME_INVALID_INPUT",
+			`Invalid income receipt amount: ${e instanceof Error ? e.message : String(e)}`,
+		);
+	}
 	if (parsedAmount.cents <= 0n) {
 		throw new IncomeError(
 			"INCOME_INVALID_INPUT",
@@ -565,7 +578,19 @@ export async function reviseIncomeReceipt(
 			);
 		}
 
-		// 4. Fetch destination account
+		// Check active window in Europe/Istanbul
+		const receivedDay = getIstanbulCalendarDate(receivedAt);
+		if (
+			receivedDay < source.activeFrom ||
+			(source.activeUntil !== null && receivedDay > source.activeUntil)
+		) {
+			throw new IncomeError(
+				"INCOME_INVALID_INPUT",
+				`Received date ${receivedDay} is outside income source active window (${source.activeFrom} to ${source.activeUntil ?? "unbounded"})`,
+			);
+		}
+
+		// 4. Fetch destination account (immutable attributes)
 		const [destAccount] = await tx
 			.select()
 			.from(ledgerAccounts)
@@ -601,12 +626,8 @@ export async function reviseIncomeReceipt(
 			);
 		}
 
-		if (destAccount.archivedAt !== null) {
-			throw new IncomeError(
-				"INCOME_DESTINATION_ACCOUNT_INVALID",
-				"Cannot post income receipt revision to an archived destination account",
-			);
-		}
+		// Note: We do NOT reject destAccount.archivedAt !== null here so historical replays succeed.
+		// Fresh postings to an archived destination will be rejected by postJournalEntryInTransaction.
 
 		// 5. Fetch previous projection revision
 		const [prevRev] = await tx
@@ -668,7 +689,8 @@ export async function reviseIncomeReceipt(
 		} catch (err) {
 			if (
 				err instanceof CanonicalTransactionError &&
-				err.code === "TRANSACTION_LEDGER_EFFECT_CONFLICT"
+				(err.code === "TRANSACTION_IDEMPOTENCY_CONFLICT" ||
+					err.code === "TRANSACTION_LEDGER_EFFECT_CONFLICT")
 			) {
 				throw new IncomeError(
 					"INCOME_IDEMPOTENCY_CONFLICT",
@@ -679,7 +701,10 @@ export async function reviseIncomeReceipt(
 				err instanceof CanonicalTransactionError &&
 				err.code === "TRANSACTION_LEDGER_EFFECT_INVALID"
 			) {
-				throw new IncomeError("INCOME_INVALID_INPUT", err.message);
+				throw new IncomeError(
+					"INCOME_DESTINATION_ACCOUNT_INVALID",
+					err.message,
+				);
 			}
 			throw err;
 		}
@@ -876,7 +901,8 @@ export async function voidIncomeReceipt(
 		} catch (err) {
 			if (
 				err instanceof CanonicalTransactionError &&
-				err.code === "TRANSACTION_LEDGER_EFFECT_CONFLICT"
+				(err.code === "TRANSACTION_IDEMPOTENCY_CONFLICT" ||
+					err.code === "TRANSACTION_LEDGER_EFFECT_CONFLICT")
 			) {
 				throw new IncomeError(
 					"INCOME_IDEMPOTENCY_CONFLICT",

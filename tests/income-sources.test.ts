@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Database } from "../src/db/client";
 import { users } from "../src/db/schema/auth";
 import { ledgerAccounts } from "../src/db/schema/ledger";
+import { IncomeError } from "../src/income/errors";
 import { archiveIncomeSource, createIncomeSource } from "../src/income/sources";
 
 describe("Income Sources Service", () => {
@@ -289,5 +290,149 @@ describe("Income Sources Service", () => {
 		});
 
 		expect(res.archivedAt).toBeInstanceOf(Date);
+	});
+
+	it("strictly validates calendar dates and rejects impossible dates with INCOME_INVALID_INPUT", async () => {
+		const mockDb = {
+			select: vi.fn().mockImplementation(() => ({
+				from: vi.fn().mockImplementation((table) => ({
+					where: vi.fn().mockImplementation(() => ({
+						limit: vi.fn().mockImplementation(() => {
+							if (table === users)
+								return Promise.resolve([{ currency: "TRY" }]);
+							if (table === ledgerAccounts) {
+								return Promise.resolve([
+									{
+										id: "ledger-acc-1",
+										userId: "user-1",
+										accountType: "INCOME",
+										normalBalance: "CREDIT",
+										currency: "TRY",
+										archivedAt: null,
+									},
+								]);
+							}
+							return Promise.resolve([]);
+						}),
+					})),
+				})),
+			})),
+		} as unknown as Database;
+
+		const invalidDates = [
+			"2026-02-30", // Feb never has 30 days
+			"2027-02-29", // 2027 is not a leap year
+			"2026-13-01", // Month 13
+			"2026-00-10", // Month 0
+			"2026-04-31", // April has 30 days
+			"2026-06-31", // June has 30 days
+			"2026-09-31", // September has 30 days
+			"2026-11-31", // November has 30 days
+			"invalid-date",
+		];
+
+		for (const d of invalidDates) {
+			await expect(
+				createIncomeSource({
+					db: mockDb,
+					userId: "user-1",
+					code: "TEST",
+					name: "Test Source",
+					nature: "REGULAR",
+					referenceMethod: "FIXED_MONTHLY",
+					expectedMonthlyAmount: "1000.00",
+					incomeLedgerAccountId: "ledger-acc-1",
+					activeFrom: d,
+				}),
+			).rejects.toSatisfy(
+				(e: unknown) =>
+					e instanceof IncomeError && e.code === "INCOME_INVALID_INPUT",
+			);
+		}
+	});
+
+	it("accepts valid leap year calendar date (2028-02-29)", async () => {
+		const mockDb = {
+			select: vi.fn().mockImplementation(() => ({
+				from: vi.fn().mockImplementation((table) => ({
+					where: vi.fn().mockImplementation(() => ({
+						limit: vi.fn().mockImplementation(() => {
+							if (table === users)
+								return Promise.resolve([{ currency: "TRY" }]);
+							if (table === ledgerAccounts) {
+								return Promise.resolve([
+									{
+										id: "ledger-acc-1",
+										userId: "user-1",
+										accountType: "INCOME",
+										normalBalance: "CREDIT",
+										currency: "TRY",
+										archivedAt: null,
+									},
+								]);
+							}
+							return Promise.resolve([]);
+						}),
+					})),
+				})),
+			})),
+			insert: vi.fn().mockImplementation(() => ({
+				values: vi.fn().mockImplementation((vals) => ({
+					onConflictDoNothing: vi.fn().mockImplementation(() => ({
+						returning: vi.fn().mockResolvedValue([
+							{
+								...vals,
+								id: "source-leap",
+								createdAt: new Date(),
+								archivedAt: null,
+							},
+						]),
+					})),
+				})),
+			})),
+		} as unknown as Database;
+
+		const res = await createIncomeSource({
+			db: mockDb,
+			userId: "user-1",
+			code: "LEAP",
+			name: "Leap Year Source",
+			nature: "REGULAR",
+			referenceMethod: "FIXED_MONTHLY",
+			expectedMonthlyAmount: "1000.00",
+			incomeLedgerAccountId: "ledger-acc-1",
+			activeFrom: "2028-02-29",
+		});
+
+		expect(res.activeFrom).toBe("2028-02-29");
+	});
+
+	it("wraps money parsing errors in INCOME_INVALID_INPUT", async () => {
+		const mockDb = {
+			select: vi.fn().mockImplementation(() => ({
+				from: vi.fn().mockImplementation(() => ({
+					where: vi.fn().mockImplementation(() => ({
+						limit: vi.fn().mockResolvedValue([{ currency: "TRY" }]),
+					})),
+				})),
+			})),
+		} as unknown as Database;
+
+		await expect(
+			createIncomeSource({
+				db: mockDb,
+				userId: "user-1",
+				code: "TEST",
+				name: "Test Source",
+				nature: "REGULAR",
+				referenceMethod: "FIXED_MONTHLY",
+				expectedMonthlyAmount: "invalid-amount",
+				incomeLedgerAccountId: "ledger-acc-1",
+				activeFrom: "2026-01-01",
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof IncomeError && e.code === "INCOME_INVALID_INPUT",
+		);
 	});
 });
