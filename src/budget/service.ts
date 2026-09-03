@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte } from "drizzle-orm";
 import type { Database } from "../db/client";
 import { users } from "../db/schema/auth";
 import {
@@ -9,10 +9,8 @@ import {
 	canonicalTransactions,
 	transactionRevisions,
 } from "../db/schema/transactions";
-import {
-	getIstanbulDateAtMidnightUtc,
-	validatePeriodMonth,
-} from "../income/calendar";
+import { getIstanbulDateAtMidnightUtc } from "../income/calendar";
+import { IncomeError } from "../income/errors";
 import { getMonthlyReferenceIncome } from "../income/reference";
 import {
 	createCanonicalTransactionInTransaction,
@@ -26,7 +24,12 @@ import {
 	PERSONAL_BUDGET_V1,
 	type PersonalBudgetV1Result,
 } from "./policy";
-import { isBudgetPeriodUniqueViolation, normalizeUuid } from "./utils";
+import {
+	isBudgetPeriodUniqueViolation,
+	mapCanonicalError,
+	normalizeUuid,
+	validateBudgetPeriodMonth,
+} from "./utils";
 
 export type BudgetPlanStatus = "ACTIVE" | "VOIDED";
 
@@ -205,7 +208,8 @@ function buildCanonicalPayload(
 /**
  * Creates a new monthly budget plan.
  * Implements historical idempotency first: if the idempotency key was previously
- * used for creation, returns the historical record without re-evaluating reference income.
+ * used for creation, calls the canonical service with the stored payload/occurredAt
+ * to validate the fingerprint before returning the stored plan.
  */
 export async function createMonthlyBudgetPlan(
 	params: CreateMonthlyBudgetPlanParams,
@@ -216,7 +220,8 @@ export async function createMonthlyBudgetPlan(
 		throw new BudgetError("BUDGET_INVALID_INPUT", "User ID is required");
 	}
 
-	const validPeriod = validatePeriodMonth(periodMonth);
+	// Defect H: validateBudgetPeriodMonth maps IncomeError -> BudgetError
+	const validPeriod = validateBudgetPeriodMonth(periodMonth);
 
 	const trimmedIdempotencyKey = idempotencyKey?.trim();
 	if (!trimmedIdempotencyKey) {
@@ -226,7 +231,7 @@ export async function createMonthlyBudgetPlan(
 		);
 	}
 
-	// 1. HISTORICAL IDEMPOTENCY CHECK FIRST
+	// 1. HISTORICAL IDEMPOTENCY CHECK FIRST (before fresh transaction)
 	// Check if a canonical transaction already exists with this creation idempotency key.
 	const [existingCanon] = await db
 		.select()
@@ -247,6 +252,7 @@ export async function createMonthlyBudgetPlan(
 			);
 		}
 
+		// Load plan identity
 		const [plan] = await db
 			.select()
 			.from(monthlyBudgetPlans)
@@ -272,6 +278,7 @@ export async function createMonthlyBudgetPlan(
 			);
 		}
 
+		// Load budget revision #1
 		const [rev1] = await db
 			.select()
 			.from(monthlyBudgetPlanRevisions)
@@ -291,205 +298,304 @@ export async function createMonthlyBudgetPlan(
 			);
 		}
 
-		return {
-			budgetPlan: formatBudgetPlanItem(plan, rev1),
-			idempotentReplay: true,
-		};
-	}
-
-	// 2. FRESH PLAN CREATION (in 1 outer transaction)
-	const occurredAt = getIstanbulDateAtMidnightUtc(validPeriod);
-
-	return await db.transaction(async (tx) => {
-		// Fetch user for currency
-		const [user] = await tx
-			.select({ currency: users.currency })
-			.from(users)
-			.where(eq(users.id, userId))
-			.limit(1);
-
-		if (!user) {
-			throw new BudgetError("BUDGET_INVALID_INPUT", "User not found");
-		}
-
-		// Check if a plan already exists for this period
-		const [existingPlan] = await tx
+		// Load stored canonical revision #1 for payload + occurredAt
+		const [storedCanonRev] = await db
 			.select()
-			.from(monthlyBudgetPlans)
+			.from(transactionRevisions)
 			.where(
 				and(
-					eq(monthlyBudgetPlans.userId, userId),
-					eq(monthlyBudgetPlans.periodMonth, validPeriod),
+					eq(transactionRevisions.transactionId, existingCanon.id),
+					eq(transactionRevisions.revisionNo, 1),
 				),
 			)
 			.limit(1);
 
-		if (existingPlan) {
+		if (!storedCanonRev) {
 			throw new BudgetError(
-				"BUDGET_PERIOD_CONFLICT",
-				`Monthly budget plan already exists for period "${validPeriod}"`,
+				"BUDGET_INVALID_STATE",
+				"Corrupted state: canonical revision #1 is missing",
 			);
 		}
 
-		// Compute reference income
-		const refIncome = await getMonthlyReferenceIncome({
-			db: tx,
-			userId,
-			asOf: validPeriod,
+		// Validate historical linkage integrity
+		if (
+			rev1.canonicalRevisionId !== storedCanonRev.id ||
+			storedCanonRev.revisionNo !== 1 ||
+			storedCanonRev.operation !== "CREATE"
+		) {
+			throw new BudgetError(
+				"BUDGET_INVALID_STATE",
+				"Historical budget plan revision linkage is inconsistent with canonical revision",
+			);
+		}
+
+		// Defect B: Run canonical fingerprint validation with stored payload/occurredAt.
+		// This ensures changed provenance is rejected with BUDGET_IDEMPOTENCY_CONFLICT.
+		// Reference income is NOT recomputed.
+		return await db.transaction(async (tx) => {
+			try {
+				const canonRes = await createCanonicalTransactionInTransaction({
+					tx,
+					userId,
+					kind: "MONTHLY_BUDGET_PLAN",
+					idempotencyKey: trimmedIdempotencyKey,
+					occurredAt: storedCanonRev.occurredAt,
+					payload: storedCanonRev.payload as Record<string, unknown>,
+					source: provenance,
+				});
+
+				if (!canonRes.idempotentReplay) {
+					throw new BudgetError(
+						"BUDGET_INVALID_STATE",
+						"Expected canonical idempotent replay but got fresh creation",
+					);
+				}
+
+				// Validate projection consistency
+				if (
+					plan.canonicalTransactionId !== canonRes.transactionId ||
+					rev1.canonicalRevisionId !== canonRes.revisionId
+				) {
+					throw new BudgetError(
+						"BUDGET_INVALID_STATE",
+						"Historical budget plan projection does not match canonical replay result",
+					);
+				}
+
+				return {
+					budgetPlan: formatBudgetPlanItem(plan, rev1),
+					idempotentReplay: true,
+				};
+			} catch (err: unknown) {
+				mapCanonicalError(err);
+			}
 		});
+	}
 
-		const normalizedSnapshot: Record<string, unknown> = {
-			asOf: refIncome.asOf,
-			currency: refIncome.currency,
-			total: refIncome.total,
-			sources: refIncome.sources.map((s) => ({
-				sourceId: s.sourceId,
-				code: s.code,
-				name: s.name,
-				nature: s.nature,
-				referenceMethod: s.referenceMethod,
-				referenceAmount: s.referenceAmount,
-			})),
-		};
+	// 2. FRESH PLAN CREATION (in 1 outer transaction with REPEATABLE READ isolation)
+	// Defect E: REPEATABLE READ ensures getMonthlyReferenceIncome sees a consistent snapshot.
+	const occurredAt = getIstanbulDateAtMidnightUtc(validPeriod);
 
-		const allocRes = allocatePersonalBudgetV1(refIncome.total);
-		const canonicalPayload = buildCanonicalPayload(
-			validPeriod,
-			refIncome.currency,
-			allocRes,
-			normalizedSnapshot,
-		);
+	return await db.transaction(
+		async (tx) => {
+			// Fetch user for currency
+			const [user] = await tx
+				.select({ currency: users.currency })
+				.from(users)
+				.where(eq(users.id, userId))
+				.limit(1);
 
-		// Create canonical transaction
-		const canonRes = await createCanonicalTransactionInTransaction({
-			tx,
-			userId,
-			kind: "MONTHLY_BUDGET_PLAN",
-			idempotencyKey: trimmedIdempotencyKey,
-			occurredAt,
-			payload: canonicalPayload,
-			source: provenance,
-		});
+			if (!user) {
+				throw new BudgetError("BUDGET_INVALID_INPUT", "User not found");
+			}
 
-		if (canonRes.idempotentReplay) {
-			const [existingPlanReplay] = await tx
+			// Check if a plan already exists for this period
+			const [existingPlan] = await tx
 				.select()
 				.from(monthlyBudgetPlans)
 				.where(
 					and(
-						eq(
-							monthlyBudgetPlans.canonicalTransactionId,
-							canonRes.transactionId,
-						),
 						eq(monthlyBudgetPlans.userId, userId),
+						eq(monthlyBudgetPlans.periodMonth, validPeriod),
 					),
 				)
 				.limit(1);
 
-			if (!existingPlanReplay) {
-				throw new BudgetError(
-					"BUDGET_INVALID_STATE",
-					"Canonical transaction replay succeeded but budget plan row missing",
-				);
-			}
-
-			const [existingRevReplay] = await tx
-				.select()
-				.from(monthlyBudgetPlanRevisions)
-				.where(
-					and(
-						eq(monthlyBudgetPlanRevisions.budgetPlanId, existingPlanReplay.id),
-						eq(monthlyBudgetPlanRevisions.userId, userId),
-						eq(monthlyBudgetPlanRevisions.revisionNo, 1),
-					),
-				)
-				.limit(1);
-
-			if (!existingRevReplay) {
-				throw new BudgetError(
-					"BUDGET_INVALID_STATE",
-					"Budget plan revision #1 missing on replay",
-				);
-			}
-
-			return {
-				budgetPlan: formatBudgetPlanItem(existingPlanReplay, existingRevReplay),
-				idempotentReplay: true,
-			};
-		}
-
-		// Insert plan identity
-		let createdPlan: typeof monthlyBudgetPlans.$inferSelect | undefined;
-		try {
-			const [inserted] = await tx
-				.insert(monthlyBudgetPlans)
-				.values({
-					userId,
-					periodMonth: validPeriod,
-					canonicalTransactionId: canonRes.transactionId,
-				})
-				.returning();
-			createdPlan = inserted;
-		} catch (err: unknown) {
-			if (isBudgetPeriodUniqueViolation(err)) {
+			if (existingPlan) {
 				throw new BudgetError(
 					"BUDGET_PERIOD_CONFLICT",
 					`Monthly budget plan already exists for period "${validPeriod}"`,
 				);
 			}
-			throw err;
-		}
 
-		if (!createdPlan) {
-			throw new BudgetError(
-				"BUDGET_INVALID_STATE",
-				"Failed to create monthly budget plan identity",
-			);
-		}
+			// Defect H: Map reference engine failures to BUDGET_REFERENCE_INVALID_STATE
+			let refIncome: Awaited<ReturnType<typeof getMonthlyReferenceIncome>>;
+			try {
+				refIncome = await getMonthlyReferenceIncome({
+					db: tx,
+					userId,
+					asOf: validPeriod,
+				});
+			} catch (err: unknown) {
+				if (err instanceof IncomeError) {
+					throw new BudgetError(
+						"BUDGET_REFERENCE_INVALID_STATE",
+						`Reference income calculation failed: ${err.message}`,
+					);
+				}
+				throw err;
+			}
 
-		// Insert revision #1
-		const [createdRev] = await tx
-			.insert(monthlyBudgetPlanRevisions)
-			.values({
-				userId,
-				budgetPlanId: createdPlan.id,
-				canonicalRevisionId: canonRes.revisionId,
-				revisionNo: 1,
-				previousBudgetRevisionId: null,
-				operation: "CREATE",
-				policyVersion: PERSONAL_BUDGET_V1,
+			const normalizedSnapshot: Record<string, unknown> = {
+				asOf: refIncome.asOf,
 				currency: refIncome.currency,
-				referenceIncomeAmount: allocRes.referenceIncome,
-				mandatoryCeilingAmount: allocRes.allocations.MANDATORY_EXPENSE.amount,
-				discretionaryCeilingAmount:
-					allocRes.allocations.DISCRETIONARY_SPEND.amount,
-				shortTermPurchaseAmount:
-					allocRes.allocations.SHORT_TERM_PURCHASE.amount,
-				mediumTermReserveAmount:
-					allocRes.allocations.MEDIUM_TERM_RESERVE.amount,
-				longTermInvestmentAmount:
-					allocRes.allocations.LONG_TERM_INVESTMENT.amount,
-				referenceSnapshot: normalizedSnapshot,
-			})
-			.returning();
+				total: refIncome.total,
+				sources: refIncome.sources.map((s) => ({
+					sourceId: s.sourceId,
+					code: s.code,
+					name: s.name,
+					nature: s.nature,
+					referenceMethod: s.referenceMethod,
+					referenceAmount: s.referenceAmount,
+				})),
+			};
 
-		if (!createdRev) {
-			throw new BudgetError(
-				"BUDGET_INVALID_STATE",
-				"Failed to insert budget plan revision #1",
+			const allocRes = allocatePersonalBudgetV1(refIncome.total);
+			const canonicalPayload = buildCanonicalPayload(
+				validPeriod,
+				refIncome.currency,
+				allocRes,
+				normalizedSnapshot,
 			);
-		}
 
-		return {
-			budgetPlan: formatBudgetPlanItem(createdPlan, createdRev),
-			idempotentReplay: false,
-		};
-	});
+			// Create canonical transaction; map canonical errors
+			let canonRes: Awaited<
+				ReturnType<typeof createCanonicalTransactionInTransaction>
+			>;
+			try {
+				canonRes = await createCanonicalTransactionInTransaction({
+					tx,
+					userId,
+					kind: "MONTHLY_BUDGET_PLAN",
+					idempotencyKey: trimmedIdempotencyKey,
+					occurredAt,
+					payload: canonicalPayload,
+					source: provenance,
+				});
+			} catch (err: unknown) {
+				mapCanonicalError(err);
+			}
+
+			if (canonRes.idempotentReplay) {
+				const [existingPlanReplay] = await tx
+					.select()
+					.from(monthlyBudgetPlans)
+					.where(
+						and(
+							eq(
+								monthlyBudgetPlans.canonicalTransactionId,
+								canonRes.transactionId,
+							),
+							eq(monthlyBudgetPlans.userId, userId),
+						),
+					)
+					.limit(1);
+
+				if (!existingPlanReplay) {
+					throw new BudgetError(
+						"BUDGET_INVALID_STATE",
+						"Canonical transaction replay succeeded but budget plan row missing",
+					);
+				}
+
+				const [existingRevReplay] = await tx
+					.select()
+					.from(monthlyBudgetPlanRevisions)
+					.where(
+						and(
+							eq(
+								monthlyBudgetPlanRevisions.budgetPlanId,
+								existingPlanReplay.id,
+							),
+							eq(monthlyBudgetPlanRevisions.userId, userId),
+							eq(monthlyBudgetPlanRevisions.revisionNo, 1),
+						),
+					)
+					.limit(1);
+
+				if (!existingRevReplay) {
+					throw new BudgetError(
+						"BUDGET_INVALID_STATE",
+						"Budget plan revision #1 missing on replay",
+					);
+				}
+
+				return {
+					budgetPlan: formatBudgetPlanItem(
+						existingPlanReplay,
+						existingRevReplay,
+					),
+					idempotentReplay: true,
+				};
+			}
+
+			// Insert plan identity
+			let createdPlan: typeof monthlyBudgetPlans.$inferSelect | undefined;
+			try {
+				const [inserted] = await tx
+					.insert(monthlyBudgetPlans)
+					.values({
+						userId,
+						periodMonth: validPeriod,
+						canonicalTransactionId: canonRes.transactionId,
+					})
+					.returning();
+				createdPlan = inserted;
+			} catch (err: unknown) {
+				if (isBudgetPeriodUniqueViolation(err)) {
+					throw new BudgetError(
+						"BUDGET_PERIOD_CONFLICT",
+						`Monthly budget plan already exists for period "${validPeriod}"`,
+					);
+				}
+				throw err;
+			}
+
+			if (!createdPlan) {
+				throw new BudgetError(
+					"BUDGET_INVALID_STATE",
+					"Failed to create monthly budget plan identity",
+				);
+			}
+
+			// Insert revision #1
+			const [createdRev] = await tx
+				.insert(monthlyBudgetPlanRevisions)
+				.values({
+					userId,
+					budgetPlanId: createdPlan.id,
+					canonicalRevisionId: canonRes.revisionId,
+					revisionNo: 1,
+					previousBudgetRevisionId: null,
+					operation: "CREATE",
+					policyVersion: PERSONAL_BUDGET_V1,
+					currency: refIncome.currency,
+					referenceIncomeAmount: allocRes.referenceIncome,
+					mandatoryCeilingAmount: allocRes.allocations.MANDATORY_EXPENSE.amount,
+					discretionaryCeilingAmount:
+						allocRes.allocations.DISCRETIONARY_SPEND.amount,
+					shortTermPurchaseAmount:
+						allocRes.allocations.SHORT_TERM_PURCHASE.amount,
+					mediumTermReserveAmount:
+						allocRes.allocations.MEDIUM_TERM_RESERVE.amount,
+					longTermInvestmentAmount:
+						allocRes.allocations.LONG_TERM_INVESTMENT.amount,
+					referenceSnapshot: normalizedSnapshot,
+				})
+				.returning();
+
+			if (!createdRev) {
+				throw new BudgetError(
+					"BUDGET_INVALID_STATE",
+					"Failed to insert budget plan revision #1",
+				);
+			}
+
+			return {
+				budgetPlan: formatBudgetPlanItem(createdPlan, createdRev),
+				idempotentReplay: false,
+			};
+		},
+		{ isolationLevel: "repeatable read" },
+	);
 }
 
 /**
  * Refreshes / recalculates a monthly budget plan based on current reference income.
  * Appends an UPDATE revision.
+ * Defect C: Idempotency replay check is FIRST — before VOID guard — and calls
+ * reviseCanonicalTransactionInTransaction with stored payload/occurredAt to validate fingerprint.
+ * Defect E: REPEATABLE READ for fresh refresh path.
  */
 export async function refreshMonthlyBudgetPlan(
 	params: RefreshMonthlyBudgetPlanParams,
@@ -524,79 +630,215 @@ export async function refreshMonthlyBudgetPlan(
 		throw new BudgetError("BUDGET_INVALID_INPUT", "Reason code is required");
 	}
 
-	return await db.transaction(async (tx) => {
-		// 1. Lock budget plan identity
-		const [plan] = await tx
-			.select()
-			.from(monthlyBudgetPlans)
-			.where(
-				and(
-					eq(monthlyBudgetPlans.id, canonicalPlanId),
-					eq(monthlyBudgetPlans.userId, userId),
-				),
-			)
-			.for("update")
-			.limit(1);
+	return await db.transaction(
+		async (tx) => {
+			// 1. Lock/resolve budget plan identity
+			const [plan] = await tx
+				.select()
+				.from(monthlyBudgetPlans)
+				.where(
+					and(
+						eq(monthlyBudgetPlans.id, canonicalPlanId),
+						eq(monthlyBudgetPlans.userId, userId),
+					),
+				)
+				.for("update")
+				.limit(1);
 
-		if (!plan) {
-			throw new BudgetError(
-				"BUDGET_PLAN_NOT_FOUND",
-				`Monthly budget plan "${canonicalPlanId}" not found`,
-			);
-		}
+			if (!plan) {
+				throw new BudgetError(
+					"BUDGET_PLAN_NOT_FOUND",
+					`Monthly budget plan "${canonicalPlanId}" not found`,
+				);
+			}
 
-		// 2. Fetch authoritative latest revision
-		const [latestRev] = await tx
-			.select()
-			.from(monthlyBudgetPlanRevisions)
-			.where(
-				and(
-					eq(monthlyBudgetPlanRevisions.budgetPlanId, plan.id),
-					eq(monthlyBudgetPlanRevisions.userId, userId),
-				),
-			)
-			.orderBy(desc(monthlyBudgetPlanRevisions.revisionNo))
-			.limit(1);
-
-		if (!latestRev) {
-			throw new BudgetError(
-				"BUDGET_INVALID_STATE",
-				"Monthly budget plan has no revisions",
-			);
-		}
-
-		if (latestRev.operation === "VOID") {
-			throw new BudgetError(
-				"BUDGET_ALREADY_VOIDED",
-				`Cannot refresh VOIDED monthly budget plan "${plan.id}"`,
-			);
-		}
-
-		// 3. Check expected revision and possible idempotent replay
-		if (latestRev.revisionNo !== expectedRevisionNo) {
-			// Check if latest revision was created with this idempotency key and expectedRevisionNo was latestRev.revisionNo - 1
-			const [replayRev] = await tx
+			// 2. Defect C: HISTORICAL IDEMPOTENCY CHECK FIRST (before VOID guard, before reference recomputation)
+			const [existingCanonRev] = await tx
 				.select()
 				.from(transactionRevisions)
 				.where(
 					and(
 						eq(transactionRevisions.transactionId, plan.canonicalTransactionId),
 						eq(transactionRevisions.idempotencyKey, trimmedIdempotencyKey),
+						eq(transactionRevisions.operation, "UPDATE"),
 					),
 				)
 				.limit(1);
 
-			if (
-				replayRev &&
-				replayRev.revisionNo === expectedRevisionNo + 1 &&
-				replayRev.operation === "UPDATE"
-			) {
+			if (existingCanonRev) {
+				let canonRes: Awaited<
+					ReturnType<typeof reviseCanonicalTransactionInTransaction>
+				>;
+				try {
+					canonRes = await reviseCanonicalTransactionInTransaction({
+						tx,
+						userId,
+						transactionId: plan.canonicalTransactionId,
+						expectedRevisionNo: existingCanonRev.revisionNo - 1,
+						idempotencyKey: trimmedIdempotencyKey,
+						occurredAt: existingCanonRev.occurredAt,
+						payload: existingCanonRev.payload as Record<string, unknown>,
+						reasonCode: trimmedReasonCode,
+						reasonNote,
+						source: provenance,
+					});
+				} catch (err: unknown) {
+					mapCanonicalError(err);
+				}
+
+				if (!canonRes.idempotentReplay) {
+					throw new BudgetError(
+						"BUDGET_INVALID_STATE",
+						"Expected canonical idempotent replay but got fresh revision",
+					);
+				}
+
 				const [storedPlanRev] = await tx
 					.select()
 					.from(monthlyBudgetPlanRevisions)
 					.where(
 						and(
-							eq(monthlyBudgetPlanRevisions.canonicalRevisionId, replayRev.id),
+							eq(
+								monthlyBudgetPlanRevisions.canonicalRevisionId,
+								canonRes.revisionId,
+							),
+							eq(monthlyBudgetPlanRevisions.userId, userId),
+						),
+					)
+					.limit(1);
+
+				if (!storedPlanRev) {
+					throw new BudgetError(
+						"BUDGET_INVALID_STATE",
+						"Idempotent refresh replay: budget plan revision row missing",
+					);
+				}
+
+				if (
+					plan.canonicalTransactionId !== canonRes.transactionId ||
+					storedPlanRev.canonicalRevisionId !== canonRes.revisionId ||
+					storedPlanRev.revisionNo !== canonRes.revisionNo ||
+					storedPlanRev.operation !== canonRes.operation
+				) {
+					throw new BudgetError(
+						"BUDGET_INVALID_STATE",
+						"Historical budget plan projection does not match canonical replay result",
+					);
+				}
+
+				return {
+					budgetPlan: formatBudgetPlanItem(plan, storedPlanRev),
+					idempotentReplay: true,
+				};
+			}
+
+			// 3. FRESH REFRESH: fetch authoritative latest revision
+			const [latestRev] = await tx
+				.select()
+				.from(monthlyBudgetPlanRevisions)
+				.where(
+					and(
+						eq(monthlyBudgetPlanRevisions.budgetPlanId, plan.id),
+						eq(monthlyBudgetPlanRevisions.userId, userId),
+					),
+				)
+				.orderBy(desc(monthlyBudgetPlanRevisions.revisionNo))
+				.limit(1);
+
+			if (!latestRev) {
+				throw new BudgetError(
+					"BUDGET_INVALID_STATE",
+					"Monthly budget plan has no revisions",
+				);
+			}
+
+			if (latestRev.operation === "VOID") {
+				throw new BudgetError(
+					"BUDGET_ALREADY_VOIDED",
+					`Cannot refresh VOIDED monthly budget plan "${plan.id}"`,
+				);
+			}
+
+			if (latestRev.revisionNo !== expectedRevisionNo) {
+				throw new BudgetError(
+					"BUDGET_REVISION_CONFLICT",
+					`Expected revision ${expectedRevisionNo}, but latest revision is ${latestRev.revisionNo}`,
+				);
+			}
+
+			// 4. Recompute reference income for the plan's period (Defect H: error boundary)
+			let refIncome: Awaited<ReturnType<typeof getMonthlyReferenceIncome>>;
+			try {
+				refIncome = await getMonthlyReferenceIncome({
+					db: tx,
+					userId,
+					asOf: plan.periodMonth,
+				});
+			} catch (err: unknown) {
+				if (err instanceof IncomeError) {
+					throw new BudgetError(
+						"BUDGET_REFERENCE_INVALID_STATE",
+						`Reference income calculation failed: ${err.message}`,
+					);
+				}
+				throw err;
+			}
+
+			const normalizedSnapshot: Record<string, unknown> = {
+				asOf: refIncome.asOf,
+				currency: refIncome.currency,
+				total: refIncome.total,
+				sources: refIncome.sources.map((s) => ({
+					sourceId: s.sourceId,
+					code: s.code,
+					name: s.name,
+					nature: s.nature,
+					referenceMethod: s.referenceMethod,
+					referenceAmount: s.referenceAmount,
+				})),
+			};
+
+			const allocRes = allocatePersonalBudgetV1(refIncome.total);
+			const canonicalPayload = buildCanonicalPayload(
+				plan.periodMonth,
+				refIncome.currency,
+				allocRes,
+				normalizedSnapshot,
+			);
+
+			const occurredAt = getIstanbulDateAtMidnightUtc(plan.periodMonth);
+
+			// 5. Revise canonical transaction (Defect H: canonical error boundary)
+			let canonRes: Awaited<
+				ReturnType<typeof reviseCanonicalTransactionInTransaction>
+			>;
+			try {
+				canonRes = await reviseCanonicalTransactionInTransaction({
+					tx,
+					userId,
+					transactionId: plan.canonicalTransactionId,
+					expectedRevisionNo,
+					idempotencyKey: trimmedIdempotencyKey,
+					occurredAt,
+					payload: canonicalPayload,
+					reasonCode: trimmedReasonCode,
+					reasonNote,
+					source: provenance,
+				});
+			} catch (err: unknown) {
+				mapCanonicalError(err);
+			}
+
+			if (canonRes.idempotentReplay) {
+				const [storedPlanRev] = await tx
+					.select()
+					.from(monthlyBudgetPlanRevisions)
+					.where(
+						and(
+							eq(
+								monthlyBudgetPlanRevisions.canonicalRevisionId,
+								canonRes.revisionId,
+							),
 							eq(monthlyBudgetPlanRevisions.userId, userId),
 						),
 					)
@@ -610,123 +852,53 @@ export async function refreshMonthlyBudgetPlan(
 				}
 			}
 
-			throw new BudgetError(
-				"BUDGET_REVISION_CONFLICT",
-				`Expected revision ${expectedRevisionNo}, but latest revision is ${latestRev.revisionNo}`,
-			);
-		}
+			// 6. Insert new revision
+			const [newRev] = await tx
+				.insert(monthlyBudgetPlanRevisions)
+				.values({
+					userId,
+					budgetPlanId: plan.id,
+					canonicalRevisionId: canonRes.revisionId,
+					revisionNo: expectedRevisionNo + 1,
+					previousBudgetRevisionId: latestRev.id,
+					operation: "UPDATE",
+					policyVersion: PERSONAL_BUDGET_V1,
+					currency: refIncome.currency,
+					referenceIncomeAmount: allocRes.referenceIncome,
+					mandatoryCeilingAmount: allocRes.allocations.MANDATORY_EXPENSE.amount,
+					discretionaryCeilingAmount:
+						allocRes.allocations.DISCRETIONARY_SPEND.amount,
+					shortTermPurchaseAmount:
+						allocRes.allocations.SHORT_TERM_PURCHASE.amount,
+					mediumTermReserveAmount:
+						allocRes.allocations.MEDIUM_TERM_RESERVE.amount,
+					longTermInvestmentAmount:
+						allocRes.allocations.LONG_TERM_INVESTMENT.amount,
+					referenceSnapshot: normalizedSnapshot,
+				})
+				.returning();
 
-		// 4. Recompute reference income for the plan's period
-		const refIncome = await getMonthlyReferenceIncome({
-			db: tx,
-			userId,
-			asOf: plan.periodMonth,
-		});
-
-		const normalizedSnapshot: Record<string, unknown> = {
-			asOf: refIncome.asOf,
-			currency: refIncome.currency,
-			total: refIncome.total,
-			sources: refIncome.sources.map((s) => ({
-				sourceId: s.sourceId,
-				code: s.code,
-				name: s.name,
-				nature: s.nature,
-				referenceMethod: s.referenceMethod,
-				referenceAmount: s.referenceAmount,
-			})),
-		};
-
-		const allocRes = allocatePersonalBudgetV1(refIncome.total);
-		const canonicalPayload = buildCanonicalPayload(
-			plan.periodMonth,
-			refIncome.currency,
-			allocRes,
-			normalizedSnapshot,
-		);
-
-		const occurredAt = getIstanbulDateAtMidnightUtc(plan.periodMonth);
-
-		// 5. Revise canonical transaction
-		const canonRes = await reviseCanonicalTransactionInTransaction({
-			tx,
-			userId,
-			transactionId: plan.canonicalTransactionId,
-			expectedRevisionNo,
-			idempotencyKey: trimmedIdempotencyKey,
-			occurredAt,
-			payload: canonicalPayload,
-			reasonCode: trimmedReasonCode,
-			reasonNote,
-			source: provenance,
-		});
-
-		if (canonRes.idempotentReplay) {
-			const [storedPlanRev] = await tx
-				.select()
-				.from(monthlyBudgetPlanRevisions)
-				.where(
-					and(
-						eq(
-							monthlyBudgetPlanRevisions.canonicalRevisionId,
-							canonRes.revisionId,
-						),
-						eq(monthlyBudgetPlanRevisions.userId, userId),
-					),
-				)
-				.limit(1);
-
-			if (storedPlanRev) {
-				return {
-					budgetPlan: formatBudgetPlanItem(plan, storedPlanRev),
-					idempotentReplay: true,
-				};
+			if (!newRev) {
+				throw new BudgetError(
+					"BUDGET_INVALID_STATE",
+					"Failed to insert updated budget plan revision",
+				);
 			}
-		}
 
-		// 6. Insert new revision
-		const [newRev] = await tx
-			.insert(monthlyBudgetPlanRevisions)
-			.values({
-				userId,
-				budgetPlanId: plan.id,
-				canonicalRevisionId: canonRes.revisionId,
-				revisionNo: expectedRevisionNo + 1,
-				previousBudgetRevisionId: latestRev.id,
-				operation: "UPDATE",
-				policyVersion: PERSONAL_BUDGET_V1,
-				currency: refIncome.currency,
-				referenceIncomeAmount: allocRes.referenceIncome,
-				mandatoryCeilingAmount: allocRes.allocations.MANDATORY_EXPENSE.amount,
-				discretionaryCeilingAmount:
-					allocRes.allocations.DISCRETIONARY_SPEND.amount,
-				shortTermPurchaseAmount:
-					allocRes.allocations.SHORT_TERM_PURCHASE.amount,
-				mediumTermReserveAmount:
-					allocRes.allocations.MEDIUM_TERM_RESERVE.amount,
-				longTermInvestmentAmount:
-					allocRes.allocations.LONG_TERM_INVESTMENT.amount,
-				referenceSnapshot: normalizedSnapshot,
-			})
-			.returning();
-
-		if (!newRev) {
-			throw new BudgetError(
-				"BUDGET_INVALID_STATE",
-				"Failed to insert updated budget plan revision",
-			);
-		}
-
-		return {
-			budgetPlan: formatBudgetPlanItem(plan, newRev),
-			idempotentReplay: false,
-		};
-	});
+			return {
+				budgetPlan: formatBudgetPlanItem(plan, newRev),
+				idempotentReplay: false,
+			};
+		},
+		{ isolationLevel: "repeatable read" },
+	);
 }
 
 /**
  * Voids a monthly budget plan.
  * Appends a VOID revision copying predecessor values exactly.
+ * Defect D: Manual VOID replay check removed — voidCanonicalTransactionInTransaction
+ * handles idempotency + fingerprint validation directly.
  */
 export async function voidMonthlyBudgetPlan(
 	params: VoidMonthlyBudgetPlanParams,
@@ -802,55 +974,29 @@ export async function voidMonthlyBudgetPlan(
 			);
 		}
 
-		if (latestRev.operation === "VOID") {
-			// Check if this was an exact replay of the void operation
-			const [replayRev] = await tx
-				.select()
-				.from(transactionRevisions)
-				.where(
-					and(
-						eq(transactionRevisions.transactionId, plan.canonicalTransactionId),
-						eq(transactionRevisions.idempotencyKey, trimmedIdempotencyKey),
-					),
-				)
-				.limit(1);
-
-			if (
-				replayRev &&
-				replayRev.id === latestRev.canonicalRevisionId &&
-				replayRev.operation === "VOID"
-			) {
-				return {
-					budgetPlan: formatBudgetPlanItem(plan, latestRev),
-					idempotentReplay: true,
-				};
-			}
-
-			throw new BudgetError(
-				"BUDGET_ALREADY_VOIDED",
-				`Monthly budget plan "${plan.id}" is already VOIDED`,
-			);
+		// 3. Append canonical VOID revision
+		// Defect D: voidCanonicalTransactionInTransaction handles both:
+		//   - idempotent replay (same key + same fingerprint) -> returns idempotentReplay: true
+		//   - changed reasonCode/provenance -> raises TRANSACTION_IDEMPOTENCY_CONFLICT
+		//   - plan already voided -> raises TRANSACTION_ALREADY_VOIDED
+		//   - revision conflict -> raises TRANSACTION_REVISION_CONFLICT
+		let canonRes: Awaited<
+			ReturnType<typeof voidCanonicalTransactionInTransaction>
+		>;
+		try {
+			canonRes = await voidCanonicalTransactionInTransaction({
+				tx,
+				userId,
+				transactionId: plan.canonicalTransactionId,
+				expectedRevisionNo,
+				idempotencyKey: trimmedIdempotencyKey,
+				reasonCode: trimmedReasonCode,
+				reasonNote,
+				source: provenance,
+			});
+		} catch (err: unknown) {
+			mapCanonicalError(err);
 		}
-
-		// 3. Verify revision sequence
-		if (latestRev.revisionNo !== expectedRevisionNo) {
-			throw new BudgetError(
-				"BUDGET_REVISION_CONFLICT",
-				`Expected revision ${expectedRevisionNo}, but latest revision is ${latestRev.revisionNo}`,
-			);
-		}
-
-		// 4. Append canonical VOID revision
-		const canonRes = await voidCanonicalTransactionInTransaction({
-			tx,
-			userId,
-			transactionId: plan.canonicalTransactionId,
-			expectedRevisionNo,
-			idempotencyKey: trimmedIdempotencyKey,
-			reasonCode: trimmedReasonCode,
-			reasonNote,
-			source: provenance,
-		});
 
 		if (canonRes.idempotentReplay) {
 			const [storedPlanRev] = await tx
@@ -875,7 +1021,15 @@ export async function voidMonthlyBudgetPlan(
 			}
 		}
 
-		// 6. Insert new VOID revision
+		// latestRev must still be the predecessor (not voided) for us to proceed
+		if (latestRev.operation === "VOID") {
+			throw new BudgetError(
+				"BUDGET_ALREADY_VOIDED",
+				`Monthly budget plan "${plan.id}" is already VOIDED`,
+			);
+		}
+
+		// 4. Insert new VOID revision
 		const [newRev] = await tx
 			.insert(monthlyBudgetPlanRevisions)
 			.values({
@@ -938,7 +1092,8 @@ export async function getMonthlyBudgetPlan(
 	}
 
 	if (periodMonth) {
-		const validPeriod = validatePeriodMonth(periodMonth);
+		// Defect H: validateBudgetPeriodMonth maps IncomeError -> BudgetError
+		const validPeriod = validateBudgetPeriodMonth(periodMonth);
 		conditions.push(eq(monthlyBudgetPlans.periodMonth, validPeriod));
 	}
 
@@ -994,14 +1149,31 @@ export async function listMonthlyBudgetPlans(
 
 	const conditions = [eq(monthlyBudgetPlans.userId, userId)];
 
+	// Defect G: Use gte/lte range operators, not equality.
+	// Defect H: validateBudgetPeriodMonth maps IncomeError -> BudgetError.
+	let validFrom: string | undefined;
+	let validUntil: string | undefined;
+
 	if (periodMonthFrom && periodMonthFrom.trim() !== "") {
-		const validFrom = validatePeriodMonth(periodMonthFrom);
-		conditions.push(eq(monthlyBudgetPlans.periodMonth, validFrom));
+		validFrom = validateBudgetPeriodMonth(periodMonthFrom);
+		conditions.push(gte(monthlyBudgetPlans.periodMonth, validFrom));
 	}
 
 	if (periodMonthUntil && periodMonthUntil.trim() !== "") {
-		const validUntil = validatePeriodMonth(periodMonthUntil);
-		conditions.push(eq(monthlyBudgetPlans.periodMonth, validUntil));
+		validUntil = validateBudgetPeriodMonth(periodMonthUntil);
+		conditions.push(lte(monthlyBudgetPlans.periodMonth, validUntil));
+	}
+
+	// Cross-range validation: from must be <= until
+	if (
+		validFrom !== undefined &&
+		validUntil !== undefined &&
+		validFrom > validUntil
+	) {
+		throw new BudgetError(
+			"BUDGET_INVALID_INPUT",
+			`periodMonthFrom "${validFrom}" must not be after periodMonthUntil "${validUntil}"`,
+		);
 	}
 
 	const plans = await db

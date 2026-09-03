@@ -154,6 +154,42 @@ describe("PERSONAL_BUDGET_V1 Policy Allocator", () => {
 		expect(sumCents).toBe(1125000n);
 	});
 
+	it("allocates max valid NUMERIC(18,2) reference income 9999999999999999.99 without bigint overflow", () => {
+		const res = allocatePersonalBudgetV1("9999999999999999.99");
+
+		// total cents = 999999999999999999n
+		// mandatory = floor(999999999999999999 * 6500 / 10000) = 649999999999999999 cents (6499999999999999.99)
+		// discretionary = floor(999999999999999999 * 500 / 10000) = 49999999999999999 cents (499999999999999.99)
+		// short = floor(999999999999999999 * 1000 / 10000) = 99999999999999999 cents (999999999999999.99)
+		// medium = floor(999999999999999999 * 1000 / 10000) = 99999999999999999 cents (999999999999999.99)
+		// long = 999999999999999999 - 649999999999999999 - 49999999999999999 - 99999999999999999 - 99999999999999999
+		//      = 100000000000000003 cents (1000000000000000.03)
+		expect(res.referenceIncome).toBe("9999999999999999.99");
+		expect(res.allocations.MANDATORY_EXPENSE.amount).toBe(
+			"6499999999999999.99",
+		);
+		expect(res.allocations.DISCRETIONARY_SPEND.amount).toBe(
+			"499999999999999.99",
+		);
+		expect(res.allocations.SHORT_TERM_PURCHASE.amount).toBe(
+			"999999999999999.99",
+		);
+		expect(res.allocations.MEDIUM_TERM_RESERVE.amount).toBe(
+			"999999999999999.99",
+		);
+		expect(res.allocations.LONG_TERM_INVESTMENT.amount).toBe(
+			"1000000000000000.03",
+		);
+
+		const sumCents =
+			res.allocations.MANDATORY_EXPENSE.cents +
+			res.allocations.DISCRETIONARY_SPEND.cents +
+			res.allocations.SHORT_TERM_PURCHASE.cents +
+			res.allocations.MEDIUM_TERM_RESERVE.cents +
+			res.allocations.LONG_TERM_INVESTMENT.cents;
+		expect(sumCents).toBe(999999999999999999n);
+	});
+
 	it("rejects negative or malformed reference income strings", () => {
 		expect(() => allocatePersonalBudgetV1("-100.00")).toThrowError(BudgetError);
 		expect(() => allocatePersonalBudgetV1("abc")).toThrowError(BudgetError);

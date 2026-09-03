@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { BudgetError } from "../src/budget/errors";
 import {
 	createMonthlyBudgetPlan,
+	getMonthlyBudgetPlan,
+	listMonthlyBudgetPlans,
 	refreshMonthlyBudgetPlan,
 	voidMonthlyBudgetPlan,
 } from "../src/budget/service";
@@ -11,7 +13,10 @@ import {
 	monthlyBudgetPlanRevisions,
 	monthlyBudgetPlans,
 } from "../src/db/schema/budget";
-import { canonicalTransactions } from "../src/db/schema/transactions";
+import {
+	canonicalTransactions,
+	transactionRevisions,
+} from "../src/db/schema/transactions";
 import * as referenceModule from "../src/income/reference";
 import * as canonicalService from "../src/transactions/service";
 
@@ -152,6 +157,21 @@ describe("Budget Service", () => {
 	it("handles historical idempotent replay without re-evaluating reference income", async () => {
 		let refIncomeCalled = false;
 
+		// The historical idempotent replay path now queries db outside any transaction:
+		// 1. canonicalTransactions (by idempotency key)
+		// 2. monthlyBudgetPlans (by canonical tx id)
+		// 3. monthlyBudgetPlanRevisions (rev #1)
+		// 4. transactionRevisions (canonical rev #1 for stored payload/occurredAt)
+		// Then it calls createCanonicalTransactionInTransaction inside a db.transaction
+		// with the stored payload/occurredAt to validate the fingerprint.
+		const storedOccurredAt = new Date("2026-09-01T00:00:00.000Z");
+		const storedPayload = {
+			periodMonth: "2026-09-01",
+			referenceIncome: "10000.00",
+		};
+
+		const mockTx = {} as unknown as DatabaseTransaction;
+
 		const mockDb = {
 			select: vi.fn().mockImplementation(() => ({
 				from: vi.fn().mockImplementation((table) => ({
@@ -201,11 +221,28 @@ describe("Budget Service", () => {
 									},
 								]);
 							}
+							if (table === transactionRevisions) {
+								// Return stored canonical revision #1
+								return Promise.resolve([
+									{
+										id: CANON_REV1_UUID,
+										transactionId: CANON_TX_UUID,
+										revisionNo: 1,
+										operation: "CREATE",
+										occurredAt: storedOccurredAt,
+										payload: storedPayload,
+									},
+								]);
+							}
 							return Promise.resolve([]);
 						}),
 					})),
 				})),
 			})),
+			transaction: vi.fn(
+				async (cb: (tx: DatabaseTransaction) => Promise<unknown>) =>
+					await cb(mockTx),
+			),
 		} as unknown as Database;
 
 		const refSpy = vi
@@ -220,6 +257,18 @@ describe("Budget Service", () => {
 				};
 			});
 
+		// The canonical service should return idempotentReplay: true
+		// because we call it with the stored payload/occurredAt.
+		const canonSpy = vi
+			.spyOn(canonicalService, "createCanonicalTransactionInTransaction")
+			.mockResolvedValue({
+				transactionId: CANON_TX_UUID,
+				revisionId: CANON_REV1_UUID,
+				revisionNo: 1,
+				idempotentReplay: true,
+				operation: "CREATE",
+			});
+
 		const res = await createMonthlyBudgetPlan({
 			db: mockDb,
 			userId: "user-1",
@@ -232,8 +281,16 @@ describe("Budget Service", () => {
 		expect(res.budgetPlan.budgetPlanId).toBe(PLAN_UUID);
 		expect(res.budgetPlan.referenceIncome).toBe("10000.00"); // returns historical amount!
 		expect(refIncomeCalled).toBe(false); // reference income was NOT re-evaluated!
+		// Verify canonical was called with stored occurredAt and payload, not fresh values
+		expect(canonSpy).toHaveBeenCalledWith(
+			expect.objectContaining({
+				occurredAt: storedOccurredAt,
+				payload: storedPayload,
+			}),
+		);
 
 		refSpy.mockRestore();
+		canonSpy.mockRestore();
 	});
 
 	it("throws BUDGET_IDEMPOTENCY_CONFLICT if existing key was for a different period", async () => {
@@ -662,5 +719,110 @@ describe("Budget Service", () => {
 			(e: unknown) =>
 				e instanceof BudgetError && e.code === "BUDGET_ALREADY_VOIDED",
 		);
+	});
+
+	it("throws BUDGET_INVALID_INPUT on malformed periodMonth (calendar error boundary)", async () => {
+		const mockDb = {} as Database;
+
+		await expect(
+			createMonthlyBudgetPlan({
+				db: mockDb,
+				userId: "user-1",
+				periodMonth: "not-a-valid-period",
+				idempotencyKey: "key-1",
+				provenance: { type: "MANUAL" },
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof BudgetError && e.code === "BUDGET_INVALID_INPUT",
+		);
+
+		await expect(
+			getMonthlyBudgetPlan({
+				db: mockDb,
+				userId: "user-1",
+				periodMonth: "2026-13-01",
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof BudgetError && e.code === "BUDGET_INVALID_INPUT",
+		);
+
+		await expect(
+			listMonthlyBudgetPlans({
+				db: mockDb,
+				userId: "user-1",
+				periodMonthFrom: "invalid",
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof BudgetError && e.code === "BUDGET_INVALID_INPUT",
+		);
+	});
+
+	it("listMonthlyBudgetPlans rejects when periodMonthFrom > periodMonthUntil", async () => {
+		const mockDb = {} as Database;
+
+		await expect(
+			listMonthlyBudgetPlans({
+				db: mockDb,
+				userId: "user-1",
+				periodMonthFrom: "2026-10-01",
+				periodMonthUntil: "2026-08-01",
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof BudgetError && e.code === "BUDGET_INVALID_INPUT",
+		);
+	});
+
+	it("getMonthlyBudgetPlan and listMonthlyBudgetPlans never call getMonthlyReferenceIncome (read regression)", async () => {
+		let refIncomeCalled = false;
+		const refSpy = vi
+			.spyOn(referenceModule, "getMonthlyReferenceIncome")
+			.mockImplementation(async () => {
+				refIncomeCalled = true;
+				return {} as unknown as Awaited<
+					ReturnType<typeof referenceModule.getMonthlyReferenceIncome>
+				>;
+			});
+
+		const mockDb = {
+			select: vi.fn().mockImplementation(() => ({
+				from: vi.fn().mockImplementation(() => ({
+					where: vi.fn().mockImplementation(() => ({
+						orderBy: vi.fn().mockImplementation(() =>
+							Object.assign(Promise.resolve([]), {
+								limit: vi.fn().mockResolvedValue([]),
+							}),
+						),
+						limit: vi.fn().mockResolvedValue([]),
+					})),
+				})),
+			})),
+		} as unknown as Database;
+
+		await expect(
+			getMonthlyBudgetPlan({
+				db: mockDb,
+				userId: "user-1",
+				periodMonth: "2026-09-01",
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof BudgetError && e.code === "BUDGET_PLAN_NOT_FOUND",
+		);
+		expect(refIncomeCalled).toBe(false);
+
+		const listRes = await listMonthlyBudgetPlans({
+			db: mockDb,
+			userId: "user-1",
+			periodMonthFrom: "2026-08-01",
+			periodMonthUntil: "2026-09-01",
+		});
+		expect(listRes).toEqual([]);
+		expect(refIncomeCalled).toBe(false);
+
+		refSpy.mockRestore();
 	});
 });
