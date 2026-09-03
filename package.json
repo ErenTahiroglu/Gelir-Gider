@@ -13,7 +13,9 @@
     "format:check": "biome format .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run cf-typegen && npm run typecheck && npm run lint && npm run format:check && npm test"
+    "check": "npm run cf-typegen && npm run typecheck && npm run lint && npm run format:check && npm test",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
     "@neondatabase/serverless": "1.1.0",
