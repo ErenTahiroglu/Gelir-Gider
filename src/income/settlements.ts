@@ -25,9 +25,7 @@ import {
 	getActiveEntitlementAllocatedCentsInTransaction,
 	lockReceiptAndEntitlementsForSettlement,
 } from "./settlement-state";
-
-const UUID_PATTERN =
-	/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+import { normalizeUuid } from "./utils";
 
 export interface IncomeReceiptSettlementAllocationItem {
 	entitlementId: string;
@@ -101,28 +99,18 @@ function normalizeAndSortAllocations(
 	const normalizedList: SettlementAllocationItem[] = [];
 
 	for (const alloc of allocations) {
-		const trimmedId = alloc?.entitlementId?.trim();
-		if (!trimmedId) {
-			throw new IncomeError(
-				"INCOME_INVALID_INPUT",
-				"Allocation entitlementId is required",
-			);
-		}
+		const canonicalId = normalizeUuid(
+			alloc?.entitlementId,
+			"allocation entitlementId",
+		);
 
-		if (!UUID_PATTERN.test(trimmedId)) {
+		if (seenEntitlementIds.has(canonicalId)) {
 			throw new IncomeError(
 				"INCOME_INVALID_INPUT",
-				`Invalid allocation entitlementId format: "${trimmedId}". Must be a valid UUID`,
+				`Duplicate entitlementId "${canonicalId}" in allocations`,
 			);
 		}
-
-		if (seenEntitlementIds.has(trimmedId)) {
-			throw new IncomeError(
-				"INCOME_INVALID_INPUT",
-				`Duplicate entitlementId "${trimmedId}" in allocations`,
-			);
-		}
-		seenEntitlementIds.add(trimmedId);
+		seenEntitlementIds.add(canonicalId);
 
 		let parsed: ParsedMoney;
 		try {
@@ -142,7 +130,7 @@ function normalizeAndSortAllocations(
 		}
 
 		normalizedList.push({
-			entitlementId: trimmedId,
+			entitlementId: canonicalId,
 			amount: parsed.normalized,
 		});
 	}
@@ -173,20 +161,7 @@ export async function createIncomeSettlement(
 		throw new IncomeError("INCOME_INVALID_INPUT", "User ID is required");
 	}
 
-	const trimmedReceiptId = incomeReceiptId?.trim();
-	if (!trimmedReceiptId) {
-		throw new IncomeError(
-			"INCOME_INVALID_INPUT",
-			"Income receipt ID is required",
-		);
-	}
-
-	if (!UUID_PATTERN.test(trimmedReceiptId)) {
-		throw new IncomeError(
-			"INCOME_INVALID_INPUT",
-			`Invalid incomeReceiptId format: "${trimmedReceiptId}". Must be a valid UUID`,
-		);
-	}
+	const canonicalReceiptId = normalizeUuid(incomeReceiptId, "incomeReceiptId");
 
 	if (!allocations || allocations.length === 0) {
 		throw new IncomeError(
@@ -225,7 +200,7 @@ export async function createIncomeSettlement(
 		const receipt = await lockReceiptAndEntitlementsForSettlement(
 			tx,
 			userId,
-			trimmedReceiptId,
+			canonicalReceiptId,
 			targetEntitlementIds,
 		);
 
@@ -520,20 +495,7 @@ export async function reviseIncomeSettlement(
 		throw new IncomeError("INCOME_INVALID_INPUT", "User ID is required");
 	}
 
-	const trimmedReceiptId = incomeReceiptId?.trim();
-	if (!trimmedReceiptId) {
-		throw new IncomeError(
-			"INCOME_INVALID_INPUT",
-			"Income receipt ID is required",
-		);
-	}
-
-	if (!UUID_PATTERN.test(trimmedReceiptId)) {
-		throw new IncomeError(
-			"INCOME_INVALID_INPUT",
-			`Invalid incomeReceiptId format: "${trimmedReceiptId}". Must be a valid UUID`,
-		);
-	}
+	const canonicalReceiptId = normalizeUuid(incomeReceiptId, "incomeReceiptId");
 
 	const normalizedAllocations =
 		allocations && allocations.length > 0
@@ -567,7 +529,7 @@ export async function reviseIncomeSettlement(
 			.from(incomeSettlementBatches)
 			.where(
 				and(
-					eq(incomeSettlementBatches.incomeReceiptId, trimmedReceiptId),
+					eq(incomeSettlementBatches.incomeReceiptId, canonicalReceiptId),
 					eq(incomeSettlementBatches.userId, userId),
 				),
 			)
@@ -576,7 +538,7 @@ export async function reviseIncomeSettlement(
 		if (!batch) {
 			throw new IncomeError(
 				"INCOME_SETTLEMENT_NOT_FOUND",
-				`Settlement batch not found for income receipt "${trimmedReceiptId}"`,
+				`Settlement batch not found for income receipt "${canonicalReceiptId}"`,
 			);
 		}
 
@@ -614,7 +576,7 @@ export async function reviseIncomeSettlement(
 		const receipt = await lockReceiptAndEntitlementsForSettlement(
 			tx,
 			userId,
-			trimmedReceiptId,
+			canonicalReceiptId,
 			Array.from(allInvolvedEntitlementIds),
 		);
 
@@ -860,20 +822,14 @@ export async function getIncomeReceiptSettlement(
 		throw new IncomeError("INCOME_INVALID_INPUT", "User ID is required");
 	}
 
-	const trimmedReceiptId = incomeReceiptId?.trim();
-	if (!trimmedReceiptId) {
-		throw new IncomeError(
-			"INCOME_INVALID_INPUT",
-			"Income receipt ID is required",
-		);
-	}
+	const canonicalReceiptId = normalizeUuid(incomeReceiptId, "incomeReceiptId");
 
 	const [receipt] = await db
 		.select()
 		.from(incomeReceipts)
 		.where(
 			and(
-				eq(incomeReceipts.id, trimmedReceiptId),
+				eq(incomeReceipts.id, canonicalReceiptId),
 				eq(incomeReceipts.userId, userId),
 			),
 		)
@@ -882,7 +838,7 @@ export async function getIncomeReceiptSettlement(
 	if (!receipt) {
 		throw new IncomeError(
 			"INCOME_RECEIPT_NOT_FOUND",
-			`Income receipt "${trimmedReceiptId}" not found`,
+			`Income receipt "${canonicalReceiptId}" not found`,
 		);
 	}
 

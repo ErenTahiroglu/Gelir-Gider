@@ -227,7 +227,7 @@ function createMockTx(options?: {
 }
 
 describe("Income Settlements Service", () => {
-	it("rejects non-UUID entitlementId with INCOME_INVALID_INPUT", async () => {
+	it("rejects non-UUID entitlementId and receiptId with INCOME_INVALID_INPUT", async () => {
 		const mockDb = {} as Database;
 
 		await expect(
@@ -237,6 +237,20 @@ describe("Income Settlements Service", () => {
 				incomeReceiptId: RECEIPT_UUID,
 				allocations: [{ entitlementId: "not-a-uuid", amount: "1000.00" }],
 				idempotencyKey: "idem-1",
+				provenance: { type: "MANUAL" },
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof IncomeError && e.code === "INCOME_INVALID_INPUT",
+		);
+
+		await expect(
+			createIncomeSettlement({
+				db: mockDb,
+				userId: "user-1",
+				incomeReceiptId: "invalid-receipt-id",
+				allocations: [{ entitlementId: ENT_SEP_UUID, amount: "1000.00" }],
+				idempotencyKey: "idem-2",
 				provenance: { type: "MANUAL" },
 			}),
 		).rejects.toSatisfy(
@@ -358,6 +372,84 @@ describe("Income Settlements Service", () => {
 		expect(allocs[1]?.entitlementId).toBe(ENT_OCT_UUID);
 
 		canonSpy.mockRestore();
+	});
+
+	it("accepts uppercase UUIDs for incomeReceiptId and entitlementId, normalizing them to canonical lowercase in canonical payload and queries", async () => {
+		const UPPER_RECEIPT_UUID = "A0000000-0000-0000-0000-000000000001";
+		const UPPER_ENT_UUID = "B0000000-0000-0000-0000-000000000001";
+		let capturedPayload: Record<string, unknown> | null = null;
+
+		const mockTx = createMockTx({
+			entitlements: [
+				{ id: ENT_SEP_UUID, periodMonth: "2026-09-01", amount: "4000.00" },
+			],
+		});
+
+		const mockDb = {
+			transaction: vi.fn(
+				async (cb: (tx: DatabaseTransaction) => Promise<unknown>) =>
+					await cb(mockTx),
+			),
+		} as unknown as Database;
+
+		const canonSpy = vi
+			.spyOn(canonicalService, "createCanonicalTransactionInTransaction")
+			.mockImplementation(async (opts) => {
+				capturedPayload = opts.payload as Record<string, unknown>;
+				return {
+					transactionId: "canon-set-tx-1",
+					revisionId: "canon-set-rev-1",
+					revisionNo: 1,
+					operation: "CREATE",
+					idempotentReplay: false,
+				};
+			});
+
+		await createIncomeSettlement({
+			db: mockDb,
+			userId: "user-1",
+			incomeReceiptId: UPPER_RECEIPT_UUID,
+			allocations: [{ entitlementId: UPPER_ENT_UUID, amount: "4000.00" }],
+			idempotencyKey: "set-upper-case",
+			provenance: { type: "MANUAL" },
+		});
+
+		expect(capturedPayload).not.toBeNull();
+		const payload = capturedPayload as unknown as {
+			incomeReceiptId: string;
+			allocations: Array<{ entitlementId: string }>;
+		};
+		expect(payload.incomeReceiptId).toBe(RECEIPT_UUID); // lowercase!
+		expect(payload.allocations[0]?.entitlementId).toBe(ENT_SEP_UUID); // lowercase!
+
+		canonSpy.mockRestore();
+	});
+
+	it("rejects case-variant duplicate entitlement IDs with INCOME_INVALID_INPUT before DB access", async () => {
+		const mockDb = {} as Database;
+
+		await expect(
+			createIncomeSettlement({
+				db: mockDb,
+				userId: "user-1",
+				incomeReceiptId: RECEIPT_UUID,
+				allocations: [
+					{
+						entitlementId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+						amount: "2000.00",
+					},
+					{
+						entitlementId: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+						amount: "2000.00",
+					},
+				],
+				idempotencyKey: "set-dup-case",
+				provenance: { type: "MANUAL" },
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof IncomeError && e.code === "INCOME_INVALID_INPUT",
+		);
 	});
 
 	it("rejects receipt over-allocation (sum of allocations > receipt amount)", async () => {

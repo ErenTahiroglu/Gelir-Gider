@@ -30,6 +30,7 @@ import {
 } from "./calendar";
 import { IncomeError } from "./errors";
 import { getActiveEntitlementAllocatedCentsInTransaction } from "./settlement-state";
+import { isEntitlementPeriodUniqueViolation, normalizeUuid } from "./utils";
 
 export type EntitlementStatus = "ACTIVE" | "VOIDED";
 export type EntitlementSettlementStatus =
@@ -148,11 +149,7 @@ export async function createIncomeEntitlement(
 		throw new IncomeError("INCOME_INVALID_INPUT", "User ID is required");
 	}
 
-	const trimmedSourceId = sourceId?.trim();
-	if (!trimmedSourceId) {
-		throw new IncomeError("INCOME_INVALID_INPUT", "Source ID is required");
-	}
-
+	const canonicalSourceId = normalizeUuid(sourceId, "sourceId");
 	const validPeriod = validatePeriodMonth(periodMonth);
 
 	let parsedAmount: ParsedMoney;
@@ -216,7 +213,7 @@ export async function createIncomeEntitlement(
 			.from(incomeSources)
 			.where(
 				and(
-					eq(incomeSources.id, trimmedSourceId),
+					eq(incomeSources.id, canonicalSourceId),
 					eq(incomeSources.userId, userId),
 				),
 			)
@@ -225,7 +222,7 @@ export async function createIncomeEntitlement(
 		if (!source) {
 			throw new IncomeError(
 				"INCOME_SOURCE_NOT_FOUND",
-				`Income source "${trimmedSourceId}" not found`,
+				`Income source "${canonicalSourceId}" not found`,
 			);
 		}
 
@@ -257,7 +254,7 @@ export async function createIncomeEntitlement(
 			.where(
 				and(
 					eq(incomeEntitlements.userId, userId),
-					eq(incomeEntitlements.sourceId, trimmedSourceId),
+					eq(incomeEntitlements.sourceId, canonicalSourceId),
 					eq(incomeEntitlements.periodMonth, validPeriod),
 				),
 			)
@@ -408,13 +405,7 @@ export async function createIncomeEntitlement(
 				.returning();
 			entitlement = created;
 		} catch (err: unknown) {
-			const errorObj = err as { code?: string; message?: string };
-			if (
-				errorObj?.code === "23505" ||
-				errorObj?.message?.includes(
-					"income_entitlements_user_id_source_id_period_month_unique",
-				)
-			) {
+			if (isEntitlementPeriodUniqueViolation(err)) {
 				throw new IncomeError(
 					"INCOME_ENTITLEMENT_PERIOD_CONFLICT",
 					`Entitlement already exists for source "${source.code}" and period "${validPeriod}"`,
@@ -505,10 +496,7 @@ export async function reviseIncomeEntitlement(
 		throw new IncomeError("INCOME_INVALID_INPUT", "User ID is required");
 	}
 
-	const trimmedEntitlementId = entitlementId?.trim();
-	if (!trimmedEntitlementId) {
-		throw new IncomeError("INCOME_INVALID_INPUT", "Entitlement ID is required");
-	}
+	const canonicalEntitlementId = normalizeUuid(entitlementId, "entitlementId");
 
 	let parsedAmount: ParsedMoney;
 	try {
@@ -558,7 +546,7 @@ export async function reviseIncomeEntitlement(
 			.from(incomeEntitlements)
 			.where(
 				and(
-					eq(incomeEntitlements.id, trimmedEntitlementId),
+					eq(incomeEntitlements.id, canonicalEntitlementId),
 					eq(incomeEntitlements.userId, userId),
 				),
 			)
@@ -568,7 +556,7 @@ export async function reviseIncomeEntitlement(
 		if (!entitlement) {
 			throw new IncomeError(
 				"INCOME_ENTITLEMENT_NOT_FOUND",
-				`Income entitlement "${trimmedEntitlementId}" not found`,
+				`Income entitlement "${canonicalEntitlementId}" not found`,
 			);
 		}
 
@@ -825,10 +813,7 @@ export async function voidIncomeEntitlement(
 		throw new IncomeError("INCOME_INVALID_INPUT", "User ID is required");
 	}
 
-	const trimmedEntitlementId = entitlementId?.trim();
-	if (!trimmedEntitlementId) {
-		throw new IncomeError("INCOME_INVALID_INPUT", "Entitlement ID is required");
-	}
+	const canonicalEntitlementId = normalizeUuid(entitlementId, "entitlementId");
 
 	const trimmedIdempotencyKey = idempotencyKey?.trim();
 	if (!trimmedIdempotencyKey) {
@@ -845,7 +830,7 @@ export async function voidIncomeEntitlement(
 			.from(incomeEntitlements)
 			.where(
 				and(
-					eq(incomeEntitlements.id, trimmedEntitlementId),
+					eq(incomeEntitlements.id, canonicalEntitlementId),
 					eq(incomeEntitlements.userId, userId),
 				),
 			)
@@ -855,7 +840,7 @@ export async function voidIncomeEntitlement(
 		if (!entitlement) {
 			throw new IncomeError(
 				"INCOME_ENTITLEMENT_NOT_FOUND",
-				`Income entitlement "${trimmedEntitlementId}" not found`,
+				`Income entitlement "${canonicalEntitlementId}" not found`,
 			);
 		}
 
@@ -1044,10 +1029,7 @@ export async function getIncomeEntitlement(
 		throw new IncomeError("INCOME_INVALID_INPUT", "User ID is required");
 	}
 
-	const trimmedEntitlementId = entitlementId?.trim();
-	if (!trimmedEntitlementId) {
-		throw new IncomeError("INCOME_INVALID_INPUT", "Entitlement ID is required");
-	}
+	const canonicalEntitlementId = normalizeUuid(entitlementId, "entitlementId");
 
 	const [entitlement] = await db
 		.select({
@@ -1062,7 +1044,7 @@ export async function getIncomeEntitlement(
 		.innerJoin(incomeSources, eq(incomeEntitlements.sourceId, incomeSources.id))
 		.where(
 			and(
-				eq(incomeEntitlements.id, trimmedEntitlementId),
+				eq(incomeEntitlements.id, canonicalEntitlementId),
 				eq(incomeEntitlements.userId, userId),
 			),
 		)
@@ -1071,7 +1053,7 @@ export async function getIncomeEntitlement(
 	if (!entitlement) {
 		throw new IncomeError(
 			"INCOME_ENTITLEMENT_NOT_FOUND",
-			`Income entitlement "${trimmedEntitlementId}" not found`,
+			`Income entitlement "${canonicalEntitlementId}" not found`,
 		);
 	}
 
@@ -1199,8 +1181,9 @@ export async function listIncomeEntitlements(
 
 	const conditions = [eq(incomeEntitlements.userId, userId)];
 
-	if (sourceId && sourceId.trim() !== "") {
-		conditions.push(eq(incomeEntitlements.sourceId, sourceId.trim()));
+	if (sourceId != null && sourceId.trim() !== "") {
+		const canonicalSourceId = normalizeUuid(sourceId, "sourceId");
+		conditions.push(eq(incomeEntitlements.sourceId, canonicalSourceId));
 	}
 
 	if (periodMonthFrom && periodMonthFrom.trim() !== "") {
