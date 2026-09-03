@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { DatabaseOrTransaction } from "../db/client";
 import { users } from "../db/schema/auth";
 import {
 	incomeReceiptRevisions,
@@ -28,7 +28,7 @@ export interface MonthlyReferenceIncomeResult {
 }
 
 export interface GetMonthlyReferenceIncomeParams {
-	db: Database;
+	db: DatabaseOrTransaction;
 	userId: string;
 	asOf: string | Date;
 }
