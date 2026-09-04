@@ -3,5 +3,6 @@ export * from "./budget";
 export * from "./income";
 export * from "./income-entitlements";
 export * from "./ledger";
+export * from "./midas";
 export * from "./transaction-ledger";
 export * from "./transactions";

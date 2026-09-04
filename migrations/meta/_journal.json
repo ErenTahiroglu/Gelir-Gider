@@ -141,6 +141,13 @@
       "when": 1788476717410,
       "tag": "0019_harden_budget_plan_integrity",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1788480000000,
+      "tag": "0020_midas_virtual_earmark_foundation",
+      "breakpoints": true
     }
   ]
 }
