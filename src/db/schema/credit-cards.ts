@@ -98,6 +98,7 @@ export const creditCardRevisions = pgTable(
 		}).notNull(),
 		lastFour: varchar("last_four", { length: 4 }),
 		note: varchar("note", { length: 500 }),
+		changeReason: varchar("change_reason", { length: 500 }),
 		occurredAt: timestamp("occurred_at", {
 			withTimezone: true,
 			mode: "date",
@@ -157,6 +158,10 @@ export const creditCardRevisions = pgTable(
 		check(
 			"cc_revisions_note_check",
 			sql`${table.note} IS NULL OR (${table.note} = btrim(${table.note}) AND length(${table.note}) >= 1 AND length(${table.note}) <= 500)`,
+		),
+		check(
+			"cc_revisions_change_reason_check",
+			sql`${table.changeReason} IS NULL OR (${table.changeReason} = btrim(${table.changeReason}) AND length(${table.changeReason}) >= 1 AND length(${table.changeReason}) <= 500)`,
 		),
 		check(
 			"cc_revisions_fingerprint_check",
@@ -284,10 +289,7 @@ export const creditCardStatementRevisions = pgTable(
 			"cc_stmt_revisions_status_check",
 			sql`${table.status} IN ('OPEN', 'VOID')`,
 		),
-		check(
-			"cc_stmt_revisions_amount_check",
-			sql`${table.statementAmount} > 0`,
-		),
+		check("cc_stmt_revisions_amount_check", sql`${table.statementAmount} > 0`),
 		check(
 			"cc_stmt_revisions_placement_check",
 			sql`${table.reservePlacement} IN ('MIDAS_FUND', 'OUTSIDE_MIDAS')`,

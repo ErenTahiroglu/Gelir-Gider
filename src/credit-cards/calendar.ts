@@ -17,9 +17,26 @@ export function isLeapYear(year: number): boolean {
  * Returns the exact number of days in a given Gregorian calendar month.
  */
 export function getDaysInMonth(year: number, month: number): number {
-	const table = [31, isLeapYear(year) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+	const table = [
+		31,
+		isLeapYear(year) ? 29 : 28,
+		31,
+		30,
+		31,
+		30,
+		31,
+		31,
+		30,
+		31,
+		30,
+		31,
+	];
 	const days = table[month - 1];
-	if (days === undefined) throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `Invalid month: ${month}`);
+	if (days === undefined)
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`Invalid month: ${month}`,
+		);
 	return days;
 }
 
@@ -28,7 +45,11 @@ export function getDaysInMonth(year: number, month: number): number {
  * Clamps statement day to the last day of the given month if necessary.
  * Returns YYYY-MM-DD string.
  */
-export function computeStatementDate(cycleYear: number, cycleMonth: number, statementDay: number): string {
+export function computeStatementDate(
+	cycleYear: number,
+	cycleMonth: number,
+	statementDay: number,
+): string {
 	const maxDay = getDaysInMonth(cycleYear, cycleMonth);
 	const actualDay = Math.min(statementDay, maxDay);
 	const mm = String(cycleMonth).padStart(2, "0");
@@ -42,14 +63,19 @@ export function computeStatementDate(cycleYear: number, cycleMonth: number, stat
  * Clamps to last day of month if necessary.
  * Returns YYYY-MM-DD string.
  */
-export function computeDueDate(statementDateStr: string, dueDay: number): string {
+export function computeDueDate(
+	statementDateStr: string,
+	dueDay: number,
+): string {
 	const parts = statementDateStr.split("-");
 	if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `Invalid statementDate: ${statementDateStr}`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`Invalid statementDate: ${statementDateStr}`,
+		);
 	}
 	const stmtYear = Number.parseInt(parts[0], 10);
 	const stmtMonth = Number.parseInt(parts[1], 10);
-	const stmtDay = Number.parseInt(parts[2], 10);
 
 	// Try same month first
 	const sameMontMaxDay = getDaysInMonth(stmtYear, stmtMonth);
@@ -80,18 +106,30 @@ export function computeDueDate(statementDateStr: string, dueDay: number): string
 /**
  * Parses a YYYY-MM cycle month string into { year, month }.
  */
-export function parseCycleMonth(cycleStr: string): { year: number; month: number } {
+export function parseCycleMonth(cycleStr: string): {
+	year: number;
+	month: number;
+} {
 	const match = CYCLE_MONTH_PATTERN.exec(cycleStr.trim());
-	if (!match || !match[1] || !match[2]) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `cycleMonth must be in YYYY-MM format: "${cycleStr}"`);
+	if (!match?.[1] || !match[2]) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`cycleMonth must be in YYYY-MM format: "${cycleStr}"`,
+		);
 	}
 	const year = Number.parseInt(match[1], 10);
 	const month = Number.parseInt(match[2], 10);
 	if (year < 2000 || year > 2200) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `cycleMonth year must be between 2000 and 2200: "${cycleStr}"`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`cycleMonth year must be between 2000 and 2200: "${cycleStr}"`,
+		);
 	}
 	if (month < 1 || month > 12) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `cycleMonth month must be between 01 and 12: "${cycleStr}"`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`cycleMonth month must be between 01 and 12: "${cycleStr}"`,
+		);
 	}
 	return { year, month };
 }
@@ -99,16 +137,28 @@ export function parseCycleMonth(cycleStr: string): { year: number; month: number
 /**
  * Validates and canonicalizes a UUID string to lowercase.
  */
-export function validateCcCanonicalUuid(value: unknown, fieldName: string): string {
+export function validateCcCanonicalUuid(
+	value: unknown,
+	fieldName: string,
+): string {
 	if (typeof value !== "string") {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName} must be a valid UUID string`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} must be a valid UUID string`,
+		);
 	}
 	const trimmed = value.trim();
 	if (trimmed === "") {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName} cannot be empty`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} cannot be empty`,
+		);
 	}
 	if (!UUID_PATTERN.test(trimmed)) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName} must be a valid canonical UUID: "${trimmed}"`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} must be a valid canonical UUID: "${trimmed}"`,
+		);
 	}
 	return trimmed.toLowerCase();
 }
@@ -118,11 +168,17 @@ export function validateCcCanonicalUuid(value: unknown, fieldName: string): stri
  */
 export function validateCardCode(value: unknown): string {
 	if (typeof value !== "string") {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", "code must be a string");
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"code must be a string",
+		);
 	}
 	const trimmed = value.trim().toUpperCase();
 	if (!CARD_CODE_PATTERN.test(trimmed)) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `code must match ^[A-Z][A-Z0-9_]{1,31}$: "${trimmed}"`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`code must match ^[A-Z][A-Z0-9_]{1,31}$: "${trimmed}"`,
+		);
 	}
 	return trimmed;
 }
@@ -130,19 +186,35 @@ export function validateCardCode(value: unknown): string {
 /**
  * Validates a required trimmed text field.
  */
-export function validateCcRequiredText(value: unknown, fieldName: string, maxLength: number): string {
+export function validateCcRequiredText(
+	value: unknown,
+	fieldName: string,
+	maxLength: number,
+): string {
 	if (value === null || value === undefined) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName} is required`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} is required`,
+		);
 	}
 	if (typeof value !== "string") {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName} must be a string`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} must be a string`,
+		);
 	}
 	const trimmed = value.trim();
 	if (trimmed === "") {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName} cannot be empty`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} cannot be empty`,
+		);
 	}
 	if (trimmed.length > maxLength) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName} cannot exceed ${maxLength} characters`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} cannot exceed ${maxLength} characters`,
+		);
 	}
 	return trimmed;
 }
@@ -150,15 +222,25 @@ export function validateCcRequiredText(value: unknown, fieldName: string, maxLen
 /**
  * Validates an optional trimmed text field.
  */
-export function validateCcOptionalText(value: unknown, fieldName: string, maxLength: number): string | null {
+export function validateCcOptionalText(
+	value: unknown,
+	fieldName: string,
+	maxLength: number,
+): string | null {
 	if (value === null || value === undefined) return null;
 	if (typeof value !== "string") {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName} must be a string`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} must be a string`,
+		);
 	}
 	const trimmed = value.trim();
 	if (trimmed === "") return null;
 	if (trimmed.length > maxLength) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName} cannot exceed ${maxLength} characters`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} cannot exceed ${maxLength} characters`,
+		);
 	}
 	return trimmed;
 }
@@ -167,8 +249,16 @@ export function validateCcOptionalText(value: unknown, fieldName: string, maxLen
  * Validates a calendar day integer (1-31).
  */
 export function validateCalendarDay(value: unknown, fieldName: string): number {
-	if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 31) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName} must be an integer between 1 and 31`);
+	if (
+		typeof value !== "number" ||
+		!Number.isInteger(value) ||
+		value < 1 ||
+		value > 31
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} must be an integer between 1 and 31`,
+		);
 	}
 	return value;
 }
@@ -176,12 +266,18 @@ export function validateCalendarDay(value: unknown, fieldName: string): number {
 /**
  * Validates a positive money string for statement amount / credit limit.
  */
-export function validateCcPositiveMoneyString(value: unknown, fieldName: string): { normalized: string; cents: bigint } {
+export function validateCcPositiveMoneyString(
+	value: unknown,
+	fieldName: string,
+): { normalized: string; cents: bigint } {
 	try {
 		return parsePositiveMoneyString(value);
 	} catch (err: unknown) {
 		const message = err instanceof Error ? err.message : String(err);
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `${fieldName}: ${message}`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName}: ${message}`,
+		);
 	}
 }
 
@@ -191,12 +287,18 @@ export function validateCcPositiveMoneyString(value: unknown, fieldName: string)
 export function validateLastFour(value: unknown): string | null {
 	if (value === null || value === undefined) return null;
 	if (typeof value !== "string") {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", "lastFour must be a string");
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"lastFour must be a string",
+		);
 	}
 	const trimmed = value.trim();
 	if (trimmed === "") return null;
 	if (!/^[0-9]{4}$/.test(trimmed)) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `lastFour must be exactly 4 decimal digits: "${trimmed}"`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`lastFour must be exactly 4 decimal digits: "${trimmed}"`,
+		);
 	}
 	return trimmed;
 }
@@ -206,7 +308,10 @@ export function validateLastFour(value: unknown): string | null {
  */
 export function validateCcOccurredAt(value: unknown): Date {
 	if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", "occurredAt must be a valid Date object");
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"occurredAt must be a valid Date object",
+		);
 	}
 	return value;
 }
@@ -215,8 +320,16 @@ export function validateCcOccurredAt(value: unknown): Date {
  * Validates an expectedRevisionNo for optimistic concurrency control.
  */
 export function validateCcExpectedRevisionNo(value: unknown): number {
-	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0 || value > Number.MAX_SAFE_INTEGER) {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", "expectedRevisionNo must be a safe positive integer (>= 1)");
+	if (
+		typeof value !== "number" ||
+		!Number.isInteger(value) ||
+		value <= 0 ||
+		value > Number.MAX_SAFE_INTEGER
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"expectedRevisionNo must be a safe positive integer (>= 1)",
+		);
 	}
 	return value;
 }
@@ -224,9 +337,14 @@ export function validateCcExpectedRevisionNo(value: unknown): number {
 /**
  * Validates a reserve placement string.
  */
-export function validateReservePlacement(value: unknown): "MIDAS_FUND" | "OUTSIDE_MIDAS" {
+export function validateReservePlacement(
+	value: unknown,
+): "MIDAS_FUND" | "OUTSIDE_MIDAS" {
 	if (value !== "MIDAS_FUND" && value !== "OUTSIDE_MIDAS") {
-		throw new CreditCardError("CREDIT_CARD_INVALID_INPUT", `reservePlacement must be MIDAS_FUND or OUTSIDE_MIDAS, found: "${String(value)}"`);
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`reservePlacement must be MIDAS_FUND or OUTSIDE_MIDAS, found: "${String(value)}"`,
+		);
 	}
 	return value;
 }

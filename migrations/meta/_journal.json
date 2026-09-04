@@ -176,6 +176,13 @@
       "when": 1788519567699,
       "tag": "0024_wise_hannibal_king",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1788528362742,
+      "tag": "0025_classy_shinobi_shaw",
+      "breakpoints": true
     }
   ]
 }

@@ -671,4 +671,75 @@ describe("Midas Service Input Validations & Error Contracts (Phase 8A / R2)", ()
 			);
 		});
 	});
+
+	describe("lockMidasAllocationStateInTransaction", () => {
+		it("locks ledger_accounts FOR UPDATE then midas_accounts FOR UPDATE in strict order", async () => {
+			const { lockMidasAllocationStateInTransaction } = await import(
+				"../src/midas/service"
+			);
+
+			const callOrder: string[] = [];
+			const mockTxLock = {
+				select: vi.fn((_fields: unknown) => ({
+					from: vi.fn((_table: unknown) => ({
+						where: vi.fn((_clause: unknown) => ({
+							limit: vi.fn(async () => {
+								callOrder.push("resolve_midas_identity_no_lock");
+								return [
+									{
+										id: "99999999-9999-4999-8999-999999999999",
+										userId: "11111111-1111-4111-8111-111111111111",
+										ledgerAccountId: "22222222-2222-4222-8222-222222222222",
+									},
+								];
+							}),
+							for: vi.fn((_mode: string) => ({
+								limit: vi.fn(async () => {
+									// Determine whether ledger_accounts or midas_accounts was called
+									if (
+										callOrder.filter((c) => c === "lock_ledger_accounts")
+											.length === 0
+									) {
+										callOrder.push("lock_ledger_accounts");
+										return [
+											{
+												id: "22222222-2222-4222-8222-222222222222",
+												userId: "11111111-1111-4111-8111-111111111111",
+											},
+										];
+									}
+									callOrder.push("lock_midas_accounts");
+									return [
+										{
+											id: "99999999-9999-4999-8999-999999999999",
+											userId: "11111111-1111-4111-8111-111111111111",
+											ledgerAccountId: "22222222-2222-4222-8222-222222222222",
+										},
+									];
+								}),
+							})),
+						})),
+					})),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const result = await lockMidasAllocationStateInTransaction({
+				tx: mockTxLock,
+				userId: "11111111-1111-4111-8111-111111111111",
+				midasAccountId: "99999999-9999-4999-8999-999999999999",
+			});
+
+			expect(result.midasAccountId).toBe(
+				"99999999-9999-4999-8999-999999999999",
+			);
+			expect(result.ledgerAccountId).toBe(
+				"22222222-2222-4222-8222-222222222222",
+			);
+			expect(callOrder).toEqual([
+				"resolve_midas_identity_no_lock",
+				"lock_ledger_accounts",
+				"lock_midas_accounts",
+			]);
+		});
+	});
 });

@@ -47,9 +47,23 @@ describe("calculateCreditCardCreateFingerprint", () => {
 	});
 
 	it("changes when code changes", async () => {
-		const base = { userId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", code: "AKBANK", displayName: "X", issuer: "X", statementDay: 2, dueDay: 12, creditLimit: "1.00", lastFour: null, note: null, occurredAt: BASE_DATE };
+		const base = {
+			userId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+			code: "AKBANK",
+			displayName: "X",
+			issuer: "X",
+			statementDay: 2,
+			dueDay: 12,
+			creditLimit: "1.00",
+			lastFour: null,
+			note: null,
+			occurredAt: BASE_DATE,
+		};
 		const fp1 = await calculateCreditCardCreateFingerprint(base);
-		const fp2 = await calculateCreditCardCreateFingerprint({ ...base, code: "ZIRAAT" });
+		const fp2 = await calculateCreditCardCreateFingerprint({
+			...base,
+			code: "ZIRAAT",
+		});
 		expect(fp1).not.toBe(fp2);
 	});
 });
@@ -103,9 +117,21 @@ describe("calculateStatementCreateFingerprint", () => {
 	});
 
 	it("changes when amount changes", async () => {
-		const base = { userId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", cardId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", cycleYear: 2026, cycleMonth: 9, statementAmount: "8000.00", reservePlacement: "MIDAS_FUND", note: null, occurredAt: BASE_DATE };
+		const base = {
+			userId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+			cardId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+			cycleYear: 2026,
+			cycleMonth: 9,
+			statementAmount: "8000.00",
+			reservePlacement: "MIDAS_FUND",
+			note: null,
+			occurredAt: BASE_DATE,
+		};
 		const fp1 = await calculateStatementCreateFingerprint(base);
-		const fp2 = await calculateStatementCreateFingerprint({ ...base, statementAmount: "9000.00" });
+		const fp2 = await calculateStatementCreateFingerprint({
+			...base,
+			statementAmount: "9000.00",
+		});
 		expect(fp1).not.toBe(fp2);
 	});
 });
@@ -151,7 +177,11 @@ describe("generateCardReserveMidasKey", () => {
 	});
 
 	it("is bounded under 128 chars", async () => {
-		const key = await generateCardReserveMidasKey("a".repeat(128), "c".repeat(36), "n");
+		const key = await generateCardReserveMidasKey(
+			"a".repeat(128),
+			"c".repeat(36),
+			"n",
+		);
 		expect(key.length).toBeLessThanOrEqual(128);
 	});
 

@@ -118,6 +118,18 @@ export interface MidasLiquidityBucketState {
 	balance: string;
 }
 
+export interface LockMidasAllocationStateInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	midasAccountId: string;
+}
+
+export interface LockedMidasAllocationIdentity {
+	midasAccountId: string;
+	userId: string;
+	ledgerAccountId: string;
+}
+
 export interface MidasLiquidityState {
 	midasAccountId: string;
 	ledgerAccountId: string;
@@ -617,6 +629,98 @@ function validateTransferInput(params: {
 }
 
 /**
+ * Locks the linked ledger account FOR UPDATE then parent Midas account FOR UPDATE
+ * in the strict global lock order to serialize Midas allocation state changes.
+ */
+export async function lockMidasAllocationStateInTransaction({
+	tx,
+	userId,
+	midasAccountId,
+}: LockMidasAllocationStateInTransactionParams): Promise<LockedMidasAllocationIdentity> {
+	const canonicalUserId = normalizeCanonicalUuid(userId, "userId");
+	const canonicalMidasAccountId = normalizeCanonicalUuid(
+		midasAccountId,
+		"midasAccountId",
+	);
+
+	// 1. Resolve Midas identity without locking only to obtain linked ledgerAccountId
+	const [midasIdentity] = await tx
+		.select({
+			id: midasAccounts.id,
+			userId: midasAccounts.userId,
+			ledgerAccountId: midasAccounts.ledgerAccountId,
+		})
+		.from(midasAccounts)
+		.where(
+			and(
+				eq(midasAccounts.id, canonicalMidasAccountId),
+				eq(midasAccounts.userId, canonicalUserId),
+			),
+		)
+		.limit(1);
+
+	if (!midasIdentity) {
+		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
+	}
+
+	// 2. Lock linked ledger account FOR UPDATE first (matching global lock order)
+	const [ledgerAccount] = await tx
+		.select({
+			id: ledgerAccounts.id,
+			userId: ledgerAccounts.userId,
+		})
+		.from(ledgerAccounts)
+		.where(
+			and(
+				eq(ledgerAccounts.id, midasIdentity.ledgerAccountId),
+				eq(ledgerAccounts.userId, canonicalUserId),
+			),
+		)
+		.for("update")
+		.limit(1);
+
+	if (!ledgerAccount) {
+		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
+	}
+
+	// 3. Lock parent Midas account FOR UPDATE
+	const [midasAccount] = await tx
+		.select({
+			id: midasAccounts.id,
+			userId: midasAccounts.userId,
+			ledgerAccountId: midasAccounts.ledgerAccountId,
+		})
+		.from(midasAccounts)
+		.where(
+			and(
+				eq(midasAccounts.id, canonicalMidasAccountId),
+				eq(midasAccounts.userId, canonicalUserId),
+			),
+		)
+		.for("update")
+		.limit(1);
+
+	if (!midasAccount) {
+		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
+	}
+
+	// 4. Revalidate after Midas lock
+	if (
+		midasAccount.userId !== canonicalUserId ||
+		midasAccount.id !== canonicalMidasAccountId ||
+		midasAccount.ledgerAccountId !== midasIdentity.ledgerAccountId
+	) {
+		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
+	}
+
+	return {
+		midasAccountId: midasAccount.id,
+		userId: midasAccount.userId,
+		ledgerAccountId: midasAccount.ledgerAccountId,
+	};
+}
+
+/**
  * Internal transaction-scoped allocation transfer execution.
  * Locks the parent Midas account FOR UPDATE to serialize free-balance allocation.
  */
@@ -704,75 +808,12 @@ export async function createMidasAllocationTransferInTransaction({
 		};
 	}
 
-	// 3. Resolve Midas identity without locking only to obtain ledgerAccountId
-	const [midasIdentity] = await tx
-		.select({
-			id: midasAccounts.id,
-			userId: midasAccounts.userId,
-			ledgerAccountId: midasAccounts.ledgerAccountId,
-		})
-		.from(midasAccounts)
-		.where(
-			and(
-				eq(midasAccounts.id, trimmedMidasAccountId),
-				eq(midasAccounts.userId, trimmedUserId),
-			),
-		)
-		.limit(1);
-
-	if (!midasIdentity) {
-		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
-	}
-
-	// 4. Lock linked ledger account FOR UPDATE first (matching global journal post order)
-	const [ledgerAccount] = await tx
-		.select({
-			id: ledgerAccounts.id,
-			userId: ledgerAccounts.userId,
-		})
-		.from(ledgerAccounts)
-		.where(
-			and(
-				eq(ledgerAccounts.id, midasIdentity.ledgerAccountId),
-				eq(ledgerAccounts.userId, trimmedUserId),
-			),
-		)
-		.for("update")
-		.limit(1);
-
-	if (!ledgerAccount) {
-		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
-	}
-
-	// 5. Lock parent Midas account FOR UPDATE
-	const [midasAccount] = await tx
-		.select({
-			id: midasAccounts.id,
-			userId: midasAccounts.userId,
-			ledgerAccountId: midasAccounts.ledgerAccountId,
-		})
-		.from(midasAccounts)
-		.where(
-			and(
-				eq(midasAccounts.id, trimmedMidasAccountId),
-				eq(midasAccounts.userId, trimmedUserId),
-			),
-		)
-		.for("update")
-		.limit(1);
-
-	if (!midasAccount) {
-		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
-	}
-
-	// 6. Revalidate after Midas lock
-	if (
-		midasAccount.userId !== trimmedUserId ||
-		midasAccount.id !== trimmedMidasAccountId ||
-		midasAccount.ledgerAccountId !== midasIdentity.ledgerAccountId
-	) {
-		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
-	}
+	// 3. Acquire global Midas allocation lock (ledger_accounts -> midas_accounts)
+	const lockedMidasIdentity = await lockMidasAllocationStateInTransaction({
+		tx,
+		userId: trimmedUserId,
+		midasAccountId: trimmedMidasAccountId,
+	});
 
 	// 4. Validate referenced buckets
 	if (normalizedFromBucketId !== null) {
@@ -921,7 +962,7 @@ export async function createMidasAllocationTransferInTransaction({
 		)
 		.where(
 			and(
-				eq(journalLines.accountId, midasAccount.ledgerAccountId),
+				eq(journalLines.accountId, lockedMidasIdentity.ledgerAccountId),
 				eq(journalEntries.status, "POSTED"),
 			),
 		);

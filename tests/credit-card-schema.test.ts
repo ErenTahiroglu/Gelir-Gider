@@ -50,8 +50,9 @@ describe("credit-cards schema tables", () => {
 		expect(columns).toBeDefined();
 	});
 
-	it("creditCardRevisions table exists with correct structure", () => {
+	it("creditCardRevisions table exists with correct structure including changeReason", () => {
 		expect(creditCardRevisions).toBeDefined();
+		expect(creditCardRevisions.changeReason).toBeDefined();
 	});
 
 	it("creditCardStatements table exists", () => {
