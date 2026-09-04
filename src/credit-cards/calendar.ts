@@ -348,3 +348,35 @@ export function validateReservePlacement(
 	}
 	return value;
 }
+
+/**
+ * Validates an optional card status filter.
+ */
+export function validateCardStatusFilter(
+	value: unknown,
+): "ACTIVE" | "ARCHIVED" | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (value !== "ACTIVE" && value !== "ARCHIVED") {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`Invalid card status filter: "${String(value)}"`,
+		);
+	}
+	return value;
+}
+
+/**
+ * Validates an optional statement status filter.
+ */
+export function validateStatementStatusFilter(
+	value: unknown,
+): "OPEN" | "VOID" | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (value !== "OPEN" && value !== "VOID") {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`Invalid statement status filter: "${String(value)}"`,
+		);
+	}
+	return value;
+}

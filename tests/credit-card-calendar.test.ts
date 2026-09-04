@@ -7,10 +7,12 @@ import {
 	parseCycleMonth,
 	validateCalendarDay,
 	validateCardCode,
+	validateCardStatusFilter,
 	validateCcExpectedRevisionNo,
 	validateCcPositiveMoneyString,
 	validateLastFour,
 	validateReservePlacement,
+	validateStatementStatusFilter,
 } from "../src/credit-cards/calendar";
 import { CreditCardError } from "../src/credit-cards/errors";
 
@@ -235,4 +237,52 @@ describe("card-specific fixture day examples", () => {
 			expect(dueDate > stmtDate).toBe(true);
 		});
 	}
+});
+
+describe("validateCardStatusFilter", () => {
+	it("returns undefined for undefined and null", () => {
+		expect(validateCardStatusFilter(undefined)).toBeUndefined();
+		expect(validateCardStatusFilter(null)).toBeUndefined();
+	});
+
+	it("accepts ACTIVE and ARCHIVED", () => {
+		expect(validateCardStatusFilter("ACTIVE")).toBe("ACTIVE");
+		expect(validateCardStatusFilter("ARCHIVED")).toBe("ARCHIVED");
+	});
+
+	it("rejects invalid card statuses", () => {
+		expect(() => validateCardStatusFilter("OPEN")).toThrow(CreditCardError);
+		expect(() => validateCardStatusFilter("VOID")).toThrow(CreditCardError);
+		expect(() => validateCardStatusFilter("PAID")).toThrow(CreditCardError);
+		expect(() => validateCardStatusFilter("")).toThrow(CreditCardError);
+		expect(() => validateCardStatusFilter("foo")).toThrow(CreditCardError);
+		expect(() => validateCardStatusFilter(123)).toThrow(CreditCardError);
+	});
+});
+
+describe("validateStatementStatusFilter", () => {
+	it("returns undefined for undefined and null", () => {
+		expect(validateStatementStatusFilter(undefined)).toBeUndefined();
+		expect(validateStatementStatusFilter(null)).toBeUndefined();
+	});
+
+	it("accepts OPEN and VOID", () => {
+		expect(validateStatementStatusFilter("OPEN")).toBe("OPEN");
+		expect(validateStatementStatusFilter("VOID")).toBe("VOID");
+	});
+
+	it("rejects invalid statement statuses", () => {
+		expect(() => validateStatementStatusFilter("ACTIVE")).toThrow(
+			CreditCardError,
+		);
+		expect(() => validateStatementStatusFilter("ARCHIVED")).toThrow(
+			CreditCardError,
+		);
+		expect(() => validateStatementStatusFilter("PAID")).toThrow(
+			CreditCardError,
+		);
+		expect(() => validateStatementStatusFilter("")).toThrow(CreditCardError);
+		expect(() => validateStatementStatusFilter("foo")).toThrow(CreditCardError);
+		expect(() => validateStatementStatusFilter(123)).toThrow(CreditCardError);
+	});
 });

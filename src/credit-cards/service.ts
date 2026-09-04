@@ -24,13 +24,13 @@ import {
 	lockMidasAllocationStateInTransaction,
 	type MidasLiquidityBucketState,
 } from "../midas/service";
-import { extractErrorCauseChain } from "../midas/utils";
 import {
 	computeDueDate,
 	computeStatementDate,
 	parseCycleMonth,
 	validateCalendarDay,
 	validateCardCode,
+	validateCardStatusFilter,
 	validateCcCanonicalUuid,
 	validateCcExpectedRevisionNo,
 	validateCcOccurredAt,
@@ -39,6 +39,7 @@ import {
 	validateCcRequiredText,
 	validateLastFour,
 	validateReservePlacement,
+	validateStatementStatusFilter,
 } from "./calendar";
 import { CreditCardError } from "./errors";
 import {
@@ -319,90 +320,144 @@ export interface ListCreditCardStatementsParams {
 // Error Mapping Helpers
 // ============================================================================
 
-function isCreditCardCodeConflictDbError(err: unknown): boolean {
-	const chain = extractErrorCauseChain(err);
-	return chain.includes("credit_cards_user_code_idx");
+export function matchesDbConstraint(
+	err: unknown,
+	exactConstraint: string,
+	triggerPattern?: string,
+): boolean {
+	let current: unknown = err;
+	let depth = 0;
+	const visited = new Set<unknown>();
+
+	while (current && depth < 10 && !visited.has(current)) {
+		visited.add(current);
+		depth++;
+
+		if (typeof current === "object" && current !== null) {
+			const obj = current as {
+				code?: string;
+				constraint?: string;
+				constraint_name?: string;
+				detail?: string;
+				message?: string;
+				cause?: unknown;
+			};
+
+			const code = obj.code;
+			const constraint = obj.constraint || obj.constraint_name;
+			const detail = obj.detail || "";
+			const message = obj.message || "";
+
+			if (code === "23505") {
+				if (constraint === exactConstraint) {
+					return true;
+				}
+				if (
+					detail.includes(exactConstraint) ||
+					message.includes(exactConstraint)
+				) {
+					return true;
+				}
+			}
+
+			if (constraint === exactConstraint) {
+				return true;
+			}
+
+			if (triggerPattern) {
+				if (
+					message.includes(triggerPattern) ||
+					detail.includes(triggerPattern)
+				) {
+					return true;
+				}
+			}
+
+			current = obj.cause;
+		} else {
+			break;
+		}
+	}
+
+	return false;
 }
 
-function isStatementPeriodConflictDbError(err: unknown): boolean {
-	const chain = extractErrorCauseChain(err);
-	return chain.includes("cc_statements_card_cycle_idx");
-}
-
-function isCreditCardRevisionConflictDbError(err: unknown): boolean {
-	const chain = extractErrorCauseChain(err);
-	return (
-		chain.includes("cc_revisions_card_rev_idx") ||
-		chain.includes("branching forbidden")
-	);
-}
-
-function isStatementRevisionConflictDbError(err: unknown): boolean {
-	const chain = extractErrorCauseChain(err);
-	return (
-		chain.includes("cc_stmt_revisions_stmt_rev_idx") ||
-		chain.includes("branching forbidden")
-	);
-}
-
-function mapMidasError(err: MidasError, context: string): never {
+export function mapMidasError(err: MidasError, _context?: string): never {
 	if (err.code === "MIDAS_INSUFFICIENT_FREE_BALANCE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_INSUFFICIENT_MIDAS_LIQUIDITY",
-			`Insufficient unallocated Midas liquidity for ${context}`,
+			"Insufficient free Midas liquidity for credit card reserve",
 		);
 	}
 	if (err.code === "MIDAS_IDEMPOTENCY_CONFLICT") {
 		throw new CreditCardError(
 			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
-			`Midas allocation idempotency conflict during ${context}`,
+			"Midas allocation idempotency conflict",
 		);
 	}
 	if (err.code === "MIDAS_INSUFFICIENT_BUCKET_BALANCE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_RESERVE_CONFLICT",
-			`Insufficient Midas reserve bucket balance for ${context}`,
+			"Insufficient reserve bucket balance",
 		);
 	}
 	throw new CreditCardError(
 		"CREDIT_CARD_INVALID_STATE",
-		`Midas domain error during ${context}: ${err.message}`,
+		"Credit card reserve state is inconsistent",
 	);
 }
 
-function mapDbError(err: unknown, context: string): never {
+export function mapDbError(err: unknown, _context?: string): never {
 	if (err instanceof CreditCardError) throw err;
 	if (err instanceof MidasError) {
-		mapMidasError(err, context);
+		mapMidasError(err);
 	}
-	if (isCreditCardCodeConflictDbError(err)) {
-		throw new CreditCardError(
-			"CREDIT_CARD_CONFLICT",
-			`Card code conflict during ${context}`,
-		);
+	if (matchesDbConstraint(err, "credit_cards_user_code_idx")) {
+		throw new CreditCardError("CREDIT_CARD_CONFLICT", "Card code conflict");
 	}
-	if (isStatementPeriodConflictDbError(err)) {
+	if (matchesDbConstraint(err, "cc_statements_card_cycle_idx")) {
 		throw new CreditCardError(
 			"CREDIT_CARD_STATEMENT_PERIOD_CONFLICT",
-			`Statement cycle period conflict during ${context}`,
+			"Statement cycle period conflict",
 		);
 	}
-	if (isCreditCardRevisionConflictDbError(err)) {
+	if (
+		matchesDbConstraint(
+			err,
+			"cc_revisions_card_rev_idx",
+			"Card revision branching forbidden",
+		) ||
+		matchesDbConstraint(
+			err,
+			"cc_revisions_card_rev_idx",
+			"trg_fn_guard_cc_revision_insert",
+		)
+	) {
 		throw new CreditCardError(
 			"CREDIT_CARD_REVISION_CONFLICT",
-			`Card revision conflict during ${context}`,
+			"Card revision conflict",
 		);
 	}
-	if (isStatementRevisionConflictDbError(err)) {
+	if (
+		matchesDbConstraint(
+			err,
+			"cc_stmt_revisions_stmt_rev_idx",
+			"Statement revision branching forbidden",
+		) ||
+		matchesDbConstraint(
+			err,
+			"cc_stmt_revisions_stmt_rev_idx",
+			"trg_fn_guard_cc_stmt_revision_insert",
+		)
+	) {
 		throw new CreditCardError(
 			"CREDIT_CARD_STATEMENT_REVISION_CONFLICT",
-			`Statement revision conflict during ${context}`,
+			"Statement revision conflict",
 		);
 	}
-	const msg = err instanceof Error ? err.message : String(err);
 	throw new CreditCardError(
 		"CREDIT_CARD_INVALID_STATE",
-		`Unexpected database error during ${context}: ${msg}`,
+		"Credit card state transition failed",
 	);
 }
 
@@ -1253,71 +1308,19 @@ export async function getCreditCard(
 	const userId = validateCcCanonicalUuid(params.userId, "userId");
 	const cardId = validateCcCanonicalUuid(params.cardId, "cardId");
 
-	const [card] = await params.db
-		.select({
-			id: creditCards.id,
-			code: creditCards.code,
-			createdAt: creditCards.createdAt,
-		})
-		.from(creditCards)
-		.where(and(eq(creditCards.id, cardId), eq(creditCards.userId, userId)))
-		.limit(1);
+	try {
+		const [card] = await params.db
+			.select({
+				id: creditCards.id,
+				code: creditCards.code,
+				createdAt: creditCards.createdAt,
+			})
+			.from(creditCards)
+			.where(and(eq(creditCards.id, cardId), eq(creditCards.userId, userId)))
+			.limit(1);
 
-	if (!card) return null;
+		if (!card) return null;
 
-	const [latest] = await params.db
-		.select({
-			revisionNo: creditCardRevisions.revisionNo,
-			status: creditCardRevisions.status,
-			displayName: creditCardRevisions.displayName,
-			issuer: creditCardRevisions.issuer,
-			statementDay: creditCardRevisions.statementDay,
-			dueDay: creditCardRevisions.dueDay,
-			creditLimit: creditCardRevisions.creditLimit,
-			lastFour: creditCardRevisions.lastFour,
-			note: creditCardRevisions.note,
-		})
-		.from(creditCardRevisions)
-		.where(eq(creditCardRevisions.creditCardId, cardId))
-		.orderBy(desc(creditCardRevisions.revisionNo))
-		.limit(1);
-
-	if (!latest) return null;
-
-	return {
-		cardId: card.id,
-		userId,
-		code: card.code,
-		status: latest.status as CreditCardStatus,
-		revisionNo: latest.revisionNo,
-		displayName: latest.displayName,
-		issuer: latest.issuer,
-		statementDay: latest.statementDay,
-		dueDay: latest.dueDay,
-		creditLimit: latest.creditLimit,
-		lastFour: latest.lastFour,
-		note: latest.note,
-		createdAt: card.createdAt,
-	};
-}
-
-export async function listCreditCards(
-	params: ListCreditCardsParams,
-): Promise<CreditCardRecord[]> {
-	const userId = validateCcCanonicalUuid(params.userId, "userId");
-
-	const allCards = await params.db
-		.select({
-			id: creditCards.id,
-			code: creditCards.code,
-			createdAt: creditCards.createdAt,
-		})
-		.from(creditCards)
-		.where(eq(creditCards.userId, userId))
-		.orderBy(asc(creditCards.createdAt));
-
-	const results: CreditCardRecord[] = [];
-	for (const card of allCards) {
 		const [latest] = await params.db
 			.select({
 				revisionNo: creditCardRevisions.revisionNo,
@@ -1331,14 +1334,13 @@ export async function listCreditCards(
 				note: creditCardRevisions.note,
 			})
 			.from(creditCardRevisions)
-			.where(eq(creditCardRevisions.creditCardId, card.id))
+			.where(eq(creditCardRevisions.creditCardId, cardId))
 			.orderBy(desc(creditCardRevisions.revisionNo))
 			.limit(1);
 
-		if (!latest) continue;
-		if (params.status && latest.status !== params.status) continue;
+		if (!latest) return null;
 
-		results.push({
+		return {
 			cardId: card.id,
 			userId,
 			code: card.code,
@@ -1352,10 +1354,72 @@ export async function listCreditCards(
 			lastFour: latest.lastFour,
 			note: latest.note,
 			createdAt: card.createdAt,
-		});
+		};
+	} catch (err: unknown) {
+		mapDbError(err);
 	}
+}
 
-	return results;
+export async function listCreditCards(
+	params: ListCreditCardsParams,
+): Promise<CreditCardRecord[]> {
+	const userId = validateCcCanonicalUuid(params.userId, "userId");
+	const statusFilter = validateCardStatusFilter(params.status);
+
+	try {
+		const allCards = await params.db
+			.select({
+				id: creditCards.id,
+				code: creditCards.code,
+				createdAt: creditCards.createdAt,
+			})
+			.from(creditCards)
+			.where(eq(creditCards.userId, userId))
+			.orderBy(asc(creditCards.createdAt));
+
+		const results: CreditCardRecord[] = [];
+		for (const card of allCards) {
+			const [latest] = await params.db
+				.select({
+					revisionNo: creditCardRevisions.revisionNo,
+					status: creditCardRevisions.status,
+					displayName: creditCardRevisions.displayName,
+					issuer: creditCardRevisions.issuer,
+					statementDay: creditCardRevisions.statementDay,
+					dueDay: creditCardRevisions.dueDay,
+					creditLimit: creditCardRevisions.creditLimit,
+					lastFour: creditCardRevisions.lastFour,
+					note: creditCardRevisions.note,
+				})
+				.from(creditCardRevisions)
+				.where(eq(creditCardRevisions.creditCardId, card.id))
+				.orderBy(desc(creditCardRevisions.revisionNo))
+				.limit(1);
+
+			if (!latest) continue;
+			if (statusFilter && latest.status !== statusFilter) continue;
+
+			results.push({
+				cardId: card.id,
+				userId,
+				code: card.code,
+				status: latest.status as CreditCardStatus,
+				revisionNo: latest.revisionNo,
+				displayName: latest.displayName,
+				issuer: latest.issuer,
+				statementDay: latest.statementDay,
+				dueDay: latest.dueDay,
+				creditLimit: latest.creditLimit,
+				lastFour: latest.lastFour,
+				note: latest.note,
+				createdAt: card.createdAt,
+			});
+		}
+
+		return results;
+	} catch (err: unknown) {
+		mapDbError(err);
+	}
 }
 
 // ============================================================================
@@ -2386,123 +2450,127 @@ export async function getCreditCardStatementInTransaction(
 		"statementId",
 	);
 
-	// 1. Resolve immutable statement identity
-	const [stmt] = await tx
-		.select({
-			id: creditCardStatements.id,
-			cardId: creditCardStatements.creditCardId,
-			cycleYear: creditCardStatements.cycleYear,
-			cycleMonth: creditCardStatements.cycleMonth,
-			midasAccountId: creditCardStatements.midasAccountId,
-			midasReserveBucketId: creditCardStatements.midasReserveBucketId,
-		})
-		.from(creditCardStatements)
-		.where(
-			and(
-				eq(creditCardStatements.id, canonicalStatementId),
-				eq(creditCardStatements.userId, canonicalUserId),
-			),
-		)
-		.limit(1);
+	try {
+		// 1. Resolve immutable statement identity
+		const [stmt] = await tx
+			.select({
+				id: creditCardStatements.id,
+				cardId: creditCardStatements.creditCardId,
+				cycleYear: creditCardStatements.cycleYear,
+				cycleMonth: creditCardStatements.cycleMonth,
+				midasAccountId: creditCardStatements.midasAccountId,
+				midasReserveBucketId: creditCardStatements.midasReserveBucketId,
+			})
+			.from(creditCardStatements)
+			.where(
+				and(
+					eq(creditCardStatements.id, canonicalStatementId),
+					eq(creditCardStatements.userId, canonicalUserId),
+				),
+			)
+			.limit(1);
 
-	if (!stmt) return null;
+		if (!stmt) return null;
 
-	// 2. Call getMidasLiquidityStateInTransaction exactly once
-	const midasState = await getMidasLiquidityStateInTransaction({
-		tx,
-		userId: canonicalUserId,
-		midasAccountId: stmt.midasAccountId,
-	});
+		// 2. Call getMidasLiquidityStateInTransaction exactly once
+		const midasState = await getMidasLiquidityStateInTransaction({
+			tx,
+			userId: canonicalUserId,
+			midasAccountId: stmt.midasAccountId,
+		});
 
-	// 3. Read authoritative latest statement revision
-	const [latest] = await tx
-		.select({
-			revisionNo: creditCardStatementRevisions.revisionNo,
-			status: creditCardStatementRevisions.status,
-			statementAmount: creditCardStatementRevisions.statementAmount,
-			statementDate: creditCardStatementRevisions.statementDate,
-			dueDate: creditCardStatementRevisions.dueDate,
-			reservePlacement: creditCardStatementRevisions.reservePlacement,
-			note: creditCardStatementRevisions.note,
-		})
-		.from(creditCardStatementRevisions)
-		.where(eq(creditCardStatementRevisions.statementId, canonicalStatementId))
-		.orderBy(desc(creditCardStatementRevisions.revisionNo))
-		.limit(1);
+		// 3. Read authoritative latest statement revision
+		const [latest] = await tx
+			.select({
+				revisionNo: creditCardStatementRevisions.revisionNo,
+				status: creditCardStatementRevisions.status,
+				statementAmount: creditCardStatementRevisions.statementAmount,
+				statementDate: creditCardStatementRevisions.statementDate,
+				dueDate: creditCardStatementRevisions.dueDate,
+				reservePlacement: creditCardStatementRevisions.reservePlacement,
+				note: creditCardStatementRevisions.note,
+			})
+			.from(creditCardStatementRevisions)
+			.where(eq(creditCardStatementRevisions.statementId, canonicalStatementId))
+			.orderBy(desc(creditCardStatementRevisions.revisionNo))
+			.limit(1);
 
-	if (!latest) return null;
+		if (!latest) return null;
 
-	// 4. Locate dedicated reserve bucket in returned Midas state
-	const bucket = midasState.buckets.find(
-		(b) => b.bucketId === stmt.midasReserveBucketId,
-	);
-	if (!bucket) {
-		throw new CreditCardError(
-			"CREDIT_CARD_INVALID_STATE",
-			`Dedicated reserve bucket ${stmt.midasReserveBucketId} not found in Midas state for statement ${canonicalStatementId}`,
+		// 4. Locate dedicated reserve bucket in returned Midas state
+		const bucket = midasState.buckets.find(
+			(b) => b.bucketId === stmt.midasReserveBucketId,
 		);
-	}
-	if (bucket.bucketType !== "CREDIT_CARD_RESERVE") {
-		throw new CreditCardError(
-			"CREDIT_CARD_INVALID_STATE",
-			`Reserve bucket ${stmt.midasReserveBucketId} has invalid bucketType: ${bucket.bucketType}`,
-		);
-	}
-
-	// Parse bucket balance
-	const parsedBal = parseSignedAggregateMoneyString(bucket.balance);
-	if (parsedBal.cents < 0n) {
-		throw new CreditCardError(
-			"CREDIT_CARD_INVALID_STATE",
-			`Reserve bucket ${stmt.midasReserveBucketId} has negative balance: ${bucket.balance}`,
-		);
-	}
-
-	const placement = latest.reservePlacement as CreditCardReservePlacement;
-	const stmtAmountCents = parseSignedAggregateMoneyString(
-		latest.statementAmount,
-	).cents;
-
-	// 5. Validate fail-closed invariants
-	if (latest.status === "VOID") {
-		if (parsedBal.cents !== 0n) {
+		if (!bucket) {
 			throw new CreditCardError(
 				"CREDIT_CARD_INVALID_STATE",
-				`VOID statement ${canonicalStatementId} has non-zero reserve bucket balance: ${bucket.balance}`,
+				`Dedicated reserve bucket ${stmt.midasReserveBucketId} not found in Midas state for statement ${canonicalStatementId}`,
 			);
 		}
-	} else if (placement === "MIDAS_FUND") {
-		if (parsedBal.cents !== stmtAmountCents) {
+		if (bucket.bucketType !== "CREDIT_CARD_RESERVE") {
 			throw new CreditCardError(
 				"CREDIT_CARD_INVALID_STATE",
-				`OPEN MIDAS_FUND statement ${canonicalStatementId} has mismatched reserve: expected ${latest.statementAmount} found ${bucket.balance}`,
+				`Reserve bucket ${stmt.midasReserveBucketId} has invalid bucketType: ${bucket.bucketType}`,
 			);
 		}
-	} else if (placement === "OUTSIDE_MIDAS") {
-		if (parsedBal.cents !== 0n) {
-			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_STATE",
-				`OPEN OUTSIDE_MIDAS statement ${canonicalStatementId} has non-zero reserve bucket balance: ${bucket.balance}`,
-			);
-		}
-	}
 
-	return {
-		statementId: stmt.id,
-		cardId: stmt.cardId,
-		userId: canonicalUserId,
-		cycleYear: stmt.cycleYear,
-		cycleMonth: stmt.cycleMonth,
-		status: latest.status as CreditCardStatementStatus,
-		revisionNo: latest.revisionNo,
-		statementAmount: latest.statementAmount,
-		statementDate: latest.statementDate,
-		dueDate: latest.dueDate,
-		reservePlacement: placement,
-		reserveAmount: bucket.balance,
-		reserveSatisfied: true,
-		note: latest.note,
-	};
+		// Parse bucket balance
+		const parsedBal = parseSignedAggregateMoneyString(bucket.balance);
+		if (parsedBal.cents < 0n) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_STATE",
+				`Reserve bucket ${stmt.midasReserveBucketId} has negative balance: ${bucket.balance}`,
+			);
+		}
+
+		const placement = latest.reservePlacement as CreditCardReservePlacement;
+		const stmtAmountCents = parseSignedAggregateMoneyString(
+			latest.statementAmount,
+		).cents;
+
+		// 5. Validate fail-closed invariants
+		if (latest.status === "VOID") {
+			if (parsedBal.cents !== 0n) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					`VOID statement ${canonicalStatementId} has non-zero reserve bucket balance: ${bucket.balance}`,
+				);
+			}
+		} else if (placement === "MIDAS_FUND") {
+			if (parsedBal.cents !== stmtAmountCents) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					`OPEN MIDAS_FUND statement ${canonicalStatementId} has mismatched reserve: expected ${latest.statementAmount} found ${bucket.balance}`,
+				);
+			}
+		} else if (placement === "OUTSIDE_MIDAS") {
+			if (parsedBal.cents !== 0n) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					`OPEN OUTSIDE_MIDAS statement ${canonicalStatementId} has non-zero reserve bucket balance: ${bucket.balance}`,
+				);
+			}
+		}
+
+		return {
+			statementId: stmt.id,
+			cardId: stmt.cardId,
+			userId: canonicalUserId,
+			cycleYear: stmt.cycleYear,
+			cycleMonth: stmt.cycleMonth,
+			status: latest.status as CreditCardStatementStatus,
+			revisionNo: latest.revisionNo,
+			statementAmount: latest.statementAmount,
+			statementDate: latest.statementDate,
+			dueDate: latest.dueDate,
+			reservePlacement: placement,
+			reserveAmount: bucket.balance,
+			reserveSatisfied: true,
+			note: latest.note,
+		};
+	} catch (err: unknown) {
+		mapDbError(err);
+	}
 }
 
 export async function getCreditCardStatement(
@@ -2540,6 +2608,11 @@ export async function listCreditCardStatementsInTransaction(
 	},
 ): Promise<CreditCardStatementRecord[]> {
 	const canonicalUserId = validateCcCanonicalUuid(params.userId, "userId");
+	const canonicalCardId =
+		params.creditCardId !== undefined && params.creditCardId !== null
+			? validateCcCanonicalUuid(params.creditCardId, "creditCardId")
+			: undefined;
+	const statusFilter = validateStatementStatusFilter(params.status);
 
 	let cycleFromYear: number | undefined;
 	let cycleFromMonth: number | undefined;
@@ -2574,203 +2647,208 @@ export async function listCreditCardStatementsInTransaction(
 		}
 	}
 
-	// 1. Resolve user's Midas account
-	const [userMidasAcc] = await tx
-		.select({ id: midasAccounts.id })
-		.from(midasAccounts)
-		.where(eq(midasAccounts.userId, canonicalUserId))
-		.limit(1);
+	try {
+		// 1. Resolve user's Midas account
+		const [userMidasAcc] = await tx
+			.select({ id: midasAccounts.id })
+			.from(midasAccounts)
+			.where(eq(midasAccounts.userId, canonicalUserId))
+			.limit(1);
 
-	// If no Midas account, user has no statements either
-	if (!userMidasAcc) {
-		return [];
-	}
-
-	// 2. Call getMidasLiquidityStateInTransaction exactly once
-	const midasState = await getMidasLiquidityStateInTransaction({
-		tx,
-		userId: canonicalUserId,
-		midasAccountId: userMidasAcc.id,
-	});
-
-	const bucketMap = new Map<string, MidasLiquidityBucketState>();
-	for (const b of midasState.buckets) {
-		bucketMap.set(b.bucketId, b);
-	}
-
-	// 3. Load statement identities in one query
-	const allStmts = await tx
-		.select({
-			id: creditCardStatements.id,
-			cardId: creditCardStatements.creditCardId,
-			cycleYear: creditCardStatements.cycleYear,
-			cycleMonth: creditCardStatements.cycleMonth,
-			midasAccountId: creditCardStatements.midasAccountId,
-			midasReserveBucketId: creditCardStatements.midasReserveBucketId,
-		})
-		.from(creditCardStatements)
-		.where(
-			and(
-				eq(creditCardStatements.userId, canonicalUserId),
-				params.creditCardId
-					? eq(creditCardStatements.creditCardId, params.creditCardId)
-					: undefined,
-			),
-		)
-		.orderBy(
-			desc(creditCardStatements.cycleYear),
-			desc(creditCardStatements.cycleMonth),
-			asc(creditCardStatements.id),
-		);
-
-	if (allStmts.length === 0) {
-		return [];
-	}
-
-	const stmtIds = allStmts.map((s) => s.id);
-
-	// 4. Load all revisions for these statements in bulk
-	const allRevisions = await tx
-		.select({
-			id: creditCardStatementRevisions.id,
-			statementId: creditCardStatementRevisions.statementId,
-			revisionNo: creditCardStatementRevisions.revisionNo,
-			status: creditCardStatementRevisions.status,
-			statementAmount: creditCardStatementRevisions.statementAmount,
-			statementDate: creditCardStatementRevisions.statementDate,
-			dueDate: creditCardStatementRevisions.dueDate,
-			reservePlacement: creditCardStatementRevisions.reservePlacement,
-			note: creditCardStatementRevisions.note,
-		})
-		.from(creditCardStatementRevisions)
-		.where(
-			and(
-				eq(creditCardStatementRevisions.userId, canonicalUserId),
-				inArray(creditCardStatementRevisions.statementId, stmtIds),
-			),
-		)
-		.orderBy(
-			asc(creditCardStatementRevisions.statementId),
-			desc(creditCardStatementRevisions.revisionNo),
-		);
-
-	// 5. Derive latest revision per statement
-	const latestRevMap = new Map<string, (typeof allRevisions)[0]>();
-	for (const rev of allRevisions) {
-		if (!latestRevMap.has(rev.statementId)) {
-			latestRevMap.set(rev.statementId, rev);
-		}
-	}
-
-	// 6. Map reserve buckets and validate ALL matched domain rows (fail closed)
-	const results: CreditCardStatementRecord[] = [];
-
-	for (const stmt of allStmts) {
-		const latest = latestRevMap.get(stmt.id);
-		if (!latest) continue;
-
-		// Find bucket in Midas state
-		const bucket = bucketMap.get(stmt.midasReserveBucketId);
-		if (!bucket) {
-			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_STATE",
-				`Dedicated reserve bucket ${stmt.midasReserveBucketId} not found in Midas state for statement ${stmt.id}`,
-			);
-		}
-		if (bucket.bucketType !== "CREDIT_CARD_RESERVE") {
-			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_STATE",
-				`Reserve bucket ${stmt.midasReserveBucketId} has invalid bucketType: ${bucket.bucketType}`,
-			);
+		// If no Midas account, user has no statements either
+		if (!userMidasAcc) {
+			return [];
 		}
 
-		const parsedBal = parseSignedAggregateMoneyString(bucket.balance);
-		if (parsedBal.cents < 0n) {
-			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_STATE",
-				`Reserve bucket ${stmt.midasReserveBucketId} has negative balance: ${bucket.balance}`,
-			);
-		}
-
-		const placement = latest.reservePlacement as CreditCardReservePlacement;
-		const stmtAmountCents = parseSignedAggregateMoneyString(
-			latest.statementAmount,
-		).cents;
-
-		// Fail-closed invariant validation
-		if (latest.status === "VOID") {
-			if (parsedBal.cents !== 0n) {
-				throw new CreditCardError(
-					"CREDIT_CARD_INVALID_STATE",
-					`VOID statement ${stmt.id} has non-zero reserve bucket balance: ${bucket.balance}`,
-				);
-			}
-		} else if (placement === "MIDAS_FUND") {
-			if (parsedBal.cents !== stmtAmountCents) {
-				throw new CreditCardError(
-					"CREDIT_CARD_INVALID_STATE",
-					`OPEN MIDAS_FUND statement ${stmt.id} has mismatched reserve: expected ${latest.statementAmount} found ${bucket.balance}`,
-				);
-			}
-		} else if (placement === "OUTSIDE_MIDAS") {
-			if (parsedBal.cents !== 0n) {
-				throw new CreditCardError(
-					"CREDIT_CARD_INVALID_STATE",
-					`OPEN OUTSIDE_MIDAS statement ${stmt.id} has non-zero reserve bucket balance: ${bucket.balance}`,
-				);
-			}
-		}
-
-		// Apply filters
-		if (params.status && latest.status !== params.status) continue;
-
-		if (cycleFromYear !== undefined && cycleFromMonth !== undefined) {
-			if (
-				stmt.cycleYear < cycleFromYear ||
-				(stmt.cycleYear === cycleFromYear && stmt.cycleMonth < cycleFromMonth)
-			) {
-				continue;
-			}
-		}
-		if (cycleUntilYear !== undefined && cycleUntilMonth !== undefined) {
-			if (
-				stmt.cycleYear > cycleUntilYear ||
-				(stmt.cycleYear === cycleUntilYear && stmt.cycleMonth > cycleUntilMonth)
-			) {
-				continue;
-			}
-		}
-
-		results.push({
-			statementId: stmt.id,
-			cardId: stmt.cardId,
+		// 2. Call getMidasLiquidityStateInTransaction exactly once
+		const midasState = await getMidasLiquidityStateInTransaction({
+			tx,
 			userId: canonicalUserId,
-			cycleYear: stmt.cycleYear,
-			cycleMonth: stmt.cycleMonth,
-			status: latest.status as CreditCardStatementStatus,
-			revisionNo: latest.revisionNo,
-			statementAmount: latest.statementAmount,
-			statementDate: latest.statementDate,
-			dueDate: latest.dueDate,
-			reservePlacement: placement,
-			reserveAmount: bucket.balance,
-			reserveSatisfied: true,
-			note: latest.note,
+			midasAccountId: userMidasAcc.id,
 		});
-	}
 
-	// 7. Sort: OPEN first (statementDate DESC, id ASC), then VOID after (same order)
-	results.sort((a, b) => {
-		const aOpen = a.status === "OPEN" ? 0 : 1;
-		const bOpen = b.status === "OPEN" ? 0 : 1;
-		if (aOpen !== bOpen) return aOpen - bOpen;
-		if (a.statementDate !== b.statementDate) {
-			return a.statementDate > b.statementDate ? -1 : 1;
+		const bucketMap = new Map<string, MidasLiquidityBucketState>();
+		for (const b of midasState.buckets) {
+			bucketMap.set(b.bucketId, b);
 		}
-		return a.statementId < b.statementId ? -1 : 1;
-	});
 
-	return results;
+		// 3. Load statement identities in one query
+		const allStmts = await tx
+			.select({
+				id: creditCardStatements.id,
+				cardId: creditCardStatements.creditCardId,
+				cycleYear: creditCardStatements.cycleYear,
+				cycleMonth: creditCardStatements.cycleMonth,
+				midasAccountId: creditCardStatements.midasAccountId,
+				midasReserveBucketId: creditCardStatements.midasReserveBucketId,
+			})
+			.from(creditCardStatements)
+			.where(
+				and(
+					eq(creditCardStatements.userId, canonicalUserId),
+					canonicalCardId
+						? eq(creditCardStatements.creditCardId, canonicalCardId)
+						: undefined,
+				),
+			)
+			.orderBy(
+				desc(creditCardStatements.cycleYear),
+				desc(creditCardStatements.cycleMonth),
+				asc(creditCardStatements.id),
+			);
+
+		if (allStmts.length === 0) {
+			return [];
+		}
+
+		const stmtIds = allStmts.map((s) => s.id);
+
+		// 4. Load all revisions for these statements in bulk
+		const allRevisions = await tx
+			.select({
+				id: creditCardStatementRevisions.id,
+				statementId: creditCardStatementRevisions.statementId,
+				revisionNo: creditCardStatementRevisions.revisionNo,
+				status: creditCardStatementRevisions.status,
+				statementAmount: creditCardStatementRevisions.statementAmount,
+				statementDate: creditCardStatementRevisions.statementDate,
+				dueDate: creditCardStatementRevisions.dueDate,
+				reservePlacement: creditCardStatementRevisions.reservePlacement,
+				note: creditCardStatementRevisions.note,
+			})
+			.from(creditCardStatementRevisions)
+			.where(
+				and(
+					eq(creditCardStatementRevisions.userId, canonicalUserId),
+					inArray(creditCardStatementRevisions.statementId, stmtIds),
+				),
+			)
+			.orderBy(
+				asc(creditCardStatementRevisions.statementId),
+				desc(creditCardStatementRevisions.revisionNo),
+			);
+
+		// 5. Derive latest revision per statement
+		const latestRevMap = new Map<string, (typeof allRevisions)[0]>();
+		for (const rev of allRevisions) {
+			if (!latestRevMap.has(rev.statementId)) {
+				latestRevMap.set(rev.statementId, rev);
+			}
+		}
+
+		// 6. Map reserve buckets and validate ALL matched domain rows (fail closed)
+		const results: CreditCardStatementRecord[] = [];
+
+		for (const stmt of allStmts) {
+			const latest = latestRevMap.get(stmt.id);
+			if (!latest) continue;
+
+			// Find bucket in Midas state
+			const bucket = bucketMap.get(stmt.midasReserveBucketId);
+			if (!bucket) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					`Dedicated reserve bucket ${stmt.midasReserveBucketId} not found in Midas state for statement ${stmt.id}`,
+				);
+			}
+			if (bucket.bucketType !== "CREDIT_CARD_RESERVE") {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					`Reserve bucket ${stmt.midasReserveBucketId} has invalid bucketType: ${bucket.bucketType}`,
+				);
+			}
+
+			const parsedBal = parseSignedAggregateMoneyString(bucket.balance);
+			if (parsedBal.cents < 0n) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					`Reserve bucket ${stmt.midasReserveBucketId} has negative balance: ${bucket.balance}`,
+				);
+			}
+
+			const placement = latest.reservePlacement as CreditCardReservePlacement;
+			const stmtAmountCents = parseSignedAggregateMoneyString(
+				latest.statementAmount,
+			).cents;
+
+			// Fail-closed invariant validation
+			if (latest.status === "VOID") {
+				if (parsedBal.cents !== 0n) {
+					throw new CreditCardError(
+						"CREDIT_CARD_INVALID_STATE",
+						`VOID statement ${stmt.id} has non-zero reserve bucket balance: ${bucket.balance}`,
+					);
+				}
+			} else if (placement === "MIDAS_FUND") {
+				if (parsedBal.cents !== stmtAmountCents) {
+					throw new CreditCardError(
+						"CREDIT_CARD_INVALID_STATE",
+						`OPEN MIDAS_FUND statement ${stmt.id} has mismatched reserve: expected ${latest.statementAmount} found ${bucket.balance}`,
+					);
+				}
+			} else if (placement === "OUTSIDE_MIDAS") {
+				if (parsedBal.cents !== 0n) {
+					throw new CreditCardError(
+						"CREDIT_CARD_INVALID_STATE",
+						`OPEN OUTSIDE_MIDAS statement ${stmt.id} has non-zero reserve bucket balance: ${bucket.balance}`,
+					);
+				}
+			}
+
+			// Apply filters
+			if (statusFilter && latest.status !== statusFilter) continue;
+
+			if (cycleFromYear !== undefined && cycleFromMonth !== undefined) {
+				if (
+					stmt.cycleYear < cycleFromYear ||
+					(stmt.cycleYear === cycleFromYear && stmt.cycleMonth < cycleFromMonth)
+				) {
+					continue;
+				}
+			}
+			if (cycleUntilYear !== undefined && cycleUntilMonth !== undefined) {
+				if (
+					stmt.cycleYear > cycleUntilYear ||
+					(stmt.cycleYear === cycleUntilYear &&
+						stmt.cycleMonth > cycleUntilMonth)
+				) {
+					continue;
+				}
+			}
+
+			results.push({
+				statementId: stmt.id,
+				cardId: stmt.cardId,
+				userId: canonicalUserId,
+				cycleYear: stmt.cycleYear,
+				cycleMonth: stmt.cycleMonth,
+				status: latest.status as CreditCardStatementStatus,
+				revisionNo: latest.revisionNo,
+				statementAmount: latest.statementAmount,
+				statementDate: latest.statementDate,
+				dueDate: latest.dueDate,
+				reservePlacement: placement,
+				reserveAmount: bucket.balance,
+				reserveSatisfied: true,
+				note: latest.note,
+			});
+		}
+
+		// 7. Sort: OPEN first (statementDate DESC, id ASC), then VOID after (same order)
+		results.sort((a, b) => {
+			const aOpen = a.status === "OPEN" ? 0 : 1;
+			const bOpen = b.status === "OPEN" ? 0 : 1;
+			if (aOpen !== bOpen) return aOpen - bOpen;
+			if (a.statementDate !== b.statementDate) {
+				return a.statementDate > b.statementDate ? -1 : 1;
+			}
+			return a.statementId < b.statementId ? -1 : 1;
+		});
+
+		return results;
+	} catch (err: unknown) {
+		mapDbError(err);
+	}
 }
 
 export async function listCreditCardStatements(

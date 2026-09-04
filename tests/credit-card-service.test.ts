@@ -11,7 +11,11 @@ import {
 	validateReservePlacement,
 } from "../src/credit-cards/calendar";
 import { CreditCardError } from "../src/credit-cards/errors";
-import type { DatabaseTransaction } from "../src/db/client";
+import type { Database, DatabaseTransaction } from "../src/db/client";
+import type {
+	CreditCardStatementStatus,
+	CreditCardStatus,
+} from "../src/db/schema/credit-cards";
 
 describe("CreditCardError", () => {
 	it("has correct name and code", () => {
@@ -501,5 +505,442 @@ describe("Credit Card Lifecycle & Replay Snapshot Contracts", () => {
 		expect(result.idempotentReplay).toBe(false);
 		expect(operations).toContain("lock_users_update");
 		expect(operations[0]).toBe("lock_users_update");
+	});
+});
+
+describe("Credit Card Error Boundaries & Lower-Layer Redaction", () => {
+	it("mapMidasError redacts sentinel secrets and maps to CreditCardError", async () => {
+		const { mapMidasError } = await import("../src/credit-cards/service");
+		const { MidasError } = await import("../src/midas/errors");
+
+		const sentinelMidasErr = new MidasError(
+			"MIDAS_INVALID_STATE",
+			"INTERNAL_MIDAS_SECRET_SENTINEL balance diagnostic 12345 secret_bucket_id",
+		);
+
+		try {
+			mapMidasError(sentinelMidasErr);
+			expect.fail("should have thrown");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			const ccErr = err as CreditCardError;
+			expect(ccErr.code).toBe("CREDIT_CARD_INVALID_STATE");
+			expect(ccErr.message).not.toContain("INTERNAL_MIDAS_SECRET_SENTINEL");
+			expect(ccErr.message).not.toContain("12345");
+			expect(ccErr.message).not.toContain("secret_bucket_id");
+			expect(ccErr.message).toBe("Credit card reserve state is inconsistent");
+		}
+	});
+
+	it("mapMidasError correctly maps stable Midas error codes to CreditCardError codes", async () => {
+		const { mapMidasError } = await import("../src/credit-cards/service");
+		const { MidasError } = await import("../src/midas/errors");
+
+		const testCases = [
+			{
+				input: new MidasError(
+					"MIDAS_INSUFFICIENT_FREE_BALANCE",
+					"not enough free balance",
+				),
+				expectedCode: "CREDIT_CARD_INSUFFICIENT_MIDAS_LIQUIDITY",
+				expectedMessage:
+					"Insufficient free Midas liquidity for credit card reserve",
+			},
+			{
+				input: new MidasError(
+					"MIDAS_IDEMPOTENCY_CONFLICT",
+					"idempotency conflict",
+				),
+				expectedCode: "CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+				expectedMessage: "Midas allocation idempotency conflict",
+			},
+			{
+				input: new MidasError(
+					"MIDAS_INSUFFICIENT_BUCKET_BALANCE",
+					"bucket underflow",
+				),
+				expectedCode: "CREDIT_CARD_RESERVE_CONFLICT",
+				expectedMessage: "Insufficient reserve bucket balance",
+			},
+			{
+				input: new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "account missing"),
+				expectedCode: "CREDIT_CARD_INVALID_STATE",
+				expectedMessage: "Credit card reserve state is inconsistent",
+			},
+			{
+				input: new MidasError("MIDAS_BUCKET_NOT_FOUND", "bucket missing"),
+				expectedCode: "CREDIT_CARD_INVALID_STATE",
+				expectedMessage: "Credit card reserve state is inconsistent",
+			},
+			{
+				input: new MidasError("MIDAS_BUCKET_INACTIVE", "inactive bucket"),
+				expectedCode: "CREDIT_CARD_INVALID_STATE",
+				expectedMessage: "Credit card reserve state is inconsistent",
+			},
+			{
+				input: new MidasError("MIDAS_BUCKET_CAP_EXCEEDED", "cap exceeded"),
+				expectedCode: "CREDIT_CARD_INVALID_STATE",
+				expectedMessage: "Credit card reserve state is inconsistent",
+			},
+			{
+				input: new MidasError("MIDAS_TRANSFER_NOT_FOUND", "transfer missing"),
+				expectedCode: "CREDIT_CARD_INVALID_STATE",
+				expectedMessage: "Credit card reserve state is inconsistent",
+			},
+			{
+				input: new MidasError(
+					"MIDAS_TRANSFER_ALREADY_REVERSED",
+					"already reversed",
+				),
+				expectedCode: "CREDIT_CARD_INVALID_STATE",
+				expectedMessage: "Credit card reserve state is inconsistent",
+			},
+			{
+				input: new MidasError("MIDAS_INVALID_INPUT", "bad input"),
+				expectedCode: "CREDIT_CARD_INVALID_STATE",
+				expectedMessage: "Credit card reserve state is inconsistent",
+			},
+		] as const;
+
+		for (const tc of testCases) {
+			try {
+				mapMidasError(tc.input);
+				expect.fail(`should have thrown for ${tc.input.code}`);
+			} catch (err: unknown) {
+				expect(err).toBeInstanceOf(CreditCardError);
+				const ccErr = err as CreditCardError;
+				expect(ccErr.code).toBe(tc.expectedCode);
+				expect(ccErr.message).toBe(tc.expectedMessage);
+			}
+		}
+	});
+
+	it("mapDbError redacts nested SQL/connection sentinel secrets", async () => {
+		const { mapDbError } = await import("../src/credit-cards/service");
+
+		const fakeDbErr = new Error("Query failed: INTERNAL_DB_SECRET_SENTINEL", {
+			cause: new Error(
+				"Connection postgresql://fake-secret:5432 failed on SELECT secret_column FROM tbl",
+				{
+					cause: {
+						code: "57014",
+						detail: "statement timeout with secret_token_xyz",
+						routine: "ProcessInterrupts",
+					},
+				},
+			),
+		});
+
+		try {
+			mapDbError(fakeDbErr);
+			expect.fail("should have thrown");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			const ccErr = err as CreditCardError;
+			expect(ccErr.code).toBe("CREDIT_CARD_INVALID_STATE");
+			expect(ccErr.message).toBe("Credit card state transition failed");
+			expect(ccErr.message).not.toContain("INTERNAL_DB_SECRET_SENTINEL");
+			expect(ccErr.message).not.toContain("postgresql://");
+			expect(ccErr.message).not.toContain("fake-secret");
+			expect(ccErr.message).not.toContain("SELECT secret_column");
+			expect(ccErr.message).not.toContain("secret_token_xyz");
+		}
+	});
+
+	it("mapDbError accurately maps exact unique constraints and triggers", async () => {
+		const { mapDbError } = await import("../src/credit-cards/service");
+
+		// 1. Card code conflict
+		try {
+			mapDbError(
+				new Error("Drizzle error", {
+					cause: {
+						code: "23505",
+						constraint: "credit_cards_user_code_idx",
+					},
+				}),
+			);
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			expect((err as CreditCardError).code).toBe("CREDIT_CARD_CONFLICT");
+			expect((err as CreditCardError).message).toBe("Card code conflict");
+		}
+
+		// 2. Statement period conflict
+		try {
+			mapDbError(
+				new Error("Drizzle error", {
+					cause: {
+						code: "23505",
+						constraint: "cc_statements_card_cycle_idx",
+					},
+				}),
+			);
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			expect((err as CreditCardError).code).toBe(
+				"CREDIT_CARD_STATEMENT_PERIOD_CONFLICT",
+			);
+			expect((err as CreditCardError).message).toBe(
+				"Statement cycle period conflict",
+			);
+		}
+
+		// 3. Card revision conflict
+		try {
+			mapDbError(
+				new Error("Drizzle error", {
+					cause: {
+						code: "23505",
+						constraint: "cc_revisions_card_rev_idx",
+					},
+				}),
+			);
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			expect((err as CreditCardError).code).toBe(
+				"CREDIT_CARD_REVISION_CONFLICT",
+			);
+			expect((err as CreditCardError).message).toBe("Card revision conflict");
+		}
+
+		// 4. Statement revision conflict
+		try {
+			mapDbError(
+				new Error("Drizzle error", {
+					cause: {
+						code: "23505",
+						constraint: "cc_stmt_revisions_stmt_rev_idx",
+					},
+				}),
+			);
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			expect((err as CreditCardError).code).toBe(
+				"CREDIT_CARD_STATEMENT_REVISION_CONFLICT",
+			);
+			expect((err as CreditCardError).message).toBe(
+				"Statement revision conflict",
+			);
+		}
+
+		// 5. Trigger branching messages
+		try {
+			mapDbError(
+				new Error(
+					"db error: Card revision branching forbidden: statement branch",
+				),
+			);
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			expect((err as CreditCardError).code).toBe(
+				"CREDIT_CARD_REVISION_CONFLICT",
+			);
+		}
+
+		try {
+			mapDbError(
+				new Error(
+					"db error: Statement revision branching forbidden: statement branch",
+				),
+			);
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			expect((err as CreditCardError).code).toBe(
+				"CREDIT_CARD_STATEMENT_REVISION_CONFLICT",
+			);
+		}
+
+		// 6. Unrelated 23505 must NOT be classified as card/statement conflict
+		try {
+			mapDbError(
+				new Error("Drizzle error", {
+					cause: {
+						code: "23505",
+						constraint: "totally_unrelated_idx",
+						detail: "Key (email)=(test@example.com) already exists.",
+					},
+				}),
+			);
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			expect((err as CreditCardError).code).toBe("CREDIT_CARD_INVALID_STATE");
+			expect((err as CreditCardError).message).toBe(
+				"Credit card state transition failed",
+			);
+		}
+
+		// 7. Unrelated constraint containing words 'statement' or 'cycle' or 'unique'
+		try {
+			mapDbError(
+				new Error("Drizzle error", {
+					cause: {
+						code: "23505",
+						constraint: "unique_statement_cycle_unrelated_table_idx",
+					},
+				}),
+			);
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			expect((err as CreditCardError).code).toBe("CREDIT_CARD_INVALID_STATE");
+		}
+	});
+
+	it("public statement read maps MidasError through CreditCardError boundary without leaking MidasError", async () => {
+		const { getCreditCardStatementInTransaction } = await import(
+			"../src/credit-cards/service"
+		);
+		const { MidasError } = await import("../src/midas/errors");
+
+		const userId = "11111111-1111-4111-8111-111111111111";
+		const statementId = "22222222-2222-4222-8222-222222222222";
+
+		// Create mockTx where Midas account query triggers a MidasError
+		const mockTx = {
+			select: vi
+				.fn()
+				// 1. Statement lookup
+				.mockReturnValueOnce({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi.fn().mockResolvedValue([
+								{
+									id: statementId,
+									cardId: "55555555-5555-4555-8555-555555555555",
+									cycleYear: 2026,
+									cycleMonth: 9,
+									midasAccountId: "33333333-3333-4333-8333-333333333333",
+									midasReserveBucketId: "44444444-4444-4444-8444-444444444444",
+								},
+							]),
+						}),
+					}),
+				})
+				// 2. Midas account lookup throwing MidasError
+				.mockReturnValueOnce({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							for: vi.fn().mockReturnValue({
+								limit: vi.fn().mockImplementation(() => {
+									throw new MidasError(
+										"MIDAS_INVALID_STATE",
+										"INTERNAL_MIDAS_SECRET_SENTINEL",
+									);
+								}),
+							}),
+						}),
+					}),
+				}),
+		} as unknown as DatabaseTransaction;
+
+		try {
+			await getCreditCardStatementInTransaction(mockTx, userId, statementId);
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			expect(err).not.toBeInstanceOf(MidasError);
+			const ccErr = err as CreditCardError;
+			expect(ccErr.code).toBe("CREDIT_CARD_INVALID_STATE");
+			expect(ccErr.message).toBe("Credit card reserve state is inconsistent");
+			expect(ccErr.message).not.toContain("INTERNAL_MIDAS_SECRET_SENTINEL");
+		}
+	});
+});
+
+describe("Runtime Filter Validation", () => {
+	const userId = "11111111-1111-4111-8111-111111111111";
+
+	it("listCreditCardStatements rejects invalid creditCardId before executing query", async () => {
+		const { listCreditCardStatementsInTransaction } = await import(
+			"../src/credit-cards/service"
+		);
+
+		const mockTx = {
+			select: vi.fn(),
+		} as unknown as DatabaseTransaction;
+
+		await expect(
+			listCreditCardStatementsInTransaction(mockTx, {
+				userId,
+				creditCardId: "bad-uuid",
+			}),
+		).rejects.toThrowError(
+			expect.objectContaining({
+				code: "CREDIT_CARD_INVALID_INPUT",
+			}),
+		);
+
+		await expect(
+			listCreditCardStatementsInTransaction(mockTx, {
+				userId,
+				creditCardId: "   ",
+			}),
+		).rejects.toThrowError(
+			expect.objectContaining({
+				code: "CREDIT_CARD_INVALID_INPUT",
+			}),
+		);
+
+		// Verified no DB queries were executed
+		expect(mockTx.select).not.toHaveBeenCalled();
+	});
+
+	it("listCreditCardStatements rejects invalid status filter before query", async () => {
+		const { listCreditCardStatementsInTransaction } = await import(
+			"../src/credit-cards/service"
+		);
+
+		const mockTx = {
+			select: vi.fn(),
+		} as unknown as DatabaseTransaction;
+
+		const invalidStatuses = ["PAID", "ACTIVE", "ARCHIVED", "foo", ""];
+		for (const invalidStatus of invalidStatuses) {
+			await expect(
+				listCreditCardStatementsInTransaction(mockTx, {
+					userId,
+					status: invalidStatus as unknown as CreditCardStatementStatus,
+				}),
+			).rejects.toThrowError(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+		}
+
+		expect(mockTx.select).not.toHaveBeenCalled();
+	});
+
+	it("listCreditCards rejects invalid status filter before query", async () => {
+		const { listCreditCards } = await import("../src/credit-cards/service");
+
+		const mockDb = {
+			select: vi.fn(),
+		};
+
+		const invalidCardStatuses = ["OPEN", "VOID", "PAID", "foo", ""];
+		for (const invalidStatus of invalidCardStatuses) {
+			await expect(
+				listCreditCards({
+					db: mockDb as unknown as Database,
+					userId,
+					status: invalidStatus as unknown as CreditCardStatus,
+				}),
+			).rejects.toThrowError(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+		}
+
+		expect(mockDb.select).not.toHaveBeenCalled();
 	});
 });
