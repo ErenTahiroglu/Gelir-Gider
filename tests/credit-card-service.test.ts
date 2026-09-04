@@ -944,3 +944,175 @@ describe("Runtime Filter Validation", () => {
 		expect(mockDb.select).not.toHaveBeenCalled();
 	});
 });
+
+describe("Outer Transaction and Deferred Commit Boundaries", () => {
+	const userId = "11111111-1111-4111-8111-111111111111";
+
+	it("isDatabaseBoundaryError distinguishes database errors from programmer errors", async () => {
+		const { isDatabaseBoundaryError } = await import(
+			"../src/credit-cards/service"
+		);
+
+		// Programmer errors
+		expect(
+			isDatabaseBoundaryError(
+				new TypeError("Cannot read properties of undefined"),
+			),
+		).toBe(false);
+		expect(
+			isDatabaseBoundaryError(new ReferenceError("foo is not defined")),
+		).toBe(false);
+		expect(
+			isDatabaseBoundaryError(new RangeError("Invalid array length")),
+		).toBe(false);
+		expect(isDatabaseBoundaryError(new Error("PROGRAMMER_BUG_SENTINEL"))).toBe(
+			false,
+		);
+
+		// Database errors
+		expect(
+			isDatabaseBoundaryError(
+				new Error("Drizzle query failed", {
+					cause: { code: "23505", constraint: "cc_statements_card_cycle_idx" },
+				}),
+			),
+		).toBe(true);
+		expect(
+			isDatabaseBoundaryError({
+				name: "DrizzleQueryError",
+				query: "SELECT secret FROM table",
+				params: [],
+			}),
+		).toBe(true);
+		expect(
+			isDatabaseBoundaryError({
+				severity: "ERROR",
+				code: "P0001",
+				detail: "postgresql://fake-secret",
+			}),
+		).toBe(true);
+		expect(
+			isDatabaseBoundaryError({
+				code: "42P01",
+				routine: "parserOpenTable",
+			}),
+		).toBe(true);
+	});
+
+	it("mapDbError preserves programmer errors without converting them to CreditCardError", async () => {
+		const { mapDbError } = await import("../src/credit-cards/service");
+
+		const typeErr = new TypeError("PROGRAMMER_BUG_SENTINEL");
+		expect(() => mapDbError(typeErr)).toThrow(typeErr);
+
+		const refErr = new ReferenceError("PROGRAMMER_REF_SENTINEL");
+		expect(() => mapDbError(refErr)).toThrow(refErr);
+	});
+
+	it("runCreditCardTransaction catches simulated deferred COMMIT rejection and redacts secrets", async () => {
+		const { createCreditCardStatement } = await import(
+			"../src/credit-cards/service"
+		);
+
+		// Mock db where transaction callback succeeds, but db.transaction promise rejects at commit
+		const mockDb = {
+			transaction: vi.fn().mockImplementation(async (_work: unknown) => {
+				// Simulate internal work succeeding...
+				// But during COMMIT, database triggers or deferred constraints fail
+				throw new Error("Commit failed", {
+					cause: {
+						code: "P0001",
+						message: "INTERNAL_COMMIT_SECRET_SENTINEL",
+						detail: "Connection postgresql://fake-secret:5432 failed on commit",
+					},
+				});
+			}),
+		} as unknown as Database;
+
+		try {
+			await createCreditCardStatement({
+				db: mockDb,
+				userId,
+				midasAccountId: "22222222-2222-4222-8222-222222222222",
+				cardId: "33333333-3333-4333-8333-333333333333",
+				cycleMonth: "2026-09",
+				statementAmount: "5000.00",
+				reservePlacement: "MIDAS_FUND",
+				occurredAt: new Date("2026-09-01T10:00:00.000Z"),
+				idempotencyKey: "stmt-commit-test-1",
+			});
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			const ccErr = err as CreditCardError;
+			expect(ccErr.code).toBe("CREDIT_CARD_INVALID_STATE");
+			expect(ccErr.message).toBe("Credit card state transition failed");
+			expect(ccErr.message).not.toContain("INTERNAL_COMMIT_SECRET_SENTINEL");
+			expect(ccErr.message).not.toContain("postgresql://");
+			expect(ccErr.message).not.toContain("fake-secret");
+		}
+	});
+
+	it("runCreditCardTransaction accurately maps deferred unique constraint on COMMIT", async () => {
+		const { createCreditCardStatement } = await import(
+			"../src/credit-cards/service"
+		);
+
+		const mockDb = {
+			transaction: vi.fn().mockImplementation(async () => {
+				throw new Error("Deferred unique index violation on COMMIT", {
+					cause: {
+						code: "23505",
+						constraint: "cc_statements_card_cycle_idx",
+					},
+				});
+			}),
+		} as unknown as Database;
+
+		try {
+			await createCreditCardStatement({
+				db: mockDb,
+				userId,
+				midasAccountId: "22222222-2222-4222-8222-222222222222",
+				cardId: "33333333-3333-4333-8333-333333333333",
+				cycleMonth: "2026-09",
+				statementAmount: "5000.00",
+				reservePlacement: "MIDAS_FUND",
+				occurredAt: new Date("2026-09-01T10:00:00.000Z"),
+				idempotencyKey: "stmt-commit-unique-1",
+			});
+			expect.fail("should throw");
+		} catch (err: unknown) {
+			expect(err).toBeInstanceOf(CreditCardError);
+			const ccErr = err as CreditCardError;
+			expect(ccErr.code).toBe("CREDIT_CARD_STATEMENT_PERIOD_CONFLICT");
+			expect(ccErr.message).toBe("Statement cycle period conflict");
+		}
+	});
+
+	it("runCreditCardTransaction propagates programmer TypeError directly without masking", async () => {
+		const { createCreditCard } = await import("../src/credit-cards/service");
+
+		const programmerErr = new TypeError("PROGRAMMER_BUG_SENTINEL");
+		const mockDb = {
+			transaction: vi.fn().mockImplementation(async () => {
+				throw programmerErr;
+			}),
+		} as unknown as Database;
+
+		await expect(
+			createCreditCard({
+				db: mockDb,
+				userId,
+				code: "TEST_PROG",
+				displayName: "Test Card",
+				issuer: "Test Bank",
+				statementDay: 1,
+				dueDay: 10,
+				creditLimit: "1000.00",
+				occurredAt: new Date(),
+				idempotencyKey: "card-prog-1",
+			}),
+		).rejects.toThrow(programmerErr);
+	});
+});

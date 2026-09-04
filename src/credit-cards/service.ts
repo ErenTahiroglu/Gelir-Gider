@@ -407,10 +407,89 @@ export function mapMidasError(err: MidasError, _context?: string): never {
 	);
 }
 
+export function isDatabaseBoundaryError(err: unknown): boolean {
+	let current: unknown = err;
+	let depth = 0;
+	const visited = new Set<unknown>();
+
+	while (current && depth < 10 && !visited.has(current)) {
+		visited.add(current);
+		depth++;
+
+		if (typeof current === "object" && current !== null) {
+			const obj = current as Record<string, unknown>;
+
+			if (
+				typeof obj.name === "string" &&
+				(obj.name === "DrizzleQueryError" ||
+					obj.name === "DrizzleError" ||
+					obj.name === "TransactionRollbackError")
+			) {
+				return true;
+			}
+			if ("query" in obj && typeof obj.query === "string") {
+				return true;
+			}
+
+			if (typeof obj.code === "string") {
+				if (/^[0-9A-Z]{5}$/.test(obj.code)) {
+					return true;
+				}
+				if (
+					obj.code.startsWith("PG_") ||
+					obj.code === "ECONNRESET" ||
+					obj.code === "ETIMEDOUT" ||
+					obj.code === "EPIPE" ||
+					obj.code === "ECONNREFUSED"
+				) {
+					return true;
+				}
+			}
+
+			if (
+				"constraint" in obj ||
+				"constraint_name" in obj ||
+				"severity" in obj ||
+				"schema" in obj ||
+				"table" in obj ||
+				"column" in obj ||
+				"routine" in obj ||
+				"internalQuery" in obj ||
+				"internalPosition" in obj
+			) {
+				return true;
+			}
+
+			if (typeof obj.message === "string") {
+				const msg = obj.message;
+				if (
+					msg.includes("branching forbidden") ||
+					msg.includes("trg_fn_guard_") ||
+					msg.includes("trg_guard_") ||
+					msg.includes("violates ") ||
+					msg.includes("duplicate key ") ||
+					msg.includes("deadlock detected")
+				) {
+					return true;
+				}
+			}
+
+			current = (current as { cause?: unknown }).cause;
+		} else {
+			break;
+		}
+	}
+
+	return false;
+}
+
 export function mapDbError(err: unknown, _context?: string): never {
 	if (err instanceof CreditCardError) throw err;
 	if (err instanceof MidasError) {
 		mapMidasError(err);
+	}
+	if (!isDatabaseBoundaryError(err)) {
+		throw err;
 	}
 	if (matchesDbConstraint(err, "credit_cards_user_code_idx")) {
 		throw new CreditCardError("CREDIT_CARD_CONFLICT", "Card code conflict");
@@ -459,6 +538,41 @@ export function mapDbError(err: unknown, _context?: string): never {
 		"CREDIT_CARD_INVALID_STATE",
 		"Credit card state transition failed",
 	);
+}
+
+/**
+ * Executes a unit of work inside a managed database transaction with centralized
+ * error boundary mapping.
+ *
+ * Catches both in-flight work errors and deferred COMMIT-time trigger/constraint rejections.
+ * - CreditCardError: rethrown unchanged
+ * - MidasError: mapped to sanitized CreditCardError
+ * - Recognized DB/Postgres/Drizzle error: mapped to sanitized CreditCardError
+ * - Programmer errors (e.g. TypeError, ReferenceError): rethrown unchanged
+ *
+ * NOTE ON DatabaseTransaction CONTRACT:
+ * When caller passes a pre-existing DatabaseTransaction, the caller owns the transaction
+ * and its eventual COMMIT. In that mode, inner work errors are mapped, but deferred
+ * COMMIT failures belong to the outer transaction owner.
+ */
+export async function runCreditCardTransaction<T>(
+	db: Database,
+	work: (tx: DatabaseTransaction) => Promise<T>,
+): Promise<T> {
+	try {
+		return await db.transaction(work);
+	} catch (err: unknown) {
+		if (err instanceof CreditCardError) {
+			throw err;
+		}
+		if (err instanceof MidasError) {
+			mapMidasError(err);
+		}
+		if (isDatabaseBoundaryError(err)) {
+			mapDbError(err);
+		}
+		throw err;
+	}
 }
 
 // ============================================================================
@@ -718,7 +832,7 @@ export async function createCreditCard(
 		"transaction" in params.db &&
 		typeof params.db.transaction === "function"
 	) {
-		return await (params.db as Database).transaction(async (tx) => {
+		return await runCreditCardTransaction(params.db as Database, async (tx) => {
 			return createCreditCardInTransaction({
 				...params,
 				tx,
@@ -997,7 +1111,7 @@ export async function updateCreditCard(
 		"transaction" in params.db &&
 		typeof params.db.transaction === "function"
 	) {
-		return await (params.db as Database).transaction(async (tx) => {
+		return await runCreditCardTransaction(params.db as Database, async (tx) => {
 			return updateCreditCardInTransaction({
 				...params,
 				tx,
@@ -1289,7 +1403,7 @@ export async function archiveCreditCard(
 		"transaction" in params.db &&
 		typeof params.db.transaction === "function"
 	) {
-		return await (params.db as Database).transaction(async (tx) => {
+		return await runCreditCardTransaction(params.db as Database, async (tx) => {
 			return archiveCreditCardInTransaction({
 				...params,
 				tx,
@@ -1766,7 +1880,7 @@ export async function createCreditCardStatement(
 		"transaction" in params.db &&
 		typeof params.db.transaction === "function"
 	) {
-		return await (params.db as Database).transaction(async (tx) => {
+		return await runCreditCardTransaction(params.db as Database, async (tx) => {
 			return createCreditCardStatementInTransaction({
 				...params,
 				tx,
@@ -2110,7 +2224,7 @@ export async function updateCreditCardStatement(
 		"transaction" in params.db &&
 		typeof params.db.transaction === "function"
 	) {
-		return await (params.db as Database).transaction(async (tx) => {
+		return await runCreditCardTransaction(params.db as Database, async (tx) => {
 			return updateCreditCardStatementInTransaction({
 				...params,
 				tx,
@@ -2422,7 +2536,7 @@ export async function voidCreditCardStatement(
 		"transaction" in params.db &&
 		typeof params.db.transaction === "function"
 	) {
-		return await (params.db as Database).transaction(async (tx) => {
+		return await runCreditCardTransaction(params.db as Database, async (tx) => {
 			return voidCreditCardStatementInTransaction({
 				...params,
 				tx,
@@ -2586,7 +2700,7 @@ export async function getCreditCardStatement(
 		"transaction" in params.db &&
 		typeof params.db.transaction === "function"
 	) {
-		return await (params.db as Database).transaction(async (tx) => {
+		return await runCreditCardTransaction(params.db as Database, async (tx) => {
 			return getCreditCardStatementInTransaction(tx, userId, statementId);
 		});
 	}
@@ -2858,7 +2972,7 @@ export async function listCreditCardStatements(
 		"transaction" in params.db &&
 		typeof params.db.transaction === "function"
 	) {
-		return await (params.db as Database).transaction(async (tx) => {
+		return await runCreditCardTransaction(params.db as Database, async (tx) => {
 			return listCreditCardStatementsInTransaction(tx, params);
 		});
 	}
