@@ -3,6 +3,7 @@ import type { Database } from "../db/client";
 import { users } from "../db/schema/auth";
 import { ledgerAccounts } from "../db/schema/ledger";
 import { midasAccounts } from "../db/schema/midas";
+import { isLedgerAccountInUseDbError } from "../midas/utils";
 import { LedgerError } from "./errors";
 
 export type AccountType =
@@ -228,30 +229,46 @@ export async function archiveLedgerAccount({
 		);
 	}
 
-	const [updated] = await db
-		.update(ledgerAccounts)
-		.set({ archivedAt: new Date() })
-		.where(
-			and(eq(ledgerAccounts.id, accountId), eq(ledgerAccounts.userId, userId)),
-		)
-		.returning();
+	try {
+		const [updated] = await db
+			.update(ledgerAccounts)
+			.set({ archivedAt: new Date() })
+			.where(
+				and(
+					eq(ledgerAccounts.id, accountId),
+					eq(ledgerAccounts.userId, userId),
+				),
+			)
+			.returning();
 
-	if (!updated) {
-		throw new LedgerError(
-			"LEDGER_ACCOUNT_NOT_FOUND",
-			"Ledger account not found during update",
-		);
+		if (!updated) {
+			throw new LedgerError(
+				"LEDGER_ACCOUNT_NOT_FOUND",
+				"Ledger account not found during update",
+			);
+		}
+
+		return {
+			id: updated.id,
+			userId: updated.userId,
+			code: updated.code,
+			name: updated.name,
+			accountType: updated.accountType as AccountType,
+			normalBalance: updated.normalBalance as NormalBalance,
+			currency: updated.currency,
+			createdAt: updated.createdAt,
+			archivedAt: updated.archivedAt,
+		};
+	} catch (err) {
+		if (err instanceof LedgerError) {
+			throw err;
+		}
+		if (isLedgerAccountInUseDbError(err)) {
+			throw new LedgerError(
+				"LEDGER_ACCOUNT_IN_USE",
+				"Cannot archive a ledger account that is linked to a Midas account",
+			);
+		}
+		throw err;
 	}
-
-	return {
-		id: updated.id,
-		userId: updated.userId,
-		code: updated.code,
-		name: updated.name,
-		accountType: updated.accountType as AccountType,
-		normalBalance: updated.normalBalance as NormalBalance,
-		currency: updated.currency,
-		createdAt: updated.createdAt,
-		archivedAt: updated.archivedAt,
-	};
 }

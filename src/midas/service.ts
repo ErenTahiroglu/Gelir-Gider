@@ -22,7 +22,10 @@ import {
 } from "../ledger/money";
 import { MidasError } from "./errors";
 import { calculateAllocationTransferFingerprint } from "./fingerprint";
-import { normalizeCanonicalUuid } from "./utils";
+import {
+	isMidasLedgerAccountInvalidDbError,
+	normalizeCanonicalUuid,
+} from "./utils";
 
 const BUCKET_CODE_PATTERN = /^[A-Z][A-Z0-9_]{1,63}$/;
 const VALID_BUCKET_TYPES_SET = new Set<string>(MIDAS_BUCKET_TYPES);
@@ -127,7 +130,6 @@ export interface GetMidasLiquidityStateInTransactionParams {
 	tx: DatabaseTransaction;
 	userId: string;
 	midasAccountId?: string | undefined;
-	lockAccount?: boolean | undefined;
 }
 
 export interface ListMidasAllocationTransfersParams {
@@ -180,7 +182,29 @@ export async function createMidasAccount({
 		throw new MidasError("MIDAS_INVALID_INPUT", "User not found");
 	}
 
-	// 2. Validate linked ledger account
+	// 2. Exact Account Replay FIRST: check existing Midas account for user before mutable revalidation
+	const [existingUserAccount] = await db
+		.select({
+			id: midasAccounts.id,
+			userId: midasAccounts.userId,
+			ledgerAccountId: midasAccounts.ledgerAccountId,
+			createdAt: midasAccounts.createdAt,
+		})
+		.from(midasAccounts)
+		.where(eq(midasAccounts.userId, canonicalUserId))
+		.limit(1);
+
+	if (existingUserAccount) {
+		if (existingUserAccount.ledgerAccountId === canonicalLedgerAccountId) {
+			return existingUserAccount;
+		}
+		throw new MidasError(
+			"MIDAS_ACCOUNT_CONFLICT",
+			"User already has a Midas account linked to a different ledger account",
+		);
+	}
+
+	// 3. Validate linked candidate ledger account (for fresh creation only)
 	const [ledgerAcc] = await db
 		.select({
 			id: ledgerAccounts.id,
@@ -213,7 +237,7 @@ export async function createMidasAccount({
 		);
 	}
 
-	// 3. Check physical balance of ledger account is non-negative
+	// 4. Check physical balance of ledger account is non-negative
 	const [physicalBalanceRow] = await db
 		.select({
 			netDebit: sql<string>`COALESCE(SUM(${journalLines.debit}) - SUM(${journalLines.credit}), 0)::text`,
@@ -237,28 +261,6 @@ export async function createMidasAccount({
 		throw new MidasError(
 			"MIDAS_LEDGER_ACCOUNT_INVALID",
 			`Cannot link Midas account to a ledger account with negative physical balance (${physicalParsed.normalized})`,
-		);
-	}
-
-	// 4. Check existing Midas account for user
-	const [existingUserAccount] = await db
-		.select({
-			id: midasAccounts.id,
-			userId: midasAccounts.userId,
-			ledgerAccountId: midasAccounts.ledgerAccountId,
-			createdAt: midasAccounts.createdAt,
-		})
-		.from(midasAccounts)
-		.where(eq(midasAccounts.userId, canonicalUserId))
-		.limit(1);
-
-	if (existingUserAccount) {
-		if (existingUserAccount.ledgerAccountId === canonicalLedgerAccountId) {
-			return existingUserAccount;
-		}
-		throw new MidasError(
-			"MIDAS_ACCOUNT_CONFLICT",
-			"User already has a Midas account linked to a different ledger account",
 		);
 	}
 
@@ -320,6 +322,12 @@ export async function createMidasAccount({
 	} catch (err) {
 		if (err instanceof MidasError) {
 			throw err;
+		}
+		if (isMidasLedgerAccountInvalidDbError(err)) {
+			throw new MidasError(
+				"MIDAS_LEDGER_ACCOUNT_INVALID",
+				"Cannot link Midas account: linked ledger account is invalid or has negative physical balance",
+			);
 		}
 		const errStr = `${err instanceof Error ? err.message : String(err)} ${(err as { cause?: Error })?.cause?.message ?? ""} ${String((err as { cause?: { code?: string } })?.cause?.code ?? "")}`;
 		if (
@@ -694,7 +702,47 @@ export async function createMidasAllocationTransferInTransaction({
 		};
 	}
 
-	// 3. Lock parent Midas account FOR UPDATE to serialize all allocation transfers
+	// 3. Resolve Midas identity without locking only to obtain ledgerAccountId
+	const [midasIdentity] = await tx
+		.select({
+			id: midasAccounts.id,
+			userId: midasAccounts.userId,
+			ledgerAccountId: midasAccounts.ledgerAccountId,
+		})
+		.from(midasAccounts)
+		.where(
+			and(
+				eq(midasAccounts.id, trimmedMidasAccountId),
+				eq(midasAccounts.userId, trimmedUserId),
+			),
+		)
+		.limit(1);
+
+	if (!midasIdentity) {
+		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
+	}
+
+	// 4. Lock linked ledger account FOR UPDATE first (matching global journal post order)
+	const [ledgerAccount] = await tx
+		.select({
+			id: ledgerAccounts.id,
+			userId: ledgerAccounts.userId,
+		})
+		.from(ledgerAccounts)
+		.where(
+			and(
+				eq(ledgerAccounts.id, midasIdentity.ledgerAccountId),
+				eq(ledgerAccounts.userId, trimmedUserId),
+			),
+		)
+		.for("update")
+		.limit(1);
+
+	if (!ledgerAccount) {
+		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
+	}
+
+	// 5. Lock parent Midas account FOR UPDATE
 	const [midasAccount] = await tx
 		.select({
 			id: midasAccounts.id,
@@ -712,6 +760,15 @@ export async function createMidasAllocationTransferInTransaction({
 		.limit(1);
 
 	if (!midasAccount) {
+		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
+	}
+
+	// 6. Revalidate after Midas lock
+	if (
+		midasAccount.userId !== trimmedUserId ||
+		midasAccount.id !== trimmedMidasAccountId ||
+		midasAccount.ledgerAccountId !== midasIdentity.ledgerAccountId
+	) {
 		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
 	}
 
@@ -1089,7 +1146,6 @@ export async function getMidasLiquidityStateInTransaction({
 	tx,
 	userId,
 	midasAccountId,
-	lockAccount = true,
 }: GetMidasLiquidityStateInTransactionParams): Promise<MidasLiquidityState> {
 	const canonicalUserId = normalizeCanonicalUuid(userId, "userId");
 	const conditions = [eq(midasAccounts.userId, canonicalUserId)];
@@ -1102,18 +1158,16 @@ export async function getMidasLiquidityStateInTransaction({
 		conditions.push(eq(midasAccounts.id, canonicalMidasAccountId));
 	}
 
-	const accountQuery = tx
+	const [account] = await tx
 		.select({
 			id: midasAccounts.id,
 			userId: midasAccounts.userId,
 			ledgerAccountId: midasAccounts.ledgerAccountId,
 		})
 		.from(midasAccounts)
-		.where(and(...conditions));
-
-	const [account] = lockAccount
-		? await accountQuery.for("update").limit(1)
-		: await accountQuery.limit(1);
+		.where(and(...conditions))
+		.for("update")
+		.limit(1);
 
 	if (!account) {
 		throw new MidasError(
@@ -1218,6 +1272,7 @@ export async function getMidasLiquidityStateInTransaction({
 		}
 	}
 
+	let sumBucketBalancesCents = 0n;
 	const bucketStates: MidasLiquidityBucketState[] = allBuckets.map((b) => {
 		const cents = bucketCentsMap.get(b.id) ?? 0n;
 		if (cents < 0n) {
@@ -1226,6 +1281,7 @@ export async function getMidasLiquidityStateInTransaction({
 				`Impossible state: bucket "${b.code}" has negative balance (${formatSignedCentsToMoney(cents)})`,
 			);
 		}
+		sumBucketBalancesCents += cents;
 		return {
 			bucketId: b.id,
 			code: b.code,
@@ -1234,6 +1290,13 @@ export async function getMidasLiquidityStateInTransaction({
 			balance: formatSignedCentsToMoney(cents),
 		};
 	});
+
+	if (sumBucketBalancesCents !== totalEarmarkedCents) {
+		throw new MidasError(
+			"MIDAS_INVALID_STATE",
+			`Impossible state: sum of bucket balances (${formatSignedCentsToMoney(sumBucketBalancesCents)}) does not match total earmarked (${formatSignedCentsToMoney(totalEarmarkedCents)})`,
+		);
+	}
 
 	if (totalEarmarkedCents < 0n) {
 		throw new MidasError(
@@ -1271,26 +1334,16 @@ export async function getMidasLiquidityState({
 	userId,
 	midasAccountId,
 }: {
-	db: Database | DatabaseTransaction;
+	db: Database;
 	userId: string;
 	midasAccountId?: string | undefined;
 }): Promise<MidasLiquidityState> {
-	if ("transaction" in db && typeof db.transaction === "function") {
-		return await db.transaction(async (tx) => {
-			return await getMidasLiquidityStateInTransaction({
-				tx,
-				userId,
-				midasAccountId,
-				lockAccount: true,
-			});
+	return await db.transaction(async (tx) => {
+		return await getMidasLiquidityStateInTransaction({
+			tx,
+			userId,
+			midasAccountId,
 		});
-	}
-
-	return await getMidasLiquidityStateInTransaction({
-		tx: db as DatabaseTransaction,
-		userId,
-		midasAccountId,
-		lockAccount: false,
 	});
 }
 

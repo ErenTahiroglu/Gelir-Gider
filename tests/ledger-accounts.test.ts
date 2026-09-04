@@ -288,6 +288,67 @@ describe("Ledger Accounts Service (Phase 4A)", () => {
 			expect(mockDb.update).not.toHaveBeenCalled();
 		});
 
+		it("throws LEDGER_ACCOUNT_IN_USE when DB trigger rejects archive due to racing Midas link", async () => {
+			const now = new Date();
+			const triggerError = new Error(
+				"Cannot archive ledger account acc-1 because it is linked to Midas liquidity account midas-1",
+			);
+			(triggerError as unknown as { cause: { message: string } }).cause = {
+				message:
+					"Cannot archive ledger account acc-1 because it is linked to Midas liquidity account midas-1",
+			};
+
+			const mockDb = {
+				select: vi
+					.fn()
+					// 1. Ledger account lookup
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([
+									{
+										id: "acc-1",
+										userId: "user-1",
+										code: "ASSET_OLD",
+										name: "Old Account",
+										accountType: "ASSET",
+										normalBalance: "DEBIT",
+										currency: "TRY",
+										createdAt: now,
+										archivedAt: null,
+									},
+								]),
+							}),
+						}),
+					})
+					// 2. Pre-check sees no Midas link (racing window)
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([]),
+							}),
+						}),
+					}),
+				update: vi.fn().mockReturnValue({
+					set: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							returning: vi.fn().mockRejectedValue(triggerError),
+						}),
+					}),
+				}),
+			} as unknown as Database;
+
+			await expect(
+				archiveLedgerAccount({
+					db: mockDb,
+					userId: "user-1",
+					accountId: "acc-1",
+				}),
+			).rejects.toMatchObject({
+				code: "LEDGER_ACCOUNT_IN_USE",
+			});
+		});
+
 		it("is idempotent when account is already archived", async () => {
 			const archivedDate = new Date("2026-01-01T00:00:00Z");
 			const mockDb = {
