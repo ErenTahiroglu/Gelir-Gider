@@ -169,6 +169,13 @@
       "when": 1788520000000,
       "tag": "0023_short_term_goals_integrity",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1788519567699,
+      "tag": "0024_wise_hannibal_king",
+      "breakpoints": true
     }
   ]
 }
