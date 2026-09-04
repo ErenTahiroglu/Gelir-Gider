@@ -190,6 +190,13 @@
       "when": 1788535532621,
       "tag": "0026_foamy_black_bolt",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1788539196082,
+      "tag": "0027_harden_credit_card_liability_payment_integrity",
+      "breakpoints": true
     }
   ]
 }

@@ -444,3 +444,24 @@ export function formatIstanbulPurchaseDate(occurredAt: Date): string {
 	});
 	return formatter.format(occurredAt);
 }
+
+/**
+ * Validates an installment count (1 to 60 or null/undefined).
+ */
+export function validateInstallmentCount(value: unknown): number | null {
+	if (value === undefined || value === null) {
+		return null;
+	}
+	if (
+		typeof value !== "number" ||
+		!Number.isInteger(value) ||
+		value < 1 ||
+		value > 60
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`Invalid installmentCount: "${String(value)}". Must be an integer between 1 and 60`,
+		);
+	}
+	return value;
+}

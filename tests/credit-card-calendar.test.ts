@@ -284,3 +284,35 @@ describe("validateStatementStatusFilter", () => {
 		expect(() => validateStatementStatusFilter(123)).toThrow(CreditCardError);
 	});
 });
+
+describe("validateInstallmentCount", () => {
+	it("accepts null and undefined and returns null", async () => {
+		const { validateInstallmentCount } = await import(
+			"../src/credit-cards/calendar"
+		);
+		expect(validateInstallmentCount(undefined)).toBeNull();
+		expect(validateInstallmentCount(null)).toBeNull();
+	});
+
+	it("accepts integers from 1 to 60", async () => {
+		const { validateInstallmentCount } = await import(
+			"../src/credit-cards/calendar"
+		);
+		expect(validateInstallmentCount(1)).toBe(1);
+		expect(validateInstallmentCount(3)).toBe(3);
+		expect(validateInstallmentCount(12)).toBe(12);
+		expect(validateInstallmentCount(60)).toBe(60);
+	});
+
+	it("rejects out-of-range or non-integer values", async () => {
+		const { validateInstallmentCount } = await import(
+			"../src/credit-cards/calendar"
+		);
+		expect(() => validateInstallmentCount(0)).toThrow(CreditCardError);
+		expect(() => validateInstallmentCount(-1)).toThrow(CreditCardError);
+		expect(() => validateInstallmentCount(61)).toThrow(CreditCardError);
+		expect(() => validateInstallmentCount(3.5)).toThrow(CreditCardError);
+		expect(() => validateInstallmentCount("3")).toThrow(CreditCardError);
+		expect(() => validateInstallmentCount(Number.NaN)).toThrow(CreditCardError);
+	});
+});

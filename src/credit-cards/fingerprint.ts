@@ -4,7 +4,9 @@
 // ============================================================================
 
 async function sha256Hex(data: unknown[]): Promise<string> {
-	const serialized = JSON.stringify(data);
+	const serialized = JSON.stringify(data, (_key, value) =>
+		typeof value === "bigint" ? value.toString() : value,
+	);
 	const encoded = new TextEncoder().encode(serialized);
 	const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
 	const hashArray = Array.from(new Uint8Array(hashBuffer));
@@ -194,6 +196,7 @@ export interface LiabilityEventCreateFingerprintParams {
 	shortTermGoalId: string | null;
 	merchant: string | null;
 	description: string | null;
+	installmentCount?: number | null | undefined;
 	occurredAt: Date;
 }
 
@@ -206,6 +209,8 @@ export interface LiabilityEventUpdateFingerprintParams {
 	shortTermGoalId: string | null;
 	merchant: string | null;
 	description: string | null;
+	installmentCount?: number | null | undefined;
+	reasonNote?: string | null | undefined;
 	occurredAt: Date;
 }
 
@@ -218,6 +223,25 @@ export interface LiabilityEventVoidFingerprintParams {
 }
 
 export async function calculateLiabilityEventCreateFingerprint(
+	params: LiabilityEventCreateFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"credit-card-liability-revision-v2",
+		params.userId.trim().toLowerCase(),
+		params.cardId.trim().toLowerCase(),
+		params.eventType,
+		"CREATE",
+		params.amount,
+		params.purchaseCategory ?? null,
+		params.shortTermGoalId ? params.shortTermGoalId.trim().toLowerCase() : null,
+		params.merchant ?? null,
+		params.description ?? null,
+		params.installmentCount ?? null,
+		params.occurredAt.toISOString(),
+	]);
+}
+
+export async function calculateLiabilityEventCreateFingerprintV1(
 	params: LiabilityEventCreateFingerprintParams,
 ): Promise<string> {
 	return sha256Hex([
@@ -239,6 +263,26 @@ export async function calculateLiabilityEventUpdateFingerprint(
 	params: LiabilityEventUpdateFingerprintParams,
 ): Promise<string> {
 	return sha256Hex([
+		"credit-card-liability-revision-v2",
+		params.userId.trim().toLowerCase(),
+		params.eventId.trim().toLowerCase(),
+		"UPDATE",
+		params.expectedRevisionNo,
+		params.amount,
+		params.purchaseCategory ?? null,
+		params.shortTermGoalId ? params.shortTermGoalId.trim().toLowerCase() : null,
+		params.merchant ?? null,
+		params.description ?? null,
+		params.installmentCount ?? null,
+		params.reasonNote ?? null,
+		params.occurredAt.toISOString(),
+	]);
+}
+
+export async function calculateLiabilityEventUpdateFingerprintV1(
+	params: LiabilityEventUpdateFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
 		"credit-card-liability-revision-v1",
 		params.userId.trim().toLowerCase(),
 		params.eventId.trim().toLowerCase(),
@@ -254,6 +298,20 @@ export async function calculateLiabilityEventUpdateFingerprint(
 }
 
 export async function calculateLiabilityEventVoidFingerprint(
+	params: LiabilityEventVoidFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"credit-card-liability-revision-v2",
+		params.userId.trim().toLowerCase(),
+		params.eventId.trim().toLowerCase(),
+		"VOID",
+		params.expectedRevisionNo,
+		params.reasonNote ?? null,
+		params.occurredAt.toISOString(),
+	]);
+}
+
+export async function calculateLiabilityEventVoidFingerprintV1(
 	params: LiabilityEventVoidFingerprintParams,
 ): Promise<string> {
 	return sha256Hex([

@@ -40,6 +40,9 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 								};
 							}
 							if (selectCallCount === 3) {
+								return { limit: vi.fn().mockResolvedValue([]) };
+							}
+							if (selectCallCount === 4) {
 								return {
 									orderBy: vi.fn().mockReturnValue({
 										limit: vi.fn().mockResolvedValue([
@@ -58,15 +61,20 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 									}),
 								};
 							}
+							if (selectCallCount === 5) {
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: assetAccountId,
+											accountType: "ASSET",
+											normalBalance: "DEBIT",
+											archivedAt: null,
+										},
+									]),
+								};
+							}
 							return {
-								limit: vi.fn().mockResolvedValue([
-									{
-										id: assetAccountId,
-										accountType: "ASSET",
-										normalBalance: "DEBIT",
-										archivedAt: null,
-									},
-								]),
+								limit: vi.fn().mockResolvedValue([]),
 							};
 						}),
 					})),
@@ -90,6 +98,16 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 				ledgerPosting,
 				"lockLedgerAccountsInTransaction",
 			).mockResolvedValue([]);
+			vi.spyOn(
+				ledgerBalances,
+				"getLedgerAccountBalanceInTransaction",
+			).mockResolvedValue({
+				accountId: liabilityAccountId,
+				currency: "TRY",
+				normalBalance: "CREDIT",
+				balance: "10000.00",
+				asOf: "2026-09-01T23:59:59.999Z",
+			});
 			const createTxSpy = vi
 				.spyOn(
 					ledgerLifecycle,
@@ -157,12 +175,15 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 											creditCardId: cardId,
 											cardId,
 											userId,
+											midasAccountId,
 											midasReserveBucketId: reserveBucketId,
 										},
 									]),
 								};
 							}
-							if (selectCallCount === 3) {
+							if (selectCallCount === 3)
+								return { limit: vi.fn().mockResolvedValue([]) };
+							if (selectCallCount === 4) {
 								return {
 									orderBy: vi.fn().mockReturnValue({
 										limit: vi.fn().mockResolvedValue([
@@ -179,6 +200,16 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 											},
 										]),
 									}),
+								};
+							}
+							if (selectCallCount === 5) {
+								// Midas account lookup
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											ledgerAccountId: assetAccountId,
+										},
+									]),
 								};
 							}
 							// Payment asset account
@@ -214,6 +245,16 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 				ledgerPosting,
 				"lockLedgerAccountsInTransaction",
 			).mockResolvedValue([]);
+			vi.spyOn(
+				ledgerBalances,
+				"getLedgerAccountBalanceInTransaction",
+			).mockResolvedValue({
+				accountId: liabilityAccountId,
+				currency: "TRY",
+				normalBalance: "CREDIT",
+				balance: "10000.00",
+				asOf: "2026-09-01T23:59:59.999Z",
+			});
 			vi.spyOn(
 				midasService,
 				"lockMidasAllocationStateInTransaction",
@@ -288,7 +329,9 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 									]),
 								};
 							}
-							if (selectCallCount === 3) {
+							if (selectCallCount === 3)
+								return { limit: vi.fn().mockResolvedValue([]) };
+							if (selectCallCount === 4) {
 								return {
 									orderBy: vi.fn().mockReturnValue({
 										limit: vi.fn().mockResolvedValue([
@@ -309,7 +352,7 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 									}),
 								};
 							}
-							if (selectCallCount === 4) {
+							if (selectCallCount === 5) {
 								// Payment event
 								return {
 									limit: vi.fn().mockResolvedValue([
@@ -322,7 +365,7 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 									]),
 								};
 							}
-							if (selectCallCount === 5) {
+							if (selectCallCount === 6) {
 								// Midas account lookup
 								return {
 									limit: vi.fn().mockResolvedValue([{ id: midasAccountId }]),
@@ -408,7 +451,7 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 	describe("reconcileCreditCardStatement", () => {
 		it("matches statement amount against live ledger liability balance", async () => {
 			let selectCallCount = 0;
-			const mockDb = {
+			const mockTx = {
 				select: vi.fn(() => ({
 					from: vi.fn(() => ({
 						where: vi.fn(() => {
@@ -432,6 +475,7 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 												revisionNo: 1,
 												statementAmount: "4500.00",
 												statementDate: "2026-09-01",
+												reservePlacement: "OUTSIDE_MIDAS",
 											},
 										]),
 									}),
@@ -443,6 +487,10 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 						}),
 					})),
 				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
 			} as unknown as Database;
 
 			vi.spyOn(
@@ -462,10 +510,182 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 				statementId,
 			});
 
-			expect(rec.isMatched).toBe(true);
+			expect(rec.liabilityCoverage).toBe("READY");
 			expect(rec.statementAmount).toBe("4500.00");
-			expect(rec.ledgerLiabilityBalance).toBe("4500.00");
-			expect(rec.difference).toBe("0.00");
+			expect(rec.cardLiabilityBalance).toBe("4500.00");
+			expect(rec.liabilityAfterPayment).toBe("0.00");
+		});
+
+		it("returns SHORTFALL when ledger liability is less than statement amount", async () => {
+			let selectCallCount = 0;
+			const mockTx = {
+				select: vi.fn(() => ({
+					from: vi.fn(() => ({
+						where: vi.fn(() => {
+							selectCallCount++;
+							if (selectCallCount === 1) {
+								return {
+									limit: vi
+										.fn()
+										.mockResolvedValue([
+											{ id: statementId, creditCardId: cardId, userId },
+										]),
+								};
+							}
+							if (selectCallCount === 2) {
+								return {
+									orderBy: vi.fn().mockReturnValue({
+										limit: vi.fn().mockResolvedValue([
+											{
+												id: "rev-stmt-1",
+												statementId,
+												revisionNo: 1,
+												statementAmount: "8000.00",
+												statementDate: "2026-09-01",
+												reservePlacement: "OUTSIDE_MIDAS",
+											},
+										]),
+									}),
+								};
+							}
+							return {
+								limit: vi.fn().mockResolvedValue([{ liabilityAccountId }]),
+							};
+						}),
+					})),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			vi.spyOn(
+				ledgerBalances,
+				"getLedgerAccountBalanceInTransaction",
+			).mockResolvedValue({
+				accountId: liabilityAccountId,
+				currency: "TRY",
+				normalBalance: "CREDIT",
+				balance: "7000.00",
+				asOf: "2026-09-01T23:59:59.999Z",
+			});
+
+			const rec = await reconcileCreditCardStatement({
+				db: mockDb,
+				userId,
+				statementId,
+			});
+
+			expect(rec.liabilityCoverage).toBe("SHORTFALL");
+			expect(rec.statementAmount).toBe("8000.00");
+			expect(rec.cardLiabilityBalance).toBe("7000.00");
+			expect(rec.liabilityAfterPayment).toBe("-1000.00");
+		});
+	});
+
+	describe("payCreditCardStatement shortfall enforcement", () => {
+		it("throws CREDIT_CARD_LIABILITY_SHORTFALL when liability is less than statement amount", async () => {
+			const { CreditCardError } = await import("../src/credit-cards/errors");
+
+			let selectCallCount = 0;
+			const mockTx = {
+				select: vi.fn(() => ({
+					from: vi.fn(() => ({
+						where: vi.fn(() => {
+							selectCallCount++;
+							if (selectCallCount === 1) {
+								return { limit: vi.fn().mockResolvedValue([]) };
+							}
+							if (selectCallCount === 2) {
+								return {
+									for: vi
+										.fn()
+										.mockResolvedValue([{ id: statementId, cardId, userId }]),
+								};
+							}
+							if (selectCallCount === 3) {
+								return { limit: vi.fn().mockResolvedValue([]) };
+							}
+							if (selectCallCount === 4) {
+								return {
+									orderBy: vi.fn().mockReturnValue({
+										limit: vi.fn().mockResolvedValue([
+											{
+												id: "rev-stmt-1",
+												statementId,
+												revisionNo: 1,
+												status: "OPEN",
+												statementAmount: "8000.00",
+												statementDate: "2026-09-01",
+												dueDate: "2026-09-15",
+												reservePlacement: "OUTSIDE_MIDAS",
+												note: null,
+											},
+										]),
+									}),
+								};
+							}
+							if (selectCallCount === 5) {
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: assetAccountId,
+											accountType: "ASSET",
+											normalBalance: "DEBIT",
+											archivedAt: null,
+										},
+									]),
+								};
+							}
+							return {
+								limit: vi.fn().mockResolvedValue([]),
+							};
+						}),
+					})),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			vi.spyOn(
+				ledgerProvisioning,
+				"ensureCreditCardLedgerLinkInTransaction",
+			).mockResolvedValue(liabilityAccountId);
+			vi.spyOn(
+				ledgerPosting,
+				"lockLedgerAccountsInTransaction",
+			).mockResolvedValue([]);
+			vi.spyOn(
+				ledgerBalances,
+				"getLedgerAccountBalanceInTransaction",
+			).mockResolvedValue({
+				accountId: liabilityAccountId,
+				currency: "TRY",
+				normalBalance: "CREDIT",
+				balance: "7000.00", // Shortfall!
+				asOf: "2026-09-01T23:59:59.999Z",
+			});
+
+			await expect(
+				payCreditCardStatement({
+					db: mockDb,
+					userId,
+					statementId,
+					expectedRevisionNo: 1,
+					paymentAmount: "8000.00",
+					paymentMethod: "OUTSIDE_MIDAS",
+					paymentAssetAccountId: assetAccountId,
+					occurredAt: new Date("2026-09-10T12:00:00Z"),
+					idempotencyKey: "k-pay-shortfall-1",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_LIABILITY_SHORTFALL",
+				}),
+			);
 		});
 	});
 });

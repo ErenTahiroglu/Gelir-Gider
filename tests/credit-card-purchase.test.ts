@@ -125,7 +125,7 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 								.fn()
 								.mockResolvedValue([{ id: cardId, code: "AKBANK", userId }]),
 							orderBy: vi.fn().mockReturnValue({
-								limit: vi.fn().mockResolvedValue([]),
+								limit: vi.fn().mockResolvedValue([{ status: "ACTIVE" }]),
 							}),
 						}),
 					}),
@@ -223,7 +223,7 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 								.fn()
 								.mockResolvedValue([{ id: cardId, code: "GARANTI", userId }]),
 							orderBy: vi.fn().mockReturnValue({
-								limit: vi.fn().mockResolvedValue([]),
+								limit: vi.fn().mockResolvedValue([{ status: "ACTIVE" }]),
 							}),
 						}),
 					}),

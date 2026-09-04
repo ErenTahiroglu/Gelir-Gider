@@ -8,19 +8,26 @@ import {
 	creditCardLiabilityEvents,
 	mapPurchaseCategoryToSystemRole,
 } from "../db/schema/credit-card-ledger";
-import { creditCards } from "../db/schema/credit-cards";
+import { creditCardRevisions, creditCards } from "../db/schema/credit-cards";
 import {
 	shortTermGoalRevisions,
 	shortTermGoals,
 } from "../db/schema/short-term-goals";
 import { transactionLedgerBindings } from "../db/schema/transaction-ledger";
 import { transactionRevisions } from "../db/schema/transactions";
+import { getLedgerAccountBalanceInTransaction } from "../ledger/balances";
+import {
+	formatSignedCentsToMoney,
+	parsePositiveMoneyString,
+	parseSignedAggregateMoneyString,
+} from "../ledger/money";
 import { lockLedgerAccountsInTransaction } from "../ledger/posting";
 import {
 	createCanonicalTransactionWithLedgerInTransaction,
 	reviseCanonicalTransactionWithLedgerInTransaction,
 	voidCanonicalTransactionWithLedgerInTransaction,
 } from "../transactions/ledger-lifecycle";
+import { runCreditCardTransaction } from "./boundary";
 import {
 	formatIstanbulPurchaseDate,
 	validateCcCanonicalUuid,
@@ -29,13 +36,19 @@ import {
 	validateCcOptionalText,
 	validateCcPositiveMoneyString,
 	validateCcRequiredText,
+	validateInstallmentCount,
 	validateLiabilityEventStatusFilter,
+	validatePurchaseCategory,
 } from "./calendar";
 import { CreditCardError } from "./errors";
 import {
 	calculateLiabilityEventCreateFingerprint,
+	calculateLiabilityEventCreateFingerprintV1,
 	calculateLiabilityEventUpdateFingerprint,
+	calculateLiabilityEventUpdateFingerprintV1,
 	calculateLiabilityEventVoidFingerprint,
+	calculateLiabilityEventVoidFingerprintV1,
+	generateCreditCardLiabilityJournalKey,
 } from "./fingerprint";
 import {
 	ensureCreditCardLedgerLinkInTransaction,
@@ -59,6 +72,7 @@ export interface CreditCardPurchaseRecord {
 	shortTermGoalId: string | null;
 	merchant: string | null;
 	description: string | null;
+	installmentCount: number | null;
 	canonicalTransactionId: string;
 	canonicalRevisionId: string;
 	journalEntryId: string | null;
@@ -72,6 +86,7 @@ export interface CreditCardPurchaseSnapshot {
 	shortTermGoalId: string | null;
 	merchant: string | null;
 	description: string | null;
+	installmentCount: number | null;
 	reasonNote: string | null;
 }
 
@@ -98,6 +113,7 @@ export interface RecordCreditCardPurchaseInTransactionParams {
 	shortTermGoalId?: string | null | undefined;
 	merchant?: string | null | undefined;
 	description?: string | null | undefined;
+	installmentCount?: number | null | undefined;
 	occurredAt: Date;
 	idempotencyKey: string;
 }
@@ -111,6 +127,7 @@ export interface RecordCreditCardPurchaseParams {
 	shortTermGoalId?: string | null | undefined;
 	merchant?: string | null | undefined;
 	description?: string | null | undefined;
+	installmentCount?: number | null | undefined;
 	occurredAt: Date;
 	idempotencyKey: string;
 }
@@ -125,6 +142,7 @@ export interface UpdateCreditCardPurchaseInTransactionParams {
 	shortTermGoalId?: string | null | undefined;
 	merchant?: string | null | undefined;
 	description?: string | null | undefined;
+	installmentCount?: number | null | undefined;
 	reasonNote?: string | null | undefined;
 	occurredAt: Date;
 	idempotencyKey: string;
@@ -140,6 +158,7 @@ export interface UpdateCreditCardPurchaseParams {
 	shortTermGoalId?: string | null | undefined;
 	merchant?: string | null | undefined;
 	description?: string | null | undefined;
+	installmentCount?: number | null | undefined;
 	reasonNote?: string | null | undefined;
 	occurredAt: Date;
 	idempotencyKey: string;
@@ -249,42 +268,34 @@ export interface ListCreditCardPurchasesParams {
 // ============================================================================
 
 export function normalizePurchaseBudgetCategory(
-	category: unknown,
+	category: string,
 ): CreditCardPurchaseBudgetCategory {
-	if (typeof category !== "string") {
-		throw new CreditCardError(
-			"CREDIT_CARD_INVALID_INPUT",
-			`purchaseCategory must be a string, found: ${String(category)}`,
-		);
+	const upper = category.trim().toUpperCase();
+	if (upper === "MANDATORY" || upper === "MANDATORY_EXPENSE") {
+		return "MANDATORY_EXPENSE";
 	}
-	const normalized = category.trim().toUpperCase();
-	switch (normalized) {
-		case "MANDATORY":
-		case "MANDATORY_EXPENSE":
-			return "MANDATORY_EXPENSE";
-		case "DISCRETIONARY":
-		case "DISCRETIONARY_SPEND":
-			return "DISCRETIONARY_SPEND";
-		case "SHORT_TERM_PURCHASE":
-			return "SHORT_TERM_PURCHASE";
-		case "UNCLASSIFIED":
-		case "UNCLASSIFIED_EXPENSE":
-			return "UNCLASSIFIED";
-		default:
-			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_INPUT",
-				`Invalid purchaseCategory: "${category}". Must be MANDATORY, DISCRETIONARY, SHORT_TERM_PURCHASE, or UNCLASSIFIED`,
-			);
+	if (upper === "DISCRETIONARY" || upper === "DISCRETIONARY_SPEND") {
+		return "DISCRETIONARY_SPEND";
 	}
+	if (upper === "SHORT_TERM_PURCHASE") {
+		return "SHORT_TERM_PURCHASE";
+	}
+	if (upper === "UNCLASSIFIED") {
+		return "UNCLASSIFIED";
+	}
+	throw new CreditCardError(
+		"CREDIT_CARD_INVALID_INPUT",
+		`Invalid purchase category: "${category}"`,
+	);
 }
 
 // ============================================================================
-// Purchase Domain Service Implementation
+// Purchase Lifecycle
 // ============================================================================
 
 /**
- * Records a new credit card purchase within an existing transaction.
- * Posts canonical transaction and exact 2-line journal entry (Dr Expense, Cr Card Liability).
+ * Records a fresh credit card purchase inside a transaction with double-entry accounting.
+ * DR Expense Account, CR Credit Card Liability Account.
  */
 export async function recordCreditCardPurchaseInTransaction({
 	tx,
@@ -295,16 +306,19 @@ export async function recordCreditCardPurchaseInTransaction({
 	shortTermGoalId,
 	merchant,
 	description,
+	installmentCount,
 	occurredAt,
 	idempotencyKey,
 }: RecordCreditCardPurchaseInTransactionParams): Promise<CreditCardLiabilityEventLifecycleResult> {
+	// 1. Input Validation
 	const validUserId = validateCcCanonicalUuid(userId, "userId");
 	const validCardId = validateCcCanonicalUuid(cardId, "cardId");
 	const validAmount = validateCcPositiveMoneyString(
 		amount,
 		"amount",
 	).normalized;
-	const validCategory = normalizePurchaseBudgetCategory(purchaseCategory);
+	const parsedCat = validatePurchaseCategory(purchaseCategory);
+	const validCategory = normalizePurchaseBudgetCategory(parsedCat);
 	const validOccurredAt = validateCcOccurredAt(occurredAt);
 	const validKey = validateCcRequiredText(
 		idempotencyKey,
@@ -313,38 +327,27 @@ export async function recordCreditCardPurchaseInTransaction({
 	);
 	const validMerchant = validateCcOptionalText(merchant, "merchant", 200);
 	const validDesc = validateCcOptionalText(description, "description", 500);
+	const validInstallmentCount = validateInstallmentCount(installmentCount);
+	const validGoalId = shortTermGoalId
+		? validateCcCanonicalUuid(shortTermGoalId, "shortTermGoalId")
+		: null;
 
-	let validGoalId: string | null = null;
-	if (validCategory === "SHORT_TERM_PURCHASE") {
-		if (!shortTermGoalId) {
-			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_INPUT",
-				"shortTermGoalId is required for SHORT_TERM_PURCHASE category",
-			);
-		}
-		validGoalId = validateCcCanonicalUuid(shortTermGoalId, "shortTermGoalId");
-	} else if (shortTermGoalId) {
+	if (validCategory === "SHORT_TERM_PURCHASE" && !validGoalId) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"shortTermGoalId is required when purchaseCategory is SHORT_TERM_PURCHASE",
+		);
+	}
+	if (validCategory !== "SHORT_TERM_PURCHASE" && validGoalId) {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",
 			"shortTermGoalId is only allowed for SHORT_TERM_PURCHASE category",
 		);
 	}
 
-	// 1. Check Idempotent Replay on Revision Key
-	const [existingRev] = await tx
-		.select({
-			id: creditCardLiabilityEventRevisions.id,
-			eventId: creditCardLiabilityEventRevisions.eventId,
-			revisionNo: creditCardLiabilityEventRevisions.revisionNo,
-			operation: creditCardLiabilityEventRevisions.operation,
-			amount: creditCardLiabilityEventRevisions.amount,
-			purchaseDate: creditCardLiabilityEventRevisions.purchaseDate,
-			budgetCategory: creditCardLiabilityEventRevisions.budgetCategory,
-			merchant: creditCardLiabilityEventRevisions.merchant,
-			description: creditCardLiabilityEventRevisions.description,
-			revisionFingerprint:
-				creditCardLiabilityEventRevisions.revisionFingerprint,
-		})
+	// 1.1 EARLY IDEMPOTENCY REPLAY CHECK
+	const [earlyRev] = await tx
+		.select()
 		.from(creditCardLiabilityEventRevisions)
 		.where(
 			and(
@@ -354,49 +357,23 @@ export async function recordCreditCardPurchaseInTransaction({
 		)
 		.limit(1);
 
-	if (existingRev) {
-		const candidateFingerprint = await calculateLiabilityEventCreateFingerprint(
-			{
-				userId: validUserId,
-				cardId: validCardId,
-				eventType: "PURCHASE",
-				amount: validAmount,
-				purchaseCategory: validCategory,
-				shortTermGoalId: validGoalId,
-				merchant: validMerchant,
-				description: validDesc,
-				occurredAt: validOccurredAt,
-			},
+	if (earlyRev) {
+		return checkPurchaseCreateReplay(
+			tx,
+			earlyRev,
+			validUserId,
+			validCardId,
+			validAmount,
+			validCategory,
+			validGoalId,
+			validMerchant,
+			validDesc,
+			validInstallmentCount,
+			validOccurredAt,
 		);
-
-		if (existingRev.revisionFingerprint !== candidateFingerprint) {
-			throw new CreditCardError(
-				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
-				"Idempotency key already used with different purchase payload",
-			);
-		}
-
-		return {
-			eventId: existingRev.eventId,
-			revisionId: existingRev.id,
-			revisionNo: existingRev.revisionNo,
-			operation: existingRev.operation as CreditCardLiabilityEventOperation,
-			status: "POSTED",
-			idempotentReplay: true,
-			snapshot: {
-				amount: existingRev.amount,
-				purchaseDate: existingRev.purchaseDate,
-				purchaseCategory:
-					existingRev.budgetCategory as CreditCardPurchaseBudgetCategory,
-				shortTermGoalId: validGoalId,
-				merchant: existingRev.merchant,
-				description: existingRev.description,
-				reasonNote: null,
-			},
-		};
 	}
 
-	// 2. Lock Card FOR UPDATE & Verify Active
+	// 2. Lock Card Anchor FOR UPDATE & Verify Active
 	const [card] = await tx
 		.select({
 			id: creditCards.id,
@@ -413,6 +390,54 @@ export async function recordCreditCardPurchaseInTransaction({
 		throw new CreditCardError(
 			"CREDIT_CARD_NOT_FOUND",
 			`Credit card "${validCardId}" not found`,
+		);
+	}
+
+	// Check latest card status
+	const [latestCardRev] = await tx
+		.select({ status: creditCardRevisions.status })
+		.from(creditCardRevisions)
+		.where(
+			and(
+				eq(creditCardRevisions.creditCardId, validCardId),
+				eq(creditCardRevisions.userId, validUserId),
+			),
+		)
+		.orderBy(desc(creditCardRevisions.revisionNo))
+		.limit(1);
+
+	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_ACTIVE",
+			`Credit card "${validCardId}" is not active`,
+		);
+	}
+
+	// 2.1 SECOND IDEMPOTENCY REPLAY CHECK (under card lock)
+	const [secondRev] = await tx
+		.select()
+		.from(creditCardLiabilityEventRevisions)
+		.where(
+			and(
+				eq(creditCardLiabilityEventRevisions.userId, validUserId),
+				eq(creditCardLiabilityEventRevisions.idempotencyKey, validKey),
+			),
+		)
+		.limit(1);
+
+	if (secondRev) {
+		return checkPurchaseCreateReplay(
+			tx,
+			secondRev,
+			validUserId,
+			validCardId,
+			validAmount,
+			validCategory,
+			validGoalId,
+			validMerchant,
+			validDesc,
+			validInstallmentCount,
+			validOccurredAt,
 		);
 	}
 
@@ -460,37 +485,49 @@ export async function recordCreditCardPurchaseInTransaction({
 		tx,
 		validUserId,
 	);
-	const expenseRole = mapPurchaseCategoryToSystemRole(validCategory);
-	const expenseAccountId = systemAccounts[expenseRole];
+	const role = mapPurchaseCategoryToSystemRole(validCategory);
+	const expenseAccountId = systemAccounts[role];
 
-	// Lock ledger accounts deterministically
+	// 5. Lock Ledger Accounts FOR UPDATE
 	await lockLedgerAccountsInTransaction({
 		tx,
 		userId: validUserId,
 		accountIds: [liabilityAccountId, expenseAccountId],
 	});
 
-	// 5. Post Canonical Transaction with Ledger Entry
+	// Pre-generate event ID before canonical transaction creation
+	const eventId = crypto.randomUUID();
+	const canonicalPurchaseDate = formatIstanbulPurchaseDate(validOccurredAt);
+	const journalKey = await generateCreditCardLiabilityJournalKey(
+		validKey,
+		eventId,
+		1,
+	);
+
+	// 6. Post Canonical Transaction with Ledger Lines
 	const canonicalRes = await createCanonicalTransactionWithLedgerInTransaction({
 		tx,
 		userId: validUserId,
 		kind: "CREDIT_CARD_PURCHASE",
-		idempotencyKey: validKey,
 		occurredAt: validOccurredAt,
+		idempotencyKey: validKey,
 		payload: {
+			eventId,
 			cardId: validCardId,
 			amount: validAmount,
 			purchaseCategory: validCategory,
 			shortTermGoalId: validGoalId,
 			merchant: validMerchant,
 			description: validDesc,
+			installmentCount: validInstallmentCount,
+			purchaseDate: canonicalPurchaseDate,
 		},
 		source: {
 			type: "CREDIT_CARD_PURCHASE",
 			ref: validKey,
 		},
 		ledger: {
-			memo: `Credit card purchase: ${validMerchant ?? card.code}`,
+			memo: `Credit card purchase: ${validMerchant ? `${validMerchant} ` : ""}(${card.code})`,
 			lines: [
 				{
 					accountId: expenseAccountId,
@@ -506,7 +543,16 @@ export async function recordCreditCardPurchaseInTransaction({
 		},
 	});
 
-	const purchaseDate = formatIstanbulPurchaseDate(validOccurredAt);
+	// 7. Insert Credit Card Liability Event Anchor
+	await tx.insert(creditCardLiabilityEvents).values({
+		id: eventId,
+		userId: validUserId,
+		creditCardId: validCardId,
+		eventType: "PURCHASE",
+		canonicalTransactionId: canonicalRes.transactionId,
+	});
+
+	// 8. Calculate SHA-256 Fingerprint v2 and Insert Revision
 	const fingerprint = await calculateLiabilityEventCreateFingerprint({
 		userId: validUserId,
 		cardId: validCardId,
@@ -516,24 +562,13 @@ export async function recordCreditCardPurchaseInTransaction({
 		shortTermGoalId: validGoalId,
 		merchant: validMerchant,
 		description: validDesc,
+		installmentCount: validInstallmentCount,
 		occurredAt: validOccurredAt,
 	});
 
-	const eventId = crypto.randomUUID();
-
-	// 6. Insert Event Anchor
-	await tx.insert(creditCardLiabilityEvents).values({
-		id: eventId,
-		userId: validUserId,
-		creditCardId: validCardId,
-		eventType: "PURCHASE",
-		canonicalTransactionId: canonicalRes.transactionId,
-	});
-
-	// 7. Insert First Revision
-	const revisionId = crypto.randomUUID();
+	const newRevisionId = crypto.randomUUID();
 	await tx.insert(creditCardLiabilityEventRevisions).values({
-		id: revisionId,
+		id: newRevisionId,
 		userId: validUserId,
 		eventId,
 		revisionNo: 1,
@@ -544,8 +579,8 @@ export async function recordCreditCardPurchaseInTransaction({
 		budgetCategory: validCategory,
 		merchant: validMerchant,
 		description: validDesc,
-		installmentCount: null,
-		purchaseDate,
+		installmentCount: validInstallmentCount,
+		purchaseDate: canonicalPurchaseDate,
 		occurredAt: validOccurredAt,
 		idempotencyKey: validKey,
 		revisionFingerprint: fingerprint,
@@ -553,36 +588,118 @@ export async function recordCreditCardPurchaseInTransaction({
 
 	return {
 		eventId,
-		revisionId,
+		revisionId: newRevisionId,
 		revisionNo: 1,
 		operation: "CREATE",
 		status: "POSTED",
 		idempotentReplay: false,
 		snapshot: {
 			amount: validAmount,
-			purchaseDate,
+			purchaseDate: canonicalPurchaseDate,
 			purchaseCategory: validCategory,
 			shortTermGoalId: validGoalId,
 			merchant: validMerchant,
 			description: validDesc,
+			installmentCount: validInstallmentCount,
+			reasonNote: null,
+		},
+	};
+}
+
+async function checkPurchaseCreateReplay(
+	tx: DatabaseTransaction,
+	existingRev: typeof creditCardLiabilityEventRevisions.$inferSelect,
+	userId: string,
+	cardId: string,
+	amount: string,
+	category: CreditCardPurchaseBudgetCategory,
+	goalId: string | null,
+	merchant: string | null,
+	description: string | null,
+	installmentCount: number | null,
+	occurredAt: Date,
+): Promise<CreditCardLiabilityEventLifecycleResult> {
+	const fpV2 = await calculateLiabilityEventCreateFingerprint({
+		userId,
+		cardId,
+		eventType: "PURCHASE",
+		amount,
+		purchaseCategory: category,
+		shortTermGoalId: goalId,
+		merchant,
+		description,
+		installmentCount,
+		occurredAt,
+	});
+
+	const fpV1 = await calculateLiabilityEventCreateFingerprintV1({
+		userId,
+		cardId,
+		eventType: "PURCHASE",
+		amount,
+		purchaseCategory: category,
+		shortTermGoalId: goalId,
+		merchant,
+		description,
+		occurredAt,
+	});
+
+	if (
+		existingRev.revisionFingerprint !== fpV2 &&
+		existingRev.revisionFingerprint !== fpV1
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used with different purchase payload",
+		);
+	}
+
+	// For v1 replay: check that caller installment intent matches stored projection
+	if (
+		existingRev.revisionFingerprint === fpV1 &&
+		installmentCount !== null &&
+		existingRev.installmentCount !== installmentCount
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used with different installmentCount",
+		);
+	}
+
+	return {
+		eventId: existingRev.eventId,
+		revisionId: existingRev.id,
+		revisionNo: existingRev.revisionNo,
+		operation: existingRev.operation as CreditCardLiabilityEventOperation,
+		status: "POSTED",
+		idempotentReplay: true,
+		snapshot: {
+			amount: existingRev.amount,
+			purchaseDate: existingRev.purchaseDate,
+			purchaseCategory:
+				existingRev.budgetCategory as CreditCardPurchaseBudgetCategory,
+			shortTermGoalId: goalId,
+			merchant: existingRev.merchant,
+			description: existingRev.description,
+			installmentCount: existingRev.installmentCount ?? null,
 			reasonNote: null,
 		},
 	};
 }
 
 /**
- * Records a new credit card purchase.
+ * Records a fresh credit card purchase.
  */
 export async function recordCreditCardPurchase(
 	params: RecordCreditCardPurchaseParams,
 ): Promise<CreditCardLiabilityEventLifecycleResult> {
-	return params.db.transaction(async (tx) => {
+	return runCreditCardTransaction(params.db, async (tx) => {
 		return recordCreditCardPurchaseInTransaction({ tx, ...params });
 	});
 }
 
 /**
- * Updates an existing credit card purchase within an existing transaction.
+ * Updates an existing credit card purchase.
  */
 export async function updateCreditCardPurchaseInTransaction({
 	tx,
@@ -594,6 +711,7 @@ export async function updateCreditCardPurchaseInTransaction({
 	shortTermGoalId,
 	merchant,
 	description,
+	installmentCount,
 	reasonNote,
 	occurredAt,
 	idempotencyKey,
@@ -605,7 +723,8 @@ export async function updateCreditCardPurchaseInTransaction({
 		amount,
 		"amount",
 	).normalized;
-	const validCategory = normalizePurchaseBudgetCategory(purchaseCategory);
+	const parsedCat = validatePurchaseCategory(purchaseCategory);
+	const validCategory = normalizePurchaseBudgetCategory(parsedCat);
 	const validOccurredAt = validateCcOccurredAt(occurredAt);
 	const validKey = validateCcRequiredText(
 		idempotencyKey,
@@ -615,38 +734,27 @@ export async function updateCreditCardPurchaseInTransaction({
 	const validMerchant = validateCcOptionalText(merchant, "merchant", 200);
 	const validDesc = validateCcOptionalText(description, "description", 500);
 	const validReason = validateCcOptionalText(reasonNote, "reasonNote", 500);
+	const validInstallmentCount = validateInstallmentCount(installmentCount);
+	const validGoalId = shortTermGoalId
+		? validateCcCanonicalUuid(shortTermGoalId, "shortTermGoalId")
+		: null;
 
-	let validGoalId: string | null = null;
-	if (validCategory === "SHORT_TERM_PURCHASE") {
-		if (!shortTermGoalId) {
-			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_INPUT",
-				"shortTermGoalId is required for SHORT_TERM_PURCHASE category",
-			);
-		}
-		validGoalId = validateCcCanonicalUuid(shortTermGoalId, "shortTermGoalId");
-	} else if (shortTermGoalId) {
+	if (validCategory === "SHORT_TERM_PURCHASE" && !validGoalId) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"shortTermGoalId is required when purchaseCategory is SHORT_TERM_PURCHASE",
+		);
+	}
+	if (validCategory !== "SHORT_TERM_PURCHASE" && validGoalId) {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",
 			"shortTermGoalId is only allowed for SHORT_TERM_PURCHASE category",
 		);
 	}
 
-	// 1. Check Idempotent Replay on Revision Key
-	const [existingRev] = await tx
-		.select({
-			id: creditCardLiabilityEventRevisions.id,
-			eventId: creditCardLiabilityEventRevisions.eventId,
-			revisionNo: creditCardLiabilityEventRevisions.revisionNo,
-			operation: creditCardLiabilityEventRevisions.operation,
-			amount: creditCardLiabilityEventRevisions.amount,
-			purchaseDate: creditCardLiabilityEventRevisions.purchaseDate,
-			budgetCategory: creditCardLiabilityEventRevisions.budgetCategory,
-			merchant: creditCardLiabilityEventRevisions.merchant,
-			description: creditCardLiabilityEventRevisions.description,
-			revisionFingerprint:
-				creditCardLiabilityEventRevisions.revisionFingerprint,
-		})
+	// 1. EARLY IDEMPOTENCY REPLAY CHECK
+	const [earlyRev] = await tx
+		.select()
 		.from(creditCardLiabilityEventRevisions)
 		.where(
 			and(
@@ -656,57 +764,27 @@ export async function updateCreditCardPurchaseInTransaction({
 		)
 		.limit(1);
 
-	if (existingRev) {
-		const candidateFingerprint = await calculateLiabilityEventUpdateFingerprint(
-			{
-				userId: validUserId,
-				eventId: validEventId,
-				expectedRevisionNo: validExpectedRev,
-				amount: validAmount,
-				purchaseCategory: validCategory,
-				shortTermGoalId: validGoalId,
-				merchant: validMerchant,
-				description: validDesc,
-				occurredAt: validOccurredAt,
-			},
+	if (earlyRev) {
+		return checkPurchaseUpdateReplay(
+			tx,
+			earlyRev,
+			validUserId,
+			validEventId,
+			validExpectedRev,
+			validAmount,
+			validCategory,
+			validGoalId,
+			validMerchant,
+			validDesc,
+			validInstallmentCount,
+			validReason,
+			validOccurredAt,
 		);
-
-		if (existingRev.revisionFingerprint !== candidateFingerprint) {
-			throw new CreditCardError(
-				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
-				"Idempotency key already used with different purchase update payload",
-			);
-		}
-
-		return {
-			eventId: existingRev.eventId,
-			revisionId: existingRev.id,
-			revisionNo: existingRev.revisionNo,
-			operation: existingRev.operation as CreditCardLiabilityEventOperation,
-			status: "POSTED",
-			idempotentReplay: true,
-			snapshot: {
-				amount: existingRev.amount,
-				purchaseDate: existingRev.purchaseDate,
-				purchaseCategory:
-					existingRev.budgetCategory as CreditCardPurchaseBudgetCategory,
-				shortTermGoalId: validGoalId,
-				merchant: existingRev.merchant,
-				description: existingRev.description,
-				reasonNote: validReason,
-			},
-		};
 	}
 
-	// 2. Lock Event Anchor FOR UPDATE
+	// 2. Resolve Event Anchor without lock to find cardId
 	const [event] = await tx
-		.select({
-			id: creditCardLiabilityEvents.id,
-			userId: creditCardLiabilityEvents.userId,
-			creditCardId: creditCardLiabilityEvents.creditCardId,
-			eventType: creditCardLiabilityEvents.eventType,
-			canonicalTransactionId: creditCardLiabilityEvents.canonicalTransactionId,
-		})
+		.select()
 		.from(creditCardLiabilityEvents)
 		.where(
 			and(
@@ -714,7 +792,7 @@ export async function updateCreditCardPurchaseInTransaction({
 				eq(creditCardLiabilityEvents.userId, validUserId),
 			),
 		)
-		.for("update");
+		.limit(1);
 
 	if (!event) {
 		throw new CreditCardError(
@@ -726,11 +804,91 @@ export async function updateCreditCardPurchaseInTransaction({
 	if (event.eventType !== "PURCHASE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",
-			`Liability event "${validEventId}" is an OPENING_BALANCE, not a PURCHASE`,
+			`Liability event "${validEventId}" is not a PURCHASE`,
 		);
 	}
 
-	// 3. Fetch latest revision
+	// 3. Lock Card Anchor FOR UPDATE & Verify Active
+	const [card] = await tx
+		.select()
+		.from(creditCards)
+		.where(
+			and(
+				eq(creditCards.id, event.creditCardId),
+				eq(creditCards.userId, validUserId),
+			),
+		)
+		.for("update");
+
+	if (!card) {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_FOUND",
+			`Credit card "${event.creditCardId}" not found`,
+		);
+	}
+
+	const [latestCardRev] = await tx
+		.select({ status: creditCardRevisions.status })
+		.from(creditCardRevisions)
+		.where(
+			and(
+				eq(creditCardRevisions.creditCardId, event.creditCardId),
+				eq(creditCardRevisions.userId, validUserId),
+			),
+		)
+		.orderBy(desc(creditCardRevisions.revisionNo))
+		.limit(1);
+
+	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_ACTIVE",
+			`Credit card "${event.creditCardId}" is not active`,
+		);
+	}
+
+	// 4. Lock Event Anchor FOR UPDATE
+	await tx
+		.select({ id: creditCardLiabilityEvents.id })
+		.from(creditCardLiabilityEvents)
+		.where(
+			and(
+				eq(creditCardLiabilityEvents.id, validEventId),
+				eq(creditCardLiabilityEvents.userId, validUserId),
+			),
+		)
+		.for("update");
+
+	// 4.1 SECOND IDEMPOTENCY REPLAY CHECK (under lock)
+	const [secondRev] = await tx
+		.select()
+		.from(creditCardLiabilityEventRevisions)
+		.where(
+			and(
+				eq(creditCardLiabilityEventRevisions.userId, validUserId),
+				eq(creditCardLiabilityEventRevisions.idempotencyKey, validKey),
+			),
+		)
+		.limit(1);
+
+	if (secondRev) {
+		return checkPurchaseUpdateReplay(
+			tx,
+			secondRev,
+			validUserId,
+			validEventId,
+			validExpectedRev,
+			validAmount,
+			validCategory,
+			validGoalId,
+			validMerchant,
+			validDesc,
+			validInstallmentCount,
+			validReason,
+			validOccurredAt,
+		);
+	}
+
+	// 5. Fetch latest revision
 	const [latestRev] = await tx
 		.select()
 		.from(creditCardLiabilityEventRevisions)
@@ -759,21 +917,7 @@ export async function updateCreditCardPurchaseInTransaction({
 		);
 	}
 
-	// Lock card FOR UPDATE
-	const [card] = await tx
-		.select({ id: creditCards.id, code: creditCards.code })
-		.from(creditCards)
-		.where(eq(creditCards.id, event.creditCardId))
-		.for("update");
-
-	if (!card) {
-		throw new CreditCardError(
-			"CREDIT_CARD_NOT_FOUND",
-			`Credit card "${event.creditCardId}" not found`,
-		);
-	}
-
-	// If short term goal, verify goal
+	// Verify short-term goal if applicable
 	if (validGoalId) {
 		const [goal] = await tx
 			.select({
@@ -801,7 +945,7 @@ export async function updateCreditCardPurchaseInTransaction({
 		}
 	}
 
-	// 4. Resolve Ledger Accounts
+	// 6. Resolve Ledger Accounts
 	const liabilityAccountId = await ensureCreditCardLedgerLinkInTransaction(
 		tx,
 		validUserId,
@@ -811,10 +955,45 @@ export async function updateCreditCardPurchaseInTransaction({
 		tx,
 		validUserId,
 	);
-	const expenseRole = mapPurchaseCategoryToSystemRole(validCategory);
-	const expenseAccountId = systemAccounts[expenseRole];
 
-	// Get latest canonical revision number
+	const oldRole = mapPurchaseCategoryToSystemRole(
+		latestRev.budgetCategory as CreditCardPurchaseBudgetCategory,
+	);
+	const newRole = mapPurchaseCategoryToSystemRole(validCategory);
+	const oldExpenseAccountId = systemAccounts[oldRole];
+	const newExpenseAccountId = systemAccounts[newRole];
+
+	// Lock ledger accounts
+	const accountIdsToLock = Array.from(
+		new Set([liabilityAccountId, oldExpenseAccountId, newExpenseAccountId]),
+	);
+	await lockLedgerAccountsInTransaction({
+		tx,
+		userId: validUserId,
+		accountIds: accountIdsToLock,
+	});
+
+	// 7. Verify Liability Non-Negativity Pre-check
+	const currentBal = await getLedgerAccountBalanceInTransaction({
+		tx,
+		userId: validUserId,
+		accountId: liabilityAccountId,
+	});
+	const currentCents = parseSignedAggregateMoneyString(
+		currentBal.balance,
+	).cents;
+	const oldCents = parsePositiveMoneyString(latestRev.amount).cents;
+	const newCents = parsePositiveMoneyString(validAmount).cents;
+	const netDiff = newCents - oldCents;
+
+	if (currentCents + netDiff < 0n) {
+		throw new CreditCardError(
+			"CREDIT_CARD_LIABILITY_SHORTFALL",
+			"Updating purchase would result in negative credit card liability balance",
+		);
+	}
+
+	// 8. Fetch latest canonical revision
 	const [canonicalRev] = await tx
 		.select({ revisionNo: transactionRevisions.revisionNo })
 		.from(transactionRevisions)
@@ -828,14 +1007,8 @@ export async function updateCreditCardPurchaseInTransaction({
 		);
 	}
 
-	// Lock ledger accounts deterministically
-	await lockLedgerAccountsInTransaction({
-		tx,
-		userId: validUserId,
-		accountIds: [liabilityAccountId, expenseAccountId],
-	});
+	const canonicalPurchaseDate = formatIstanbulPurchaseDate(validOccurredAt);
 
-	// 5. Revise Canonical Transaction with Ledger Entry
 	const canonicalRes = await reviseCanonicalTransactionWithLedgerInTransaction({
 		tx,
 		userId: validUserId,
@@ -844,12 +1017,15 @@ export async function updateCreditCardPurchaseInTransaction({
 		idempotencyKey: validKey,
 		occurredAt: validOccurredAt,
 		payload: {
+			eventId: validEventId,
 			cardId: event.creditCardId,
 			amount: validAmount,
 			purchaseCategory: validCategory,
 			shortTermGoalId: validGoalId,
 			merchant: validMerchant,
 			description: validDesc,
+			installmentCount: validInstallmentCount,
+			purchaseDate: canonicalPurchaseDate,
 		},
 		reasonCode: "PURCHASE_UPDATE",
 		reasonNote: validReason,
@@ -858,10 +1034,10 @@ export async function updateCreditCardPurchaseInTransaction({
 			ref: validKey,
 		},
 		ledger: {
-			memo: `Credit card purchase update: ${validMerchant ?? card.code}`,
+			memo: `Credit card purchase update: ${validMerchant ? `${validMerchant} ` : ""}(${card.code})`,
 			lines: [
 				{
-					accountId: expenseAccountId,
+					accountId: newExpenseAccountId,
 					side: "DEBIT",
 					amount: validAmount,
 				},
@@ -874,7 +1050,9 @@ export async function updateCreditCardPurchaseInTransaction({
 		},
 	});
 
-	const purchaseDate = formatIstanbulPurchaseDate(validOccurredAt);
+	const newRevisionId = crypto.randomUUID();
+	const newRevisionNo = latestRev.revisionNo + 1;
+
 	const fingerprint = await calculateLiabilityEventUpdateFingerprint({
 		userId: validUserId,
 		eventId: validEventId,
@@ -884,11 +1062,10 @@ export async function updateCreditCardPurchaseInTransaction({
 		shortTermGoalId: validGoalId,
 		merchant: validMerchant,
 		description: validDesc,
+		installmentCount: validInstallmentCount,
+		reasonNote: validReason,
 		occurredAt: validOccurredAt,
 	});
-
-	const newRevisionNo = latestRev.revisionNo + 1;
-	const newRevisionId = crypto.randomUUID();
 
 	await tx.insert(creditCardLiabilityEventRevisions).values({
 		id: newRevisionId,
@@ -902,8 +1079,8 @@ export async function updateCreditCardPurchaseInTransaction({
 		budgetCategory: validCategory,
 		merchant: validMerchant,
 		description: validDesc,
-		installmentCount: null,
-		purchaseDate,
+		installmentCount: validInstallmentCount,
+		purchaseDate: canonicalPurchaseDate,
 		occurredAt: validOccurredAt,
 		idempotencyKey: validKey,
 		revisionFingerprint: fingerprint,
@@ -918,12 +1095,110 @@ export async function updateCreditCardPurchaseInTransaction({
 		idempotentReplay: false,
 		snapshot: {
 			amount: validAmount,
-			purchaseDate,
+			purchaseDate: canonicalPurchaseDate,
 			purchaseCategory: validCategory,
 			shortTermGoalId: validGoalId,
 			merchant: validMerchant,
 			description: validDesc,
+			installmentCount: validInstallmentCount,
 			reasonNote: validReason,
+		},
+	};
+}
+
+async function checkPurchaseUpdateReplay(
+	tx: DatabaseTransaction,
+	existingRev: typeof creditCardLiabilityEventRevisions.$inferSelect,
+	userId: string,
+	eventId: string,
+	expectedRevisionNo: number,
+	amount: string,
+	category: CreditCardPurchaseBudgetCategory,
+	goalId: string | null,
+	merchant: string | null,
+	description: string | null,
+	installmentCount: number | null,
+	reasonNote: string | null,
+	occurredAt: Date,
+): Promise<CreditCardLiabilityEventLifecycleResult> {
+	const fpV2 = await calculateLiabilityEventUpdateFingerprint({
+		userId,
+		eventId,
+		expectedRevisionNo,
+		amount,
+		purchaseCategory: category,
+		shortTermGoalId: goalId,
+		merchant,
+		description,
+		installmentCount,
+		reasonNote,
+		occurredAt,
+	});
+
+	const fpV1 = await calculateLiabilityEventUpdateFingerprintV1({
+		userId,
+		eventId,
+		expectedRevisionNo,
+		amount,
+		purchaseCategory: category,
+		shortTermGoalId: goalId,
+		merchant,
+		description,
+		occurredAt,
+	});
+
+	if (
+		existingRev.revisionFingerprint !== fpV2 &&
+		existingRev.revisionFingerprint !== fpV1
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used with different update payload",
+		);
+	}
+
+	// For legacy v1 replay: check reasonNote and installmentCount against canonical revision
+	if (existingRev.revisionFingerprint === fpV1) {
+		if (
+			installmentCount !== null &&
+			existingRev.installmentCount !== installmentCount
+		) {
+			throw new CreditCardError(
+				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+				"Idempotency key already used with different installmentCount",
+			);
+		}
+		const [canRev] = await tx
+			.select({ reasonNote: transactionRevisions.reasonNote })
+			.from(transactionRevisions)
+			.where(eq(transactionRevisions.id, existingRev.canonicalRevisionId))
+			.limit(1);
+
+		if (canRev && (canRev.reasonNote ?? null) !== reasonNote) {
+			throw new CreditCardError(
+				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+				"Idempotency key already used with different reasonNote",
+			);
+		}
+	}
+
+	return {
+		eventId: existingRev.eventId,
+		revisionId: existingRev.id,
+		revisionNo: existingRev.revisionNo,
+		operation: existingRev.operation as CreditCardLiabilityEventOperation,
+		status: "POSTED",
+		idempotentReplay: true,
+		snapshot: {
+			amount: existingRev.amount,
+			purchaseDate: existingRev.purchaseDate,
+			purchaseCategory:
+				existingRev.budgetCategory as CreditCardPurchaseBudgetCategory,
+			shortTermGoalId: goalId,
+			merchant: existingRev.merchant,
+			description: existingRev.description,
+			installmentCount: existingRev.installmentCount ?? null,
+			reasonNote,
 		},
 	};
 }
@@ -934,13 +1209,13 @@ export async function updateCreditCardPurchaseInTransaction({
 export async function updateCreditCardPurchase(
 	params: UpdateCreditCardPurchaseParams,
 ): Promise<CreditCardLiabilityEventLifecycleResult> {
-	return params.db.transaction(async (tx) => {
+	return runCreditCardTransaction(params.db, async (tx) => {
 		return updateCreditCardPurchaseInTransaction({ tx, ...params });
 	});
 }
 
 /**
- * Voids an existing credit card purchase within an existing transaction.
+ * Voids an existing credit card purchase inside a transaction.
  */
 export async function voidCreditCardPurchaseInTransaction({
 	tx,
@@ -962,21 +1237,9 @@ export async function voidCreditCardPurchaseInTransaction({
 	);
 	const validReason = validateCcOptionalText(reasonNote, "reasonNote", 500);
 
-	// 1. Check Idempotent Replay on Revision Key
-	const [existingRev] = await tx
-		.select({
-			id: creditCardLiabilityEventRevisions.id,
-			eventId: creditCardLiabilityEventRevisions.eventId,
-			revisionNo: creditCardLiabilityEventRevisions.revisionNo,
-			operation: creditCardLiabilityEventRevisions.operation,
-			amount: creditCardLiabilityEventRevisions.amount,
-			purchaseDate: creditCardLiabilityEventRevisions.purchaseDate,
-			budgetCategory: creditCardLiabilityEventRevisions.budgetCategory,
-			merchant: creditCardLiabilityEventRevisions.merchant,
-			description: creditCardLiabilityEventRevisions.description,
-			revisionFingerprint:
-				creditCardLiabilityEventRevisions.revisionFingerprint,
-		})
+	// 1. EARLY IDEMPOTENCY REPLAY CHECK
+	const [earlyRev] = await tx
+		.select()
 		.from(creditCardLiabilityEventRevisions)
 		.where(
 			and(
@@ -986,51 +1249,20 @@ export async function voidCreditCardPurchaseInTransaction({
 		)
 		.limit(1);
 
-	if (existingRev) {
-		const candidateFingerprint = await calculateLiabilityEventVoidFingerprint({
-			userId: validUserId,
-			eventId: validEventId,
-			expectedRevisionNo: validExpectedRev,
-			reasonNote: validReason,
-			occurredAt: validOccurredAt,
-		});
-
-		if (existingRev.revisionFingerprint !== candidateFingerprint) {
-			throw new CreditCardError(
-				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
-				"Idempotency key already used with different purchase void payload",
-			);
-		}
-
-		return {
-			eventId: existingRev.eventId,
-			revisionId: existingRev.id,
-			revisionNo: existingRev.revisionNo,
-			operation: "VOID",
-			status: "VOID",
-			idempotentReplay: true,
-			snapshot: {
-				amount: existingRev.amount,
-				purchaseDate: existingRev.purchaseDate,
-				purchaseCategory:
-					existingRev.budgetCategory as CreditCardPurchaseBudgetCategory,
-				shortTermGoalId: null,
-				merchant: existingRev.merchant,
-				description: existingRev.description,
-				reasonNote: validReason,
-			},
-		};
+	if (earlyRev) {
+		return checkPurchaseVoidReplay(
+			earlyRev,
+			validUserId,
+			validEventId,
+			validExpectedRev,
+			validReason,
+			validOccurredAt,
+		);
 	}
 
-	// 2. Lock Event Anchor FOR UPDATE
+	// 2. Resolve Event Anchor without lock to find cardId
 	const [event] = await tx
-		.select({
-			id: creditCardLiabilityEvents.id,
-			userId: creditCardLiabilityEvents.userId,
-			creditCardId: creditCardLiabilityEvents.creditCardId,
-			eventType: creditCardLiabilityEvents.eventType,
-			canonicalTransactionId: creditCardLiabilityEvents.canonicalTransactionId,
-		})
+		.select()
 		.from(creditCardLiabilityEvents)
 		.where(
 			and(
@@ -1038,7 +1270,7 @@ export async function voidCreditCardPurchaseInTransaction({
 				eq(creditCardLiabilityEvents.userId, validUserId),
 			),
 		)
-		.for("update");
+		.limit(1);
 
 	if (!event) {
 		throw new CreditCardError(
@@ -1050,11 +1282,84 @@ export async function voidCreditCardPurchaseInTransaction({
 	if (event.eventType !== "PURCHASE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",
-			`Liability event "${validEventId}" is an OPENING_BALANCE, not a PURCHASE`,
+			`Liability event "${validEventId}" is not a PURCHASE`,
 		);
 	}
 
-	// 3. Fetch latest revision
+	// 3. Lock Card Anchor FOR UPDATE & Verify Active
+	const [card] = await tx
+		.select()
+		.from(creditCards)
+		.where(
+			and(
+				eq(creditCards.id, event.creditCardId),
+				eq(creditCards.userId, validUserId),
+			),
+		)
+		.for("update");
+
+	if (!card) {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_FOUND",
+			`Credit card "${event.creditCardId}" not found`,
+		);
+	}
+
+	const [latestCardRev] = await tx
+		.select({ status: creditCardRevisions.status })
+		.from(creditCardRevisions)
+		.where(
+			and(
+				eq(creditCardRevisions.creditCardId, event.creditCardId),
+				eq(creditCardRevisions.userId, validUserId),
+			),
+		)
+		.orderBy(desc(creditCardRevisions.revisionNo))
+		.limit(1);
+
+	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_ACTIVE",
+			`Credit card "${event.creditCardId}" is not active`,
+		);
+	}
+
+	// 4. Lock Event Anchor FOR UPDATE
+	await tx
+		.select({ id: creditCardLiabilityEvents.id })
+		.from(creditCardLiabilityEvents)
+		.where(
+			and(
+				eq(creditCardLiabilityEvents.id, validEventId),
+				eq(creditCardLiabilityEvents.userId, validUserId),
+			),
+		)
+		.for("update");
+
+	// 4.1 SECOND IDEMPOTENCY REPLAY CHECK (under lock)
+	const [secondRev] = await tx
+		.select()
+		.from(creditCardLiabilityEventRevisions)
+		.where(
+			and(
+				eq(creditCardLiabilityEventRevisions.userId, validUserId),
+				eq(creditCardLiabilityEventRevisions.idempotencyKey, validKey),
+			),
+		)
+		.limit(1);
+
+	if (secondRev) {
+		return checkPurchaseVoidReplay(
+			secondRev,
+			validUserId,
+			validEventId,
+			validExpectedRev,
+			validReason,
+			validOccurredAt,
+		);
+	}
+
+	// 5. Fetch latest revision
 	const [latestRev] = await tx
 		.select()
 		.from(creditCardLiabilityEventRevisions)
@@ -1072,7 +1377,7 @@ export async function voidCreditCardPurchaseInTransaction({
 	if (latestRev.operation === "VOID") {
 		throw new CreditCardError(
 			"CREDIT_CARD_PURCHASE_NOT_ACTIVE",
-			`Purchase "${validEventId}" is already VOID`,
+			`Purchase "${validEventId}" is already voided`,
 		);
 	}
 
@@ -1083,7 +1388,46 @@ export async function voidCreditCardPurchaseInTransaction({
 		);
 	}
 
-	// 4. Resolve latest canonical revision number
+	// 6. Resolve Ledger Accounts
+	const liabilityAccountId = await ensureCreditCardLedgerLinkInTransaction(
+		tx,
+		validUserId,
+		event.creditCardId,
+	);
+	const systemAccounts = await ensureCreditCardSystemAccountsInTransaction(
+		tx,
+		validUserId,
+	);
+	const role = mapPurchaseCategoryToSystemRole(
+		latestRev.budgetCategory as CreditCardPurchaseBudgetCategory,
+	);
+	const expenseAccountId = systemAccounts[role];
+
+	await lockLedgerAccountsInTransaction({
+		tx,
+		userId: validUserId,
+		accountIds: [liabilityAccountId, expenseAccountId],
+	});
+
+	// 7. Verify Liability Non-Negativity Pre-check
+	const currentBal = await getLedgerAccountBalanceInTransaction({
+		tx,
+		userId: validUserId,
+		accountId: liabilityAccountId,
+	});
+	const currentCents = parseSignedAggregateMoneyString(
+		currentBal.balance,
+	).cents;
+	const voidCents = parsePositiveMoneyString(latestRev.amount).cents;
+
+	if (currentCents - voidCents < 0n) {
+		throw new CreditCardError(
+			"CREDIT_CARD_LIABILITY_SHORTFALL",
+			"Voiding purchase would result in negative credit card liability balance",
+		);
+	}
+
+	// 8. Fetch latest canonical revision
 	const [canonicalRev] = await tx
 		.select({ revisionNo: transactionRevisions.revisionNo })
 		.from(transactionRevisions)
@@ -1097,7 +1441,6 @@ export async function voidCreditCardPurchaseInTransaction({
 		);
 	}
 
-	// 5. Void Canonical Transaction with Reversal Journal Posting
 	const canonicalRes = await voidCanonicalTransactionWithLedgerInTransaction({
 		tx,
 		userId: validUserId,
@@ -1112,6 +1455,9 @@ export async function voidCreditCardPurchaseInTransaction({
 		},
 	});
 
+	const newRevisionId = crypto.randomUUID();
+	const newRevisionNo = latestRev.revisionNo + 1;
+
 	const fingerprint = await calculateLiabilityEventVoidFingerprint({
 		userId: validUserId,
 		eventId: validEventId,
@@ -1119,9 +1465,6 @@ export async function voidCreditCardPurchaseInTransaction({
 		reasonNote: validReason,
 		occurredAt: validOccurredAt,
 	});
-
-	const newRevisionNo = latestRev.revisionNo + 1;
-	const newRevisionId = crypto.randomUUID();
 
 	await tx.insert(creditCardLiabilityEventRevisions).values({
 		id: newRevisionId,
@@ -1135,7 +1478,7 @@ export async function voidCreditCardPurchaseInTransaction({
 		budgetCategory: latestRev.budgetCategory,
 		merchant: latestRev.merchant,
 		description: latestRev.description,
-		installmentCount: null,
+		installmentCount: latestRev.installmentCount,
 		purchaseDate: latestRev.purchaseDate,
 		occurredAt: validOccurredAt,
 		idempotencyKey: validKey,
@@ -1157,7 +1500,62 @@ export async function voidCreditCardPurchaseInTransaction({
 			shortTermGoalId: null,
 			merchant: latestRev.merchant,
 			description: latestRev.description,
+			installmentCount: latestRev.installmentCount ?? null,
 			reasonNote: validReason,
+		},
+	};
+}
+
+async function checkPurchaseVoidReplay(
+	existingRev: typeof creditCardLiabilityEventRevisions.$inferSelect,
+	userId: string,
+	eventId: string,
+	expectedRevisionNo: number,
+	reasonNote: string | null,
+	occurredAt: Date,
+): Promise<CreditCardLiabilityEventLifecycleResult> {
+	const fpV2 = await calculateLiabilityEventVoidFingerprint({
+		userId,
+		eventId,
+		expectedRevisionNo,
+		reasonNote,
+		occurredAt,
+	});
+	const fpV1 = await calculateLiabilityEventVoidFingerprintV1({
+		userId,
+		eventId,
+		expectedRevisionNo,
+		reasonNote,
+		occurredAt,
+	});
+
+	if (
+		existingRev.revisionFingerprint !== fpV2 &&
+		existingRev.revisionFingerprint !== fpV1
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used with different void payload",
+		);
+	}
+
+	return {
+		eventId: existingRev.eventId,
+		revisionId: existingRev.id,
+		revisionNo: existingRev.revisionNo,
+		operation: "VOID",
+		status: "VOID",
+		idempotentReplay: true,
+		snapshot: {
+			amount: existingRev.amount,
+			purchaseDate: existingRev.purchaseDate,
+			purchaseCategory:
+				existingRev.budgetCategory as CreditCardPurchaseBudgetCategory,
+			shortTermGoalId: null,
+			merchant: existingRev.merchant,
+			description: existingRev.description,
+			installmentCount: existingRev.installmentCount ?? null,
+			reasonNote,
 		},
 	};
 }
@@ -1168,18 +1566,18 @@ export async function voidCreditCardPurchaseInTransaction({
 export async function voidCreditCardPurchase(
 	params: VoidCreditCardPurchaseParams,
 ): Promise<CreditCardLiabilityEventLifecycleResult> {
-	return params.db.transaction(async (tx) => {
+	return runCreditCardTransaction(params.db, async (tx) => {
 		return voidCreditCardPurchaseInTransaction({ tx, ...params });
 	});
 }
 
 // ============================================================================
-// Opening Balance Domain Service Implementation
+// Opening Balance Lifecycle
 // ============================================================================
 
 /**
- * Records a credit card opening balance within an existing transaction.
- * Posts Dr Opening Equity, Cr Card Liability (no new expense).
+ * Records an initial credit card opening balance.
+ * DR OPENING_EQUITY, CR Card Liability Account.
  */
 export async function recordCreditCardOpeningBalanceInTransaction({
 	tx,
@@ -1204,18 +1602,9 @@ export async function recordCreditCardOpeningBalanceInTransaction({
 	);
 	const validDesc = validateCcOptionalText(description, "description", 500);
 
-	// 1. Check Idempotent Replay on Revision Key
-	const [existingRev] = await tx
-		.select({
-			id: creditCardLiabilityEventRevisions.id,
-			eventId: creditCardLiabilityEventRevisions.eventId,
-			revisionNo: creditCardLiabilityEventRevisions.revisionNo,
-			operation: creditCardLiabilityEventRevisions.operation,
-			amount: creditCardLiabilityEventRevisions.amount,
-			description: creditCardLiabilityEventRevisions.description,
-			revisionFingerprint:
-				creditCardLiabilityEventRevisions.revisionFingerprint,
-		})
+	// 1. EARLY IDEMPOTENCY REPLAY CHECK
+	const [earlyRev] = await tx
+		.select()
 		.from(creditCardLiabilityEventRevisions)
 		.where(
 			and(
@@ -1225,48 +1614,80 @@ export async function recordCreditCardOpeningBalanceInTransaction({
 		)
 		.limit(1);
 
-	if (existingRev) {
-		const candidateFingerprint = await calculateLiabilityEventCreateFingerprint(
-			{
-				userId: validUserId,
-				cardId: validCardId,
-				eventType: "OPENING_BALANCE",
-				amount: validAmount,
-				purchaseCategory: null,
-				shortTermGoalId: null,
-				merchant: null,
-				description: validDesc,
-				occurredAt: validOccurredAt,
-			},
+	if (earlyRev) {
+		return checkOpeningCreateReplay(
+			earlyRev,
+			validUserId,
+			validCardId,
+			validAmount,
+			validDesc,
+			validOccurredAt,
 		);
-
-		if (existingRev.revisionFingerprint !== candidateFingerprint) {
-			throw new CreditCardError(
-				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
-				"Idempotency key already used with different opening balance payload",
-			);
-		}
-
-		return {
-			eventId: existingRev.eventId,
-			revisionId: existingRev.id,
-			revisionNo: existingRev.revisionNo,
-			operation: "CREATE",
-			status: "POSTED",
-			idempotentReplay: true,
-			snapshot: {
-				amount: existingRev.amount,
-				purchaseDate: null,
-				purchaseCategory: null,
-				shortTermGoalId: null,
-				merchant: null,
-				description: existingRev.description,
-				reasonNote: null,
-			},
-		};
 	}
 
-	// 2. Check if an opening balance already exists for this card
+	// 2. Lock Card Anchor FOR UPDATE & Verify Active
+	const [card] = await tx
+		.select({
+			id: creditCards.id,
+			code: creditCards.code,
+			userId: creditCards.userId,
+		})
+		.from(creditCards)
+		.where(
+			and(eq(creditCards.id, validCardId), eq(creditCards.userId, validUserId)),
+		)
+		.for("update");
+
+	if (!card) {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_FOUND",
+			`Credit card "${validCardId}" not found`,
+		);
+	}
+
+	const [latestCardRev] = await tx
+		.select({ status: creditCardRevisions.status })
+		.from(creditCardRevisions)
+		.where(
+			and(
+				eq(creditCardRevisions.creditCardId, validCardId),
+				eq(creditCardRevisions.userId, validUserId),
+			),
+		)
+		.orderBy(desc(creditCardRevisions.revisionNo))
+		.limit(1);
+
+	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_ACTIVE",
+			`Credit card "${validCardId}" is not active`,
+		);
+	}
+
+	// 2.1 SECOND IDEMPOTENCY REPLAY CHECK (under card lock)
+	const [secondRev] = await tx
+		.select()
+		.from(creditCardLiabilityEventRevisions)
+		.where(
+			and(
+				eq(creditCardLiabilityEventRevisions.userId, validUserId),
+				eq(creditCardLiabilityEventRevisions.idempotencyKey, validKey),
+			),
+		)
+		.limit(1);
+
+	if (secondRev) {
+		return checkOpeningCreateReplay(
+			secondRev,
+			validUserId,
+			validCardId,
+			validAmount,
+			validDesc,
+			validOccurredAt,
+		);
+	}
+
+	// 3. Ensure card does not already have an opening balance event
 	const [existingOpening] = await tx
 		.select({ id: creditCardLiabilityEvents.id })
 		.from(creditCardLiabilityEvents)
@@ -1281,23 +1702,7 @@ export async function recordCreditCardOpeningBalanceInTransaction({
 	if (existingOpening) {
 		throw new CreditCardError(
 			"CREDIT_CARD_OPENING_BALANCE_CONFLICT",
-			`Opening balance already exists for credit card "${validCardId}"`,
-		);
-	}
-
-	// 3. Lock Card FOR UPDATE
-	const [card] = await tx
-		.select({ id: creditCards.id, code: creditCards.code })
-		.from(creditCards)
-		.where(
-			and(eq(creditCards.id, validCardId), eq(creditCards.userId, validUserId)),
-		)
-		.for("update");
-
-	if (!card) {
-		throw new CreditCardError(
-			"CREDIT_CARD_NOT_FOUND",
-			`Credit card "${validCardId}" not found`,
+			`Credit card "${validCardId}" already has an opening balance event`,
 		);
 	}
 
@@ -1313,21 +1718,23 @@ export async function recordCreditCardOpeningBalanceInTransaction({
 	);
 	const equityAccountId = systemAccounts.OPENING_EQUITY;
 
-	// Lock ledger accounts deterministically
 	await lockLedgerAccountsInTransaction({
 		tx,
 		userId: validUserId,
 		accountIds: [liabilityAccountId, equityAccountId],
 	});
 
-	// 5. Post Canonical Transaction with Ledger Entry
+	const eventId = crypto.randomUUID();
+
+	// 5. Post Canonical Transaction
 	const canonicalRes = await createCanonicalTransactionWithLedgerInTransaction({
 		tx,
 		userId: validUserId,
 		kind: "CREDIT_CARD_OPENING_BALANCE",
-		idempotencyKey: validKey,
 		occurredAt: validOccurredAt,
+		idempotencyKey: validKey,
 		payload: {
+			eventId,
 			cardId: validCardId,
 			amount: validAmount,
 			description: validDesc,
@@ -1353,6 +1760,15 @@ export async function recordCreditCardOpeningBalanceInTransaction({
 		},
 	});
 
+	// 6. Insert Event Anchor & Revision
+	await tx.insert(creditCardLiabilityEvents).values({
+		id: eventId,
+		userId: validUserId,
+		creditCardId: validCardId,
+		eventType: "OPENING_BALANCE",
+		canonicalTransactionId: canonicalRes.transactionId,
+	});
+
 	const fingerprint = await calculateLiabilityEventCreateFingerprint({
 		userId: validUserId,
 		cardId: validCardId,
@@ -1362,22 +1778,13 @@ export async function recordCreditCardOpeningBalanceInTransaction({
 		shortTermGoalId: null,
 		merchant: null,
 		description: validDesc,
+		installmentCount: null,
 		occurredAt: validOccurredAt,
 	});
 
-	const eventId = crypto.randomUUID();
-
-	await tx.insert(creditCardLiabilityEvents).values({
-		id: eventId,
-		userId: validUserId,
-		creditCardId: validCardId,
-		eventType: "OPENING_BALANCE",
-		canonicalTransactionId: canonicalRes.transactionId,
-	});
-
-	const revisionId = crypto.randomUUID();
+	const newRevisionId = crypto.randomUUID();
 	await tx.insert(creditCardLiabilityEventRevisions).values({
-		id: revisionId,
+		id: newRevisionId,
 		userId: validUserId,
 		eventId,
 		revisionNo: 1,
@@ -1397,7 +1804,7 @@ export async function recordCreditCardOpeningBalanceInTransaction({
 
 	return {
 		eventId,
-		revisionId,
+		revisionId: newRevisionId,
 		revisionNo: 1,
 		operation: "CREATE",
 		status: "POSTED",
@@ -1409,24 +1816,87 @@ export async function recordCreditCardOpeningBalanceInTransaction({
 			shortTermGoalId: null,
 			merchant: null,
 			description: validDesc,
+			installmentCount: null,
+			reasonNote: null,
+		},
+	};
+}
+
+async function checkOpeningCreateReplay(
+	existingRev: typeof creditCardLiabilityEventRevisions.$inferSelect,
+	userId: string,
+	cardId: string,
+	amount: string,
+	description: string | null,
+	occurredAt: Date,
+): Promise<CreditCardLiabilityEventLifecycleResult> {
+	const fpV2 = await calculateLiabilityEventCreateFingerprint({
+		userId,
+		cardId,
+		eventType: "OPENING_BALANCE",
+		amount,
+		purchaseCategory: null,
+		shortTermGoalId: null,
+		merchant: null,
+		description,
+		installmentCount: null,
+		occurredAt,
+	});
+	const fpV1 = await calculateLiabilityEventCreateFingerprintV1({
+		userId,
+		cardId,
+		eventType: "OPENING_BALANCE",
+		amount,
+		purchaseCategory: null,
+		shortTermGoalId: null,
+		merchant: null,
+		description,
+		occurredAt,
+	});
+
+	if (
+		existingRev.revisionFingerprint !== fpV2 &&
+		existingRev.revisionFingerprint !== fpV1
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used with different opening balance payload",
+		);
+	}
+
+	return {
+		eventId: existingRev.eventId,
+		revisionId: existingRev.id,
+		revisionNo: existingRev.revisionNo,
+		operation: "CREATE",
+		status: "POSTED",
+		idempotentReplay: true,
+		snapshot: {
+			amount: existingRev.amount,
+			purchaseDate: null,
+			purchaseCategory: null,
+			shortTermGoalId: null,
+			merchant: null,
+			description: existingRev.description,
+			installmentCount: null,
 			reasonNote: null,
 		},
 	};
 }
 
 /**
- * Records a credit card opening balance.
+ * Records an initial credit card opening balance.
  */
 export async function recordCreditCardOpeningBalance(
 	params: RecordCreditCardOpeningBalanceParams,
 ): Promise<CreditCardLiabilityEventLifecycleResult> {
-	return params.db.transaction(async (tx) => {
+	return runCreditCardTransaction(params.db, async (tx) => {
 		return recordCreditCardOpeningBalanceInTransaction({ tx, ...params });
 	});
 }
 
 /**
- * Updates a credit card opening balance within an existing transaction.
+ * Updates a credit card opening balance inside a transaction.
  */
 export async function updateCreditCardOpeningBalanceInTransaction({
 	tx,
@@ -1455,18 +1925,9 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 	const validDesc = validateCcOptionalText(description, "description", 500);
 	const validReason = validateCcOptionalText(reasonNote, "reasonNote", 500);
 
-	// 1. Check Idempotent Replay on Revision Key
-	const [existingRev] = await tx
-		.select({
-			id: creditCardLiabilityEventRevisions.id,
-			eventId: creditCardLiabilityEventRevisions.eventId,
-			revisionNo: creditCardLiabilityEventRevisions.revisionNo,
-			operation: creditCardLiabilityEventRevisions.operation,
-			amount: creditCardLiabilityEventRevisions.amount,
-			description: creditCardLiabilityEventRevisions.description,
-			revisionFingerprint:
-				creditCardLiabilityEventRevisions.revisionFingerprint,
-		})
+	// 1. EARLY IDEMPOTENCY REPLAY CHECK
+	const [earlyRev] = await tx
+		.select()
 		.from(creditCardLiabilityEventRevisions)
 		.where(
 			and(
@@ -1476,56 +1937,23 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 		)
 		.limit(1);
 
-	if (existingRev) {
-		const candidateFingerprint = await calculateLiabilityEventUpdateFingerprint(
-			{
-				userId: validUserId,
-				eventId: validEventId,
-				expectedRevisionNo: validExpectedRev,
-				amount: validAmount,
-				purchaseCategory: null,
-				shortTermGoalId: null,
-				merchant: null,
-				description: validDesc,
-				occurredAt: validOccurredAt,
-			},
+	if (earlyRev) {
+		return checkOpeningUpdateReplay(
+			tx,
+			earlyRev,
+			validUserId,
+			validEventId,
+			validExpectedRev,
+			validAmount,
+			validDesc,
+			validReason,
+			validOccurredAt,
 		);
-
-		if (existingRev.revisionFingerprint !== candidateFingerprint) {
-			throw new CreditCardError(
-				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
-				"Idempotency key already used with different opening balance update payload",
-			);
-		}
-
-		return {
-			eventId: existingRev.eventId,
-			revisionId: existingRev.id,
-			revisionNo: existingRev.revisionNo,
-			operation: "UPDATE",
-			status: "POSTED",
-			idempotentReplay: true,
-			snapshot: {
-				amount: existingRev.amount,
-				purchaseDate: null,
-				purchaseCategory: null,
-				shortTermGoalId: null,
-				merchant: null,
-				description: existingRev.description,
-				reasonNote: validReason,
-			},
-		};
 	}
 
-	// 2. Lock Event Anchor FOR UPDATE
+	// 2. Resolve Event Anchor without lock to find cardId
 	const [event] = await tx
-		.select({
-			id: creditCardLiabilityEvents.id,
-			userId: creditCardLiabilityEvents.userId,
-			creditCardId: creditCardLiabilityEvents.creditCardId,
-			eventType: creditCardLiabilityEvents.eventType,
-			canonicalTransactionId: creditCardLiabilityEvents.canonicalTransactionId,
-		})
+		.select()
 		.from(creditCardLiabilityEvents)
 		.where(
 			and(
@@ -1533,7 +1961,7 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 				eq(creditCardLiabilityEvents.userId, validUserId),
 			),
 		)
-		.for("update");
+		.limit(1);
 
 	if (!event) {
 		throw new CreditCardError(
@@ -1545,11 +1973,87 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 	if (event.eventType !== "OPENING_BALANCE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",
-			`Liability event "${validEventId}" is a PURCHASE, not an OPENING_BALANCE`,
+			`Liability event "${validEventId}" is not an OPENING_BALANCE`,
 		);
 	}
 
-	// 3. Fetch latest revision
+	// 3. Lock Card Anchor FOR UPDATE & Verify Active
+	const [card] = await tx
+		.select()
+		.from(creditCards)
+		.where(
+			and(
+				eq(creditCards.id, event.creditCardId),
+				eq(creditCards.userId, validUserId),
+			),
+		)
+		.for("update");
+
+	if (!card) {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_FOUND",
+			`Credit card "${event.creditCardId}" not found`,
+		);
+	}
+
+	const [latestCardRev] = await tx
+		.select({ status: creditCardRevisions.status })
+		.from(creditCardRevisions)
+		.where(
+			and(
+				eq(creditCardRevisions.creditCardId, event.creditCardId),
+				eq(creditCardRevisions.userId, validUserId),
+			),
+		)
+		.orderBy(desc(creditCardRevisions.revisionNo))
+		.limit(1);
+
+	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_ACTIVE",
+			`Credit card "${event.creditCardId}" is not active`,
+		);
+	}
+
+	// 4. Lock Event Anchor FOR UPDATE
+	await tx
+		.select({ id: creditCardLiabilityEvents.id })
+		.from(creditCardLiabilityEvents)
+		.where(
+			and(
+				eq(creditCardLiabilityEvents.id, validEventId),
+				eq(creditCardLiabilityEvents.userId, validUserId),
+			),
+		)
+		.for("update");
+
+	// 4.1 SECOND IDEMPOTENCY REPLAY CHECK (under lock)
+	const [secondRev] = await tx
+		.select()
+		.from(creditCardLiabilityEventRevisions)
+		.where(
+			and(
+				eq(creditCardLiabilityEventRevisions.userId, validUserId),
+				eq(creditCardLiabilityEventRevisions.idempotencyKey, validKey),
+			),
+		)
+		.limit(1);
+
+	if (secondRev) {
+		return checkOpeningUpdateReplay(
+			tx,
+			secondRev,
+			validUserId,
+			validEventId,
+			validExpectedRev,
+			validAmount,
+			validDesc,
+			validReason,
+			validOccurredAt,
+		);
+	}
+
+	// 5. Fetch latest revision
 	const [latestRev] = await tx
 		.select()
 		.from(creditCardLiabilityEventRevisions)
@@ -1578,7 +2082,7 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 		);
 	}
 
-	// 4. Resolve Ledger Accounts
+	// 6. Resolve Ledger Accounts
 	const liabilityAccountId = await ensureCreditCardLedgerLinkInTransaction(
 		tx,
 		validUserId,
@@ -1590,12 +2094,33 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 	);
 	const equityAccountId = systemAccounts.OPENING_EQUITY;
 
-	const [card] = await tx
-		.select({ id: creditCards.id, code: creditCards.code })
-		.from(creditCards)
-		.where(eq(creditCards.id, event.creditCardId))
-		.for("update");
+	await lockLedgerAccountsInTransaction({
+		tx,
+		userId: validUserId,
+		accountIds: [liabilityAccountId, equityAccountId],
+	});
 
+	// 7. Verify Liability Non-Negativity Pre-check
+	const currentBal = await getLedgerAccountBalanceInTransaction({
+		tx,
+		userId: validUserId,
+		accountId: liabilityAccountId,
+	});
+	const currentCents = parseSignedAggregateMoneyString(
+		currentBal.balance,
+	).cents;
+	const oldCents = parsePositiveMoneyString(latestRev.amount).cents;
+	const newCents = parsePositiveMoneyString(validAmount).cents;
+	const netDiff = newCents - oldCents;
+
+	if (currentCents + netDiff < 0n) {
+		throw new CreditCardError(
+			"CREDIT_CARD_LIABILITY_SHORTFALL",
+			"Updating opening balance would result in negative credit card liability balance",
+		);
+	}
+
+	// 8. Fetch latest canonical revision
 	const [canonicalRev] = await tx
 		.select({ revisionNo: transactionRevisions.revisionNo })
 		.from(transactionRevisions)
@@ -1609,12 +2134,6 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 		);
 	}
 
-	await lockLedgerAccountsInTransaction({
-		tx,
-		userId: validUserId,
-		accountIds: [liabilityAccountId, equityAccountId],
-	});
-
 	const canonicalRes = await reviseCanonicalTransactionWithLedgerInTransaction({
 		tx,
 		userId: validUserId,
@@ -1623,6 +2142,7 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 		idempotencyKey: validKey,
 		occurredAt: validOccurredAt,
 		payload: {
+			eventId: validEventId,
 			cardId: event.creditCardId,
 			amount: validAmount,
 			description: validDesc,
@@ -1634,7 +2154,7 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 			ref: validKey,
 		},
 		ledger: {
-			memo: `Credit card opening balance update: ${card?.code ?? ""}`,
+			memo: `Credit card opening balance update: ${card.code}`,
 			lines: [
 				{
 					accountId: equityAccountId,
@@ -1650,6 +2170,9 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 		},
 	});
 
+	const newRevisionId = crypto.randomUUID();
+	const newRevisionNo = latestRev.revisionNo + 1;
+
 	const fingerprint = await calculateLiabilityEventUpdateFingerprint({
 		userId: validUserId,
 		eventId: validEventId,
@@ -1659,11 +2182,10 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 		shortTermGoalId: null,
 		merchant: null,
 		description: validDesc,
+		installmentCount: null,
+		reasonNote: validReason,
 		occurredAt: validOccurredAt,
 	});
-
-	const newRevisionNo = latestRev.revisionNo + 1;
-	const newRevisionId = crypto.randomUUID();
 
 	await tx.insert(creditCardLiabilityEventRevisions).values({
 		id: newRevisionId,
@@ -1698,7 +2220,90 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 			shortTermGoalId: null,
 			merchant: null,
 			description: validDesc,
+			installmentCount: null,
 			reasonNote: validReason,
+		},
+	};
+}
+
+async function checkOpeningUpdateReplay(
+	tx: DatabaseTransaction,
+	existingRev: typeof creditCardLiabilityEventRevisions.$inferSelect,
+	userId: string,
+	eventId: string,
+	expectedRevisionNo: number,
+	amount: string,
+	description: string | null,
+	reasonNote: string | null,
+	occurredAt: Date,
+): Promise<CreditCardLiabilityEventLifecycleResult> {
+	const fpV2 = await calculateLiabilityEventUpdateFingerprint({
+		userId,
+		eventId,
+		expectedRevisionNo,
+		amount,
+		purchaseCategory: null,
+		shortTermGoalId: null,
+		merchant: null,
+		description,
+		installmentCount: null,
+		reasonNote,
+		occurredAt,
+	});
+
+	const fpV1 = await calculateLiabilityEventUpdateFingerprintV1({
+		userId,
+		eventId,
+		expectedRevisionNo,
+		amount,
+		purchaseCategory: null,
+		shortTermGoalId: null,
+		merchant: null,
+		description,
+		occurredAt,
+	});
+
+	if (
+		existingRev.revisionFingerprint !== fpV2 &&
+		existingRev.revisionFingerprint !== fpV1
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used with different update payload",
+		);
+	}
+
+	if (existingRev.revisionFingerprint === fpV1) {
+		const [canRev] = await tx
+			.select({ reasonNote: transactionRevisions.reasonNote })
+			.from(transactionRevisions)
+			.where(eq(transactionRevisions.id, existingRev.canonicalRevisionId))
+			.limit(1);
+
+		if (canRev && (canRev.reasonNote ?? null) !== reasonNote) {
+			throw new CreditCardError(
+				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+				"Idempotency key already used with different reasonNote",
+			);
+		}
+	}
+
+	return {
+		eventId: existingRev.eventId,
+		revisionId: existingRev.id,
+		revisionNo: existingRev.revisionNo,
+		operation: "UPDATE",
+		status: "POSTED",
+		idempotentReplay: true,
+		snapshot: {
+			amount: existingRev.amount,
+			purchaseDate: null,
+			purchaseCategory: null,
+			shortTermGoalId: null,
+			merchant: null,
+			description: existingRev.description,
+			installmentCount: null,
+			reasonNote,
 		},
 	};
 }
@@ -1709,13 +2314,13 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 export async function updateCreditCardOpeningBalance(
 	params: UpdateCreditCardOpeningBalanceParams,
 ): Promise<CreditCardLiabilityEventLifecycleResult> {
-	return params.db.transaction(async (tx) => {
+	return runCreditCardTransaction(params.db, async (tx) => {
 		return updateCreditCardOpeningBalanceInTransaction({ tx, ...params });
 	});
 }
 
 /**
- * Voids a credit card opening balance within an existing transaction.
+ * Voids a credit card opening balance inside a transaction.
  */
 export async function voidCreditCardOpeningBalanceInTransaction({
 	tx,
@@ -1737,18 +2342,9 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 	);
 	const validReason = validateCcOptionalText(reasonNote, "reasonNote", 500);
 
-	// 1. Check Idempotent Replay on Revision Key
-	const [existingRev] = await tx
-		.select({
-			id: creditCardLiabilityEventRevisions.id,
-			eventId: creditCardLiabilityEventRevisions.eventId,
-			revisionNo: creditCardLiabilityEventRevisions.revisionNo,
-			operation: creditCardLiabilityEventRevisions.operation,
-			amount: creditCardLiabilityEventRevisions.amount,
-			description: creditCardLiabilityEventRevisions.description,
-			revisionFingerprint:
-				creditCardLiabilityEventRevisions.revisionFingerprint,
-		})
+	// 1. EARLY IDEMPOTENCY REPLAY CHECK
+	const [earlyRev] = await tx
+		.select()
 		.from(creditCardLiabilityEventRevisions)
 		.where(
 			and(
@@ -1758,50 +2354,20 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 		)
 		.limit(1);
 
-	if (existingRev) {
-		const candidateFingerprint = await calculateLiabilityEventVoidFingerprint({
-			userId: validUserId,
-			eventId: validEventId,
-			expectedRevisionNo: validExpectedRev,
-			reasonNote: validReason,
-			occurredAt: validOccurredAt,
-		});
-
-		if (existingRev.revisionFingerprint !== candidateFingerprint) {
-			throw new CreditCardError(
-				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
-				"Idempotency key already used with different opening balance void payload",
-			);
-		}
-
-		return {
-			eventId: existingRev.eventId,
-			revisionId: existingRev.id,
-			revisionNo: existingRev.revisionNo,
-			operation: "VOID",
-			status: "VOID",
-			idempotentReplay: true,
-			snapshot: {
-				amount: existingRev.amount,
-				purchaseDate: null,
-				purchaseCategory: null,
-				shortTermGoalId: null,
-				merchant: null,
-				description: existingRev.description,
-				reasonNote: validReason,
-			},
-		};
+	if (earlyRev) {
+		return checkOpeningVoidReplay(
+			earlyRev,
+			validUserId,
+			validEventId,
+			validExpectedRev,
+			validReason,
+			validOccurredAt,
+		);
 	}
 
-	// 2. Lock Event Anchor FOR UPDATE
+	// 2. Resolve Event Anchor without lock to find cardId
 	const [event] = await tx
-		.select({
-			id: creditCardLiabilityEvents.id,
-			userId: creditCardLiabilityEvents.userId,
-			creditCardId: creditCardLiabilityEvents.creditCardId,
-			eventType: creditCardLiabilityEvents.eventType,
-			canonicalTransactionId: creditCardLiabilityEvents.canonicalTransactionId,
-		})
+		.select()
 		.from(creditCardLiabilityEvents)
 		.where(
 			and(
@@ -1809,7 +2375,7 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 				eq(creditCardLiabilityEvents.userId, validUserId),
 			),
 		)
-		.for("update");
+		.limit(1);
 
 	if (!event) {
 		throw new CreditCardError(
@@ -1821,11 +2387,84 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 	if (event.eventType !== "OPENING_BALANCE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",
-			`Liability event "${validEventId}" is a PURCHASE, not an OPENING_BALANCE`,
+			`Liability event "${validEventId}" is not an OPENING_BALANCE`,
 		);
 	}
 
-	// 3. Fetch latest revision
+	// 3. Lock Card Anchor FOR UPDATE & Verify Active
+	const [card] = await tx
+		.select()
+		.from(creditCards)
+		.where(
+			and(
+				eq(creditCards.id, event.creditCardId),
+				eq(creditCards.userId, validUserId),
+			),
+		)
+		.for("update");
+
+	if (!card) {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_FOUND",
+			`Credit card "${event.creditCardId}" not found`,
+		);
+	}
+
+	const [latestCardRev] = await tx
+		.select({ status: creditCardRevisions.status })
+		.from(creditCardRevisions)
+		.where(
+			and(
+				eq(creditCardRevisions.creditCardId, event.creditCardId),
+				eq(creditCardRevisions.userId, validUserId),
+			),
+		)
+		.orderBy(desc(creditCardRevisions.revisionNo))
+		.limit(1);
+
+	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_ACTIVE",
+			`Credit card "${event.creditCardId}" is not active`,
+		);
+	}
+
+	// 4. Lock Event Anchor FOR UPDATE
+	await tx
+		.select({ id: creditCardLiabilityEvents.id })
+		.from(creditCardLiabilityEvents)
+		.where(
+			and(
+				eq(creditCardLiabilityEvents.id, validEventId),
+				eq(creditCardLiabilityEvents.userId, validUserId),
+			),
+		)
+		.for("update");
+
+	// 4.1 SECOND IDEMPOTENCY REPLAY CHECK (under lock)
+	const [secondRev] = await tx
+		.select()
+		.from(creditCardLiabilityEventRevisions)
+		.where(
+			and(
+				eq(creditCardLiabilityEventRevisions.userId, validUserId),
+				eq(creditCardLiabilityEventRevisions.idempotencyKey, validKey),
+			),
+		)
+		.limit(1);
+
+	if (secondRev) {
+		return checkOpeningVoidReplay(
+			secondRev,
+			validUserId,
+			validEventId,
+			validExpectedRev,
+			validReason,
+			validOccurredAt,
+		);
+	}
+
+	// 5. Fetch latest revision
 	const [latestRev] = await tx
 		.select()
 		.from(creditCardLiabilityEventRevisions)
@@ -1843,7 +2482,7 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 	if (latestRev.operation === "VOID") {
 		throw new CreditCardError(
 			"CREDIT_CARD_PURCHASE_NOT_ACTIVE",
-			`Opening balance "${validEventId}" is already VOID`,
+			`Opening balance "${validEventId}" is already voided`,
 		);
 	}
 
@@ -1854,6 +2493,43 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 		);
 	}
 
+	// 6. Resolve Ledger Accounts
+	const liabilityAccountId = await ensureCreditCardLedgerLinkInTransaction(
+		tx,
+		validUserId,
+		event.creditCardId,
+	);
+	const systemAccounts = await ensureCreditCardSystemAccountsInTransaction(
+		tx,
+		validUserId,
+	);
+	const equityAccountId = systemAccounts.OPENING_EQUITY;
+
+	await lockLedgerAccountsInTransaction({
+		tx,
+		userId: validUserId,
+		accountIds: [liabilityAccountId, equityAccountId],
+	});
+
+	// 7. Verify Liability Non-Negativity Pre-check
+	const currentBal = await getLedgerAccountBalanceInTransaction({
+		tx,
+		userId: validUserId,
+		accountId: liabilityAccountId,
+	});
+	const currentCents = parseSignedAggregateMoneyString(
+		currentBal.balance,
+	).cents;
+	const voidCents = parsePositiveMoneyString(latestRev.amount).cents;
+
+	if (currentCents - voidCents < 0n) {
+		throw new CreditCardError(
+			"CREDIT_CARD_LIABILITY_SHORTFALL",
+			"Voiding opening balance would result in negative credit card liability balance",
+		);
+	}
+
+	// 8. Fetch latest canonical revision
 	const [canonicalRev] = await tx
 		.select({ revisionNo: transactionRevisions.revisionNo })
 		.from(transactionRevisions)
@@ -1881,6 +2557,9 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 		},
 	});
 
+	const newRevisionId = crypto.randomUUID();
+	const newRevisionNo = latestRev.revisionNo + 1;
+
 	const fingerprint = await calculateLiabilityEventVoidFingerprint({
 		userId: validUserId,
 		eventId: validEventId,
@@ -1888,9 +2567,6 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 		reasonNote: validReason,
 		occurredAt: validOccurredAt,
 	});
-
-	const newRevisionNo = latestRev.revisionNo + 1;
-	const newRevisionId = crypto.randomUUID();
 
 	await tx.insert(creditCardLiabilityEventRevisions).values({
 		id: newRevisionId,
@@ -1925,7 +2601,61 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 			shortTermGoalId: null,
 			merchant: null,
 			description: latestRev.description,
+			installmentCount: null,
 			reasonNote: validReason,
+		},
+	};
+}
+
+async function checkOpeningVoidReplay(
+	existingRev: typeof creditCardLiabilityEventRevisions.$inferSelect,
+	userId: string,
+	eventId: string,
+	expectedRevisionNo: number,
+	reasonNote: string | null,
+	occurredAt: Date,
+): Promise<CreditCardLiabilityEventLifecycleResult> {
+	const fpV2 = await calculateLiabilityEventVoidFingerprint({
+		userId,
+		eventId,
+		expectedRevisionNo,
+		reasonNote,
+		occurredAt,
+	});
+	const fpV1 = await calculateLiabilityEventVoidFingerprintV1({
+		userId,
+		eventId,
+		expectedRevisionNo,
+		reasonNote,
+		occurredAt,
+	});
+
+	if (
+		existingRev.revisionFingerprint !== fpV2 &&
+		existingRev.revisionFingerprint !== fpV1
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used with different void payload",
+		);
+	}
+
+	return {
+		eventId: existingRev.eventId,
+		revisionId: existingRev.id,
+		revisionNo: existingRev.revisionNo,
+		operation: "VOID",
+		status: "VOID",
+		idempotentReplay: true,
+		snapshot: {
+			amount: existingRev.amount,
+			purchaseDate: null,
+			purchaseCategory: null,
+			shortTermGoalId: null,
+			merchant: null,
+			description: existingRev.description,
+			installmentCount: null,
+			reasonNote,
 		},
 	};
 }
@@ -1936,7 +2666,7 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 export async function voidCreditCardOpeningBalance(
 	params: VoidCreditCardOpeningBalanceParams,
 ): Promise<CreditCardLiabilityEventLifecycleResult> {
-	return params.db.transaction(async (tx) => {
+	return runCreditCardTransaction(params.db, async (tx) => {
 		return voidCreditCardOpeningBalanceInTransaction({ tx, ...params });
 	});
 }
@@ -2025,6 +2755,7 @@ export async function getCreditCardPurchase({
 		shortTermGoalId,
 		merchant: latestRev.merchant,
 		description: latestRev.description,
+		installmentCount: latestRev.installmentCount ?? null,
 		canonicalTransactionId: event.canonicalTransactionId,
 		canonicalRevisionId: latestRev.canonicalRevisionId,
 		journalEntryId: binding?.appliedJournalEntryId ?? null,
@@ -2111,6 +2842,7 @@ export async function listCreditCardPurchases({
 			shortTermGoalId,
 			merchant: latestRev.merchant,
 			description: latestRev.description,
+			installmentCount: latestRev.installmentCount ?? null,
 			canonicalTransactionId: ev.canonicalTransactionId,
 			canonicalRevisionId: latestRev.canonicalRevisionId,
 			journalEntryId: binding?.appliedJournalEntryId ?? null,
