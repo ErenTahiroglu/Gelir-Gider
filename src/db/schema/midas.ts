@@ -100,7 +100,7 @@ export const midasBuckets = pgTable(
 		),
 		check(
 			"midas_buckets_name_check",
-			sql`length(trim(${table.name})) >= 1 AND length(${table.name}) <= 120`,
+			sql`${table.name} = btrim(${table.name}) AND length(${table.name}) >= 1 AND length(${table.name}) <= 120`,
 		),
 	],
 );
@@ -175,11 +175,11 @@ export const midasAllocationTransfers = pgTable(
 		),
 		check(
 			"midas_transfers_idempotency_check",
-			sql`length(trim(${table.idempotencyKey})) >= 1 AND length(${table.idempotencyKey}) <= 128`,
+			sql`${table.idempotencyKey} = btrim(${table.idempotencyKey}) AND length(${table.idempotencyKey}) >= 1 AND length(${table.idempotencyKey}) <= 128`,
 		),
 		check(
 			"midas_transfers_memo_check",
-			sql`${table.memo} IS NULL OR length(${table.memo}) <= 500`,
+			sql`${table.memo} IS NULL OR (${table.memo} = btrim(${table.memo}) AND length(${table.memo}) >= 1 AND length(${table.memo}) <= 500)`,
 		),
 	],
 );

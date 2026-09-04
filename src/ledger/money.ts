@@ -77,6 +77,64 @@ export function parsePositiveMoneyString(value: unknown): ParsedMoney {
 }
 
 /**
+ * Pattern for signed exact money strings resulting from PostgreSQL aggregations.
+ * Supports optional leading minus sign, unbounded integer digits, and 0-2 decimal places.
+ */
+const SIGNED_AGGREGATE_MONEY_PATTERN = /^-?(0|[1-9]\d*)(\.\d{1,2})?$/;
+
+/**
+ * Parses an exact signed decimal money string resulting from PostgreSQL aggregations (e.g. SUM(debit) - SUM(credit)).
+ * Correctly preserves negative signs on sub-unit amounts (e.g. "-0.50" -> -50n cents).
+ *
+ * Accepted examples: "-0.50", "-0.01", "-1.00", "0", "0.00", "1.23", "19999999999999999.98"
+ * Normalization: "-0.5" -> "-0.50", "-0.00" -> "0.00", "1" -> "1.00"
+ */
+export function parseSignedAggregateMoneyString(value: unknown): ParsedMoney {
+	if (typeof value !== "string") {
+		throw new Error("Money value must be a string");
+	}
+
+	const trimmed = value.trim();
+	if (trimmed === "") {
+		throw new Error("Money value cannot be empty");
+	}
+
+	if (!SIGNED_AGGREGATE_MONEY_PATTERN.test(trimmed)) {
+		throw new Error(`Invalid money string format: "${trimmed}"`);
+	}
+
+	const isNegative = trimmed.startsWith("-");
+	const clean = isNegative ? trimmed.slice(1) : trimmed;
+
+	const parts = clean.split(".");
+	const intPart = parts[0] ?? "0";
+	let fracPart = parts[1] ?? "";
+
+	if (fracPart.length === 0) {
+		fracPart = "00";
+	} else if (fracPart.length === 1) {
+		fracPart = `${fracPart}0`;
+	}
+
+	const absCents = BigInt(intPart) * 100n + BigInt(fracPart);
+
+	if (absCents === 0n) {
+		return {
+			normalized: "0.00",
+			cents: 0n,
+		};
+	}
+
+	const normalized = `${isNegative ? "-" : ""}${intPart}.${fracPart}`;
+	const cents = isNegative ? -absCents : absCents;
+
+	return {
+		normalized,
+		cents,
+	};
+}
+
+/**
  * Parses an exact decimal money string resulting from PostgreSQL aggregations (e.g. SUM(debit), SUM(credit)).
  * Unlike single-line NUMERIC(18,2) parsing, this supports unbounded integer digits beyond 16 digits
  * using pure BigInt capacity without precision loss.

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Database } from "../src/db/client";
 import { MidasError } from "../src/midas/errors";
 import {
@@ -23,6 +23,18 @@ describe("Midas Service Input Validations & Error Contracts (Phase 8A)", () => {
 			).rejects.toThrowError(MidasError);
 		});
 
+		it("rejects non-UUID userId", async () => {
+			await expect(
+				createMidasAccount({
+					db: mockDb,
+					userId: "not-a-valid-uuid",
+					ledgerAccountId: "11111111-1111-4111-8111-111111111111",
+				}),
+			).rejects.toMatchObject({
+				code: "MIDAS_INVALID_INPUT",
+			});
+		});
+
 		it("rejects empty ledgerAccountId", async () => {
 			await expect(
 				createMidasAccount({
@@ -31,6 +43,77 @@ describe("Midas Service Input Validations & Error Contracts (Phase 8A)", () => {
 					ledgerAccountId: "",
 				}),
 			).rejects.toThrowError(MidasError);
+		});
+
+		it("rejects non-UUID ledgerAccountId", async () => {
+			await expect(
+				createMidasAccount({
+					db: mockDb,
+					userId: "11111111-1111-4111-8111-111111111111",
+					ledgerAccountId: "invalid-account-uuid",
+				}),
+			).rejects.toMatchObject({
+				code: "MIDAS_INVALID_INPUT",
+			});
+		});
+
+		it("rejects linking a ledger account with negative physical balance", async () => {
+			const mockDbWithNegBalance = {
+				select: vi
+					.fn()
+					// 1. User
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([
+									{
+										id: "11111111-1111-4111-8111-111111111111",
+										currency: "TRY",
+									},
+								]),
+							}),
+						}),
+					})
+					// 2. Ledger Account
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([
+									{
+										id: "22222222-2222-4222-8222-222222222222",
+										userId: "11111111-1111-4111-8111-111111111111",
+										accountType: "ASSET",
+										normalBalance: "DEBIT",
+										currency: "TRY",
+										archivedAt: null,
+									},
+								]),
+							}),
+						}),
+					})
+					// 3. Physical Balance query: netDebit = -50.00
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							innerJoin: vi.fn().mockReturnValue({
+								where: vi.fn().mockResolvedValue([
+									{
+										netDebit: "-50.00",
+									},
+								]),
+							}),
+						}),
+					}),
+			} as unknown as Database;
+
+			await expect(
+				createMidasAccount({
+					db: mockDbWithNegBalance,
+					userId: "11111111-1111-4111-8111-111111111111",
+					ledgerAccountId: "22222222-2222-4222-8222-222222222222",
+				}),
+			).rejects.toMatchObject({
+				code: "MIDAS_LEDGER_ACCOUNT_INVALID",
+			});
 		});
 	});
 
@@ -200,7 +283,7 @@ describe("Midas Service Input Validations & Error Contracts (Phase 8A)", () => {
 		});
 	});
 
-	describe("getMidasLiquidityState input validation", () => {
+	describe("getMidasLiquidityState input validation and consistency invariants", () => {
 		it("rejects empty userId", async () => {
 			await expect(
 				getMidasLiquidityState({
@@ -208,6 +291,83 @@ describe("Midas Service Input Validations & Error Contracts (Phase 8A)", () => {
 					userId: "",
 				}),
 			).rejects.toThrowError(MidasError);
+		});
+
+		it("rejects non-UUID userId", async () => {
+			await expect(
+				getMidasLiquidityState({
+					db: mockDb,
+					userId: "not-a-valid-uuid",
+				}),
+			).rejects.toMatchObject({
+				code: "MIDAS_INVALID_INPUT",
+			});
+		});
+
+		it("rejects non-UUID midasAccountId", async () => {
+			await expect(
+				getMidasLiquidityState({
+					db: mockDb,
+					userId: "11111111-1111-4111-8111-111111111111",
+					midasAccountId: "not-a-valid-uuid",
+				}),
+			).rejects.toMatchObject({
+				code: "MIDAS_INVALID_INPUT",
+			});
+		});
+
+		it("throws MIDAS_INVALID_STATE if impossible negative physical balance is encountered", async () => {
+			const mockDbWithNegPhysical = {
+				select: vi
+					.fn()
+					// 1. Midas Account
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([
+									{
+										id: "22222222-2222-4222-8222-222222222222",
+										userId: "11111111-1111-4111-8111-111111111111",
+										ledgerAccountId: "33333333-3333-4333-8333-333333333333",
+									},
+								]),
+							}),
+						}),
+					})
+					// 2. Ledger Account Currency
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([
+									{
+										currency: "TRY",
+									},
+								]),
+							}),
+						}),
+					})
+					// 3. Physical Balance query: netDebit = -10.00
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							innerJoin: vi.fn().mockReturnValue({
+								where: vi.fn().mockResolvedValue([
+									{
+										netDebit: "-10.00",
+									},
+								]),
+							}),
+						}),
+					}),
+			} as unknown as Database;
+
+			await expect(
+				getMidasLiquidityState({
+					db: mockDbWithNegPhysical,
+					userId: "11111111-1111-4111-8111-111111111111",
+				}),
+			).rejects.toMatchObject({
+				code: "MIDAS_INVALID_STATE",
+			});
 		});
 	});
 });

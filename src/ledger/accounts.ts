@@ -2,6 +2,7 @@ import { and, eq } from "drizzle-orm";
 import type { Database } from "../db/client";
 import { users } from "../db/schema/auth";
 import { ledgerAccounts } from "../db/schema/ledger";
+import { midasAccounts } from "../db/schema/midas";
 import { LedgerError } from "./errors";
 
 export type AccountType =
@@ -211,6 +212,20 @@ export async function archiveLedgerAccount({
 			createdAt: account.createdAt,
 			archivedAt: account.archivedAt,
 		};
+	}
+
+	// Check if this account is linked to an active Midas account
+	const [linkedMidas] = await db
+		.select({ id: midasAccounts.id })
+		.from(midasAccounts)
+		.where(eq(midasAccounts.ledgerAccountId, accountId))
+		.limit(1);
+
+	if (linkedMidas) {
+		throw new LedgerError(
+			"LEDGER_ACCOUNT_IN_USE",
+			"Cannot archive a ledger account that is linked to a Midas account",
+		);
 	}
 
 	const [updated] = await db

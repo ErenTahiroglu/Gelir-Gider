@@ -5,6 +5,7 @@ import {
 	parseAggregateMoneyString,
 	parseMoneyString,
 	parsePositiveMoneyString,
+	parseSignedAggregateMoneyString,
 } from "../src/ledger/money";
 
 describe("Exact-Decimal Money Engine (Phase 4A & 4B-R1)", () => {
@@ -282,6 +283,91 @@ describe("Exact-Decimal Money Engine (Phase 4A & 4B-R1)", () => {
 			expect(formatSignedCentsToMoney(-999999999999999999n)).toBe(
 				"-9999999999999999.99",
 			);
+		});
+	});
+
+	describe("parseSignedAggregateMoneyString (Signed Aggregate Contract)", () => {
+		it("correctly parses zero, positive, and negative amounts", () => {
+			expect(parseSignedAggregateMoneyString("0")).toEqual({
+				normalized: "0.00",
+				cents: 0n,
+			});
+			expect(parseSignedAggregateMoneyString("-0")).toEqual({
+				normalized: "0.00",
+				cents: 0n,
+			});
+			expect(parseSignedAggregateMoneyString("0.00")).toEqual({
+				normalized: "0.00",
+				cents: 0n,
+			});
+			expect(parseSignedAggregateMoneyString("-0.00")).toEqual({
+				normalized: "0.00",
+				cents: 0n,
+			});
+			expect(parseSignedAggregateMoneyString("0.50")).toEqual({
+				normalized: "0.50",
+				cents: 50n,
+			});
+			expect(parseSignedAggregateMoneyString("-0.50")).toEqual({
+				normalized: "-0.50",
+				cents: -50n,
+			});
+			expect(parseSignedAggregateMoneyString("-0.01")).toEqual({
+				normalized: "-0.01",
+				cents: -1n,
+			});
+			expect(parseSignedAggregateMoneyString("-0.5")).toEqual({
+				normalized: "-0.50",
+				cents: -50n,
+			});
+			expect(parseSignedAggregateMoneyString("1250.50")).toEqual({
+				normalized: "1250.50",
+				cents: 125050n,
+			});
+			expect(parseSignedAggregateMoneyString("-1250.50")).toEqual({
+				normalized: "-1250.50",
+				cents: -125050n,
+			});
+			expect(parseSignedAggregateMoneyString("-1250")).toEqual({
+				normalized: "-1250.00",
+				cents: -125000n,
+			});
+		});
+
+		it("correctly avoids BigInt('-0') truncation bug", () => {
+			const parsedNegCents = parseSignedAggregateMoneyString("-0.50");
+			expect(parsedNegCents.cents).toBe(-50n);
+			expect(parsedNegCents.normalized).toBe("-0.50");
+
+			const parsedNegPenny = parseSignedAggregateMoneyString("-0.01");
+			expect(parsedNegPenny.cents).toBe(-1n);
+			expect(parsedNegPenny.normalized).toBe("-0.01");
+		});
+
+		it("rejects invalid inputs", () => {
+			const invalid = [
+				"",
+				"   ",
+				"+1.00",
+				"1,00",
+				"1e5",
+				"NaN",
+				"Infinity",
+				".50",
+				"-.50",
+				"1.",
+				"-1.",
+				"1.234",
+				"-1.234",
+				"01",
+				"-01",
+				null as unknown as string,
+				undefined as unknown as string,
+			];
+
+			for (const val of invalid) {
+				expect(() => parseSignedAggregateMoneyString(val)).toThrow();
+			}
 		});
 	});
 });

@@ -1,6 +1,7 @@
 import { getTableColumns } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import migration0020Sql from "../migrations/0020_midas_virtual_earmark_foundation.sql?raw";
+import migration0021Sql from "../migrations/0021_unusual_bug.sql?raw";
 import {
 	MIDAS_BUCKET_TYPES,
 	midasAccounts,
@@ -9,7 +10,7 @@ import {
 	SINGLETON_BUCKET_TYPES,
 } from "../src/db/schema/midas";
 
-describe("Midas Schema Definitions (Phase 8A)", () => {
+describe("Midas Schema Definitions (Phase 8A & 8A-R1)", () => {
 	it("exports midas_accounts with exact physical identity columns and NO duplicate balance column", () => {
 		const cols = getTableColumns(midasAccounts);
 		expect(cols.id.dataType).toBe("string");
@@ -101,5 +102,38 @@ describe("Midas Schema Definitions (Phase 8A)", () => {
 		);
 		expect(sqlContent).toContain("Midas cross-ledger solvency violation");
 		expect(sqlContent).toContain("FOR v_midas_account IN");
+	});
+
+	it("verifies migration 0021 contains btrim check constraints, FOR UPDATE insert guard, archive protection, and lock hierarchy reordering", () => {
+		const sqlContent = migration0021Sql;
+
+		// btrim check constraints
+		expect(sqlContent).toContain('btrim("midas_buckets"."name")');
+		expect(sqlContent).toContain(
+			'btrim("midas_allocation_transfers"."idempotency_key")',
+		);
+		expect(sqlContent).toContain('btrim("midas_allocation_transfers"."memo")');
+
+		// FOR UPDATE and negative balance check on midas_accounts insert
+		expect(sqlContent).toContain("WHERE id = NEW.ledger_account_id");
+		expect(sqlContent).toContain("FOR UPDATE");
+		expect(sqlContent).toContain("v_physical_balance < 0");
+
+		// Ledger account archive protection trigger
+		expect(sqlContent).toContain("trg_fn_guard_ledger_accounts_archive");
+		expect(sqlContent).toContain("trg_guard_ledger_accounts_archive");
+		expect(sqlContent).toContain(
+			"Cannot archive ledger account % because it is linked to Midas liquidity account %",
+		);
+
+		// Lock reordering in transition guard: ledger_accounts locked before midas_accounts
+		expect(sqlContent).toContain(
+			"CREATE OR REPLACE FUNCTION trg_fn_guard_journal_entries_transition",
+		);
+		const ledgerLockIndex = sqlContent.indexOf("FOR v_account IN");
+		const midasLockIndex = sqlContent.indexOf("FOR v_midas_account IN");
+		expect(ledgerLockIndex).toBeGreaterThan(0);
+		expect(midasLockIndex).toBeGreaterThan(0);
+		expect(ledgerLockIndex).toBeLessThan(midasLockIndex);
 	});
 });

@@ -18,14 +18,16 @@ export async function calculateAllocationTransferFingerprint(
 ): Promise<string> {
 	const canonicalTuple = [
 		"midas-allocation-transfer-v1",
-		params.userId,
-		params.midasAccountId,
-		params.fromBucketId,
-		params.toBucketId,
+		params.userId.trim().toLowerCase(),
+		params.midasAccountId.trim().toLowerCase(),
+		params.fromBucketId ? params.fromBucketId.trim().toLowerCase() : null,
+		params.toBucketId ? params.toBucketId.trim().toLowerCase() : null,
 		params.amount,
 		params.occurredAt.toISOString(),
 		params.memo,
-		params.reversalOfTransferId,
+		params.reversalOfTransferId
+			? params.reversalOfTransferId.trim().toLowerCase()
+			: null,
 	];
 
 	const serialized = JSON.stringify(canonicalTuple);

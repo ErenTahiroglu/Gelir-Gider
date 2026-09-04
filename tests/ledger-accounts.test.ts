@@ -180,25 +180,34 @@ describe("Ledger Accounts Service (Phase 4A)", () => {
 		it("archives an active ledger account", async () => {
 			const now = new Date();
 			const mockDb = {
-				select: vi.fn().mockReturnValue({
-					from: vi.fn().mockReturnValue({
-						where: vi.fn().mockReturnValue({
-							limit: vi.fn().mockResolvedValue([
-								{
-									id: "acc-1",
-									userId: "user-1",
-									code: "ASSET_OLD",
-									name: "Old Account",
-									accountType: "ASSET",
-									normalBalance: "DEBIT",
-									currency: "TRY",
-									createdAt: now,
-									archivedAt: null,
-								},
-							]),
+				select: vi
+					.fn()
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([
+									{
+										id: "acc-1",
+										userId: "user-1",
+										code: "ASSET_OLD",
+										name: "Old Account",
+										accountType: "ASSET",
+										normalBalance: "DEBIT",
+										currency: "TRY",
+										createdAt: now,
+										archivedAt: null,
+									},
+								]),
+							}),
+						}),
+					})
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([]),
+							}),
 						}),
 					}),
-				}),
 				update: vi.fn().mockReturnValue({
 					set: vi.fn().mockReturnValue({
 						where: vi.fn().mockReturnValue({
@@ -227,6 +236,56 @@ describe("Ledger Accounts Service (Phase 4A)", () => {
 			});
 
 			expect(result.archivedAt).toEqual(now);
+		});
+
+		it("throws LEDGER_ACCOUNT_IN_USE when account is linked to a Midas account", async () => {
+			const now = new Date();
+			const mockDb = {
+				select: vi
+					.fn()
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([
+									{
+										id: "acc-1",
+										userId: "user-1",
+										code: "ASSET_OLD",
+										name: "Old Account",
+										accountType: "ASSET",
+										normalBalance: "DEBIT",
+										currency: "TRY",
+										createdAt: now,
+										archivedAt: null,
+									},
+								]),
+							}),
+						}),
+					})
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([
+									{
+										id: "midas-1",
+									},
+								]),
+							}),
+						}),
+					}),
+				update: vi.fn(),
+			} as unknown as Database;
+
+			await expect(
+				archiveLedgerAccount({
+					db: mockDb,
+					userId: "user-1",
+					accountId: "acc-1",
+				}),
+			).rejects.toMatchObject({
+				code: "LEDGER_ACCOUNT_IN_USE",
+			});
+			expect(mockDb.update).not.toHaveBeenCalled();
 		});
 
 		it("is idempotent when account is already archived", async () => {

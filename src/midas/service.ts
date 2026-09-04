@@ -18,9 +18,11 @@ import {
 	formatSignedCentsToMoney,
 	parseMoneyString,
 	parsePositiveMoneyString,
+	parseSignedAggregateMoneyString,
 } from "../ledger/money";
 import { MidasError } from "./errors";
 import { calculateAllocationTransferFingerprint } from "./fingerprint";
+import { normalizeCanonicalUuid } from "./utils";
 
 const BUCKET_CODE_PATTERN = /^[A-Z][A-Z0-9_]{1,63}$/;
 const VALID_BUCKET_TYPES_SET = new Set<string>(MIDAS_BUCKET_TYPES);
@@ -121,6 +123,13 @@ export interface MidasLiquidityState {
 	buckets: MidasLiquidityBucketState[];
 }
 
+export interface GetMidasLiquidityStateInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	midasAccountId?: string | undefined;
+	lockAccount?: boolean | undefined;
+}
+
 export interface ListMidasAllocationTransfersParams {
 	db: Database | DatabaseTransaction;
 	userId: string;
@@ -154,24 +163,17 @@ export async function createMidasAccount({
 	userId,
 	ledgerAccountId,
 }: CreateMidasAccountParams): Promise<MidasAccountRecord> {
-	if (!userId || userId.trim() === "") {
-		throw new MidasError("MIDAS_INVALID_INPUT", "User ID is required");
-	}
-	if (!ledgerAccountId || ledgerAccountId.trim() === "") {
-		throw new MidasError(
-			"MIDAS_INVALID_INPUT",
-			"Ledger account ID is required",
-		);
-	}
-
-	const trimmedUserId = userId.trim();
-	const trimmedLedgerAccountId = ledgerAccountId.trim();
+	const canonicalUserId = normalizeCanonicalUuid(userId, "userId");
+	const canonicalLedgerAccountId = normalizeCanonicalUuid(
+		ledgerAccountId,
+		"ledgerAccountId",
+	);
 
 	// 1. Check user exists
 	const [user] = await db
 		.select({ id: users.id, currency: users.currency })
 		.from(users)
-		.where(eq(users.id, trimmedUserId))
+		.where(eq(users.id, canonicalUserId))
 		.limit(1);
 
 	if (!user) {
@@ -189,10 +191,10 @@ export async function createMidasAccount({
 			archivedAt: ledgerAccounts.archivedAt,
 		})
 		.from(ledgerAccounts)
-		.where(eq(ledgerAccounts.id, trimmedLedgerAccountId))
+		.where(eq(ledgerAccounts.id, canonicalLedgerAccountId))
 		.limit(1);
 
-	if (!ledgerAcc || ledgerAcc.userId !== trimmedUserId) {
+	if (!ledgerAcc || ledgerAcc.userId !== canonicalUserId) {
 		throw new MidasError(
 			"MIDAS_LEDGER_ACCOUNT_INVALID",
 			"Ledger account not found for this user",
@@ -211,7 +213,34 @@ export async function createMidasAccount({
 		);
 	}
 
-	// 3. Check existing Midas account for user
+	// 3. Check physical balance of ledger account is non-negative
+	const [physicalBalanceRow] = await db
+		.select({
+			netDebit: sql<string>`COALESCE(SUM(${journalLines.debit}) - SUM(${journalLines.credit}), 0)::text`,
+		})
+		.from(journalLines)
+		.innerJoin(
+			journalEntries,
+			eq(journalEntries.id, journalLines.journalEntryId),
+		)
+		.where(
+			and(
+				eq(journalLines.accountId, canonicalLedgerAccountId),
+				eq(journalEntries.status, "POSTED"),
+			),
+		);
+
+	const physicalParsed = parseSignedAggregateMoneyString(
+		physicalBalanceRow?.netDebit ?? "0.00",
+	);
+	if (physicalParsed.cents < 0n) {
+		throw new MidasError(
+			"MIDAS_LEDGER_ACCOUNT_INVALID",
+			`Cannot link Midas account to a ledger account with negative physical balance (${physicalParsed.normalized})`,
+		);
+	}
+
+	// 4. Check existing Midas account for user
 	const [existingUserAccount] = await db
 		.select({
 			id: midasAccounts.id,
@@ -220,11 +249,11 @@ export async function createMidasAccount({
 			createdAt: midasAccounts.createdAt,
 		})
 		.from(midasAccounts)
-		.where(eq(midasAccounts.userId, trimmedUserId))
+		.where(eq(midasAccounts.userId, canonicalUserId))
 		.limit(1);
 
 	if (existingUserAccount) {
-		if (existingUserAccount.ledgerAccountId === trimmedLedgerAccountId) {
+		if (existingUserAccount.ledgerAccountId === canonicalLedgerAccountId) {
 			return existingUserAccount;
 		}
 		throw new MidasError(
@@ -233,11 +262,11 @@ export async function createMidasAccount({
 		);
 	}
 
-	// 4. Check if ledger account is already linked to another user's Midas account
+	// 5. Check if ledger account is already linked to another user's Midas account
 	const [existingLedgerLink] = await db
 		.select({ id: midasAccounts.id })
 		.from(midasAccounts)
-		.where(eq(midasAccounts.ledgerAccountId, trimmedLedgerAccountId))
+		.where(eq(midasAccounts.ledgerAccountId, canonicalLedgerAccountId))
 		.limit(1);
 
 	if (existingLedgerLink) {
@@ -247,23 +276,81 @@ export async function createMidasAccount({
 		);
 	}
 
-	// 5. Insert Midas account
-	const [created] = await db
-		.insert(midasAccounts)
-		.values({
-			userId: trimmedUserId,
-			ledgerAccountId: trimmedLedgerAccountId,
-		})
-		.returning();
+	// 6. Insert Midas account with race safety
+	try {
+		const [created] = await db
+			.insert(midasAccounts)
+			.values({
+				userId: canonicalUserId,
+				ledgerAccountId: canonicalLedgerAccountId,
+			})
+			.onConflictDoNothing({ target: [midasAccounts.userId] })
+			.returning();
 
-	if (!created) {
+		if (created) {
+			return created;
+		}
+
+		// Re-check after conflict
+		const [existingLate] = await db
+			.select({
+				id: midasAccounts.id,
+				userId: midasAccounts.userId,
+				ledgerAccountId: midasAccounts.ledgerAccountId,
+				createdAt: midasAccounts.createdAt,
+			})
+			.from(midasAccounts)
+			.where(eq(midasAccounts.userId, canonicalUserId))
+			.limit(1);
+
+		if (existingLate) {
+			if (existingLate.ledgerAccountId === canonicalLedgerAccountId) {
+				return existingLate;
+			}
+			throw new MidasError(
+				"MIDAS_ACCOUNT_CONFLICT",
+				"User already has a Midas account linked to a different ledger account",
+			);
+		}
+
 		throw new MidasError(
-			"MIDAS_INVALID_STATE",
-			"Failed to create Midas account",
+			"MIDAS_ACCOUNT_CONFLICT",
+			"Ledger account is already linked to a Midas account",
 		);
-	}
+	} catch (err) {
+		if (err instanceof MidasError) {
+			throw err;
+		}
+		const errStr = `${err instanceof Error ? err.message : String(err)} ${(err as { cause?: Error })?.cause?.message ?? ""} ${String((err as { cause?: { code?: string } })?.cause?.code ?? "")}`;
+		if (
+			errStr.includes("23505") ||
+			errStr.includes("unique") ||
+			errStr.includes("duplicate key")
+		) {
+			const [existingAfterErr] = await db
+				.select({
+					id: midasAccounts.id,
+					userId: midasAccounts.userId,
+					ledgerAccountId: midasAccounts.ledgerAccountId,
+					createdAt: midasAccounts.createdAt,
+				})
+				.from(midasAccounts)
+				.where(eq(midasAccounts.userId, canonicalUserId))
+				.limit(1);
 
-	return created;
+			if (
+				existingAfterErr &&
+				existingAfterErr.ledgerAccountId === canonicalLedgerAccountId
+			) {
+				return existingAfterErr;
+			}
+			throw new MidasError(
+				"MIDAS_ACCOUNT_CONFLICT",
+				"Midas account or linked ledger account already exists",
+			);
+		}
+		throw err;
+	}
 }
 
 /**
@@ -277,12 +364,11 @@ export async function createMidasBucket({
 	name,
 	bucketType,
 }: CreateMidasBucketParams): Promise<MidasBucketRecord> {
-	if (!userId || userId.trim() === "") {
-		throw new MidasError("MIDAS_INVALID_INPUT", "User ID is required");
-	}
-	if (!midasAccountId || midasAccountId.trim() === "") {
-		throw new MidasError("MIDAS_INVALID_INPUT", "Midas account ID is required");
-	}
+	const canonicalUserId = normalizeCanonicalUuid(userId, "userId");
+	const canonicalMidasAccountId = normalizeCanonicalUuid(
+		midasAccountId,
+		"midasAccountId",
+	);
 
 	const trimmedCode = code?.trim();
 	if (!trimmedCode || !BUCKET_CODE_PATTERN.test(trimmedCode)) {
@@ -307,17 +393,14 @@ export async function createMidasBucket({
 		);
 	}
 
-	const trimmedUserId = userId.trim();
-	const trimmedMidasAccountId = midasAccountId.trim();
-
 	// Check Midas account exists and belongs to user
 	const [account] = await db
 		.select({ id: midasAccounts.id, userId: midasAccounts.userId })
 		.from(midasAccounts)
 		.where(
 			and(
-				eq(midasAccounts.id, trimmedMidasAccountId),
-				eq(midasAccounts.userId, trimmedUserId),
+				eq(midasAccounts.id, canonicalMidasAccountId),
+				eq(midasAccounts.userId, canonicalUserId),
 			),
 		)
 		.limit(1);
@@ -332,7 +415,7 @@ export async function createMidasBucket({
 		.from(midasBuckets)
 		.where(
 			and(
-				eq(midasBuckets.midasAccountId, trimmedMidasAccountId),
+				eq(midasBuckets.midasAccountId, canonicalMidasAccountId),
 				eq(midasBuckets.code, trimmedCode),
 			),
 		)
@@ -352,7 +435,7 @@ export async function createMidasBucket({
 			.from(midasBuckets)
 			.where(
 				and(
-					eq(midasBuckets.midasAccountId, trimmedMidasAccountId),
+					eq(midasBuckets.midasAccountId, canonicalMidasAccountId),
 					eq(midasBuckets.bucketType, bucketType),
 				),
 			)
@@ -366,34 +449,50 @@ export async function createMidasBucket({
 		}
 	}
 
-	// Insert bucket
-	const [created] = await db
-		.insert(midasBuckets)
-		.values({
-			userId: trimmedUserId,
-			midasAccountId: trimmedMidasAccountId,
-			code: trimmedCode,
-			name: trimmedName,
-			bucketType,
-		})
-		.returning();
+	// Insert bucket with race safety mapping
+	try {
+		const [created] = await db
+			.insert(midasBuckets)
+			.values({
+				userId: canonicalUserId,
+				midasAccountId: canonicalMidasAccountId,
+				code: trimmedCode,
+				name: trimmedName,
+				bucketType,
+			})
+			.returning();
 
-	if (!created) {
-		throw new MidasError(
-			"MIDAS_INVALID_STATE",
-			"Failed to create Midas bucket",
-		);
+		if (!created) {
+			throw new MidasError(
+				"MIDAS_INVALID_STATE",
+				"Failed to create Midas bucket",
+			);
+		}
+
+		return {
+			id: created.id,
+			userId: created.userId,
+			midasAccountId: created.midasAccountId,
+			code: created.code,
+			name: created.name,
+			bucketType: created.bucketType as MidasBucketType,
+			createdAt: created.createdAt,
+		};
+	} catch (err) {
+		if (err instanceof MidasError) throw err;
+		const errStr = `${err instanceof Error ? err.message : String(err)} ${(err as { cause?: Error })?.cause?.message ?? ""} ${String((err as { cause?: { code?: string } })?.cause?.code ?? "")}`;
+		if (
+			errStr.includes("23505") ||
+			errStr.includes("unique") ||
+			errStr.includes("duplicate key")
+		) {
+			throw new MidasError(
+				"MIDAS_BUCKET_CONFLICT",
+				`Bucket conflict for code "${trimmedCode}" or type "${bucketType}"`,
+			);
+		}
+		throw err;
 	}
-
-	return {
-		id: created.id,
-		userId: created.userId,
-		midasAccountId: created.midasAccountId,
-		code: created.code,
-		name: created.name,
-		bucketType: created.bucketType as MidasBucketType,
-		createdAt: created.createdAt,
-	};
 }
 
 /**
@@ -410,12 +509,11 @@ function validateTransferInput(params: {
 	memo?: string | null | undefined;
 	reversalOfTransferId?: string | null | undefined;
 }) {
-	if (!params.userId || params.userId.trim() === "") {
-		throw new MidasError("MIDAS_INVALID_INPUT", "User ID is required");
-	}
-	if (!params.midasAccountId || params.midasAccountId.trim() === "") {
-		throw new MidasError("MIDAS_INVALID_INPUT", "Midas account ID is required");
-	}
+	const canonicalUserId = normalizeCanonicalUuid(params.userId, "userId");
+	const canonicalMidasAccountId = normalizeCanonicalUuid(
+		params.midasAccountId,
+		"midasAccountId",
+	);
 
 	const trimmedIdempotencyKey = params.idempotencyKey?.trim();
 	if (
@@ -439,8 +537,14 @@ function validateTransferInput(params: {
 		);
 	}
 
-	const normalizedFromBucketId = params.fromBucketId?.trim() || null;
-	const normalizedToBucketId = params.toBucketId?.trim() || null;
+	const normalizedFromBucketId =
+		params.fromBucketId !== undefined && params.fromBucketId !== null
+			? normalizeCanonicalUuid(params.fromBucketId, "fromBucketId")
+			: null;
+	const normalizedToBucketId =
+		params.toBucketId !== undefined && params.toBucketId !== null
+			? normalizeCanonicalUuid(params.toBucketId, "toBucketId")
+			: null;
 
 	if (normalizedFromBucketId === null && normalizedToBucketId === null) {
 		throw new MidasError(
@@ -482,11 +586,17 @@ function validateTransferInput(params: {
 	}
 
 	const normalizedReversalOfTransferId =
-		params.reversalOfTransferId?.trim() || null;
+		params.reversalOfTransferId !== undefined &&
+		params.reversalOfTransferId !== null
+			? normalizeCanonicalUuid(
+					params.reversalOfTransferId,
+					"reversalOfTransferId",
+				)
+			: null;
 
 	return {
-		trimmedUserId: params.userId.trim(),
-		trimmedMidasAccountId: params.midasAccountId.trim(),
+		trimmedUserId: canonicalUserId,
+		trimmedMidasAccountId: canonicalMidasAccountId,
 		trimmedIdempotencyKey,
 		normalizedFromBucketId,
 		normalizedToBucketId,
@@ -728,20 +838,14 @@ export async function createMidasAllocationTransferInTransaction({
 				eq(midasAllocationTransfers.midasAccountId, trimmedMidasAccountId),
 			);
 
-		const rawNet = sourceBalanceRow?.netAmount ?? "0.00";
-		const parts = rawNet.split(".");
-		const intPart = BigInt(parts[0] ?? "0");
-		let fracPart = parts[1] ?? "00";
-		if (fracPart.length === 1) fracPart = `${fracPart}0`;
-		const accurateSourceCents =
-			intPart >= 0n
-				? intPart * 100n + BigInt(fracPart)
-				: intPart * 100n - BigInt(fracPart);
+		const parsedSource = parseSignedAggregateMoneyString(
+			sourceBalanceRow?.netAmount ?? "0.00",
+		);
 
-		if (accurateSourceCents < parsedAmount.cents) {
+		if (parsedSource.cents < parsedAmount.cents) {
 			throw new MidasError(
 				"MIDAS_INSUFFICIENT_BUCKET_BALANCE",
-				`Source bucket has insufficient balance (${formatSignedCentsToMoney(accurateSourceCents)}) for transfer amount (${parsedAmount.normalized})`,
+				`Source bucket has insufficient balance (${parsedSource.normalized}) for transfer amount (${parsedAmount.normalized})`,
 			);
 		}
 	}
@@ -763,13 +867,10 @@ export async function createMidasAllocationTransferInTransaction({
 			),
 		);
 
-	const rawPhysical = physicalBalanceRow?.netDebit ?? "0.00";
-	const pParts = rawPhysical.split(".");
-	const pInt = BigInt(pParts[0] ?? "0");
-	let pFrac = pParts[1] ?? "00";
-	if (pFrac.length === 1) pFrac = `${pFrac}0`;
-	const physicalBalanceCents =
-		pInt >= 0n ? pInt * 100n + BigInt(pFrac) : pInt * 100n - BigInt(pFrac);
+	const physicalParsed = parseSignedAggregateMoneyString(
+		physicalBalanceRow?.netDebit ?? "0.00",
+	);
+	const physicalBalanceCents = physicalParsed.cents;
 
 	const [totalEarmarkedRow] = await tx
 		.select({
@@ -778,13 +879,21 @@ export async function createMidasAllocationTransferInTransaction({
 		.from(midasAllocationTransfers)
 		.where(eq(midasAllocationTransfers.midasAccountId, trimmedMidasAccountId));
 
-	const rawEarmarked = totalEarmarkedRow?.netAllocated ?? "0.00";
-	const eParts = rawEarmarked.split(".");
-	const eInt = BigInt(eParts[0] ?? "0");
-	let eFrac = eParts[1] ?? "00";
-	if (eFrac.length === 1) eFrac = `${eFrac}0`;
-	const currentEarmarkedCents =
-		eInt >= 0n ? eInt * 100n + BigInt(eFrac) : eInt * 100n - BigInt(eFrac);
+	const earmarkedParsed = parseSignedAggregateMoneyString(
+		totalEarmarkedRow?.netAllocated ?? "0.00",
+	);
+	const currentEarmarkedCents = earmarkedParsed.cents;
+
+	if (
+		currentEarmarkedCents < 0n ||
+		physicalBalanceCents < 0n ||
+		currentEarmarkedCents > physicalBalanceCents
+	) {
+		throw new MidasError(
+			"MIDAS_INVALID_STATE",
+			`Inconsistent liquidity state detected: physical=${physicalParsed.normalized}, earmarked=${earmarkedParsed.normalized}`,
+		);
+	}
 
 	let deltaCents = 0n;
 	if (normalizedFromBucketId === null) {
@@ -917,20 +1026,13 @@ export async function reverseMidasAllocationTransfer({
 	occurredAt,
 	memo,
 }: ReverseMidasAllocationTransferParams): Promise<MidasAllocationTransferResult> {
-	if (!userId || userId.trim() === "") {
-		throw new MidasError("MIDAS_INVALID_INPUT", "User ID is required");
-	}
-	if (!targetTransferId || targetTransferId.trim() === "") {
-		throw new MidasError(
-			"MIDAS_INVALID_INPUT",
-			"Target transfer ID is required",
-		);
-	}
+	const canonicalUserId = normalizeCanonicalUuid(userId, "userId");
+	const canonicalTargetId = normalizeCanonicalUuid(
+		targetTransferId,
+		"targetTransferId",
+	);
 
 	return await db.transaction(async (tx) => {
-		const trimmedUserId = userId.trim();
-		const trimmedTargetId = targetTransferId.trim();
-
 		const [target] = await tx
 			.select({
 				id: midasAllocationTransfers.id,
@@ -944,8 +1046,8 @@ export async function reverseMidasAllocationTransfer({
 			.from(midasAllocationTransfers)
 			.where(
 				and(
-					eq(midasAllocationTransfers.id, trimmedTargetId),
-					eq(midasAllocationTransfers.userId, trimmedUserId),
+					eq(midasAllocationTransfers.id, canonicalTargetId),
+					eq(midasAllocationTransfers.userId, canonicalUserId),
 				),
 			)
 			.limit(1);
@@ -953,7 +1055,7 @@ export async function reverseMidasAllocationTransfer({
 		if (!target) {
 			throw new MidasError(
 				"MIDAS_TRANSFER_NOT_FOUND",
-				`Target transfer "${trimmedTargetId}" not found for this user`,
+				`Target transfer "${canonicalTargetId}" not found for this user`,
 			);
 		}
 
@@ -966,7 +1068,7 @@ export async function reverseMidasAllocationTransfer({
 
 		return await createMidasAllocationTransferInTransaction({
 			tx,
-			userId: trimmedUserId,
+			userId: canonicalUserId,
 			midasAccountId: target.midasAccountId,
 			idempotencyKey,
 			fromBucketId: target.toBucketId,
@@ -980,37 +1082,38 @@ export async function reverseMidasAllocationTransfer({
 }
 
 /**
- * Retrieves the complete Midas liquidity state including physical ledger balance,
- * total earmarked, unallocated balance, and individual bucket balances.
+ * Retrieves the complete Midas liquidity state within an active transaction.
+ * Defaults to locking the Midas account FOR UPDATE to guarantee snapshot isolation.
  */
-export async function getMidasLiquidityState({
-	db,
+export async function getMidasLiquidityStateInTransaction({
+	tx,
 	userId,
 	midasAccountId,
-}: {
-	db: Database | DatabaseTransaction;
-	userId: string;
-	midasAccountId?: string | undefined;
-}): Promise<MidasLiquidityState> {
-	if (!userId || userId.trim() === "") {
-		throw new MidasError("MIDAS_INVALID_INPUT", "User ID is required");
-	}
+	lockAccount = true,
+}: GetMidasLiquidityStateInTransactionParams): Promise<MidasLiquidityState> {
+	const canonicalUserId = normalizeCanonicalUuid(userId, "userId");
+	const conditions = [eq(midasAccounts.userId, canonicalUserId)];
 
-	const trimmedUserId = userId.trim();
-	const conditions = [eq(midasAccounts.userId, trimmedUserId)];
 	if (midasAccountId && midasAccountId.trim() !== "") {
-		conditions.push(eq(midasAccounts.id, midasAccountId.trim()));
+		const canonicalMidasAccountId = normalizeCanonicalUuid(
+			midasAccountId,
+			"midasAccountId",
+		);
+		conditions.push(eq(midasAccounts.id, canonicalMidasAccountId));
 	}
 
-	const [account] = await db
+	const accountQuery = tx
 		.select({
 			id: midasAccounts.id,
 			userId: midasAccounts.userId,
 			ledgerAccountId: midasAccounts.ledgerAccountId,
 		})
 		.from(midasAccounts)
-		.where(and(...conditions))
-		.limit(1);
+		.where(and(...conditions));
+
+	const [account] = lockAccount
+		? await accountQuery.for("update").limit(1)
+		: await accountQuery.limit(1);
 
 	if (!account) {
 		throw new MidasError(
@@ -1020,7 +1123,7 @@ export async function getMidasLiquidityState({
 	}
 
 	// Fetch linked ledger account currency
-	const [ledgerAcc] = await db
+	const [ledgerAcc] = await tx
 		.select({
 			currency: ledgerAccounts.currency,
 		})
@@ -1036,7 +1139,7 @@ export async function getMidasLiquidityState({
 	}
 
 	// Calculate physical balance from POSTED journal lines
-	const [physicalRow] = await db
+	const [physicalRow] = await tx
 		.select({
 			netDebit: sql<string>`COALESCE(SUM(${journalLines.debit}) - SUM(${journalLines.credit}), 0)::text`,
 		})
@@ -1052,16 +1155,20 @@ export async function getMidasLiquidityState({
 			),
 		);
 
-	const rawPhysical = physicalRow?.netDebit ?? "0.00";
-	const pParts = rawPhysical.split(".");
-	const pInt = BigInt(pParts[0] ?? "0");
-	let pFrac = pParts[1] ?? "00";
-	if (pFrac.length === 1) pFrac = `${pFrac}0`;
-	const physicalBalanceCents =
-		pInt >= 0n ? pInt * 100n + BigInt(pFrac) : pInt * 100n - BigInt(pFrac);
+	const physicalParsed = parseSignedAggregateMoneyString(
+		physicalRow?.netDebit ?? "0.00",
+	);
+	const physicalBalanceCents = physicalParsed.cents;
+
+	if (physicalBalanceCents < 0n) {
+		throw new MidasError(
+			"MIDAS_INVALID_STATE",
+			`Impossible state: negative physical balance on linked ledger account (${physicalParsed.normalized})`,
+		);
+	}
 
 	// Fetch all buckets for this Midas account
-	const allBuckets = await db
+	const allBuckets = await tx
 		.select({
 			id: midasBuckets.id,
 			code: midasBuckets.code,
@@ -1077,7 +1184,7 @@ export async function getMidasLiquidityState({
 		);
 
 	// Fetch all allocation transfers for this Midas account to compute per-bucket balances
-	const transfers = await db
+	const transfers = await tx
 		.select({
 			fromBucketId: midasAllocationTransfers.fromBucketId,
 			toBucketId: midasAllocationTransfers.toBucketId,
@@ -1113,6 +1220,12 @@ export async function getMidasLiquidityState({
 
 	const bucketStates: MidasLiquidityBucketState[] = allBuckets.map((b) => {
 		const cents = bucketCentsMap.get(b.id) ?? 0n;
+		if (cents < 0n) {
+			throw new MidasError(
+				"MIDAS_INVALID_STATE",
+				`Impossible state: bucket "${b.code}" has negative balance (${formatSignedCentsToMoney(cents)})`,
+			);
+		}
 		return {
 			bucketId: b.id,
 			code: b.code,
@@ -1121,6 +1234,20 @@ export async function getMidasLiquidityState({
 			balance: formatSignedCentsToMoney(cents),
 		};
 	});
+
+	if (totalEarmarkedCents < 0n) {
+		throw new MidasError(
+			"MIDAS_INVALID_STATE",
+			`Impossible state: total earmarked is negative (${formatSignedCentsToMoney(totalEarmarkedCents)})`,
+		);
+	}
+
+	if (totalEarmarkedCents > physicalBalanceCents) {
+		throw new MidasError(
+			"MIDAS_INVALID_STATE",
+			`Impossible state: total earmarked (${formatSignedCentsToMoney(totalEarmarkedCents)}) exceeds physical balance (${formatSignedCentsToMoney(physicalBalanceCents)})`,
+		);
+	}
 
 	const unallocatedCents = physicalBalanceCents - totalEarmarkedCents;
 
@@ -1136,6 +1263,38 @@ export async function getMidasLiquidityState({
 }
 
 /**
+ * Retrieves the complete Midas liquidity state including physical ledger balance,
+ * total earmarked, unallocated balance, and individual bucket balances.
+ */
+export async function getMidasLiquidityState({
+	db,
+	userId,
+	midasAccountId,
+}: {
+	db: Database | DatabaseTransaction;
+	userId: string;
+	midasAccountId?: string | undefined;
+}): Promise<MidasLiquidityState> {
+	if ("transaction" in db && typeof db.transaction === "function") {
+		return await db.transaction(async (tx) => {
+			return await getMidasLiquidityStateInTransaction({
+				tx,
+				userId,
+				midasAccountId,
+				lockAccount: true,
+			});
+		});
+	}
+
+	return await getMidasLiquidityStateInTransaction({
+		tx: db as DatabaseTransaction,
+		userId,
+		midasAccountId,
+		lockAccount: false,
+	});
+}
+
+/**
  * Lists allocation transfers for a Midas account.
  */
 export async function listMidasAllocationTransfers({
@@ -1148,28 +1307,25 @@ export async function listMidasAllocationTransfers({
 }: ListMidasAllocationTransfersParams): Promise<
 	MidasAllocationTransferRecord[]
 > {
-	if (!userId || userId.trim() === "") {
-		throw new MidasError("MIDAS_INVALID_INPUT", "User ID is required");
-	}
-	if (!midasAccountId || midasAccountId.trim() === "") {
-		throw new MidasError("MIDAS_INVALID_INPUT", "Midas account ID is required");
-	}
+	const canonicalUserId = normalizeCanonicalUuid(userId, "userId");
+	const canonicalMidasAccountId = normalizeCanonicalUuid(
+		midasAccountId,
+		"midasAccountId",
+	);
 
-	const trimmedUserId = userId.trim();
-	const trimmedMidasAccountId = midasAccountId.trim();
 	const sanitizedLimit = Math.max(1, Math.min(limit, 100));
 	const sanitizedOffset = Math.max(0, offset);
 
 	const conditions = [
-		eq(midasAllocationTransfers.userId, trimmedUserId),
-		eq(midasAllocationTransfers.midasAccountId, trimmedMidasAccountId),
+		eq(midasAllocationTransfers.userId, canonicalUserId),
+		eq(midasAllocationTransfers.midasAccountId, canonicalMidasAccountId),
 	];
 
 	if (bucketId && bucketId.trim() !== "") {
-		const trimmedBucketId = bucketId.trim();
+		const canonicalBucketId = normalizeCanonicalUuid(bucketId, "bucketId");
 		const bucketFilter = or(
-			eq(midasAllocationTransfers.fromBucketId, trimmedBucketId),
-			eq(midasAllocationTransfers.toBucketId, trimmedBucketId),
+			eq(midasAllocationTransfers.fromBucketId, canonicalBucketId),
+			eq(midasAllocationTransfers.toBucketId, canonicalBucketId),
 		);
 		if (bucketFilter) {
 			conditions.push(bucketFilter);

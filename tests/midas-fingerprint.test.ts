@@ -80,4 +80,16 @@ describe("Midas Allocation Transfer Fingerprinting (Phase 8A)", () => {
 
 		expect(fp1).not.toBe(fp2);
 	});
+
+	it("produces identical fingerprint for uppercase UUIDs due to canonical normalization", async () => {
+		const fpLower = await calculateAllocationTransferFingerprint(baseParams);
+		const fpUpper = await calculateAllocationTransferFingerprint({
+			...baseParams,
+			userId: baseParams.userId.toUpperCase(),
+			midasAccountId: baseParams.midasAccountId.toUpperCase(),
+			toBucketId: baseParams.toBucketId?.toUpperCase(),
+		});
+
+		expect(fpUpper).toBe(fpLower);
+	});
 });

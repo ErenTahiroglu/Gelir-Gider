@@ -11,7 +11,8 @@ export type LedgerErrorCode =
 	| "LEDGER_CURRENCY_MISMATCH"
 	| "LEDGER_ENTRY_NOT_FOUND"
 	| "LEDGER_ALREADY_REVERSED"
-	| "LEDGER_INVALID_REVERSAL";
+	| "LEDGER_INVALID_REVERSAL"
+	| "LEDGER_ACCOUNT_IN_USE";
 
 export class LedgerError extends Error {
 	readonly code: LedgerErrorCode;
