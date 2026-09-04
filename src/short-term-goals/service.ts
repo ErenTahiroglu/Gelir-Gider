@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	midasAccounts,
@@ -13,26 +13,31 @@ import {
 	shortTermGoalRevisions,
 	shortTermGoals,
 } from "../db/schema/short-term-goals";
-import {
-	formatSignedCentsToMoney,
-	parseMoneyString,
-	parseSignedAggregateMoneyString,
-} from "../ledger/money";
+import { formatSignedCentsToMoney, parseMoneyString } from "../ledger/money";
 import { MidasError } from "../midas/errors";
-import { createMidasAllocationTransferInTransaction } from "../midas/service";
+import {
+	createMidasAllocationTransferInTransaction,
+	getMidasLiquidityStateInTransaction,
+} from "../midas/service";
 import {
 	validateCanonicalUuid,
+	validateExpectedRevisionNo,
 	validateGregorianDate,
 	validateOccurredAt,
 	validateOptionalTrimmedText,
 	validatePositiveMoneyString,
+	validatePriorityPosition,
 	validateProductUrl,
 	validateRequiredTrimmedText,
 } from "./calendar";
 import { ShortTermGoalError } from "./errors";
 import {
+	calculateShortTermGoalCreateFingerprintV2,
 	calculateShortTermGoalPriorityFingerprint,
-	calculateShortTermGoalRevisionFingerprint,
+	calculateShortTermGoalRevisionFingerprintV1,
+	calculateShortTermGoalTerminalFingerprintV2,
+	calculateShortTermGoalUpdateFingerprintV2,
+	generateHashedPriorityIdempotencyKey,
 } from "./fingerprint";
 
 export interface ShortTermGoalRecord {
@@ -51,10 +56,50 @@ export interface ShortTermGoalRecord {
 	targetPrice: string | null;
 	productUrl: string | null;
 	note: string | null;
-	priorityIndex: number | null;
+	priority: number | null; // 1-based: 1, 2, 3... or null
+	priorityIndex?: number | null; // 0-based compatibility helper if needed
 	latestRevisionNo: number;
 	createdAt: Date;
 	updatedAt: Date;
+}
+
+export interface ShortTermGoalLifecycleResult {
+	goalId: string;
+	revisionId: string;
+	revisionNo: number;
+	operation: ShortTermGoalOperation;
+	status: ShortTermGoalStatus;
+	idempotentReplay: boolean;
+	snapshot: {
+		name: string;
+		fundingTarget: string;
+		targetDate: string | null;
+		maxBudget: string | null;
+		targetPrice: string | null;
+		productUrl: string | null;
+		note: string | null;
+	};
+}
+
+export interface ShortTermGoalReorderResult {
+	priorityRevisionId: string;
+	revisionNo: number;
+	orderedGoalIds: string[];
+	idempotentReplay: boolean;
+}
+
+export interface ShortTermGoalFundingResult {
+	goalId: string;
+	transferId: string;
+	amount: string;
+	idempotentReplay: boolean;
+}
+
+export interface ShortTermGoalReleaseResult {
+	goalId: string;
+	transferId: string;
+	amount: string;
+	idempotentReplay: boolean;
 }
 
 export interface CreateShortTermGoalParams {
@@ -68,7 +113,7 @@ export interface CreateShortTermGoalParams {
 	targetPrice?: string | null;
 	productUrl?: string | null;
 	note?: string | null;
-	priorityIndex?: number | null;
+	priorityPosition?: number | null; // 1-based
 	occurredAt: Date;
 	idempotencyKey: string;
 }
@@ -77,6 +122,7 @@ export interface UpdateShortTermGoalParams {
 	db: Database | DatabaseTransaction;
 	userId: string;
 	goalId: string;
+	expectedRevisionNo: number;
 	name?: string;
 	fundingTarget?: string;
 	targetDate?: string | null;
@@ -93,6 +139,7 @@ export interface CompleteShortTermGoalParams {
 	db: Database | DatabaseTransaction;
 	userId: string;
 	goalId: string;
+	expectedRevisionNo: number;
 	changeReason?: string | null;
 	occurredAt: Date;
 	idempotencyKey: string;
@@ -102,6 +149,7 @@ export interface CancelShortTermGoalParams {
 	db: Database | DatabaseTransaction;
 	userId: string;
 	goalId: string;
+	expectedRevisionNo: number;
 	changeReason?: string | null;
 	occurredAt: Date;
 	idempotencyKey: string;
@@ -139,13 +187,26 @@ export interface ReleaseShortTermGoalFundingParams {
 }
 
 export interface GetShortTermGoalParams {
-	db: Database | DatabaseTransaction;
+	db: Database;
+	userId: string;
+	goalId: string;
+}
+
+export interface GetShortTermGoalInTransactionParams {
+	tx: DatabaseTransaction;
 	userId: string;
 	goalId: string;
 }
 
 export interface ListShortTermGoalsParams {
-	db: Database | DatabaseTransaction;
+	db: Database;
+	userId: string;
+	midasAccountId: string;
+	status?: ShortTermGoalStatus | undefined;
+}
+
+export interface ListShortTermGoalsInTransactionParams {
+	tx: DatabaseTransaction;
 	userId: string;
 	midasAccountId: string;
 	status?: ShortTermGoalStatus | undefined;
@@ -185,11 +246,11 @@ function deriveFundingMetrics(
 }
 
 /**
- * Creates a new short-term goal, dedicated Midas virtual bucket, initial revision, and updates priority order.
+ * Creates a new short-term goal, dedicated deterministic Midas virtual bucket, initial revision, and updates priority order.
  */
 export async function createShortTermGoal(
 	params: CreateShortTermGoalParams,
-): Promise<ShortTermGoalRecord> {
+): Promise<ShortTermGoalLifecycleResult> {
 	const userId = validateCanonicalUuid(params.userId, "userId");
 	const midasAccountId = validateCanonicalUuid(
 		params.midasAccountId,
@@ -235,8 +296,27 @@ export async function createShortTermGoal(
 		targetPrice = parsedPrice.normalized;
 	}
 
-	return await params.db.transaction(async (tx) => {
-		// 1. Check idempotency on revisions early
+	// Early check priorityPosition format if provided
+	if (
+		params.priorityPosition !== undefined &&
+		params.priorityPosition !== null
+	) {
+		if (
+			typeof params.priorityPosition !== "number" ||
+			!Number.isInteger(params.priorityPosition) ||
+			params.priorityPosition < 1
+		) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_INPUT",
+				"priorityPosition must be a safe 1-based positive integer",
+			);
+		}
+	}
+
+	const executeInTx = async (
+		tx: DatabaseTransaction,
+	): Promise<ShortTermGoalLifecycleResult> => {
+		// 1. Check idempotency on revisions early (before lock)
 		const [existingRev] = await tx
 			.select()
 			.from(shortTermGoalRevisions)
@@ -249,14 +329,17 @@ export async function createShortTermGoal(
 			.limit(1);
 
 		if (existingRev) {
-			// Validate candidate fingerprint matches
-			const candidateFp = await calculateShortTermGoalRevisionFingerprint({
+			if (existingRev.operation !== "CREATE") {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used for different operation",
+				);
+			}
+
+			// Validate candidate fingerprint (check v2 first, then fallback to v1)
+			const candidateFpV2 = await calculateShortTermGoalCreateFingerprintV2({
 				userId,
 				goalId: existingRev.goalId,
-				revisionNo: existingRev.revisionNo,
-				previousRevisionId: existingRev.previousRevisionId,
-				operation: existingRev.operation,
-				status: existingRev.status,
 				name,
 				fundingTarget: parsedTarget.normalized,
 				targetDate,
@@ -264,23 +347,58 @@ export async function createShortTermGoal(
 				targetPrice,
 				productUrl,
 				note,
-				changeReason: null,
+				priorityPosition: params.priorityPosition ?? 1,
 				occurredAt,
 			});
 
-			if (existingRev.revisionFingerprint !== candidateFp) {
+			let matches = existingRev.revisionFingerprint === candidateFpV2;
+			if (!matches) {
+				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
+					{
+						userId,
+						goalId: existingRev.goalId,
+						revisionNo: existingRev.revisionNo,
+						previousRevisionId: existingRev.previousRevisionId,
+						operation: existingRev.operation,
+						status: existingRev.status,
+						name,
+						fundingTarget: parsedTarget.normalized,
+						targetDate,
+						maxBudget,
+						targetPrice,
+						productUrl,
+						note,
+						changeReason: null,
+						occurredAt,
+					},
+				);
+				matches = existingRev.revisionFingerprint === candidateFpV1;
+			}
+
+			if (!matches) {
 				throw new ShortTermGoalError(
 					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
 					"Idempotency key already used with different parameters",
 				);
 			}
 
-			// Return existing goal hydrated
-			return await getShortTermGoalInTx({
-				tx,
-				userId,
+			return {
 				goalId: existingRev.goalId,
-			});
+				revisionId: existingRev.id,
+				revisionNo: existingRev.revisionNo,
+				operation: existingRev.operation as ShortTermGoalOperation,
+				status: existingRev.status as ShortTermGoalStatus,
+				idempotentReplay: true,
+				snapshot: {
+					name: existingRev.name,
+					fundingTarget: existingRev.fundingTarget,
+					targetDate: existingRev.targetDate,
+					maxBudget: existingRev.maxBudget,
+					targetPrice: existingRev.targetPrice,
+					productUrl: existingRev.productUrl,
+					note: existingRev.note,
+				},
+			};
 		}
 
 		// 2. Lock parent Midas account FOR UPDATE to serialize priority and goal additions
@@ -303,21 +421,128 @@ export async function createShortTermGoal(
 			);
 		}
 
-		// 3. Create dedicated Midas virtual bucket with type SHORT_TERM_GOAL
-		const randomBucketSuffix = crypto
-			.randomUUID()
-			.replace(/-/g, "")
-			.slice(0, 12)
-			.toUpperCase();
-		const bucketCode = `STG_${randomBucketSuffix}`;
+		// 3. SECOND Idempotency Check (under Midas lock to close concurrent same-key races)
+		const [existingRevPostLock] = await tx
+			.select()
+			.from(shortTermGoalRevisions)
+			.where(
+				and(
+					eq(shortTermGoalRevisions.userId, userId),
+					eq(shortTermGoalRevisions.idempotencyKey, idempotencyKey),
+				),
+			)
+			.limit(1);
 
+		if (existingRevPostLock) {
+			if (existingRevPostLock.operation !== "CREATE") {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used for different operation",
+				);
+			}
+
+			const candidateFpV2 = await calculateShortTermGoalCreateFingerprintV2({
+				userId,
+				goalId: existingRevPostLock.goalId,
+				name,
+				fundingTarget: parsedTarget.normalized,
+				targetDate,
+				maxBudget,
+				targetPrice,
+				productUrl,
+				note,
+				priorityPosition: params.priorityPosition ?? 1,
+				occurredAt,
+			});
+
+			let matches = existingRevPostLock.revisionFingerprint === candidateFpV2;
+			if (!matches) {
+				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
+					{
+						userId,
+						goalId: existingRevPostLock.goalId,
+						revisionNo: existingRevPostLock.revisionNo,
+						previousRevisionId: existingRevPostLock.previousRevisionId,
+						operation: existingRevPostLock.operation,
+						status: existingRevPostLock.status,
+						name,
+						fundingTarget: parsedTarget.normalized,
+						targetDate,
+						maxBudget,
+						targetPrice,
+						productUrl,
+						note,
+						changeReason: null,
+						occurredAt,
+					},
+				);
+				matches = existingRevPostLock.revisionFingerprint === candidateFpV1;
+			}
+
+			if (!matches) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used with different parameters",
+				);
+			}
+
+			return {
+				goalId: existingRevPostLock.goalId,
+				revisionId: existingRevPostLock.id,
+				revisionNo: existingRevPostLock.revisionNo,
+				operation: existingRevPostLock.operation as ShortTermGoalOperation,
+				status: existingRevPostLock.status as ShortTermGoalStatus,
+				idempotentReplay: true,
+				snapshot: {
+					name: existingRevPostLock.name,
+					fundingTarget: existingRevPostLock.fundingTarget,
+					targetDate: existingRevPostLock.targetDate,
+					maxBudget: existingRevPostLock.maxBudget,
+					targetPrice: existingRevPostLock.targetPrice,
+					productUrl: existingRevPostLock.productUrl,
+					note: existingRevPostLock.note,
+				},
+			};
+		}
+
+		// 4. Fetch current priority ordering to resolve active goal count & validated position
+		const [latestPriority] = await tx
+			.select()
+			.from(shortTermGoalPriorityRevisions)
+			.where(
+				and(
+					eq(shortTermGoalPriorityRevisions.midasAccountId, midasAccountId),
+					eq(shortTermGoalPriorityRevisions.userId, userId),
+				),
+			)
+			.orderBy(desc(shortTermGoalPriorityRevisions.revisionNo))
+			.limit(1);
+
+		const currentOrderedList: string[] = latestPriority
+			? (latestPriority.orderedGoalIds as string[])
+			: [];
+
+		const activeGoalCount = currentOrderedList.length;
+		const validatedPosition = validatePriorityPosition(
+			params.priorityPosition,
+			activeGoalCount,
+			"priorityPosition",
+		);
+
+		// 5. Deterministic Internal Bucket & Goal ID generation
+		const goalId = crypto.randomUUID();
+		const rawHex = goalId.replace(/-/g, "").toUpperCase();
+		const bucketCode = `STG_${rawHex}`;
+		const bucketName = `Short-term goal ${goalId.slice(0, 8)}`;
+
+		// 6. Create dedicated Midas virtual bucket with type SHORT_TERM_GOAL
 		const [midasBucket] = await tx
 			.insert(midasBuckets)
 			.values({
 				userId,
 				midasAccountId,
 				code: bucketCode,
-				name,
+				name: bucketName,
 				bucketType: "SHORT_TERM_GOAL",
 			})
 			.returning();
@@ -329,10 +554,11 @@ export async function createShortTermGoal(
 			);
 		}
 
-		// 4. Insert short_term_goals anchor identity
+		// 7. Insert short_term_goals anchor identity with generated goalId
 		const [goal] = await tx
 			.insert(shortTermGoals)
 			.values({
+				id: goalId,
 				userId,
 				midasAccountId,
 				midasBucketId: midasBucket.id,
@@ -346,15 +572,11 @@ export async function createShortTermGoal(
 			);
 		}
 
-		// 5. Calculate revision 1 fingerprint & insert revision
-		const revisionFingerprint = await calculateShortTermGoalRevisionFingerprint(
+		// 8. Calculate revision 1 fingerprint v2 & insert revision
+		const revisionFingerprint = await calculateShortTermGoalCreateFingerprintV2(
 			{
 				userId,
 				goalId: goal.id,
-				revisionNo: 1,
-				previousRevisionId: null,
-				operation: "CREATE",
-				status: "ACTIVE",
 				name,
 				fundingTarget: parsedTarget.normalized,
 				targetDate,
@@ -362,7 +584,7 @@ export async function createShortTermGoal(
 				targetPrice,
 				productUrl,
 				note,
-				changeReason: null,
+				priorityPosition: validatedPosition,
 				occurredAt,
 			},
 		);
@@ -397,34 +619,10 @@ export async function createShortTermGoal(
 			);
 		}
 
-		// 6. Update manual priority ordering
-		const [latestPriority] = await tx
-			.select()
-			.from(shortTermGoalPriorityRevisions)
-			.where(
-				and(
-					eq(shortTermGoalPriorityRevisions.midasAccountId, midasAccountId),
-					eq(shortTermGoalPriorityRevisions.userId, userId),
-				),
-			)
-			.orderBy(desc(shortTermGoalPriorityRevisions.revisionNo))
-			.limit(1);
-
-		const currentOrderedList: string[] = latestPriority
-			? (latestPriority.orderedGoalIds as string[])
-			: [];
-
+		// 9. Update manual priority ordering
 		const nextOrderedList = [...currentOrderedList];
-		if (
-			params.priorityIndex !== undefined &&
-			params.priorityIndex !== null &&
-			params.priorityIndex >= 0 &&
-			params.priorityIndex <= nextOrderedList.length
-		) {
-			nextOrderedList.splice(params.priorityIndex, 0, goal.id);
-		} else {
-			nextOrderedList.push(goal.id);
-		}
+		const insertIndex = validatedPosition - 1;
+		nextOrderedList.splice(insertIndex, 0, goal.id);
 
 		const nextPriorityRevNo = (latestPriority?.revisionNo ?? 0) + 1;
 		const priorityFingerprint = await calculateShortTermGoalPriorityFingerprint(
@@ -438,7 +636,11 @@ export async function createShortTermGoal(
 			},
 		);
 
-		const priorityIdempotencyKey = `${idempotencyKey}:priority`;
+		const priorityIdempotencyKey = await generateHashedPriorityIdempotencyKey(
+			idempotencyKey,
+			goal.id,
+			"CREATE",
+		);
 
 		await tx.insert(shortTermGoalPriorityRevisions).values({
 			userId,
@@ -451,43 +653,43 @@ export async function createShortTermGoal(
 			occurredAt,
 		});
 
-		const priorityIdx = nextOrderedList.indexOf(goal.id);
-
-		const { accumulatedAmount, fundingStatus, progressPercentage } =
-			deriveFundingMetrics(0n, parsedTarget.cents);
-
 		return {
-			id: goal.id,
-			userId: goal.userId,
-			midasAccountId: goal.midasAccountId,
-			midasBucketId: goal.midasBucketId,
-			status: revision.status as ShortTermGoalStatus,
-			name: revision.name,
-			fundingTarget: revision.fundingTarget,
-			accumulatedAmount,
-			fundingStatus,
-			progressPercentage,
-			targetDate: revision.targetDate,
-			maxBudget: revision.maxBudget,
-			targetPrice: revision.targetPrice,
-			productUrl: revision.productUrl,
-			note: revision.note,
-			priorityIndex: priorityIdx >= 0 ? priorityIdx : null,
-			latestRevisionNo: revision.revisionNo,
-			createdAt: goal.createdAt,
-			updatedAt: revision.occurredAt,
+			goalId: goal.id,
+			revisionId: revision.id,
+			revisionNo: 1,
+			operation: "CREATE",
+			status: "ACTIVE",
+			idempotentReplay: false,
+			snapshot: {
+				name: revision.name,
+				fundingTarget: revision.fundingTarget,
+				targetDate: revision.targetDate,
+				maxBudget: revision.maxBudget,
+				targetPrice: revision.targetPrice,
+				productUrl: revision.productUrl,
+				note: revision.note,
+			},
 		};
-	});
+	};
+
+	if ("transaction" in params.db) {
+		return await params.db.transaction(executeInTx);
+	}
+	return await executeInTx(params.db as DatabaseTransaction);
 }
 
 /**
- * Updates an active short-term goal configuration.
+ * Updates an active short-term goal configuration with optimistic concurrency control.
  */
 export async function updateShortTermGoal(
 	params: UpdateShortTermGoalParams,
-): Promise<ShortTermGoalRecord> {
+): Promise<ShortTermGoalLifecycleResult> {
 	const userId = validateCanonicalUuid(params.userId, "userId");
 	const goalId = validateCanonicalUuid(params.goalId, "goalId");
+	const expectedRevisionNo = validateExpectedRevisionNo(
+		params.expectedRevisionNo,
+		"expectedRevisionNo",
+	);
 	const idempotencyKey = validateRequiredTrimmedText(
 		params.idempotencyKey,
 		"idempotencyKey",
@@ -500,8 +702,10 @@ export async function updateShortTermGoal(
 		500,
 	);
 
-	return await params.db.transaction(async (tx) => {
-		// 1. Early idempotency check
+	const executeInTx = async (
+		tx: DatabaseTransaction,
+	): Promise<ShortTermGoalLifecycleResult> => {
+		// 1. Early idempotency check (happens before latest-state / active checks)
 		const [existingRev] = await tx
 			.select()
 			.from(shortTermGoalRevisions)
@@ -514,13 +718,102 @@ export async function updateShortTermGoal(
 			.limit(1);
 
 		if (existingRev) {
-			if (existingRev.goalId !== goalId) {
+			if (existingRev.goalId !== goalId || existingRev.operation !== "UPDATE") {
 				throw new ShortTermGoalError(
 					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with different goal",
+					"Idempotency key already used for different goal or operation",
 				);
 			}
-			return await getShortTermGoalInTx({ tx, userId, goalId });
+
+			// Reconstruct candidate fingerprint v2 to verify exact replay
+			const candidateFpV2 = await calculateShortTermGoalUpdateFingerprintV2({
+				userId,
+				goalId,
+				expectedRevisionNo,
+				name: params.name !== undefined ? params.name.trim() : existingRev.name,
+				fundingTarget:
+					params.fundingTarget !== undefined
+						? validatePositiveMoneyString(params.fundingTarget, "fundingTarget")
+								.normalized
+						: existingRev.fundingTarget,
+				targetDate:
+					params.targetDate !== undefined
+						? validateGregorianDate(params.targetDate, "targetDate")
+						: existingRev.targetDate,
+				maxBudget:
+					params.maxBudget !== undefined
+						? params.maxBudget === null
+							? null
+							: validatePositiveMoneyString(params.maxBudget, "maxBudget")
+									.normalized
+						: existingRev.maxBudget,
+				targetPrice:
+					params.targetPrice !== undefined
+						? params.targetPrice === null
+							? null
+							: validatePositiveMoneyString(params.targetPrice, "targetPrice")
+									.normalized
+						: existingRev.targetPrice,
+				productUrl:
+					params.productUrl !== undefined
+						? validateProductUrl(params.productUrl)
+						: existingRev.productUrl,
+				note:
+					params.note !== undefined
+						? validateOptionalTrimmedText(params.note, "note", 500)
+						: existingRev.note,
+				changeReason,
+				occurredAt,
+			});
+
+			let matches = existingRev.revisionFingerprint === candidateFpV2;
+			if (!matches) {
+				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
+					{
+						userId,
+						goalId,
+						revisionNo: existingRev.revisionNo,
+						previousRevisionId: existingRev.previousRevisionId,
+						operation: "UPDATE",
+						status: "ACTIVE",
+						name: existingRev.name,
+						fundingTarget: existingRev.fundingTarget,
+						targetDate: existingRev.targetDate,
+						maxBudget: existingRev.maxBudget,
+						targetPrice: existingRev.targetPrice,
+						productUrl: existingRev.productUrl,
+						note: existingRev.note,
+						changeReason,
+						occurredAt,
+					},
+				);
+				matches = existingRev.revisionFingerprint === candidateFpV1;
+			}
+
+			if (!matches) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used with different parameters",
+				);
+			}
+
+			return {
+				goalId: existingRev.goalId,
+				revisionId: existingRev.id,
+				revisionNo: existingRev.revisionNo,
+				operation: existingRev.operation as ShortTermGoalOperation,
+				status: existingRev.status as ShortTermGoalStatus,
+				idempotentReplay: true,
+				snapshot: {
+					name: existingRev.name,
+					fundingTarget: existingRev.fundingTarget,
+					targetDate: existingRev.targetDate,
+					maxBudget: existingRev.maxBudget,
+					targetPrice: existingRev.targetPrice,
+					productUrl: existingRev.productUrl,
+					note: existingRev.note,
+				},
+			};
 		}
 
 		// 2. Fetch goal identity
@@ -552,7 +845,123 @@ export async function updateShortTermGoal(
 			.for("update")
 			.limit(1);
 
-		// 4. Fetch latest revision
+		// 4. SECOND Idempotency Check (under lock)
+		const [existingRevPostLock] = await tx
+			.select()
+			.from(shortTermGoalRevisions)
+			.where(
+				and(
+					eq(shortTermGoalRevisions.userId, userId),
+					eq(shortTermGoalRevisions.idempotencyKey, idempotencyKey),
+				),
+			)
+			.limit(1);
+
+		if (existingRevPostLock) {
+			if (
+				existingRevPostLock.goalId !== goalId ||
+				existingRevPostLock.operation !== "UPDATE"
+			) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used for different goal or operation",
+				);
+			}
+
+			const candidateFpV2 = await calculateShortTermGoalUpdateFingerprintV2({
+				userId,
+				goalId,
+				expectedRevisionNo,
+				name:
+					params.name !== undefined
+						? params.name.trim()
+						: existingRevPostLock.name,
+				fundingTarget:
+					params.fundingTarget !== undefined
+						? validatePositiveMoneyString(params.fundingTarget, "fundingTarget")
+								.normalized
+						: existingRevPostLock.fundingTarget,
+				targetDate:
+					params.targetDate !== undefined
+						? validateGregorianDate(params.targetDate, "targetDate")
+						: existingRevPostLock.targetDate,
+				maxBudget:
+					params.maxBudget !== undefined
+						? params.maxBudget === null
+							? null
+							: validatePositiveMoneyString(params.maxBudget, "maxBudget")
+									.normalized
+						: existingRevPostLock.maxBudget,
+				targetPrice:
+					params.targetPrice !== undefined
+						? params.targetPrice === null
+							? null
+							: validatePositiveMoneyString(params.targetPrice, "targetPrice")
+									.normalized
+						: existingRevPostLock.targetPrice,
+				productUrl:
+					params.productUrl !== undefined
+						? validateProductUrl(params.productUrl)
+						: existingRevPostLock.productUrl,
+				note:
+					params.note !== undefined
+						? validateOptionalTrimmedText(params.note, "note", 500)
+						: existingRevPostLock.note,
+				changeReason,
+				occurredAt,
+			});
+
+			let matches = existingRevPostLock.revisionFingerprint === candidateFpV2;
+			if (!matches) {
+				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
+					{
+						userId,
+						goalId,
+						revisionNo: existingRevPostLock.revisionNo,
+						previousRevisionId: existingRevPostLock.previousRevisionId,
+						operation: "UPDATE",
+						status: "ACTIVE",
+						name: existingRevPostLock.name,
+						fundingTarget: existingRevPostLock.fundingTarget,
+						targetDate: existingRevPostLock.targetDate,
+						maxBudget: existingRevPostLock.maxBudget,
+						targetPrice: existingRevPostLock.targetPrice,
+						productUrl: existingRevPostLock.productUrl,
+						note: existingRevPostLock.note,
+						changeReason,
+						occurredAt,
+					},
+				);
+				matches = existingRevPostLock.revisionFingerprint === candidateFpV1;
+			}
+
+			if (!matches) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used with different parameters",
+				);
+			}
+
+			return {
+				goalId: existingRevPostLock.goalId,
+				revisionId: existingRevPostLock.id,
+				revisionNo: existingRevPostLock.revisionNo,
+				operation: existingRevPostLock.operation as ShortTermGoalOperation,
+				status: existingRevPostLock.status as ShortTermGoalStatus,
+				idempotentReplay: true,
+				snapshot: {
+					name: existingRevPostLock.name,
+					fundingTarget: existingRevPostLock.fundingTarget,
+					targetDate: existingRevPostLock.targetDate,
+					maxBudget: existingRevPostLock.maxBudget,
+					targetPrice: existingRevPostLock.targetPrice,
+					productUrl: existingRevPostLock.productUrl,
+					note: existingRevPostLock.note,
+				},
+			};
+		}
+
+		// 5. Fetch latest revision and check optimistic concurrency
 		const [latestRev] = await tx
 			.select()
 			.from(shortTermGoalRevisions)
@@ -572,6 +981,13 @@ export async function updateShortTermGoal(
 			);
 		}
 
+		if (latestRev.revisionNo !== expectedRevisionNo) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_REVISION_CONFLICT",
+				`Goal revision conflict: expected revision ${expectedRevisionNo} but latest is ${latestRev.revisionNo}`,
+			);
+		}
+
 		if (latestRev.status !== "ACTIVE") {
 			throw new ShortTermGoalError(
 				"SHORT_TERM_GOAL_NOT_ACTIVE",
@@ -579,7 +995,7 @@ export async function updateShortTermGoal(
 			);
 		}
 
-		// 5. Merge fields
+		// 6. Merge fields
 		const name =
 			params.name !== undefined
 				? validateRequiredTrimmedText(params.name, "name", 120)
@@ -621,23 +1037,28 @@ export async function updateShortTermGoal(
 			}
 
 			// Validate current bucket balance does not exceed new maxBudget
-			const [balanceRow] = await tx
+			const transfers = await tx
 				.select({
-					netAmount: sql<string>`COALESCE(SUM(CASE WHEN ${midasAllocationTransfers.toBucketId} = ${goal.midasBucketId} THEN ${midasAllocationTransfers.amount} WHEN ${midasAllocationTransfers.fromBucketId} = ${goal.midasBucketId} THEN -${midasAllocationTransfers.amount} ELSE 0 END), 0)::text`,
+					toBucketId: midasAllocationTransfers.toBucketId,
+					fromBucketId: midasAllocationTransfers.fromBucketId,
+					amount: midasAllocationTransfers.amount,
 				})
 				.from(midasAllocationTransfers)
 				.where(
 					eq(midasAllocationTransfers.midasAccountId, goal.midasAccountId),
 				);
 
-			const currentAccumulated = parseSignedAggregateMoneyString(
-				balanceRow?.netAmount ?? "0.00",
-			);
+			let netCents = 0n;
+			for (const t of transfers) {
+				const p = parseMoneyString(t.amount);
+				if (t.toBucketId === goal.midasBucketId) netCents += p.cents;
+				if (t.fromBucketId === goal.midasBucketId) netCents -= p.cents;
+			}
 
-			if (currentAccumulated.cents > maxParsed.cents) {
+			if (netCents > maxParsed.cents) {
 				throw new ShortTermGoalError(
 					"SHORT_TERM_GOAL_MAX_BUDGET_EXCEEDED",
-					`Current accumulated balance (${currentAccumulated.normalized}) exceeds new maxBudget (${maxBudget})`,
+					`Current accumulated balance (${formatSignedCentsToMoney(netCents)}) exceeds new maxBudget (${maxBudget})`,
 				);
 			}
 		}
@@ -666,8 +1087,26 @@ export async function updateShortTermGoal(
 
 		const nextRevNo = latestRev.revisionNo + 1;
 
-		const revisionFingerprint = await calculateShortTermGoalRevisionFingerprint(
+		const revisionFingerprint = await calculateShortTermGoalUpdateFingerprintV2(
 			{
+				userId,
+				goalId,
+				expectedRevisionNo,
+				name,
+				fundingTarget,
+				targetDate,
+				maxBudget,
+				targetPrice,
+				productUrl,
+				note,
+				changeReason,
+				occurredAt,
+			},
+		);
+
+		const [createdRev] = await tx
+			.insert(shortTermGoalRevisions)
+			.values({
 				userId,
 				goalId,
 				revisionNo: nextRevNo,
@@ -683,39 +1122,49 @@ export async function updateShortTermGoal(
 				note,
 				changeReason,
 				occurredAt,
-			},
-		);
+				idempotencyKey,
+				revisionFingerprint,
+			})
+			.returning();
 
-		await tx.insert(shortTermGoalRevisions).values({
-			userId,
+		if (!createdRev) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				"Failed to create update revision",
+			);
+		}
+
+		return {
 			goalId,
-			revisionNo: nextRevNo,
-			previousRevisionId: latestRev.id,
+			revisionId: createdRev.id,
+			revisionNo: createdRev.revisionNo,
 			operation: "UPDATE",
 			status: "ACTIVE",
-			name,
-			fundingTarget,
-			targetDate,
-			maxBudget,
-			targetPrice,
-			productUrl,
-			note,
-			changeReason,
-			occurredAt,
-			idempotencyKey,
-			revisionFingerprint,
-		});
+			idempotentReplay: false,
+			snapshot: {
+				name,
+				fundingTarget,
+				targetDate,
+				maxBudget,
+				targetPrice,
+				productUrl,
+				note,
+			},
+		};
+	};
 
-		return await getShortTermGoalInTx({ tx, userId, goalId });
-	});
+	if ("transaction" in params.db) {
+		return await params.db.transaction(executeInTx);
+	}
+	return await executeInTx(params.db as DatabaseTransaction);
 }
 
 /**
- * Transitions a short-term goal to COMPLETED status (requires 0.00 bucket balance).
+ * Transitions a short-term goal to COMPLETED status (requires 0.00 bucket balance and optimistic revision check).
  */
 export async function completeShortTermGoal(
 	params: CompleteShortTermGoalParams,
-): Promise<ShortTermGoalRecord> {
+): Promise<ShortTermGoalLifecycleResult> {
 	return await transitionTerminalStatus({
 		...params,
 		targetStatus: "COMPLETED",
@@ -724,11 +1173,11 @@ export async function completeShortTermGoal(
 }
 
 /**
- * Transitions a short-term goal to CANCELLED status (requires 0.00 bucket balance).
+ * Transitions a short-term goal to CANCELLED status (requires 0.00 bucket balance and optimistic revision check).
  */
 export async function cancelShortTermGoal(
 	params: CancelShortTermGoalParams,
-): Promise<ShortTermGoalRecord> {
+): Promise<ShortTermGoalLifecycleResult> {
 	return await transitionTerminalStatus({
 		...params,
 		targetStatus: "CANCELLED",
@@ -740,14 +1189,19 @@ async function transitionTerminalStatus(params: {
 	db: Database | DatabaseTransaction;
 	userId: string;
 	goalId: string;
+	expectedRevisionNo: number;
 	changeReason?: string | null;
 	occurredAt: Date;
 	idempotencyKey: string;
 	targetStatus: ShortTermGoalStatus;
-	operation: ShortTermGoalOperation;
-}): Promise<ShortTermGoalRecord> {
+	operation: "COMPLETE" | "CANCEL";
+}): Promise<ShortTermGoalLifecycleResult> {
 	const userId = validateCanonicalUuid(params.userId, "userId");
 	const goalId = validateCanonicalUuid(params.goalId, "goalId");
+	const expectedRevisionNo = validateExpectedRevisionNo(
+		params.expectedRevisionNo,
+		"expectedRevisionNo",
+	);
 	const idempotencyKey = validateRequiredTrimmedText(
 		params.idempotencyKey,
 		"idempotencyKey",
@@ -760,8 +1214,10 @@ async function transitionTerminalStatus(params: {
 		500,
 	);
 
-	return await params.db.transaction(async (tx) => {
-		// 1. Early idempotency check
+	const executeInTx = async (
+		tx: DatabaseTransaction,
+	): Promise<ShortTermGoalLifecycleResult> => {
+		// 1. Early idempotency check (happens before latest-state / active checks)
 		const [existingRev] = await tx
 			.select()
 			.from(shortTermGoalRevisions)
@@ -774,13 +1230,73 @@ async function transitionTerminalStatus(params: {
 			.limit(1);
 
 		if (existingRev) {
-			if (existingRev.goalId !== goalId) {
+			if (
+				existingRev.goalId !== goalId ||
+				existingRev.operation !== params.operation
+			) {
 				throw new ShortTermGoalError(
 					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with different goal",
+					"Idempotency key already used for different goal or operation",
 				);
 			}
-			return await getShortTermGoalInTx({ tx, userId, goalId });
+
+			const candidateFpV2 = await calculateShortTermGoalTerminalFingerprintV2({
+				userId,
+				goalId,
+				operation: params.operation,
+				expectedRevisionNo,
+				changeReason,
+				occurredAt,
+			});
+
+			let matches = existingRev.revisionFingerprint === candidateFpV2;
+			if (!matches) {
+				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
+					{
+						userId,
+						goalId,
+						revisionNo: existingRev.revisionNo,
+						previousRevisionId: existingRev.previousRevisionId,
+						operation: params.operation,
+						status: params.targetStatus,
+						name: existingRev.name,
+						fundingTarget: existingRev.fundingTarget,
+						targetDate: existingRev.targetDate,
+						maxBudget: existingRev.maxBudget,
+						targetPrice: existingRev.targetPrice,
+						productUrl: existingRev.productUrl,
+						note: existingRev.note,
+						changeReason,
+						occurredAt,
+					},
+				);
+				matches = existingRev.revisionFingerprint === candidateFpV1;
+			}
+
+			if (!matches) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used with different parameters",
+				);
+			}
+
+			return {
+				goalId: existingRev.goalId,
+				revisionId: existingRev.id,
+				revisionNo: existingRev.revisionNo,
+				operation: existingRev.operation as ShortTermGoalOperation,
+				status: existingRev.status as ShortTermGoalStatus,
+				idempotentReplay: true,
+				snapshot: {
+					name: existingRev.name,
+					fundingTarget: existingRev.fundingTarget,
+					targetDate: existingRev.targetDate,
+					maxBudget: existingRev.maxBudget,
+					targetPrice: existingRev.targetPrice,
+					productUrl: existingRev.productUrl,
+					note: existingRev.note,
+				},
+			};
 		}
 
 		// 2. Fetch goal identity
@@ -812,7 +1328,89 @@ async function transitionTerminalStatus(params: {
 			.for("update")
 			.limit(1);
 
-		// 4. Fetch latest revision
+		// 4. SECOND Idempotency Check (under lock)
+		const [existingRevPostLock] = await tx
+			.select()
+			.from(shortTermGoalRevisions)
+			.where(
+				and(
+					eq(shortTermGoalRevisions.userId, userId),
+					eq(shortTermGoalRevisions.idempotencyKey, idempotencyKey),
+				),
+			)
+			.limit(1);
+
+		if (existingRevPostLock) {
+			if (
+				existingRevPostLock.goalId !== goalId ||
+				existingRevPostLock.operation !== params.operation
+			) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used for different goal or operation",
+				);
+			}
+
+			const candidateFpV2 = await calculateShortTermGoalTerminalFingerprintV2({
+				userId,
+				goalId,
+				operation: params.operation,
+				expectedRevisionNo,
+				changeReason,
+				occurredAt,
+			});
+
+			let matches = existingRevPostLock.revisionFingerprint === candidateFpV2;
+			if (!matches) {
+				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
+					{
+						userId,
+						goalId,
+						revisionNo: existingRevPostLock.revisionNo,
+						previousRevisionId: existingRevPostLock.previousRevisionId,
+						operation: params.operation,
+						status: params.targetStatus,
+						name: existingRevPostLock.name,
+						fundingTarget: existingRevPostLock.fundingTarget,
+						targetDate: existingRevPostLock.targetDate,
+						maxBudget: existingRevPostLock.maxBudget,
+						targetPrice: existingRevPostLock.targetPrice,
+						productUrl: existingRevPostLock.productUrl,
+						note: existingRevPostLock.note,
+						changeReason,
+						occurredAt,
+					},
+				);
+				matches = existingRevPostLock.revisionFingerprint === candidateFpV1;
+			}
+
+			if (!matches) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used with different parameters",
+				);
+			}
+
+			return {
+				goalId: existingRevPostLock.goalId,
+				revisionId: existingRevPostLock.id,
+				revisionNo: existingRevPostLock.revisionNo,
+				operation: existingRevPostLock.operation as ShortTermGoalOperation,
+				status: existingRevPostLock.status as ShortTermGoalStatus,
+				idempotentReplay: true,
+				snapshot: {
+					name: existingRevPostLock.name,
+					fundingTarget: existingRevPostLock.fundingTarget,
+					targetDate: existingRevPostLock.targetDate,
+					maxBudget: existingRevPostLock.maxBudget,
+					targetPrice: existingRevPostLock.targetPrice,
+					productUrl: existingRevPostLock.productUrl,
+					note: existingRevPostLock.note,
+				},
+			};
+		}
+
+		// 5. Fetch latest revision and check optimistic concurrency
 		const [latestRev] = await tx
 			.select()
 			.from(shortTermGoalRevisions)
@@ -832,6 +1430,13 @@ async function transitionTerminalStatus(params: {
 			);
 		}
 
+		if (latestRev.revisionNo !== expectedRevisionNo) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_REVISION_CONFLICT",
+				`Goal revision conflict: expected revision ${expectedRevisionNo} but latest is ${latestRev.revisionNo}`,
+			);
+		}
+
 		if (latestRev.status !== "ACTIVE") {
 			throw new ShortTermGoalError(
 				"SHORT_TERM_GOAL_NOT_ACTIVE",
@@ -839,30 +1444,46 @@ async function transitionTerminalStatus(params: {
 			);
 		}
 
-		// 5. Verify bucket balance is exactly 0.00
-		const [balanceRow] = await tx
+		// 6. Verify bucket balance is exactly 0.00
+		const transfers = await tx
 			.select({
-				netAmount: sql<string>`COALESCE(SUM(CASE WHEN ${midasAllocationTransfers.toBucketId} = ${goal.midasBucketId} THEN ${midasAllocationTransfers.amount} WHEN ${midasAllocationTransfers.fromBucketId} = ${goal.midasBucketId} THEN -${midasAllocationTransfers.amount} ELSE 0 END), 0)::text`,
+				toBucketId: midasAllocationTransfers.toBucketId,
+				fromBucketId: midasAllocationTransfers.fromBucketId,
+				amount: midasAllocationTransfers.amount,
 			})
 			.from(midasAllocationTransfers)
 			.where(eq(midasAllocationTransfers.midasAccountId, goal.midasAccountId));
 
-		const currentAccumulated = parseSignedAggregateMoneyString(
-			balanceRow?.netAmount ?? "0.00",
-		);
+		let netCents = 0n;
+		for (const t of transfers) {
+			const p = parseMoneyString(t.amount);
+			if (t.toBucketId === goal.midasBucketId) netCents += p.cents;
+			if (t.fromBucketId === goal.midasBucketId) netCents -= p.cents;
+		}
 
-		if (currentAccumulated.cents !== 0n) {
+		if (netCents !== 0n) {
 			throw new ShortTermGoalError(
-				"SHORT_TERM_GOAL_NON_ZERO_BALANCE",
-				`Cannot transition goal to ${params.targetStatus} with non-zero accumulated balance (${currentAccumulated.normalized}). Release or reallocate funds first.`,
+				"SHORT_TERM_GOAL_BALANCE_NOT_ZERO",
+				`Cannot transition goal to ${params.targetStatus} with non-zero accumulated balance (${formatSignedCentsToMoney(netCents)}). Release or reallocate funds first.`,
 			);
 		}
 
-		// 6. Insert terminal revision (exact copy of config fields)
+		// 7. Insert terminal revision
 		const nextRevNo = latestRev.revisionNo + 1;
 
-		const revisionFingerprint = await calculateShortTermGoalRevisionFingerprint(
-			{
+		const revisionFingerprint =
+			await calculateShortTermGoalTerminalFingerprintV2({
+				userId,
+				goalId,
+				operation: params.operation,
+				expectedRevisionNo,
+				changeReason,
+				occurredAt,
+			});
+
+		const [createdRev] = await tx
+			.insert(shortTermGoalRevisions)
+			.values({
 				userId,
 				goalId,
 				revisionNo: nextRevNo,
@@ -878,30 +1499,19 @@ async function transitionTerminalStatus(params: {
 				note: latestRev.note,
 				changeReason,
 				occurredAt,
-			},
-		);
+				idempotencyKey,
+				revisionFingerprint,
+			})
+			.returning();
 
-		await tx.insert(shortTermGoalRevisions).values({
-			userId,
-			goalId,
-			revisionNo: nextRevNo,
-			previousRevisionId: latestRev.id,
-			operation: params.operation,
-			status: params.targetStatus,
-			name: latestRev.name,
-			fundingTarget: latestRev.fundingTarget,
-			targetDate: latestRev.targetDate,
-			maxBudget: latestRev.maxBudget,
-			targetPrice: latestRev.targetPrice,
-			productUrl: latestRev.productUrl,
-			note: latestRev.note,
-			changeReason,
-			occurredAt,
-			idempotencyKey,
-			revisionFingerprint,
-		});
+		if (!createdRev) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				"Failed to create terminal revision",
+			);
+		}
 
-		// 7. Update priority revision (remove goal from active ordered array)
+		// 8. Update priority revision (remove goal from active ordered array)
 		const [latestPriority] = await tx
 			.select()
 			.from(shortTermGoalPriorityRevisions)
@@ -935,7 +1545,11 @@ async function transitionTerminalStatus(params: {
 			},
 		);
 
-		const priorityIdempotencyKey = `${idempotencyKey}:priority`;
+		const priorityIdempotencyKey = await generateHashedPriorityIdempotencyKey(
+			idempotencyKey,
+			goalId,
+			params.operation,
+		);
 
 		await tx.insert(shortTermGoalPriorityRevisions).values({
 			userId,
@@ -948,8 +1562,29 @@ async function transitionTerminalStatus(params: {
 			occurredAt,
 		});
 
-		return await getShortTermGoalInTx({ tx, userId, goalId });
-	});
+		return {
+			goalId,
+			revisionId: createdRev.id,
+			revisionNo: createdRev.revisionNo,
+			operation: params.operation,
+			status: params.targetStatus,
+			idempotentReplay: false,
+			snapshot: {
+				name: latestRev.name,
+				fundingTarget: latestRev.fundingTarget,
+				targetDate: latestRev.targetDate,
+				maxBudget: latestRev.maxBudget,
+				targetPrice: latestRev.targetPrice,
+				productUrl: latestRev.productUrl,
+				note: latestRev.note,
+			},
+		};
+	};
+
+	if ("transaction" in params.db) {
+		return await params.db.transaction(executeInTx);
+	}
+	return await executeInTx(params.db as DatabaseTransaction);
 }
 
 /**
@@ -957,7 +1592,7 @@ async function transitionTerminalStatus(params: {
  */
 export async function reorderShortTermGoals(
 	params: ReorderShortTermGoalsParams,
-): Promise<ShortTermGoalRecord[]> {
+): Promise<ShortTermGoalReorderResult> {
 	const userId = validateCanonicalUuid(params.userId, "userId");
 	const midasAccountId = validateCanonicalUuid(
 		params.midasAccountId,
@@ -990,7 +1625,9 @@ export async function reorderShortTermGoals(
 		);
 	}
 
-	return await params.db.transaction(async (tx) => {
+	const executeInTx = async (
+		tx: DatabaseTransaction,
+	): Promise<ShortTermGoalReorderResult> => {
 		// 1. Early idempotency check
 		const [existingPriority] = await tx
 			.select()
@@ -1004,6 +1641,13 @@ export async function reorderShortTermGoals(
 			.limit(1);
 
 		if (existingPriority) {
+			if (existingPriority.midasAccountId !== midasAccountId) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used for different Midas account",
+				);
+			}
+
 			const candidateFp = await calculateShortTermGoalPriorityFingerprint({
 				userId,
 				midasAccountId,
@@ -1020,12 +1664,12 @@ export async function reorderShortTermGoals(
 				);
 			}
 
-			return await listShortTermGoalsInTx({
-				tx,
-				userId,
-				midasAccountId,
-				status: "ACTIVE",
-			});
+			return {
+				priorityRevisionId: existingPriority.id,
+				revisionNo: existingPriority.revisionNo,
+				orderedGoalIds: existingPriority.orderedGoalIds as string[],
+				idempotentReplay: true,
+			};
 		}
 
 		// 2. Lock parent Midas account FOR UPDATE
@@ -1048,7 +1692,51 @@ export async function reorderShortTermGoals(
 			);
 		}
 
-		// 3. Fetch all active goals for account
+		// 3. SECOND Idempotency Check (under lock)
+		const [existingPriorityPostLock] = await tx
+			.select()
+			.from(shortTermGoalPriorityRevisions)
+			.where(
+				and(
+					eq(shortTermGoalPriorityRevisions.userId, userId),
+					eq(shortTermGoalPriorityRevisions.idempotencyKey, idempotencyKey),
+				),
+			)
+			.limit(1);
+
+		if (existingPriorityPostLock) {
+			if (existingPriorityPostLock.midasAccountId !== midasAccountId) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used for different Midas account",
+				);
+			}
+
+			const candidateFp = await calculateShortTermGoalPriorityFingerprint({
+				userId,
+				midasAccountId,
+				revisionNo: existingPriorityPostLock.revisionNo,
+				previousRevisionId: existingPriorityPostLock.previousRevisionId,
+				orderedGoalIds: normalizedGoalIds,
+				occurredAt,
+			});
+
+			if (existingPriorityPostLock.priorityFingerprint !== candidateFp) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used with different priority ordering",
+				);
+			}
+
+			return {
+				priorityRevisionId: existingPriorityPostLock.id,
+				revisionNo: existingPriorityPostLock.revisionNo,
+				orderedGoalIds: existingPriorityPostLock.orderedGoalIds as string[],
+				idempotentReplay: true,
+			};
+		}
+
+		// 4. Fetch all active goals for account
 		const activeGoals = await listActiveGoalIdsInTx({
 			tx,
 			userId,
@@ -1072,7 +1760,7 @@ export async function reorderShortTermGoals(
 			}
 		}
 
-		// 4. Fetch latest priority revision
+		// 5. Fetch latest priority revision
 		const [latestPriority] = await tx
 			.select()
 			.from(shortTermGoalPriorityRevisions)
@@ -1097,32 +1785,48 @@ export async function reorderShortTermGoals(
 			},
 		);
 
-		await tx.insert(shortTermGoalPriorityRevisions).values({
-			userId,
-			midasAccountId,
-			revisionNo: nextPriorityRevNo,
-			previousRevisionId: latestPriority ? latestPriority.id : null,
-			orderedGoalIds: normalizedGoalIds,
-			idempotencyKey,
-			priorityFingerprint,
-			occurredAt,
-		});
+		const [createdPriority] = await tx
+			.insert(shortTermGoalPriorityRevisions)
+			.values({
+				userId,
+				midasAccountId,
+				revisionNo: nextPriorityRevNo,
+				previousRevisionId: latestPriority ? latestPriority.id : null,
+				orderedGoalIds: normalizedGoalIds,
+				idempotencyKey,
+				priorityFingerprint,
+				occurredAt,
+			})
+			.returning();
 
-		return await listShortTermGoalsInTx({
-			tx,
-			userId,
-			midasAccountId,
-			status: "ACTIVE",
-		});
-	});
+		if (!createdPriority) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				"Failed to create priority revision",
+			);
+		}
+
+		return {
+			priorityRevisionId: createdPriority.id,
+			revisionNo: createdPriority.revisionNo,
+			orderedGoalIds: normalizedGoalIds,
+			idempotentReplay: false,
+		};
+	};
+
+	if ("transaction" in params.db) {
+		return await params.db.transaction(executeInTx);
+	}
+	return await executeInTx(params.db as DatabaseTransaction);
 }
 
 /**
  * Virtually funds a short-term goal by transferring liquidity into its Midas bucket.
+ * Exact historical replay takes precedence before mutable goal checks.
  */
 export async function fundShortTermGoal(
 	params: FundShortTermGoalParams,
-): Promise<ShortTermGoalRecord> {
+): Promise<ShortTermGoalFundingResult> {
 	const userId = validateCanonicalUuid(params.userId, "userId");
 	const goalId = validateCanonicalUuid(params.goalId, "goalId");
 	const idempotencyKey = validateRequiredTrimmedText(
@@ -1139,10 +1843,17 @@ export async function fundShortTermGoal(
 
 	const parsedAmount = validatePositiveMoneyString(params.amount, "amount");
 
-	return await params.db.transaction(async (tx) => {
-		// 1. Fetch goal
+	const executeInTx = async (
+		tx: DatabaseTransaction,
+	): Promise<ShortTermGoalFundingResult> => {
+		// 1. Resolve immutable goal identity only
 		const [goal] = await tx
-			.select()
+			.select({
+				id: shortTermGoals.id,
+				userId: shortTermGoals.userId,
+				midasAccountId: shortTermGoals.midasAccountId,
+				midasBucketId: shortTermGoals.midasBucketId,
+			})
 			.from(shortTermGoals)
 			.where(
 				and(eq(shortTermGoals.id, goalId), eq(shortTermGoals.userId, userId)),
@@ -1156,60 +1867,9 @@ export async function fundShortTermGoal(
 			);
 		}
 
-		// 2. Fetch latest revision to verify ACTIVE status and maxBudget
-		const [latestRev] = await tx
-			.select()
-			.from(shortTermGoalRevisions)
-			.where(
-				and(
-					eq(shortTermGoalRevisions.goalId, goalId),
-					eq(shortTermGoalRevisions.userId, userId),
-				),
-			)
-			.orderBy(desc(shortTermGoalRevisions.revisionNo))
-			.limit(1);
-
-		if (!latestRev) {
-			throw new ShortTermGoalError(
-				"SHORT_TERM_GOAL_NOT_FOUND",
-				"No revisions found for goal",
-			);
-		}
-
-		if (latestRev.status !== "ACTIVE") {
-			throw new ShortTermGoalError(
-				"SHORT_TERM_GOAL_NOT_ACTIVE",
-				`Cannot fund goal in ${latestRev.status} status`,
-			);
-		}
-
-		// 3. Pre-check maxBudget if configured
-		if (latestRev.maxBudget !== null) {
-			const maxParsed = parseMoneyString(latestRev.maxBudget);
-			const [balanceRow] = await tx
-				.select({
-					netAmount: sql<string>`COALESCE(SUM(CASE WHEN ${midasAllocationTransfers.toBucketId} = ${goal.midasBucketId} THEN ${midasAllocationTransfers.amount} WHEN ${midasAllocationTransfers.fromBucketId} = ${goal.midasBucketId} THEN -${midasAllocationTransfers.amount} ELSE 0 END), 0)::text`,
-				})
-				.from(midasAllocationTransfers)
-				.where(
-					eq(midasAllocationTransfers.midasAccountId, goal.midasAccountId),
-				);
-
-			const currentAccumulated = parseSignedAggregateMoneyString(
-				balanceRow?.netAmount ?? "0.00",
-			);
-
-			if (currentAccumulated.cents + parsedAmount.cents > maxParsed.cents) {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_MAX_BUDGET_EXCEEDED",
-					`Transfer amount ${parsedAmount.normalized} would exceed goal maxBudget ${latestRev.maxBudget} (current accumulated: ${currentAccumulated.normalized})`,
-				);
-			}
-		}
-
-		// 4. Delegate to Midas allocation transfer
+		// 2. Delegate to Midas allocation transfer (handles early historical replay inside)
 		try {
-			await createMidasAllocationTransferInTransaction({
+			const res = await createMidasAllocationTransferInTransaction({
 				tx,
 				userId,
 				midasAccountId: goal.midasAccountId,
@@ -1218,8 +1878,15 @@ export async function fundShortTermGoal(
 				toBucketId: goal.midasBucketId,
 				amount: parsedAmount.normalized,
 				occurredAt,
-				memo: memo ?? `Virtual funding for short-term goal: ${latestRev.name}`,
+				memo: memo ?? `Virtual funding for short-term goal: ${goal.id}`,
 			});
+
+			return {
+				goalId: goal.id,
+				transferId: res.transferId,
+				amount: res.amount,
+				idempotentReplay: res.idempotentReplay,
+			};
 		} catch (err: unknown) {
 			if (err instanceof MidasError) {
 				if (err.code === "MIDAS_BUCKET_INACTIVE") {
@@ -1234,6 +1901,18 @@ export async function fundShortTermGoal(
 						"Funding amount would exceed goal maximum budget",
 					);
 				}
+				if (err.code === "MIDAS_INSUFFICIENT_FREE_BALANCE") {
+					throw new ShortTermGoalError(
+						"SHORT_TERM_GOAL_INSUFFICIENT_FREE_BALANCE",
+						err.message,
+					);
+				}
+				if (err.code === "MIDAS_INSUFFICIENT_BUCKET_BALANCE") {
+					throw new ShortTermGoalError(
+						"SHORT_TERM_GOAL_INSUFFICIENT_BALANCE",
+						err.message,
+					);
+				}
 				if (err.code === "MIDAS_IDEMPOTENCY_CONFLICT") {
 					throw new ShortTermGoalError(
 						"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
@@ -1243,9 +1922,12 @@ export async function fundShortTermGoal(
 			}
 			throw err;
 		}
+	};
 
-		return await getShortTermGoalInTx({ tx, userId, goalId });
-	});
+	if ("transaction" in params.db) {
+		return await params.db.transaction(executeInTx);
+	}
+	return await executeInTx(params.db as DatabaseTransaction);
 }
 
 /**
@@ -1253,7 +1935,7 @@ export async function fundShortTermGoal(
  */
 export async function releaseShortTermGoalFunding(
 	params: ReleaseShortTermGoalFundingParams,
-): Promise<ShortTermGoalRecord> {
+): Promise<ShortTermGoalReleaseResult> {
 	const userId = validateCanonicalUuid(params.userId, "userId");
 	const goalId = validateCanonicalUuid(params.goalId, "goalId");
 	const idempotencyKey = validateRequiredTrimmedText(
@@ -1270,10 +1952,17 @@ export async function releaseShortTermGoalFunding(
 
 	const parsedAmount = validatePositiveMoneyString(params.amount, "amount");
 
-	return await params.db.transaction(async (tx) => {
-		// 1. Fetch goal
+	const executeInTx = async (
+		tx: DatabaseTransaction,
+	): Promise<ShortTermGoalReleaseResult> => {
+		// 1. Resolve immutable goal identity only
 		const [goal] = await tx
-			.select()
+			.select({
+				id: shortTermGoals.id,
+				userId: shortTermGoals.userId,
+				midasAccountId: shortTermGoals.midasAccountId,
+				midasBucketId: shortTermGoals.midasBucketId,
+			})
 			.from(shortTermGoals)
 			.where(
 				and(eq(shortTermGoals.id, goalId), eq(shortTermGoals.userId, userId)),
@@ -1287,29 +1976,9 @@ export async function releaseShortTermGoalFunding(
 			);
 		}
 
-		// 2. Fetch latest revision
-		const [latestRev] = await tx
-			.select()
-			.from(shortTermGoalRevisions)
-			.where(
-				and(
-					eq(shortTermGoalRevisions.goalId, goalId),
-					eq(shortTermGoalRevisions.userId, userId),
-				),
-			)
-			.orderBy(desc(shortTermGoalRevisions.revisionNo))
-			.limit(1);
-
-		if (!latestRev) {
-			throw new ShortTermGoalError(
-				"SHORT_TERM_GOAL_NOT_FOUND",
-				"No revisions found for goal",
-			);
-		}
-
-		// 3. Delegate to Midas allocation transfer
+		// 2. Delegate to Midas allocation transfer
 		try {
-			await createMidasAllocationTransferInTransaction({
+			const res = await createMidasAllocationTransferInTransaction({
 				tx,
 				userId,
 				midasAccountId: goal.midasAccountId,
@@ -1318,10 +1987,15 @@ export async function releaseShortTermGoalFunding(
 				toBucketId,
 				amount: parsedAmount.normalized,
 				occurredAt,
-				memo:
-					memo ??
-					`Virtual funding release for short-term goal: ${latestRev.name}`,
+				memo: memo ?? `Virtual funding release for short-term goal: ${goal.id}`,
 			});
+
+			return {
+				goalId: goal.id,
+				transferId: res.transferId,
+				amount: res.amount,
+				idempotentReplay: res.idempotentReplay,
+			};
 		} catch (err: unknown) {
 			if (err instanceof MidasError) {
 				if (err.code === "MIDAS_BUCKET_INACTIVE") {
@@ -1336,6 +2010,18 @@ export async function releaseShortTermGoalFunding(
 						"Transfer would exceed target goal maximum budget",
 					);
 				}
+				if (err.code === "MIDAS_INSUFFICIENT_BUCKET_BALANCE") {
+					throw new ShortTermGoalError(
+						"SHORT_TERM_GOAL_INSUFFICIENT_BALANCE",
+						"Insufficient balance in short-term goal bucket to release",
+					);
+				}
+				if (err.code === "MIDAS_INSUFFICIENT_FREE_BALANCE") {
+					throw new ShortTermGoalError(
+						"SHORT_TERM_GOAL_INSUFFICIENT_FREE_BALANCE",
+						err.message,
+					);
+				}
 				if (err.code === "MIDAS_IDEMPOTENCY_CONFLICT") {
 					throw new ShortTermGoalError(
 						"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
@@ -1345,13 +2031,17 @@ export async function releaseShortTermGoalFunding(
 			}
 			throw err;
 		}
+	};
 
-		return await getShortTermGoalInTx({ tx, userId, goalId });
-	});
+	if ("transaction" in params.db) {
+		return await params.db.transaction(executeInTx);
+	}
+	return await executeInTx(params.db as DatabaseTransaction);
 }
 
 /**
- * Retrieves a single short-term goal with derived funding status.
+ * Retrieves a single short-term goal with derived funding and manual priority.
+ * Guaranteed consistent snapshot via single outer transaction.
  */
 export async function getShortTermGoal(
 	params: GetShortTermGoalParams,
@@ -1359,42 +2049,17 @@ export async function getShortTermGoal(
 	const userId = validateCanonicalUuid(params.userId, "userId");
 	const goalId = validateCanonicalUuid(params.goalId, "goalId");
 
-	return await getShortTermGoalInTx({
-		tx: params.db,
-		userId,
-		goalId,
+	return await params.db.transaction(async (tx) => {
+		return await getShortTermGoalInTransaction({ tx, userId, goalId });
 	});
 }
 
 /**
- * Lists all short-term goals for a Midas account ordered by priority (ACTIVE) then recent (terminal).
+ * Transactional read for a single short-term goal.
  */
-export async function listShortTermGoals(
-	params: ListShortTermGoalsParams,
-): Promise<ShortTermGoalRecord[]> {
-	const userId = validateCanonicalUuid(params.userId, "userId");
-	const midasAccountId = validateCanonicalUuid(
-		params.midasAccountId,
-		"midasAccountId",
-	);
-
-	return await listShortTermGoalsInTx({
-		tx: params.db,
-		userId,
-		midasAccountId,
-		status: params.status,
-	});
-}
-
-// ---------------------------------------------------------
-// Internal Transactional Helpers
-// ---------------------------------------------------------
-
-async function getShortTermGoalInTx(params: {
-	tx: Database | DatabaseTransaction;
-	userId: string;
-	goalId: string;
-}): Promise<ShortTermGoalRecord> {
+export async function getShortTermGoalInTransaction(
+	params: GetShortTermGoalInTransactionParams,
+): Promise<ShortTermGoalRecord> {
 	const { tx, userId, goalId } = params;
 
 	const [goal] = await tx
@@ -1412,6 +2077,14 @@ async function getShortTermGoalInTx(params: {
 		);
 	}
 
+	// 1. Lock Midas liquidity state FOR UPDATE to get authoritative snapshot
+	const liquidityState = await getMidasLiquidityStateInTransaction({
+		tx,
+		userId,
+		midasAccountId: goal.midasAccountId,
+	});
+
+	// 2. Fetch latest revision for goal
 	const [latestRev] = await tx
 		.select()
 		.from(shortTermGoalRevisions)
@@ -1431,46 +2104,88 @@ async function getShortTermGoalInTx(params: {
 		);
 	}
 
-	const [balanceRow] = await tx
-		.select({
-			netAmount: sql<string>`COALESCE(SUM(CASE WHEN ${midasAllocationTransfers.toBucketId} = ${goal.midasBucketId} THEN ${midasAllocationTransfers.amount} WHEN ${midasAllocationTransfers.fromBucketId} = ${goal.midasBucketId} THEN -${midasAllocationTransfers.amount} ELSE 0 END), 0)::text`,
-		})
-		.from(midasAllocationTransfers)
-		.where(eq(midasAllocationTransfers.midasAccountId, goal.midasAccountId));
+	// 3. Fetch latest priority revision
+	const [latestPriority] = await tx
+		.select()
+		.from(shortTermGoalPriorityRevisions)
+		.where(
+			and(
+				eq(shortTermGoalPriorityRevisions.midasAccountId, goal.midasAccountId),
+				eq(shortTermGoalPriorityRevisions.userId, userId),
+			),
+		)
+		.orderBy(desc(shortTermGoalPriorityRevisions.revisionNo))
+		.limit(1);
 
-	const parsedAccumulated = parseSignedAggregateMoneyString(
-		balanceRow?.netAmount ?? "0.00",
+	const priorityOrder: string[] = latestPriority
+		? (latestPriority.orderedGoalIds as string[])
+		: [];
+
+	// 4. Fail-closed invariant validations
+	const bucketInfo = liquidityState.buckets.find(
+		(b) => b.bucketId === goal.midasBucketId,
 	);
+	if (!bucketInfo) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_INVALID_STATE",
+			`Goal bucket ${goal.midasBucketId} not found in Midas liquidity state`,
+		);
+	}
 
-	const parsedTarget = parseMoneyString(latestRev.fundingTarget);
+	if (bucketInfo.bucketType !== "SHORT_TERM_GOAL") {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_INVALID_STATE",
+			`Goal bucket ${goal.midasBucketId} has invalid type ${bucketInfo.bucketType}`,
+		);
+	}
 
-	const { accumulatedAmount, fundingStatus, progressPercentage } =
-		deriveFundingMetrics(parsedAccumulated.cents, parsedTarget.cents);
+	const balanceParsed = parseMoneyString(bucketInfo.balance);
+	if (balanceParsed.cents < 0n) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_INVALID_STATE",
+			`Negative balance (${bucketInfo.balance}) on short-term goal bucket`,
+		);
+	}
 
-	// Priority resolution
-	let priorityIndex: number | null = null;
+	let priority: number | null = null;
+	const priorityIdx = priorityOrder.indexOf(goalId);
+
 	if (latestRev.status === "ACTIVE") {
-		const [latestPriority] = await tx
-			.select()
-			.from(shortTermGoalPriorityRevisions)
-			.where(
-				and(
-					eq(
-						shortTermGoalPriorityRevisions.midasAccountId,
-						goal.midasAccountId,
-					),
-					eq(shortTermGoalPriorityRevisions.userId, userId),
-				),
-			)
-			.orderBy(desc(shortTermGoalPriorityRevisions.revisionNo))
-			.limit(1);
-
-		if (latestPriority) {
-			const list = latestPriority.orderedGoalIds as string[];
-			const idx = list.indexOf(goalId);
-			priorityIndex = idx >= 0 ? idx : null;
+		if (priorityIdx < 0) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				`ACTIVE goal ${goalId} is absent from latest priority ordering`,
+			);
+		}
+		priority = priorityIdx + 1; // 1-based priority
+	} else {
+		if (priorityIdx >= 0) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				`Terminal goal ${goalId} (${latestRev.status}) is present in priority ordering`,
+			);
+		}
+		if (balanceParsed.cents !== 0n) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				`Terminal goal ${goalId} (${latestRev.status}) has non-zero balance ${bucketInfo.balance}`,
+			);
 		}
 	}
+
+	if (latestRev.maxBudget !== null) {
+		const maxParsed = parseMoneyString(latestRev.maxBudget);
+		if (balanceParsed.cents > maxParsed.cents) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				`Goal balance ${bucketInfo.balance} exceeds configured maxBudget ${latestRev.maxBudget}`,
+			);
+		}
+	}
+
+	const targetParsed = parseMoneyString(latestRev.fundingTarget);
+	const { accumulatedAmount, fundingStatus, progressPercentage } =
+		deriveFundingMetrics(balanceParsed.cents, targetParsed.cents);
 
 	return {
 		id: goal.id,
@@ -1488,21 +2203,236 @@ async function getShortTermGoalInTx(params: {
 		targetPrice: latestRev.targetPrice,
 		productUrl: latestRev.productUrl,
 		note: latestRev.note,
-		priorityIndex,
+		priority,
+		priorityIndex: priority !== null ? priority - 1 : null,
 		latestRevisionNo: latestRev.revisionNo,
 		createdAt: goal.createdAt,
 		updatedAt: latestRev.occurredAt,
 	};
 }
 
+/**
+ * Lists all short-term goals for a Midas account ordered by priority (ACTIVE) then recent (terminal).
+ * Guaranteed consistent snapshot via single outer transaction.
+ */
+export async function listShortTermGoals(
+	params: ListShortTermGoalsParams,
+): Promise<ShortTermGoalRecord[]> {
+	const userId = validateCanonicalUuid(params.userId, "userId");
+	const midasAccountId = validateCanonicalUuid(
+		params.midasAccountId,
+		"midasAccountId",
+	);
+
+	return await params.db.transaction(async (tx) => {
+		return await listShortTermGoalsInTransaction({
+			tx,
+			userId,
+			midasAccountId,
+			status: params.status,
+		});
+	});
+}
+
+/**
+ * Transactional list for short-term goals.
+ */
+export async function listShortTermGoalsInTransaction(
+	params: ListShortTermGoalsInTransactionParams,
+): Promise<ShortTermGoalRecord[]> {
+	const { tx, userId, midasAccountId, status } = params;
+
+	// 1. Lock Midas liquidity state FOR UPDATE exactly once to serialize view
+	const liquidityState = await getMidasLiquidityStateInTransaction({
+		tx,
+		userId,
+		midasAccountId,
+	});
+
+	// 2. Fetch all goals for account
+	const goals = await tx
+		.select()
+		.from(shortTermGoals)
+		.where(
+			and(
+				eq(shortTermGoals.midasAccountId, midasAccountId),
+				eq(shortTermGoals.userId, userId),
+			),
+		);
+
+	if (goals.length === 0) return [];
+
+	const goalIds = goals.map((g) => g.id);
+
+	// 3. Fetch all revisions for goals
+	const allRevisions = await tx
+		.select()
+		.from(shortTermGoalRevisions)
+		.where(
+			and(
+				eq(shortTermGoalRevisions.userId, userId),
+				inArray(shortTermGoalRevisions.goalId, goalIds),
+			),
+		)
+		.orderBy(desc(shortTermGoalRevisions.revisionNo));
+
+	const latestRevMap = new Map<string, (typeof allRevisions)[0]>();
+	for (const rev of allRevisions) {
+		if (!latestRevMap.has(rev.goalId)) {
+			latestRevMap.set(rev.goalId, rev);
+		}
+	}
+
+	// 4. Fetch latest priority revision
+	const [latestPriority] = await tx
+		.select()
+		.from(shortTermGoalPriorityRevisions)
+		.where(
+			and(
+				eq(shortTermGoalPriorityRevisions.midasAccountId, midasAccountId),
+				eq(shortTermGoalPriorityRevisions.userId, userId),
+			),
+		)
+		.orderBy(desc(shortTermGoalPriorityRevisions.revisionNo))
+		.limit(1);
+
+	const priorityOrder: string[] = latestPriority
+		? (latestPriority.orderedGoalIds as string[])
+		: [];
+
+	const priorityMap = new Map<string, number>();
+	priorityOrder.forEach((id, idx) => {
+		priorityMap.set(id, idx + 1); // 1-based priority
+	});
+
+	const bucketMap = new Map<string, (typeof liquidityState.buckets)[0]>();
+	for (const b of liquidityState.buckets) {
+		bucketMap.set(b.bucketId, b);
+	}
+
+	const records: ShortTermGoalRecord[] = [];
+
+	for (const goal of goals) {
+		const latestRev = latestRevMap.get(goal.id);
+		if (!latestRev) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				`Goal ${goal.id} has no revisions`,
+			);
+		}
+
+		const bucketInfo = bucketMap.get(goal.midasBucketId);
+		if (!bucketInfo) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				`Goal bucket ${goal.midasBucketId} not found in Midas state`,
+			);
+		}
+
+		if (bucketInfo.bucketType !== "SHORT_TERM_GOAL") {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				`Goal bucket ${goal.midasBucketId} has invalid type ${bucketInfo.bucketType}`,
+			);
+		}
+
+		const balanceParsed = parseMoneyString(bucketInfo.balance);
+		if (balanceParsed.cents < 0n) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				`Negative balance (${bucketInfo.balance}) on goal ${goal.id}`,
+			);
+		}
+
+		const hasPriority = priorityMap.has(goal.id);
+		const pNum = hasPriority ? (priorityMap.get(goal.id) ?? null) : null;
+
+		if (latestRev.status === "ACTIVE") {
+			if (!hasPriority) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_INVALID_STATE",
+					`ACTIVE goal ${goal.id} is absent from latest priority ordering`,
+				);
+			}
+		} else {
+			if (hasPriority) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_INVALID_STATE",
+					`Terminal goal ${goal.id} (${latestRev.status}) is present in priority ordering`,
+				);
+			}
+			if (balanceParsed.cents !== 0n) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_INVALID_STATE",
+					`Terminal goal ${goal.id} (${latestRev.status}) has non-zero balance ${bucketInfo.balance}`,
+				);
+			}
+		}
+
+		if (latestRev.maxBudget !== null) {
+			const maxParsed = parseMoneyString(latestRev.maxBudget);
+			if (balanceParsed.cents > maxParsed.cents) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_INVALID_STATE",
+					`Goal balance ${bucketInfo.balance} exceeds maxBudget ${latestRev.maxBudget}`,
+				);
+			}
+		}
+
+		if (status && latestRev.status !== status) {
+			continue;
+		}
+
+		const targetParsed = parseMoneyString(latestRev.fundingTarget);
+		const { accumulatedAmount, fundingStatus, progressPercentage } =
+			deriveFundingMetrics(balanceParsed.cents, targetParsed.cents);
+
+		records.push({
+			id: goal.id,
+			userId: goal.userId,
+			midasAccountId: goal.midasAccountId,
+			midasBucketId: goal.midasBucketId,
+			status: latestRev.status as ShortTermGoalStatus,
+			name: latestRev.name,
+			fundingTarget: latestRev.fundingTarget,
+			accumulatedAmount,
+			fundingStatus,
+			progressPercentage,
+			targetDate: latestRev.targetDate,
+			maxBudget: latestRev.maxBudget,
+			targetPrice: latestRev.targetPrice,
+			productUrl: latestRev.productUrl,
+			note: latestRev.note,
+			priority: pNum,
+			priorityIndex: pNum !== null ? pNum - 1 : null,
+			latestRevisionNo: latestRev.revisionNo,
+			createdAt: goal.createdAt,
+			updatedAt: latestRev.occurredAt,
+		});
+	}
+
+	// Sort: Active goals by priority (ascending 1, 2, 3...), terminal goals by updatedAt descending
+	records.sort((a, b) => {
+		if (a.status === "ACTIVE" && b.status === "ACTIVE") {
+			const pA = a.priority ?? Number.MAX_SAFE_INTEGER;
+			const pB = b.priority ?? Number.MAX_SAFE_INTEGER;
+			return pA - pB;
+		}
+		if (a.status === "ACTIVE") return -1;
+		if (b.status === "ACTIVE") return 1;
+		return b.updatedAt.getTime() - a.updatedAt.getTime();
+	});
+
+	return records;
+}
+
 async function listActiveGoalIdsInTx(params: {
-	tx: Database | DatabaseTransaction;
+	tx: DatabaseTransaction;
 	userId: string;
 	midasAccountId: string;
 }): Promise<string[]> {
 	const { tx, userId, midasAccountId } = params;
 
-	// Query latest revision for every goal in this account
 	const goals = await tx
 		.select({ id: shortTermGoals.id })
 		.from(shortTermGoals)
@@ -1517,7 +2447,6 @@ async function listActiveGoalIdsInTx(params: {
 
 	const goalIds = goals.map((g) => g.id);
 
-	// Select latest revision for each goal
 	const revisions = await tx
 		.select({
 			goalId: shortTermGoalRevisions.goalId,
@@ -1541,162 +2470,4 @@ async function listActiveGoalIdsInTx(params: {
 	}
 
 	return goalIds.filter((id) => latestStatusMap.get(id) === "ACTIVE");
-}
-
-async function listShortTermGoalsInTx(params: {
-	tx: Database | DatabaseTransaction;
-	userId: string;
-	midasAccountId: string;
-	status?: ShortTermGoalStatus | undefined;
-}): Promise<ShortTermGoalRecord[]> {
-	const { tx, userId, midasAccountId, status } = params;
-
-	const goals = await tx
-		.select()
-		.from(shortTermGoals)
-		.where(
-			and(
-				eq(shortTermGoals.midasAccountId, midasAccountId),
-				eq(shortTermGoals.userId, userId),
-			),
-		);
-
-	if (goals.length === 0) return [];
-
-	const goalIds = goals.map((g) => g.id);
-
-	// Fetch all revisions
-	const allRevisions = await tx
-		.select()
-		.from(shortTermGoalRevisions)
-		.where(
-			and(
-				eq(shortTermGoalRevisions.userId, userId),
-				inArray(shortTermGoalRevisions.goalId, goalIds),
-			),
-		)
-		.orderBy(desc(shortTermGoalRevisions.revisionNo));
-
-	const latestRevMap = new Map<string, (typeof allRevisions)[0]>();
-	for (const rev of allRevisions) {
-		if (!latestRevMap.has(rev.goalId)) {
-			latestRevMap.set(rev.goalId, rev);
-		}
-	}
-
-	// Fetch all bucket balances in one query
-	const bucketIds = goals.map((g) => g.midasBucketId);
-	const balances = await tx
-		.select({
-			toBucketId: midasAllocationTransfers.toBucketId,
-			fromBucketId: midasAllocationTransfers.fromBucketId,
-			amount: midasAllocationTransfers.amount,
-		})
-		.from(midasAllocationTransfers)
-		.where(
-			and(
-				eq(midasAllocationTransfers.midasAccountId, midasAccountId),
-				or(
-					inArray(midasAllocationTransfers.toBucketId, bucketIds),
-					inArray(midasAllocationTransfers.fromBucketId, bucketIds),
-				),
-			),
-		);
-
-	const bucketBalanceCentsMap = new Map<string, bigint>();
-	for (const b of bucketIds) {
-		bucketBalanceCentsMap.set(b, 0n);
-	}
-
-	for (const row of balances) {
-		const parsed = parseMoneyString(row.amount);
-		if (row.toBucketId && bucketBalanceCentsMap.has(row.toBucketId)) {
-			const curr = bucketBalanceCentsMap.get(row.toBucketId) ?? 0n;
-			bucketBalanceCentsMap.set(row.toBucketId, curr + parsed.cents);
-		}
-		if (row.fromBucketId && bucketBalanceCentsMap.has(row.fromBucketId)) {
-			const curr = bucketBalanceCentsMap.get(row.fromBucketId) ?? 0n;
-			bucketBalanceCentsMap.set(row.fromBucketId, curr - parsed.cents);
-		}
-	}
-
-	// Priority list
-	const [latestPriority] = await tx
-		.select()
-		.from(shortTermGoalPriorityRevisions)
-		.where(
-			and(
-				eq(shortTermGoalPriorityRevisions.midasAccountId, midasAccountId),
-				eq(shortTermGoalPriorityRevisions.userId, userId),
-			),
-		)
-		.orderBy(desc(shortTermGoalPriorityRevisions.revisionNo))
-		.limit(1);
-
-	const priorityOrder: string[] = latestPriority
-		? (latestPriority.orderedGoalIds as string[])
-		: [];
-
-	const priorityMap = new Map<string, number>();
-	priorityOrder.forEach((id, idx) => {
-		priorityMap.set(id, idx);
-	});
-
-	const records: ShortTermGoalRecord[] = [];
-
-	for (const goal of goals) {
-		const latestRev = latestRevMap.get(goal.id);
-		if (!latestRev) continue;
-
-		if (status && latestRev.status !== status) {
-			continue;
-		}
-
-		const balanceCents = bucketBalanceCentsMap.get(goal.midasBucketId) ?? 0n;
-		const targetParsed = parseMoneyString(latestRev.fundingTarget);
-
-		const { accumulatedAmount, fundingStatus, progressPercentage } =
-			deriveFundingMetrics(balanceCents, targetParsed.cents);
-
-		const pIdx =
-			latestRev.status === "ACTIVE" && priorityMap.has(goal.id)
-				? (priorityMap.get(goal.id) ?? null)
-				: null;
-
-		records.push({
-			id: goal.id,
-			userId: goal.userId,
-			midasAccountId: goal.midasAccountId,
-			midasBucketId: goal.midasBucketId,
-			status: latestRev.status as ShortTermGoalStatus,
-			name: latestRev.name,
-			fundingTarget: latestRev.fundingTarget,
-			accumulatedAmount,
-			fundingStatus,
-			progressPercentage,
-			targetDate: latestRev.targetDate,
-			maxBudget: latestRev.maxBudget,
-			targetPrice: latestRev.targetPrice,
-			productUrl: latestRev.productUrl,
-			note: latestRev.note,
-			priorityIndex: pIdx,
-			latestRevisionNo: latestRev.revisionNo,
-			createdAt: goal.createdAt,
-			updatedAt: latestRev.occurredAt,
-		});
-	}
-
-	// Sort: Active goals by priorityIndex ascending, non-active goals by updatedAt descending
-	records.sort((a, b) => {
-		if (a.status === "ACTIVE" && b.status === "ACTIVE") {
-			const idxA = a.priorityIndex ?? Number.MAX_SAFE_INTEGER;
-			const idxB = b.priorityIndex ?? Number.MAX_SAFE_INTEGER;
-			return idxA - idxB;
-		}
-		if (a.status === "ACTIVE") return -1;
-		if (b.status === "ACTIVE") return 1;
-		return b.updatedAt.getTime() - a.updatedAt.getTime();
-	});
-
-	return records;
 }

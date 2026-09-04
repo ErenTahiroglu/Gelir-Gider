@@ -162,6 +162,13 @@
       "when": 1788513405930,
       "tag": "0022_hot_mystique",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1788520000000,
+      "tag": "0023_short_term_goals_integrity",
+      "breakpoints": true
     }
   ]
 }

@@ -301,3 +301,55 @@ export function validatePositiveMoneyString(
 		);
 	}
 }
+
+/**
+ * Validates an expectedRevisionNo for optimistic concurrency control.
+ * Must be a safe positive integer (1, 2, 3...).
+ */
+export function validateExpectedRevisionNo(
+	value: unknown,
+	fieldName = "expectedRevisionNo",
+): number {
+	if (
+		typeof value !== "number" ||
+		!Number.isInteger(value) ||
+		value <= 0 ||
+		value > Number.MAX_SAFE_INTEGER
+	) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_INVALID_INPUT",
+			`${fieldName} must be a safe positive integer (>= 1)`,
+		);
+	}
+	return value;
+}
+
+/**
+ * Validates a 1-based priorityPosition for goal creation.
+ * If omitted (undefined or null), returns activeCount + 1 (append).
+ * If provided, must satisfy: 1 <= priorityPosition <= activeCount + 1.
+ */
+export function validatePriorityPosition(
+	value: unknown,
+	activeCount: number,
+	fieldName = "priorityPosition",
+): number {
+	if (value === undefined || value === null) {
+		return activeCount + 1;
+	}
+
+	if (
+		typeof value !== "number" ||
+		!Number.isInteger(value) ||
+		value < 1 ||
+		value > activeCount + 1 ||
+		value > Number.MAX_SAFE_INTEGER
+	) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_INVALID_INPUT",
+			`${fieldName} must be a 1-based integer between 1 and ${activeCount + 1}`,
+		);
+	}
+
+	return value;
+}

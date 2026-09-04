@@ -107,8 +107,10 @@ export function isMidasBucketInactiveDbError(err: unknown): boolean {
 	if (!chain) return false;
 
 	return (
-		chain.includes("because goal is in") &&
-		chain.includes("status (must be ACTIVE)")
+		(chain.includes("short-term goal") && chain.includes("ACTIVE status")) ||
+		(chain.includes("because goal is in") &&
+			chain.includes("status (must be ACTIVE)")) ||
+		chain.includes("not in ACTIVE status")
 	);
 }
 
@@ -120,5 +122,9 @@ export function isMidasBucketCapExceededDbError(err: unknown): boolean {
 	const chain = extractErrorCauseChain(err);
 	if (!chain) return false;
 
-	return chain.includes("exceeds short-term goal max budget");
+	return (
+		chain.includes("exceed short-term goal max budget") ||
+		chain.includes("exceeds short-term goal max budget") ||
+		chain.includes("trg_fn_guard_midas_transfers_goal_cap")
+	);
 }
