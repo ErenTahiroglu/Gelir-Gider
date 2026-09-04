@@ -97,3 +97,28 @@ export function isLedgerAccountInUseDbError(err: unknown): boolean {
 		chain.includes("trg_guard_ledger_accounts_archive")
 	);
 }
+
+/**
+ * Narrowly checks if a database error during allocation transfer insertion was caused
+ * by a short-term goal bucket trigger because the goal is not in ACTIVE status.
+ */
+export function isMidasBucketInactiveDbError(err: unknown): boolean {
+	const chain = extractErrorCauseChain(err);
+	if (!chain) return false;
+
+	return (
+		chain.includes("because goal is in") &&
+		chain.includes("status (must be ACTIVE)")
+	);
+}
+
+/**
+ * Narrowly checks if a database error during allocation transfer insertion was caused
+ * by a short-term goal bucket trigger because the transfer would exceed max_budget.
+ */
+export function isMidasBucketCapExceededDbError(err: unknown): boolean {
+	const chain = extractErrorCauseChain(err);
+	if (!chain) return false;
+
+	return chain.includes("exceeds short-term goal max budget");
+}

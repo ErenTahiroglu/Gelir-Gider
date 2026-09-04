@@ -23,6 +23,8 @@ import {
 import { MidasError } from "./errors";
 import { calculateAllocationTransferFingerprint } from "./fingerprint";
 import {
+	isMidasBucketCapExceededDbError,
+	isMidasBucketInactiveDbError,
 	isMidasLedgerAccountInvalidDbError,
 	normalizeCanonicalUuid,
 } from "./utils";
@@ -970,27 +972,45 @@ export async function createMidasAllocationTransferInTransaction({
 	}
 
 	// 8. Insert allocation transfer with race-safe ON CONFLICT DO NOTHING
-	const [inserted] = await tx
-		.insert(midasAllocationTransfers)
-		.values({
-			userId: trimmedUserId,
-			midasAccountId: trimmedMidasAccountId,
-			idempotencyKey: trimmedIdempotencyKey,
-			transferFingerprint: candidateFingerprint,
-			fromBucketId: normalizedFromBucketId,
-			toBucketId: normalizedToBucketId,
-			amount: parsedAmount.normalized,
-			occurredAt,
-			memo: normalizedMemo,
-			reversalOfTransferId: normalizedReversalOfTransferId,
-		})
-		.onConflictDoNothing({
-			target: [
-				midasAllocationTransfers.userId,
-				midasAllocationTransfers.idempotencyKey,
-			],
-		})
-		.returning();
+	let inserted: typeof midasAllocationTransfers.$inferSelect | undefined;
+	try {
+		const [res] = await tx
+			.insert(midasAllocationTransfers)
+			.values({
+				userId: trimmedUserId,
+				midasAccountId: trimmedMidasAccountId,
+				idempotencyKey: trimmedIdempotencyKey,
+				transferFingerprint: candidateFingerprint,
+				fromBucketId: normalizedFromBucketId,
+				toBucketId: normalizedToBucketId,
+				amount: parsedAmount.normalized,
+				occurredAt,
+				memo: normalizedMemo,
+				reversalOfTransferId: normalizedReversalOfTransferId,
+			})
+			.onConflictDoNothing({
+				target: [
+					midasAllocationTransfers.userId,
+					midasAllocationTransfers.idempotencyKey,
+				],
+			})
+			.returning();
+		inserted = res;
+	} catch (err: unknown) {
+		if (isMidasBucketInactiveDbError(err)) {
+			throw new MidasError(
+				"MIDAS_BUCKET_INACTIVE",
+				"Cannot transfer funds into bucket because linked goal is not active",
+			);
+		}
+		if (isMidasBucketCapExceededDbError(err)) {
+			throw new MidasError(
+				"MIDAS_BUCKET_CAP_EXCEEDED",
+				"Transfer would exceed maximum budget cap for linked goal",
+			);
+		}
+		throw err;
+	}
 
 	if (!inserted) {
 		// Race condition: another transaction inserted same idempotency key

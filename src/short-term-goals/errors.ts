@@ -1,0 +1,23 @@
+export type ShortTermGoalErrorCode =
+	| "SHORT_TERM_GOAL_INVALID_INPUT"
+	| "SHORT_TERM_GOAL_NOT_FOUND"
+	| "SHORT_TERM_GOAL_NOT_ACTIVE"
+	| "SHORT_TERM_GOAL_NON_ZERO_BALANCE"
+	| "SHORT_TERM_GOAL_BUCKET_NOT_FOUND"
+	| "SHORT_TERM_GOAL_MIDAS_ACCOUNT_NOT_FOUND"
+	| "SHORT_TERM_GOAL_MAX_BUDGET_EXCEEDED"
+	| "SHORT_TERM_GOAL_PRIORITY_COLLISION"
+	| "SHORT_TERM_GOAL_PRIORITY_MISMATCH"
+	| "SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT"
+	| "SHORT_TERM_GOAL_INVALID_STATE";
+
+export class ShortTermGoalError extends Error {
+	readonly code: ShortTermGoalErrorCode;
+
+	constructor(code: ShortTermGoalErrorCode, message: string) {
+		super(message);
+		this.name = "ShortTermGoalError";
+		this.code = code;
+		Object.setPrototypeOf(this, ShortTermGoalError.prototype);
+	}
+}

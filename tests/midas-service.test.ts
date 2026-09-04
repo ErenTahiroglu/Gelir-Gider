@@ -620,4 +620,55 @@ describe("Midas Service Input Validations & Error Contracts (Phase 8A / R2)", ()
 			});
 		});
 	});
+
+	describe("Midas Goal Trigger Error Trapping Helpers (Phase 9)", () => {
+		it("detects goal inactive db error messages across cause chain", async () => {
+			const { isMidasBucketInactiveDbError } = await import(
+				"../src/midas/utils"
+			);
+
+			const directErr = new Error(
+				'Cannot transfer funds into short-term goal bucket "b1" because goal is in "COMPLETED" status (must be ACTIVE)',
+			);
+			expect(isMidasBucketInactiveDbError(directErr)).toBe(true);
+
+			const nestedErr = {
+				message: "DrizzleQueryError",
+				cause: {
+					message: "Database error",
+					detail:
+						'Cannot transfer funds into short-term goal bucket "b2" because goal is in "CANCELLED" status (must be ACTIVE)',
+				},
+			};
+			expect(isMidasBucketInactiveDbError(nestedErr)).toBe(true);
+
+			expect(isMidasBucketInactiveDbError(new Error("Other error"))).toBe(
+				false,
+			);
+		});
+
+		it("detects goal max budget cap exceeded db error messages across cause chain", async () => {
+			const { isMidasBucketCapExceededDbError } = await import(
+				"../src/midas/utils"
+			);
+
+			const directErr = new Error(
+				"Transfer amount 500.00 exceeds short-term goal max budget 1000.00 (current accumulated: 600.00)",
+			);
+			expect(isMidasBucketCapExceededDbError(directErr)).toBe(true);
+
+			const nestedErr = {
+				message: "DrizzleQueryError",
+				cause: {
+					detail:
+						"Transfer amount 100.00 exceeds short-term goal max budget 500.00",
+				},
+			};
+			expect(isMidasBucketCapExceededDbError(nestedErr)).toBe(true);
+
+			expect(isMidasBucketCapExceededDbError(new Error("Other error"))).toBe(
+				false,
+			);
+		});
+	});
 });
