@@ -7,6 +7,7 @@ import {
 	validatePositiveMoneyString,
 	validatePriorityPosition,
 	validateProductUrl,
+	validateSuppliedPriorityPosition,
 	validateTrimmedText,
 } from "../src/short-term-goals/calendar";
 import {
@@ -99,6 +100,37 @@ describe("Short-Term Goal Service & Validation Unit Tests (DB-less)", () => {
 				ShortTermGoalError,
 			);
 			expect(() => validatePriorityPosition("1", 3)).toThrowError(
+				ShortTermGoalError,
+			);
+		});
+	});
+
+	describe("Supplied Priority Position Validation (Section 12)", () => {
+		it("accepts undefined and null as omitted", () => {
+			expect(validateSuppliedPriorityPosition(undefined)).toBeUndefined();
+			expect(validateSuppliedPriorityPosition(null)).toBeUndefined();
+		});
+
+		it("accepts safe integers >= 1", () => {
+			expect(validateSuppliedPriorityPosition(1)).toBe(1);
+			expect(validateSuppliedPriorityPosition(5)).toBe(5);
+			expect(validateSuppliedPriorityPosition(100)).toBe(100);
+		});
+
+		it("rejects 0, negative numbers, non-safe integers, floats, and strings", () => {
+			expect(() => validateSuppliedPriorityPosition(0)).toThrowError(
+				ShortTermGoalError,
+			);
+			expect(() => validateSuppliedPriorityPosition(-1)).toThrowError(
+				ShortTermGoalError,
+			);
+			expect(() => validateSuppliedPriorityPosition(1.5)).toThrowError(
+				ShortTermGoalError,
+			);
+			expect(() =>
+				validateSuppliedPriorityPosition(Number.MAX_SAFE_INTEGER + 1),
+			).toThrowError(ShortTermGoalError);
+			expect(() => validateSuppliedPriorityPosition("1")).toThrowError(
 				ShortTermGoalError,
 			);
 		});
@@ -229,7 +261,29 @@ describe("Short-Term Goal Service & Validation Unit Tests (DB-less)", () => {
 		});
 	});
 
-	describe("ShortTermGoalError Error Code Coverage (Phase 9-R1)", () => {
+	describe("Exact remainingToTarget & Funding Metrics (Section 14, 15)", () => {
+		it("calculates remainingToTarget with exact BigInt-cent arithmetic", () => {
+			const targetCents = 1000000n; // 10000.00
+			const balanceCents = 300000n; // 3000.00
+			const safeAccumulated = balanceCents < 0n ? 0n : balanceCents;
+			const remainingCents =
+				targetCents > safeAccumulated ? targetCents - safeAccumulated : 0n;
+
+			expect(remainingCents).toBe(700000n);
+		});
+
+		it("clamps remainingToTarget to 0.00 when balance exceeds target", () => {
+			const targetCents = 800000n; // 8000.00
+			const balanceCents = 900000n; // 9000.00
+			const safeAccumulated = balanceCents < 0n ? 0n : balanceCents;
+			const remainingCents =
+				targetCents > safeAccumulated ? targetCents - safeAccumulated : 0n;
+
+			expect(remainingCents).toBe(0n);
+		});
+	});
+
+	describe("ShortTermGoalError Error Code Coverage (Phase 9-R1/R2)", () => {
 		it("constructs ShortTermGoalError with code and message", () => {
 			const codes: ShortTermGoalErrorCode[] = [
 				"SHORT_TERM_GOAL_INVALID_INPUT",

@@ -29,6 +29,7 @@ import {
 	validatePriorityPosition,
 	validateProductUrl,
 	validateRequiredTrimmedText,
+	validateSuppliedPriorityPosition,
 } from "./calendar";
 import { ShortTermGoalError } from "./errors";
 import {
@@ -49,6 +50,7 @@ export interface ShortTermGoalRecord {
 	name: string;
 	fundingTarget: string;
 	accumulatedAmount: string;
+	remainingToTarget: string; // exact BigInt-cent: max(fundingTarget - accumulatedAmount, 0)
 	fundingStatus: ShortTermGoalFundingStatus;
 	progressPercentage: number;
 	targetDate: string | null;
@@ -57,7 +59,6 @@ export interface ShortTermGoalRecord {
 	productUrl: string | null;
 	note: string | null;
 	priority: number | null; // 1-based: 1, 2, 3... or null
-	priorityIndex?: number | null; // 0-based compatibility helper if needed
 	latestRevisionNo: number;
 	createdAt: Date;
 	updatedAt: Date;
@@ -203,6 +204,7 @@ export interface ListShortTermGoalsParams {
 	userId: string;
 	midasAccountId: string;
 	status?: ShortTermGoalStatus | undefined;
+	includeTerminal?: boolean | undefined;
 }
 
 export interface ListShortTermGoalsInTransactionParams {
@@ -210,6 +212,7 @@ export interface ListShortTermGoalsInTransactionParams {
 	userId: string;
 	midasAccountId: string;
 	status?: ShortTermGoalStatus | undefined;
+	includeTerminal?: boolean | undefined;
 }
 
 function deriveFundingMetrics(
@@ -217,11 +220,16 @@ function deriveFundingMetrics(
 	targetCents: bigint,
 ): {
 	accumulatedAmount: string;
+	remainingToTarget: string;
 	fundingStatus: ShortTermGoalFundingStatus;
 	progressPercentage: number;
 } {
 	const safeAccumulated = accumulatedCents < 0n ? 0n : accumulatedCents;
 	const accumulatedAmount = formatSignedCentsToMoney(safeAccumulated);
+
+	const remainingCents =
+		targetCents > safeAccumulated ? targetCents - safeAccumulated : 0n;
+	const remainingToTarget = formatSignedCentsToMoney(remainingCents);
 
 	let fundingStatus: ShortTermGoalFundingStatus = "EMPTY";
 	if (safeAccumulated === 0n) {
@@ -234,15 +242,499 @@ function deriveFundingMetrics(
 
 	const progressPercentage =
 		targetCents > 0n
-			? Math.round((Number(safeAccumulated) / Number(targetCents)) * 10000) /
-				100
+			? Math.round(Number((safeAccumulated * 10000n) / targetCents)) / 100
 			: 0;
 
 	return {
 		accumulatedAmount,
+		remainingToTarget,
 		fundingStatus,
 		progressPercentage,
 	};
+}
+
+async function validateAndBuildCreateReplayInTransaction(
+	tx: DatabaseTransaction,
+	existingRev: typeof shortTermGoalRevisions.$inferSelect,
+	userId: string,
+	idempotencyKey: string,
+	name: string,
+	parsedTargetNormalized: string,
+	targetDate: string | null,
+	maxBudget: string | null,
+	targetPrice: string | null,
+	productUrl: string | null,
+	note: string | null,
+	suppliedPriorityPosition: number | undefined,
+	occurredAt: Date,
+): Promise<ShortTermGoalLifecycleResult> {
+	if (existingRev.operation !== "CREATE") {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used for different operation",
+		);
+	}
+
+	// 1. Resolve original priority position from the priority snapshot created by this CREATE
+	const internalPriorityKey = await generateHashedPriorityIdempotencyKey(
+		idempotencyKey,
+		existingRev.goalId,
+		"CREATE",
+	);
+
+	let [priorityRev] = await tx
+		.select()
+		.from(shortTermGoalPriorityRevisions)
+		.where(
+			and(
+				eq(shortTermGoalPriorityRevisions.userId, userId),
+				eq(shortTermGoalPriorityRevisions.idempotencyKey, internalPriorityKey),
+			),
+		)
+		.limit(1);
+
+	if (!priorityRev) {
+		const legacyKey = `${idempotencyKey}:priority`;
+		[priorityRev] = await tx
+			.select()
+			.from(shortTermGoalPriorityRevisions)
+			.where(
+				and(
+					eq(shortTermGoalPriorityRevisions.userId, userId),
+					eq(shortTermGoalPriorityRevisions.idempotencyKey, legacyKey),
+				),
+			)
+			.limit(1);
+	}
+
+	let historicalPosition: number | undefined;
+	if (priorityRev) {
+		const orderedIds = priorityRev.orderedGoalIds as string[];
+		const idx = orderedIds.indexOf(existingRev.goalId);
+		if (idx === -1) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_STATE",
+				`Goal ${existingRev.goalId} not found in creation priority snapshot`,
+			);
+		}
+		historicalPosition = idx + 1;
+	}
+
+	// 2. Candidate v2 fingerprint check
+	const posForV2 = suppliedPriorityPosition ?? historicalPosition;
+	if (posForV2 !== undefined) {
+		const candidateFpV2 = await calculateShortTermGoalCreateFingerprintV2({
+			userId,
+			goalId: existingRev.goalId,
+			name,
+			fundingTarget: parsedTargetNormalized,
+			targetDate,
+			maxBudget,
+			targetPrice,
+			productUrl,
+			note,
+			priorityPosition: posForV2,
+			occurredAt,
+		});
+
+		if (existingRev.revisionFingerprint === candidateFpV2) {
+			if (
+				suppliedPriorityPosition !== undefined &&
+				historicalPosition !== undefined &&
+				suppliedPriorityPosition !== historicalPosition
+			) {
+				throw new ShortTermGoalError(
+					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+					"Idempotency key already used with different priorityPosition",
+				);
+			}
+
+			return {
+				goalId: existingRev.goalId,
+				revisionId: existingRev.id,
+				revisionNo: existingRev.revisionNo,
+				operation: existingRev.operation as ShortTermGoalOperation,
+				status: existingRev.status as ShortTermGoalStatus,
+				idempotentReplay: true,
+				snapshot: {
+					name: existingRev.name,
+					fundingTarget: existingRev.fundingTarget,
+					targetDate: existingRev.targetDate,
+					maxBudget: existingRev.maxBudget,
+					targetPrice: existingRev.targetPrice,
+					productUrl: existingRev.productUrl,
+					note: existingRev.note,
+				},
+			};
+		}
+	}
+
+	// 3. Legacy v1 fallback check (Section 7)
+	const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1({
+		userId,
+		goalId: existingRev.goalId,
+		revisionNo: existingRev.revisionNo,
+		previousRevisionId: existingRev.previousRevisionId,
+		operation: existingRev.operation,
+		status: existingRev.status,
+		name,
+		fundingTarget: parsedTargetNormalized,
+		targetDate,
+		maxBudget,
+		targetPrice,
+		productUrl,
+		note,
+		changeReason: null,
+		occurredAt,
+	});
+
+	if (existingRev.revisionFingerprint === candidateFpV1) {
+		if (
+			suppliedPriorityPosition !== undefined &&
+			historicalPosition !== undefined &&
+			suppliedPriorityPosition !== historicalPosition
+		) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+				"Idempotency key already used with different priorityPosition",
+			);
+		}
+
+		return {
+			goalId: existingRev.goalId,
+			revisionId: existingRev.id,
+			revisionNo: existingRev.revisionNo,
+			operation: existingRev.operation as ShortTermGoalOperation,
+			status: existingRev.status as ShortTermGoalStatus,
+			idempotentReplay: true,
+			snapshot: {
+				name: existingRev.name,
+				fundingTarget: existingRev.fundingTarget,
+				targetDate: existingRev.targetDate,
+				maxBudget: existingRev.maxBudget,
+				targetPrice: existingRev.targetPrice,
+				productUrl: existingRev.productUrl,
+				note: existingRev.note,
+			},
+		};
+	}
+
+	throw new ShortTermGoalError(
+		"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+		"Idempotency key already used with different parameters",
+	);
+}
+
+async function validateAndBuildUpdateReplayInTransaction(
+	tx: DatabaseTransaction,
+	existingRev: typeof shortTermGoalRevisions.$inferSelect,
+	userId: string,
+	goalId: string,
+	expectedRevisionNo: number,
+	params: UpdateShortTermGoalParams,
+	changeReason: string | null,
+	occurredAt: Date,
+): Promise<ShortTermGoalLifecycleResult> {
+	if (existingRev.goalId !== goalId || existingRev.operation !== "UPDATE") {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used for different goal or operation",
+		);
+	}
+
+	if (!existingRev.previousRevisionId) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_INVALID_STATE",
+			"UPDATE revision has no previousRevisionId",
+		);
+	}
+
+	// Load predecessor
+	const [predecessor] = await tx
+		.select()
+		.from(shortTermGoalRevisions)
+		.where(
+			and(
+				eq(shortTermGoalRevisions.id, existingRev.previousRevisionId),
+				eq(shortTermGoalRevisions.userId, userId),
+				eq(shortTermGoalRevisions.goalId, goalId),
+			),
+		)
+		.limit(1);
+
+	if (!predecessor || predecessor.revisionNo !== existingRev.revisionNo - 1) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_INVALID_STATE",
+			"UPDATE revision predecessor missing or invalid",
+		);
+	}
+
+	if (expectedRevisionNo !== predecessor.revisionNo) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+			`Idempotency key was used with expectedRevisionNo ${predecessor.revisionNo}, caller supplied ${expectedRevisionNo}`,
+		);
+	}
+
+	// Reconstruct caller's intended resulting snapshot by applying caller fields to PREDECESSOR snapshot
+	const intendedName =
+		params.name !== undefined
+			? validateRequiredTrimmedText(params.name, "name", 120)
+			: predecessor.name;
+
+	const intendedFundingTarget =
+		params.fundingTarget !== undefined
+			? validatePositiveMoneyString(params.fundingTarget, "fundingTarget")
+					.normalized
+			: predecessor.fundingTarget;
+
+	const intendedTargetDate =
+		params.targetDate !== undefined
+			? validateGregorianDate(params.targetDate, "targetDate")
+			: predecessor.targetDate;
+
+	const intendedMaxBudget =
+		params.maxBudget !== undefined
+			? params.maxBudget === null
+				? null
+				: validatePositiveMoneyString(params.maxBudget, "maxBudget").normalized
+			: predecessor.maxBudget;
+
+	const intendedTargetPrice =
+		params.targetPrice !== undefined
+			? params.targetPrice === null
+				? null
+				: validatePositiveMoneyString(params.targetPrice, "targetPrice")
+						.normalized
+			: predecessor.targetPrice;
+
+	const intendedProductUrl =
+		params.productUrl !== undefined
+			? validateProductUrl(params.productUrl)
+			: predecessor.productUrl;
+
+	const intendedNote =
+		params.note !== undefined
+			? validateOptionalTrimmedText(params.note, "note", 500)
+			: predecessor.note;
+
+	// Validate maxBudget >= fundingTarget on intended snapshot
+	if (intendedMaxBudget !== null) {
+		const maxParsed = parseMoneyString(intendedMaxBudget);
+		const targetParsed = parseMoneyString(intendedFundingTarget);
+		if (maxParsed.cents < targetParsed.cents) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_INVALID_INPUT",
+				`maxBudget (${intendedMaxBudget}) cannot be less than fundingTarget (${intendedFundingTarget})`,
+			);
+		}
+	}
+
+	// Candidate v2 check
+	const candidateFpV2 = await calculateShortTermGoalUpdateFingerprintV2({
+		userId,
+		goalId,
+		expectedRevisionNo,
+		name: intendedName,
+		fundingTarget: intendedFundingTarget,
+		targetDate: intendedTargetDate,
+		maxBudget: intendedMaxBudget,
+		targetPrice: intendedTargetPrice,
+		productUrl: intendedProductUrl,
+		note: intendedNote,
+		changeReason,
+		occurredAt,
+	});
+
+	if (existingRev.revisionFingerprint === candidateFpV2) {
+		return {
+			goalId: existingRev.goalId,
+			revisionId: existingRev.id,
+			revisionNo: existingRev.revisionNo,
+			operation: existingRev.operation as ShortTermGoalOperation,
+			status: existingRev.status as ShortTermGoalStatus,
+			idempotentReplay: true,
+			snapshot: {
+				name: existingRev.name,
+				fundingTarget: existingRev.fundingTarget,
+				targetDate: existingRev.targetDate,
+				maxBudget: existingRev.maxBudget,
+				targetPrice: existingRev.targetPrice,
+				productUrl: existingRev.productUrl,
+				note: existingRev.note,
+			},
+		};
+	}
+
+	// Legacy v1 fallback check (Section 8)
+	const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1({
+		userId,
+		goalId,
+		revisionNo: existingRev.revisionNo,
+		previousRevisionId: existingRev.previousRevisionId,
+		operation: "UPDATE",
+		status: "ACTIVE",
+		name: intendedName,
+		fundingTarget: intendedFundingTarget,
+		targetDate: intendedTargetDate,
+		maxBudget: intendedMaxBudget,
+		targetPrice: intendedTargetPrice,
+		productUrl: intendedProductUrl,
+		note: intendedNote,
+		changeReason,
+		occurredAt,
+	});
+
+	if (existingRev.revisionFingerprint === candidateFpV1) {
+		return {
+			goalId: existingRev.goalId,
+			revisionId: existingRev.id,
+			revisionNo: existingRev.revisionNo,
+			operation: existingRev.operation as ShortTermGoalOperation,
+			status: existingRev.status as ShortTermGoalStatus,
+			idempotentReplay: true,
+			snapshot: {
+				name: existingRev.name,
+				fundingTarget: existingRev.fundingTarget,
+				targetDate: existingRev.targetDate,
+				maxBudget: existingRev.maxBudget,
+				targetPrice: existingRev.targetPrice,
+				productUrl: existingRev.productUrl,
+				note: existingRev.note,
+			},
+		};
+	}
+
+	throw new ShortTermGoalError(
+		"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+		"Idempotency key already used with different parameters",
+	);
+}
+
+async function validateAndBuildTerminalReplayInTransaction(
+	tx: DatabaseTransaction,
+	existingRev: typeof shortTermGoalRevisions.$inferSelect,
+	userId: string,
+	goalId: string,
+	operation: "COMPLETE" | "CANCEL",
+	targetStatus: ShortTermGoalStatus,
+	expectedRevisionNo: number,
+	changeReason: string | null,
+	occurredAt: Date,
+): Promise<ShortTermGoalLifecycleResult> {
+	if (existingRev.goalId !== goalId || existingRev.operation !== operation) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used for different goal or operation",
+		);
+	}
+
+	// Candidate v2 check
+	const candidateFpV2 = await calculateShortTermGoalTerminalFingerprintV2({
+		userId,
+		goalId,
+		operation,
+		expectedRevisionNo,
+		changeReason,
+		occurredAt,
+	});
+
+	if (existingRev.revisionFingerprint === candidateFpV2) {
+		return {
+			goalId: existingRev.goalId,
+			revisionId: existingRev.id,
+			revisionNo: existingRev.revisionNo,
+			operation: existingRev.operation as ShortTermGoalOperation,
+			status: existingRev.status as ShortTermGoalStatus,
+			idempotentReplay: true,
+			snapshot: {
+				name: existingRev.name,
+				fundingTarget: existingRev.fundingTarget,
+				targetDate: existingRev.targetDate,
+				maxBudget: existingRev.maxBudget,
+				targetPrice: existingRev.targetPrice,
+				productUrl: existingRev.productUrl,
+				note: existingRev.note,
+			},
+		};
+	}
+
+	// Legacy v1 check: must require expectedRevisionNo = existingRev.revisionNo - 1 (Section 10)
+	if (!existingRev.previousRevisionId) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_INVALID_STATE",
+			"Terminal revision missing predecessor ID",
+		);
+	}
+
+	const [predecessor] = await tx
+		.select()
+		.from(shortTermGoalRevisions)
+		.where(
+			and(
+				eq(shortTermGoalRevisions.id, existingRev.previousRevisionId),
+				eq(shortTermGoalRevisions.userId, userId),
+				eq(shortTermGoalRevisions.goalId, goalId),
+			),
+		)
+		.limit(1);
+
+	if (!predecessor || predecessor.revisionNo !== existingRev.revisionNo - 1) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_INVALID_STATE",
+			"Terminal revision predecessor missing or invalid",
+		);
+	}
+
+	if (expectedRevisionNo !== predecessor.revisionNo) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+			`Idempotency key was used with expectedRevisionNo ${predecessor.revisionNo}, caller supplied ${expectedRevisionNo}`,
+		);
+	}
+
+	const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1({
+		userId,
+		goalId,
+		revisionNo: existingRev.revisionNo,
+		previousRevisionId: existingRev.previousRevisionId,
+		operation,
+		status: targetStatus,
+		name: existingRev.name,
+		fundingTarget: existingRev.fundingTarget,
+		targetDate: existingRev.targetDate,
+		maxBudget: existingRev.maxBudget,
+		targetPrice: existingRev.targetPrice,
+		productUrl: existingRev.productUrl,
+		note: existingRev.note,
+		changeReason,
+		occurredAt,
+	});
+
+	if (existingRev.revisionFingerprint === candidateFpV1) {
+		return {
+			goalId: existingRev.goalId,
+			revisionId: existingRev.id,
+			revisionNo: existingRev.revisionNo,
+			operation: existingRev.operation as ShortTermGoalOperation,
+			status: existingRev.status as ShortTermGoalStatus,
+			idempotentReplay: true,
+			snapshot: {
+				name: existingRev.name,
+				fundingTarget: existingRev.fundingTarget,
+				targetDate: existingRev.targetDate,
+				maxBudget: existingRev.maxBudget,
+				targetPrice: existingRev.targetPrice,
+				productUrl: existingRev.productUrl,
+				note: existingRev.note,
+			},
+		};
+	}
+
+	throw new ShortTermGoalError(
+		"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
+		"Idempotency key already used with different parameters",
+	);
 }
 
 /**
@@ -297,21 +789,10 @@ export async function createShortTermGoal(
 	}
 
 	// Early check priorityPosition format if provided
-	if (
-		params.priorityPosition !== undefined &&
-		params.priorityPosition !== null
-	) {
-		if (
-			typeof params.priorityPosition !== "number" ||
-			!Number.isInteger(params.priorityPosition) ||
-			params.priorityPosition < 1
-		) {
-			throw new ShortTermGoalError(
-				"SHORT_TERM_GOAL_INVALID_INPUT",
-				"priorityPosition must be a safe 1-based positive integer",
-			);
-		}
-	}
+	const suppliedPosition = validateSuppliedPriorityPosition(
+		params.priorityPosition,
+		"priorityPosition",
+	);
 
 	const executeInTx = async (
 		tx: DatabaseTransaction,
@@ -329,76 +810,21 @@ export async function createShortTermGoal(
 			.limit(1);
 
 		if (existingRev) {
-			if (existingRev.operation !== "CREATE") {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used for different operation",
-				);
-			}
-
-			// Validate candidate fingerprint (check v2 first, then fallback to v1)
-			const candidateFpV2 = await calculateShortTermGoalCreateFingerprintV2({
+			return await validateAndBuildCreateReplayInTransaction(
+				tx,
+				existingRev,
 				userId,
-				goalId: existingRev.goalId,
+				idempotencyKey,
 				name,
-				fundingTarget: parsedTarget.normalized,
+				parsedTarget.normalized,
 				targetDate,
 				maxBudget,
 				targetPrice,
 				productUrl,
 				note,
-				priorityPosition: params.priorityPosition ?? 1,
+				suppliedPosition,
 				occurredAt,
-			});
-
-			let matches = existingRev.revisionFingerprint === candidateFpV2;
-			if (!matches) {
-				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
-					{
-						userId,
-						goalId: existingRev.goalId,
-						revisionNo: existingRev.revisionNo,
-						previousRevisionId: existingRev.previousRevisionId,
-						operation: existingRev.operation,
-						status: existingRev.status,
-						name,
-						fundingTarget: parsedTarget.normalized,
-						targetDate,
-						maxBudget,
-						targetPrice,
-						productUrl,
-						note,
-						changeReason: null,
-						occurredAt,
-					},
-				);
-				matches = existingRev.revisionFingerprint === candidateFpV1;
-			}
-
-			if (!matches) {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with different parameters",
-				);
-			}
-
-			return {
-				goalId: existingRev.goalId,
-				revisionId: existingRev.id,
-				revisionNo: existingRev.revisionNo,
-				operation: existingRev.operation as ShortTermGoalOperation,
-				status: existingRev.status as ShortTermGoalStatus,
-				idempotentReplay: true,
-				snapshot: {
-					name: existingRev.name,
-					fundingTarget: existingRev.fundingTarget,
-					targetDate: existingRev.targetDate,
-					maxBudget: existingRev.maxBudget,
-					targetPrice: existingRev.targetPrice,
-					productUrl: existingRev.productUrl,
-					note: existingRev.note,
-				},
-			};
+			);
 		}
 
 		// 2. Lock parent Midas account FOR UPDATE to serialize priority and goal additions
@@ -434,75 +860,21 @@ export async function createShortTermGoal(
 			.limit(1);
 
 		if (existingRevPostLock) {
-			if (existingRevPostLock.operation !== "CREATE") {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used for different operation",
-				);
-			}
-
-			const candidateFpV2 = await calculateShortTermGoalCreateFingerprintV2({
+			return await validateAndBuildCreateReplayInTransaction(
+				tx,
+				existingRevPostLock,
 				userId,
-				goalId: existingRevPostLock.goalId,
+				idempotencyKey,
 				name,
-				fundingTarget: parsedTarget.normalized,
+				parsedTarget.normalized,
 				targetDate,
 				maxBudget,
 				targetPrice,
 				productUrl,
 				note,
-				priorityPosition: params.priorityPosition ?? 1,
+				suppliedPosition,
 				occurredAt,
-			});
-
-			let matches = existingRevPostLock.revisionFingerprint === candidateFpV2;
-			if (!matches) {
-				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
-					{
-						userId,
-						goalId: existingRevPostLock.goalId,
-						revisionNo: existingRevPostLock.revisionNo,
-						previousRevisionId: existingRevPostLock.previousRevisionId,
-						operation: existingRevPostLock.operation,
-						status: existingRevPostLock.status,
-						name,
-						fundingTarget: parsedTarget.normalized,
-						targetDate,
-						maxBudget,
-						targetPrice,
-						productUrl,
-						note,
-						changeReason: null,
-						occurredAt,
-					},
-				);
-				matches = existingRevPostLock.revisionFingerprint === candidateFpV1;
-			}
-
-			if (!matches) {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with different parameters",
-				);
-			}
-
-			return {
-				goalId: existingRevPostLock.goalId,
-				revisionId: existingRevPostLock.id,
-				revisionNo: existingRevPostLock.revisionNo,
-				operation: existingRevPostLock.operation as ShortTermGoalOperation,
-				status: existingRevPostLock.status as ShortTermGoalStatus,
-				idempotentReplay: true,
-				snapshot: {
-					name: existingRevPostLock.name,
-					fundingTarget: existingRevPostLock.fundingTarget,
-					targetDate: existingRevPostLock.targetDate,
-					maxBudget: existingRevPostLock.maxBudget,
-					targetPrice: existingRevPostLock.targetPrice,
-					productUrl: existingRevPostLock.productUrl,
-					note: existingRevPostLock.note,
-				},
-			};
+			);
 		}
 
 		// 4. Fetch current priority ordering to resolve active goal count & validated position
@@ -718,102 +1090,16 @@ export async function updateShortTermGoal(
 			.limit(1);
 
 		if (existingRev) {
-			if (existingRev.goalId !== goalId || existingRev.operation !== "UPDATE") {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used for different goal or operation",
-				);
-			}
-
-			// Reconstruct candidate fingerprint v2 to verify exact replay
-			const candidateFpV2 = await calculateShortTermGoalUpdateFingerprintV2({
+			return await validateAndBuildUpdateReplayInTransaction(
+				tx,
+				existingRev,
 				userId,
 				goalId,
 				expectedRevisionNo,
-				name: params.name !== undefined ? params.name.trim() : existingRev.name,
-				fundingTarget:
-					params.fundingTarget !== undefined
-						? validatePositiveMoneyString(params.fundingTarget, "fundingTarget")
-								.normalized
-						: existingRev.fundingTarget,
-				targetDate:
-					params.targetDate !== undefined
-						? validateGregorianDate(params.targetDate, "targetDate")
-						: existingRev.targetDate,
-				maxBudget:
-					params.maxBudget !== undefined
-						? params.maxBudget === null
-							? null
-							: validatePositiveMoneyString(params.maxBudget, "maxBudget")
-									.normalized
-						: existingRev.maxBudget,
-				targetPrice:
-					params.targetPrice !== undefined
-						? params.targetPrice === null
-							? null
-							: validatePositiveMoneyString(params.targetPrice, "targetPrice")
-									.normalized
-						: existingRev.targetPrice,
-				productUrl:
-					params.productUrl !== undefined
-						? validateProductUrl(params.productUrl)
-						: existingRev.productUrl,
-				note:
-					params.note !== undefined
-						? validateOptionalTrimmedText(params.note, "note", 500)
-						: existingRev.note,
+				params,
 				changeReason,
 				occurredAt,
-			});
-
-			let matches = existingRev.revisionFingerprint === candidateFpV2;
-			if (!matches) {
-				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
-					{
-						userId,
-						goalId,
-						revisionNo: existingRev.revisionNo,
-						previousRevisionId: existingRev.previousRevisionId,
-						operation: "UPDATE",
-						status: "ACTIVE",
-						name: existingRev.name,
-						fundingTarget: existingRev.fundingTarget,
-						targetDate: existingRev.targetDate,
-						maxBudget: existingRev.maxBudget,
-						targetPrice: existingRev.targetPrice,
-						productUrl: existingRev.productUrl,
-						note: existingRev.note,
-						changeReason,
-						occurredAt,
-					},
-				);
-				matches = existingRev.revisionFingerprint === candidateFpV1;
-			}
-
-			if (!matches) {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with different parameters",
-				);
-			}
-
-			return {
-				goalId: existingRev.goalId,
-				revisionId: existingRev.id,
-				revisionNo: existingRev.revisionNo,
-				operation: existingRev.operation as ShortTermGoalOperation,
-				status: existingRev.status as ShortTermGoalStatus,
-				idempotentReplay: true,
-				snapshot: {
-					name: existingRev.name,
-					fundingTarget: existingRev.fundingTarget,
-					targetDate: existingRev.targetDate,
-					maxBudget: existingRev.maxBudget,
-					targetPrice: existingRev.targetPrice,
-					productUrl: existingRev.productUrl,
-					note: existingRev.note,
-				},
-			};
+			);
 		}
 
 		// 2. Fetch goal identity
@@ -858,107 +1144,16 @@ export async function updateShortTermGoal(
 			.limit(1);
 
 		if (existingRevPostLock) {
-			if (
-				existingRevPostLock.goalId !== goalId ||
-				existingRevPostLock.operation !== "UPDATE"
-			) {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used for different goal or operation",
-				);
-			}
-
-			const candidateFpV2 = await calculateShortTermGoalUpdateFingerprintV2({
+			return await validateAndBuildUpdateReplayInTransaction(
+				tx,
+				existingRevPostLock,
 				userId,
 				goalId,
 				expectedRevisionNo,
-				name:
-					params.name !== undefined
-						? params.name.trim()
-						: existingRevPostLock.name,
-				fundingTarget:
-					params.fundingTarget !== undefined
-						? validatePositiveMoneyString(params.fundingTarget, "fundingTarget")
-								.normalized
-						: existingRevPostLock.fundingTarget,
-				targetDate:
-					params.targetDate !== undefined
-						? validateGregorianDate(params.targetDate, "targetDate")
-						: existingRevPostLock.targetDate,
-				maxBudget:
-					params.maxBudget !== undefined
-						? params.maxBudget === null
-							? null
-							: validatePositiveMoneyString(params.maxBudget, "maxBudget")
-									.normalized
-						: existingRevPostLock.maxBudget,
-				targetPrice:
-					params.targetPrice !== undefined
-						? params.targetPrice === null
-							? null
-							: validatePositiveMoneyString(params.targetPrice, "targetPrice")
-									.normalized
-						: existingRevPostLock.targetPrice,
-				productUrl:
-					params.productUrl !== undefined
-						? validateProductUrl(params.productUrl)
-						: existingRevPostLock.productUrl,
-				note:
-					params.note !== undefined
-						? validateOptionalTrimmedText(params.note, "note", 500)
-						: existingRevPostLock.note,
+				params,
 				changeReason,
 				occurredAt,
-			});
-
-			let matches = existingRevPostLock.revisionFingerprint === candidateFpV2;
-			if (!matches) {
-				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
-					{
-						userId,
-						goalId,
-						revisionNo: existingRevPostLock.revisionNo,
-						previousRevisionId: existingRevPostLock.previousRevisionId,
-						operation: "UPDATE",
-						status: "ACTIVE",
-						name: existingRevPostLock.name,
-						fundingTarget: existingRevPostLock.fundingTarget,
-						targetDate: existingRevPostLock.targetDate,
-						maxBudget: existingRevPostLock.maxBudget,
-						targetPrice: existingRevPostLock.targetPrice,
-						productUrl: existingRevPostLock.productUrl,
-						note: existingRevPostLock.note,
-						changeReason,
-						occurredAt,
-					},
-				);
-				matches = existingRevPostLock.revisionFingerprint === candidateFpV1;
-			}
-
-			if (!matches) {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with different parameters",
-				);
-			}
-
-			return {
-				goalId: existingRevPostLock.goalId,
-				revisionId: existingRevPostLock.id,
-				revisionNo: existingRevPostLock.revisionNo,
-				operation: existingRevPostLock.operation as ShortTermGoalOperation,
-				status: existingRevPostLock.status as ShortTermGoalStatus,
-				idempotentReplay: true,
-				snapshot: {
-					name: existingRevPostLock.name,
-					fundingTarget: existingRevPostLock.fundingTarget,
-					targetDate: existingRevPostLock.targetDate,
-					maxBudget: existingRevPostLock.maxBudget,
-					targetPrice: existingRevPostLock.targetPrice,
-					productUrl: existingRevPostLock.productUrl,
-					note: existingRevPostLock.note,
-				},
-			};
+			);
 		}
 
 		// 5. Fetch latest revision and check optimistic concurrency
@@ -1230,73 +1425,17 @@ async function transitionTerminalStatus(params: {
 			.limit(1);
 
 		if (existingRev) {
-			if (
-				existingRev.goalId !== goalId ||
-				existingRev.operation !== params.operation
-			) {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used for different goal or operation",
-				);
-			}
-
-			const candidateFpV2 = await calculateShortTermGoalTerminalFingerprintV2({
+			return await validateAndBuildTerminalReplayInTransaction(
+				tx,
+				existingRev,
 				userId,
 				goalId,
-				operation: params.operation,
+				params.operation,
+				params.targetStatus,
 				expectedRevisionNo,
 				changeReason,
 				occurredAt,
-			});
-
-			let matches = existingRev.revisionFingerprint === candidateFpV2;
-			if (!matches) {
-				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
-					{
-						userId,
-						goalId,
-						revisionNo: existingRev.revisionNo,
-						previousRevisionId: existingRev.previousRevisionId,
-						operation: params.operation,
-						status: params.targetStatus,
-						name: existingRev.name,
-						fundingTarget: existingRev.fundingTarget,
-						targetDate: existingRev.targetDate,
-						maxBudget: existingRev.maxBudget,
-						targetPrice: existingRev.targetPrice,
-						productUrl: existingRev.productUrl,
-						note: existingRev.note,
-						changeReason,
-						occurredAt,
-					},
-				);
-				matches = existingRev.revisionFingerprint === candidateFpV1;
-			}
-
-			if (!matches) {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with different parameters",
-				);
-			}
-
-			return {
-				goalId: existingRev.goalId,
-				revisionId: existingRev.id,
-				revisionNo: existingRev.revisionNo,
-				operation: existingRev.operation as ShortTermGoalOperation,
-				status: existingRev.status as ShortTermGoalStatus,
-				idempotentReplay: true,
-				snapshot: {
-					name: existingRev.name,
-					fundingTarget: existingRev.fundingTarget,
-					targetDate: existingRev.targetDate,
-					maxBudget: existingRev.maxBudget,
-					targetPrice: existingRev.targetPrice,
-					productUrl: existingRev.productUrl,
-					note: existingRev.note,
-				},
-			};
+			);
 		}
 
 		// 2. Fetch goal identity
@@ -1341,73 +1480,17 @@ async function transitionTerminalStatus(params: {
 			.limit(1);
 
 		if (existingRevPostLock) {
-			if (
-				existingRevPostLock.goalId !== goalId ||
-				existingRevPostLock.operation !== params.operation
-			) {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used for different goal or operation",
-				);
-			}
-
-			const candidateFpV2 = await calculateShortTermGoalTerminalFingerprintV2({
+			return await validateAndBuildTerminalReplayInTransaction(
+				tx,
+				existingRevPostLock,
 				userId,
 				goalId,
-				operation: params.operation,
+				params.operation,
+				params.targetStatus,
 				expectedRevisionNo,
 				changeReason,
 				occurredAt,
-			});
-
-			let matches = existingRevPostLock.revisionFingerprint === candidateFpV2;
-			if (!matches) {
-				const candidateFpV1 = await calculateShortTermGoalRevisionFingerprintV1(
-					{
-						userId,
-						goalId,
-						revisionNo: existingRevPostLock.revisionNo,
-						previousRevisionId: existingRevPostLock.previousRevisionId,
-						operation: params.operation,
-						status: params.targetStatus,
-						name: existingRevPostLock.name,
-						fundingTarget: existingRevPostLock.fundingTarget,
-						targetDate: existingRevPostLock.targetDate,
-						maxBudget: existingRevPostLock.maxBudget,
-						targetPrice: existingRevPostLock.targetPrice,
-						productUrl: existingRevPostLock.productUrl,
-						note: existingRevPostLock.note,
-						changeReason,
-						occurredAt,
-					},
-				);
-				matches = existingRevPostLock.revisionFingerprint === candidateFpV1;
-			}
-
-			if (!matches) {
-				throw new ShortTermGoalError(
-					"SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT",
-					"Idempotency key already used with different parameters",
-				);
-			}
-
-			return {
-				goalId: existingRevPostLock.goalId,
-				revisionId: existingRevPostLock.id,
-				revisionNo: existingRevPostLock.revisionNo,
-				operation: existingRevPostLock.operation as ShortTermGoalOperation,
-				status: existingRevPostLock.status as ShortTermGoalStatus,
-				idempotentReplay: true,
-				snapshot: {
-					name: existingRevPostLock.name,
-					fundingTarget: existingRevPostLock.fundingTarget,
-					targetDate: existingRevPostLock.targetDate,
-					maxBudget: existingRevPostLock.maxBudget,
-					targetPrice: existingRevPostLock.targetPrice,
-					productUrl: existingRevPostLock.productUrl,
-					note: existingRevPostLock.note,
-				},
-			};
+			);
 		}
 
 		// 5. Fetch latest revision and check optimistic concurrency
@@ -2184,8 +2267,12 @@ export async function getShortTermGoalInTransaction(
 	}
 
 	const targetParsed = parseMoneyString(latestRev.fundingTarget);
-	const { accumulatedAmount, fundingStatus, progressPercentage } =
-		deriveFundingMetrics(balanceParsed.cents, targetParsed.cents);
+	const {
+		accumulatedAmount,
+		remainingToTarget,
+		fundingStatus,
+		progressPercentage,
+	} = deriveFundingMetrics(balanceParsed.cents, targetParsed.cents);
 
 	return {
 		id: goal.id,
@@ -2196,6 +2283,7 @@ export async function getShortTermGoalInTransaction(
 		name: latestRev.name,
 		fundingTarget: latestRev.fundingTarget,
 		accumulatedAmount,
+		remainingToTarget,
 		fundingStatus,
 		progressPercentage,
 		targetDate: latestRev.targetDate,
@@ -2204,7 +2292,6 @@ export async function getShortTermGoalInTransaction(
 		productUrl: latestRev.productUrl,
 		note: latestRev.note,
 		priority,
-		priorityIndex: priority !== null ? priority - 1 : null,
 		latestRevisionNo: latestRev.revisionNo,
 		createdAt: goal.createdAt,
 		updatedAt: latestRev.occurredAt,
@@ -2230,6 +2317,7 @@ export async function listShortTermGoals(
 			userId,
 			midasAccountId,
 			status: params.status,
+			includeTerminal: params.includeTerminal,
 		});
 	});
 }
@@ -2240,7 +2328,13 @@ export async function listShortTermGoals(
 export async function listShortTermGoalsInTransaction(
 	params: ListShortTermGoalsInTransactionParams,
 ): Promise<ShortTermGoalRecord[]> {
-	const { tx, userId, midasAccountId, status } = params;
+	const {
+		tx,
+		userId,
+		midasAccountId,
+		status,
+		includeTerminal = false,
+	} = params;
 
 	// 1. Lock Midas liquidity state FOR UPDATE exactly once to serialize view
 	const liquidityState = await getMidasLiquidityStateInTransaction({
@@ -2347,6 +2441,7 @@ export async function listShortTermGoalsInTransaction(
 		const hasPriority = priorityMap.has(goal.id);
 		const pNum = hasPriority ? (priorityMap.get(goal.id) ?? null) : null;
 
+		// Invariant validations apply to ALL goals
 		if (latestRev.status === "ACTIVE") {
 			if (!hasPriority) {
 				throw new ShortTermGoalError(
@@ -2379,13 +2474,24 @@ export async function listShortTermGoalsInTransaction(
 			}
 		}
 
-		if (status && latestRev.status !== status) {
-			continue;
+		// Filter status (Section 16)
+		if (status !== undefined) {
+			if (latestRev.status !== status) {
+				continue;
+			}
+		} else {
+			if (!includeTerminal && latestRev.status !== "ACTIVE") {
+				continue;
+			}
 		}
 
 		const targetParsed = parseMoneyString(latestRev.fundingTarget);
-		const { accumulatedAmount, fundingStatus, progressPercentage } =
-			deriveFundingMetrics(balanceParsed.cents, targetParsed.cents);
+		const {
+			accumulatedAmount,
+			remainingToTarget,
+			fundingStatus,
+			progressPercentage,
+		} = deriveFundingMetrics(balanceParsed.cents, targetParsed.cents);
 
 		records.push({
 			id: goal.id,
@@ -2396,6 +2502,7 @@ export async function listShortTermGoalsInTransaction(
 			name: latestRev.name,
 			fundingTarget: latestRev.fundingTarget,
 			accumulatedAmount,
+			remainingToTarget,
 			fundingStatus,
 			progressPercentage,
 			targetDate: latestRev.targetDate,
@@ -2404,14 +2511,13 @@ export async function listShortTermGoalsInTransaction(
 			productUrl: latestRev.productUrl,
 			note: latestRev.note,
 			priority: pNum,
-			priorityIndex: pNum !== null ? pNum - 1 : null,
 			latestRevisionNo: latestRev.revisionNo,
 			createdAt: goal.createdAt,
 			updatedAt: latestRev.occurredAt,
 		});
 	}
 
-	// Sort: Active goals by priority (ascending 1, 2, 3...), terminal goals by updatedAt descending
+	// Sort: Active goals by priority (ascending 1, 2, 3...), terminal goals by createdAt DESC, id ASC (Section 17)
 	records.sort((a, b) => {
 		if (a.status === "ACTIVE" && b.status === "ACTIVE") {
 			const pA = a.priority ?? Number.MAX_SAFE_INTEGER;
@@ -2420,7 +2526,9 @@ export async function listShortTermGoalsInTransaction(
 		}
 		if (a.status === "ACTIVE") return -1;
 		if (b.status === "ACTIVE") return 1;
-		return b.updatedAt.getTime() - a.updatedAt.getTime();
+		const timeDiff = b.createdAt.getTime() - a.createdAt.getTime();
+		if (timeDiff !== 0) return timeDiff;
+		return a.id.localeCompare(b.id);
 	});
 
 	return records;

@@ -325,6 +325,29 @@ export function validateExpectedRevisionNo(
 }
 
 /**
+ * Validates an optionally supplied priorityPosition before any replay lookups.
+ * If provided, must be a safe integer >= 1.
+ * If undefined or null, returns undefined.
+ */
+export function validateSuppliedPriorityPosition(
+	value: unknown,
+	fieldName = "priorityPosition",
+): number | undefined {
+	if (value === undefined || value === null) {
+		return undefined;
+	}
+
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+		throw new ShortTermGoalError(
+			"SHORT_TERM_GOAL_INVALID_INPUT",
+			`${fieldName} must be a safe 1-based positive integer (>= 1)`,
+		);
+	}
+
+	return value;
+}
+
+/**
  * Validates a 1-based priorityPosition for goal creation.
  * If omitted (undefined or null), returns activeCount + 1 (append).
  * If provided, must satisfy: 1 <= priorityPosition <= activeCount + 1.
@@ -340,10 +363,9 @@ export function validatePriorityPosition(
 
 	if (
 		typeof value !== "number" ||
-		!Number.isInteger(value) ||
+		!Number.isSafeInteger(value) ||
 		value < 1 ||
-		value > activeCount + 1 ||
-		value > Number.MAX_SAFE_INTEGER
+		value > activeCount + 1
 	) {
 		throw new ShortTermGoalError(
 			"SHORT_TERM_GOAL_INVALID_INPUT",
