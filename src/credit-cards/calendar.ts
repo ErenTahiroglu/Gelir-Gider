@@ -370,13 +370,77 @@ export function validateCardStatusFilter(
  */
 export function validateStatementStatusFilter(
 	value: unknown,
-): "OPEN" | "VOID" | undefined {
+): "OPEN" | "VOID" | "PAID" | undefined {
 	if (value === undefined || value === null) return undefined;
-	if (value !== "OPEN" && value !== "VOID") {
+	if (value !== "OPEN" && value !== "VOID" && value !== "PAID") {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",
 			`Invalid statement status filter: "${String(value)}"`,
 		);
 	}
 	return value;
+}
+
+/**
+ * Validates a credit card purchase category.
+ */
+export function validatePurchaseCategory(
+	value: unknown,
+): "MANDATORY" | "DISCRETIONARY" | "SHORT_TERM_PURCHASE" | "UNCLASSIFIED" {
+	if (
+		value !== "MANDATORY" &&
+		value !== "DISCRETIONARY" &&
+		value !== "SHORT_TERM_PURCHASE" &&
+		value !== "UNCLASSIFIED"
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`Invalid purchaseCategory: "${String(value)}". Must be MANDATORY, DISCRETIONARY, SHORT_TERM_PURCHASE, or UNCLASSIFIED`,
+		);
+	}
+	return value;
+}
+
+/**
+ * Validates a credit card statement payment method.
+ */
+export function validatePaymentMethod(
+	value: unknown,
+): "MIDAS_FUND" | "OUTSIDE_MIDAS" {
+	if (value !== "MIDAS_FUND" && value !== "OUTSIDE_MIDAS") {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`Invalid paymentMethod: "${String(value)}". Must be MIDAS_FUND or OUTSIDE_MIDAS`,
+		);
+	}
+	return value;
+}
+
+/**
+ * Validates an optional liability event status filter.
+ */
+export function validateLiabilityEventStatusFilter(
+	value: unknown,
+): "POSTED" | "VOID" | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (value !== "POSTED" && value !== "VOID") {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`Invalid liability event status filter: "${String(value)}"`,
+		);
+	}
+	return value;
+}
+
+/**
+ * Formats a Date object as a YYYY-MM-DD string in the Europe/Istanbul time zone.
+ */
+export function formatIstanbulPurchaseDate(occurredAt: Date): string {
+	const formatter = new Intl.DateTimeFormat("en-CA", {
+		timeZone: "Europe/Istanbul",
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+	});
+	return formatter.format(occurredAt);
 }

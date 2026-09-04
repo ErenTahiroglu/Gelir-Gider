@@ -25,11 +25,13 @@ export const CREDIT_CARD_STATEMENT_OPERATIONS = [
 	"CREATE",
 	"UPDATE",
 	"VOID",
+	"PAY",
+	"REOPEN",
 ] as const;
 export type CreditCardStatementOperation =
 	(typeof CREDIT_CARD_STATEMENT_OPERATIONS)[number];
 
-export const CREDIT_CARD_STATEMENT_STATUSES = ["OPEN", "VOID"] as const;
+export const CREDIT_CARD_STATEMENT_STATUSES = ["OPEN", "VOID", "PAID"] as const;
 export type CreditCardStatementStatus =
 	(typeof CREDIT_CARD_STATEMENT_STATUSES)[number];
 
@@ -252,6 +254,7 @@ export const creditCardStatementRevisions = pgTable(
 		statementDate: date("statement_date").notNull(),
 		dueDate: date("due_date").notNull(),
 		reservePlacement: varchar("reserve_placement", { length: 20 }).notNull(),
+		paymentEventId: uuid("payment_event_id"),
 		note: varchar("note", { length: 500 }),
 		reasonNote: varchar("reason_note", { length: 500 }),
 		occurredAt: timestamp("occurred_at", {
@@ -280,14 +283,15 @@ export const creditCardStatementRevisions = pgTable(
 			.where(sql`${table.previousRevisionId} IS NOT NULL`),
 		index("cc_stmt_revisions_stmt_idx").on(table.statementId),
 		index("cc_stmt_revisions_user_idx").on(table.userId),
+		index("cc_stmt_revisions_payment_event_idx").on(table.paymentEventId),
 		check("cc_stmt_revisions_rev_no_check", sql`${table.revisionNo} > 0`),
 		check(
 			"cc_stmt_revisions_operation_check",
-			sql`${table.operation} IN ('CREATE', 'UPDATE', 'VOID')`,
+			sql`${table.operation} IN ('CREATE', 'UPDATE', 'VOID', 'PAY', 'REOPEN')`,
 		),
 		check(
 			"cc_stmt_revisions_status_check",
-			sql`${table.status} IN ('OPEN', 'VOID')`,
+			sql`${table.status} IN ('OPEN', 'VOID', 'PAID')`,
 		),
 		check("cc_stmt_revisions_amount_check", sql`${table.statementAmount} > 0`),
 		check(

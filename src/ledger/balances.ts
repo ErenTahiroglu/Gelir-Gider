@@ -1,5 +1,5 @@
 import { and, eq, isNull, lte, sql } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	journalEntries,
 	journalLines,
@@ -12,7 +12,14 @@ export interface GetLedgerAccountBalanceParams {
 	db: Database;
 	userId: string;
 	accountId: string;
-	asOf?: Date;
+	asOf?: Date | undefined;
+}
+
+export interface GetLedgerAccountBalanceInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	accountId: string;
+	asOf?: Date | undefined;
 }
 
 export interface LedgerAccountBalanceResult {
@@ -42,15 +49,15 @@ export interface LedgerAccountBalanceListItem {
 }
 
 /**
- * Calculates the exact signed decimal balance for a specific ledger account.
+ * Calculates the exact signed decimal balance for a specific ledger account inside a transaction.
  * Reads ONLY from POSTED journal entries and supports historical asOf timestamp.
  */
-export async function getLedgerAccountBalance({
-	db,
+export async function getLedgerAccountBalanceInTransaction({
+	tx,
 	userId,
 	accountId,
 	asOf,
-}: GetLedgerAccountBalanceParams): Promise<LedgerAccountBalanceResult> {
+}: GetLedgerAccountBalanceInTransactionParams): Promise<LedgerAccountBalanceResult> {
 	if (!userId || userId.trim() === "") {
 		throw new LedgerError("LEDGER_USER_NOT_FOUND", "User ID is required");
 	}
@@ -68,7 +75,7 @@ export async function getLedgerAccountBalance({
 	}
 
 	// 1. Verify account exists and belongs to user
-	const [account] = await db
+	const [account] = await tx
 		.select({
 			id: ledgerAccounts.id,
 			userId: ledgerAccounts.userId,
@@ -101,7 +108,7 @@ export async function getLedgerAccountBalance({
 		conditions.push(lte(journalEntries.occurredAt, asOf));
 	}
 
-	const [aggregate] = await db
+	const [aggregate] = await tx
 		.select({
 			debitSum: sql<string>`COALESCE(SUM(${journalLines.debit}), 0.00)`,
 			creditSum: sql<string>`COALESCE(SUM(${journalLines.credit}), 0.00)`,
@@ -134,6 +141,24 @@ export async function getLedgerAccountBalance({
 		balance: formatSignedCentsToMoney(signedCents),
 		asOf: asOf ? asOf.toISOString() : null,
 	};
+}
+
+/**
+ * Calculates the exact signed decimal balance for a specific ledger account.
+ * Reads ONLY from POSTED journal entries and supports historical asOf timestamp.
+ */
+export async function getLedgerAccountBalance({
+	db,
+	userId,
+	accountId,
+	asOf,
+}: GetLedgerAccountBalanceParams): Promise<LedgerAccountBalanceResult> {
+	return getLedgerAccountBalanceInTransaction({
+		tx: db as unknown as DatabaseTransaction,
+		userId,
+		accountId,
+		asOf,
+	});
 }
 
 /**

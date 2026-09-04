@@ -1,4 +1,7 @@
 export * from "./calendar";
 export * from "./errors";
 export * from "./fingerprint";
+export * from "./ledger-provisioning";
+export * from "./payments";
+export * from "./purchases";
 export * from "./service";

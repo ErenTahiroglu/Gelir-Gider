@@ -461,6 +461,30 @@ describe("Credit Card Lifecycle & Replay Snapshot Contracts", () => {
 							limit: vi.fn().mockResolvedValue([]),
 						}),
 					}),
+				})
+				// 5. ensureCreditCardLedgerLink existing check
+				.mockReturnValueOnce({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockReturnValue({
+							limit: vi
+								.fn()
+								.mockResolvedValue([
+									{ id: "link-1", liabilityAccountId: "liab-1" },
+								]),
+						}),
+					}),
+				})
+				// 6. ensureCreditCardSystemAccounts existing check
+				.mockReturnValueOnce({
+					from: vi.fn().mockReturnValue({
+						where: vi.fn().mockResolvedValue([
+							{ role: "MANDATORY_EXPENSE", ledgerAccountId: "sys-1" },
+							{ role: "DISCRETIONARY_EXPENSE", ledgerAccountId: "sys-2" },
+							{ role: "SHORT_TERM_PURCHASE", ledgerAccountId: "sys-3" },
+							{ role: "UNCLASSIFIED_EXPENSE", ledgerAccountId: "sys-4" },
+							{ role: "OPENING_EQUITY", ledgerAccountId: "sys-5" },
+						]),
+					}),
 				}),
 			insert: vi.fn((_table: unknown) => ({
 				values: vi.fn((_vals: unknown) => ({
@@ -902,7 +926,7 @@ describe("Runtime Filter Validation", () => {
 			select: vi.fn(),
 		} as unknown as DatabaseTransaction;
 
-		const invalidStatuses = ["PAID", "ACTIVE", "ARCHIVED", "foo", ""];
+		const invalidStatuses = ["ACTIVE", "ARCHIVED", "foo", ""];
 		for (const invalidStatus of invalidStatuses) {
 			await expect(
 				listCreditCardStatementsInTransaction(mockTx, {

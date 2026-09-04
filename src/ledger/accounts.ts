@@ -1,6 +1,10 @@
 import { and, eq } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { Database, DatabaseTransaction } from "../db/client";
 import { users } from "../db/schema/auth";
+import {
+	creditCardLedgerLinks,
+	creditCardSystemAccounts,
+} from "../db/schema/credit-card-ledger";
 import { ledgerAccounts } from "../db/schema/ledger";
 import { midasAccounts } from "../db/schema/midas";
 import { isLedgerAccountInUseDbError } from "../midas/utils";
@@ -48,6 +52,14 @@ export interface CreateLedgerAccountParams {
 	accountType: AccountType;
 }
 
+export interface CreateLedgerAccountInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	code: string;
+	name: string;
+	accountType: AccountType;
+}
+
 export interface LedgerAccountRecord {
 	id: string;
 	userId: string;
@@ -61,16 +73,15 @@ export interface LedgerAccountRecord {
 }
 
 /**
- * Creates a new ledger account for the given user.
- * Derives normal balance from account type and currency from user's base currency.
+ * Creates a new ledger account within an existing transaction.
  */
-export async function createLedgerAccount({
-	db,
+export async function createLedgerAccountInTransaction({
+	tx,
 	userId,
 	code,
 	name,
 	accountType,
-}: CreateLedgerAccountParams): Promise<LedgerAccountRecord> {
+}: CreateLedgerAccountInTransactionParams): Promise<LedgerAccountRecord> {
 	if (!userId || userId.trim() === "") {
 		throw new LedgerError("LEDGER_USER_NOT_FOUND", "User ID is required");
 	}
@@ -99,7 +110,7 @@ export async function createLedgerAccount({
 	}
 
 	// Resolve user to verify existence and derive currency
-	const [user] = await db
+	const [user] = await tx
 		.select({ id: users.id, currency: users.currency })
 		.from(users)
 		.where(eq(users.id, userId))
@@ -112,7 +123,7 @@ export async function createLedgerAccount({
 	const normalBalance = deriveNormalBalance(accountType);
 
 	try {
-		const [created] = await db
+		const [created] = await tx
 			.insert(ledgerAccounts)
 			.values({
 				userId: user.id,
@@ -163,21 +174,46 @@ export async function createLedgerAccount({
 	}
 }
 
+/**
+ * Creates a new ledger account for the given user.
+ * Derives normal balance from account type and currency from user's base currency.
+ */
+export async function createLedgerAccount({
+	db,
+	userId,
+	code,
+	name,
+	accountType,
+}: CreateLedgerAccountParams): Promise<LedgerAccountRecord> {
+	return createLedgerAccountInTransaction({
+		tx: db as unknown as DatabaseTransaction,
+		userId,
+		code,
+		name,
+		accountType,
+	});
+}
+
 export interface ArchiveLedgerAccountParams {
 	db: Database;
 	userId: string;
 	accountId: string;
 }
 
+export interface ArchiveLedgerAccountInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	accountId: string;
+}
+
 /**
- * Soft-archives a ledger account. Idempotent if already archived.
- * Historical lines remain intact; new journal postings to this account are prohibited.
+ * Soft-archives a ledger account inside a transaction.
  */
-export async function archiveLedgerAccount({
-	db,
+export async function archiveLedgerAccountInTransaction({
+	tx,
 	userId,
 	accountId,
-}: ArchiveLedgerAccountParams): Promise<LedgerAccountRecord> {
+}: ArchiveLedgerAccountInTransactionParams): Promise<LedgerAccountRecord> {
 	if (!userId || !accountId) {
 		throw new LedgerError(
 			"LEDGER_INVALID_ENTRY",
@@ -185,7 +221,7 @@ export async function archiveLedgerAccount({
 		);
 	}
 
-	const [account] = await db
+	const [account] = await tx
 		.select()
 		.from(ledgerAccounts)
 		.where(
@@ -216,7 +252,7 @@ export async function archiveLedgerAccount({
 	}
 
 	// Check if this account is linked to an active Midas account
-	const [linkedMidas] = await db
+	const [linkedMidas] = await tx
 		.select({ id: midasAccounts.id })
 		.from(midasAccounts)
 		.where(eq(midasAccounts.ledgerAccountId, accountId))
@@ -229,8 +265,36 @@ export async function archiveLedgerAccount({
 		);
 	}
 
+	// Check if this account is linked to a credit card
+	const [linkedCard] = await tx
+		.select({ cardId: creditCardLedgerLinks.creditCardId })
+		.from(creditCardLedgerLinks)
+		.where(eq(creditCardLedgerLinks.liabilityAccountId, accountId))
+		.limit(1);
+
+	if (linkedCard) {
+		throw new LedgerError(
+			"LEDGER_ACCOUNT_IN_USE",
+			"Cannot archive a ledger account that is linked to a credit card",
+		);
+	}
+
+	// Check if this account is linked to a credit card system role
+	const [linkedSystem] = await tx
+		.select({ role: creditCardSystemAccounts.role })
+		.from(creditCardSystemAccounts)
+		.where(eq(creditCardSystemAccounts.ledgerAccountId, accountId))
+		.limit(1);
+
+	if (linkedSystem) {
+		throw new LedgerError(
+			"LEDGER_ACCOUNT_IN_USE",
+			`Cannot archive a ledger account that is linked to credit card system role: ${linkedSystem.role}`,
+		);
+	}
+
 	try {
-		const [updated] = await db
+		const [updated] = await tx
 			.update(ledgerAccounts)
 			.set({ archivedAt: new Date() })
 			.where(
@@ -266,9 +330,25 @@ export async function archiveLedgerAccount({
 		if (isLedgerAccountInUseDbError(err)) {
 			throw new LedgerError(
 				"LEDGER_ACCOUNT_IN_USE",
-				"Cannot archive a ledger account that is linked to a Midas account",
+				"Cannot archive a ledger account that is linked to a Midas account or credit card",
 			);
 		}
 		throw err;
 	}
+}
+
+/**
+ * Soft-archives a ledger account. Idempotent if already archived.
+ * Historical lines remain intact; new journal postings to this account are prohibited.
+ */
+export async function archiveLedgerAccount({
+	db,
+	userId,
+	accountId,
+}: ArchiveLedgerAccountParams): Promise<LedgerAccountRecord> {
+	return archiveLedgerAccountInTransaction({
+		tx: db as unknown as DatabaseTransaction,
+		userId,
+		accountId,
+	});
 }

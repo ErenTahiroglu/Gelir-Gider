@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import { users } from "../db/schema/auth";
+import { creditCardLedgerLinks } from "../db/schema/credit-card-ledger";
 import {
 	type CreditCardOperation,
 	type CreditCardReservePlacement,
@@ -13,6 +14,7 @@ import {
 	creditCards,
 } from "../db/schema/credit-cards";
 import { midasAccounts, midasBuckets } from "../db/schema/midas";
+import { getLedgerAccountBalanceInTransaction } from "../ledger/balances";
 import {
 	formatSignedCentsToMoney,
 	parseSignedAggregateMoneyString,
@@ -24,6 +26,7 @@ import {
 	lockMidasAllocationStateInTransaction,
 	type MidasLiquidityBucketState,
 } from "../midas/service";
+import { extractErrorCauseChain } from "../midas/utils";
 import {
 	computeDueDate,
 	computeStatementDate,
@@ -51,6 +54,10 @@ import {
 	calculateStatementVoidFingerprint,
 	generateCardReserveMidasKey,
 } from "./fingerprint";
+import {
+	ensureCreditCardLedgerLinkInTransaction,
+	ensureCreditCardSystemAccountsInTransaction,
+} from "./ledger-provisioning";
 
 // ============================================================================
 // Record Types & Lifecycle Snapshots
@@ -70,6 +77,8 @@ export interface CreditCardRecord {
 	lastFour: string | null;
 	note: string | null;
 	createdAt: Date;
+	liabilityAccountId?: string | undefined;
+	liveLiabilityBalance?: string | undefined;
 }
 
 export interface CreditCardStatementRecord {
@@ -491,6 +500,22 @@ export function mapDbError(err: unknown, _context?: string): never {
 	if (!isDatabaseBoundaryError(err)) {
 		throw err;
 	}
+	const causeChain = extractErrorCauseChain(err);
+	if (
+		causeChain.includes("non-zero liability balance") ||
+		causeChain.includes("with non-zero liability balance")
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_CANNOT_ARCHIVE_WITH_LIABILITY",
+			"Cannot archive credit card with non-zero liability balance",
+		);
+	}
+	if (causeChain.includes("with OPEN statements")) {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_ACTIVE",
+			"Cannot archive card with OPEN statements",
+		);
+	}
 	if (matchesDbConstraint(err, "credit_cards_user_code_idx")) {
 		throw new CreditCardError("CREDIT_CARD_CONFLICT", "Card code conflict");
 	}
@@ -532,6 +557,30 @@ export function mapDbError(err: unknown, _context?: string): never {
 		throw new CreditCardError(
 			"CREDIT_CARD_STATEMENT_REVISION_CONFLICT",
 			"Statement revision conflict",
+		);
+	}
+	if (matchesDbConstraint(err, "cc_liability_events_card_opening_idx")) {
+		throw new CreditCardError(
+			"CREDIT_CARD_OPENING_BALANCE_CONFLICT",
+			"Opening balance already exists for this card",
+		);
+	}
+	if (
+		matchesDbConstraint(
+			err,
+			"cc_liability_event_revisions_event_rev_idx",
+			"trg_fn_guard_cc_liability_event_revision_insert",
+		)
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_REVISION_CONFLICT",
+			"Liability event revision conflict",
+		);
+	}
+	if (matchesDbConstraint(err, "cc_stmt_payment_events_canonical_tx_idx")) {
+		throw new CreditCardError(
+			"CREDIT_CARD_PAYMENT_CONFLICT",
+			"Statement payment conflict",
 		);
 	}
 	throw new CreditCardError(
@@ -801,6 +850,14 @@ export async function createCreditCardInTransaction(
 				"Failed to create card revision",
 			);
 		}
+
+		// Provision linked liability ledger account and system accounts
+		await ensureCreditCardLedgerLinkInTransaction(
+			params.tx,
+			userId,
+			newCard.id,
+		);
+		await ensureCreditCardSystemAccountsInTransaction(params.tx, userId);
 
 		return {
 			cardId: newCard.id,
@@ -1343,6 +1400,32 @@ export async function archiveCreditCardInTransaction(
 			}
 		}
 
+		// Check for non-zero live liability balance
+		const [link] = await params.tx
+			.select({ liabilityAccountId: creditCardLedgerLinks.liabilityAccountId })
+			.from(creditCardLedgerLinks)
+			.where(
+				and(
+					eq(creditCardLedgerLinks.userId, userId),
+					eq(creditCardLedgerLinks.creditCardId, cardId),
+				),
+			)
+			.limit(1);
+
+		if (link) {
+			const bal = await getLedgerAccountBalanceInTransaction({
+				tx: params.tx,
+				userId,
+				accountId: link.liabilityAccountId,
+			});
+			if (bal.balance !== "0.00") {
+				throw new CreditCardError(
+					"CREDIT_CARD_CANNOT_ARCHIVE_WITH_LIABILITY",
+					`Cannot archive credit card ${cardId} with non-zero liability balance ${bal.balance}`,
+				);
+			}
+		}
+
 		const [newRev] = await params.tx
 			.insert(creditCardRevisions)
 			.values({
@@ -1454,6 +1537,27 @@ export async function getCreditCard(
 
 		if (!latest) return null;
 
+		const [link] = await params.db
+			.select({ liabilityAccountId: creditCardLedgerLinks.liabilityAccountId })
+			.from(creditCardLedgerLinks)
+			.where(
+				and(
+					eq(creditCardLedgerLinks.userId, userId),
+					eq(creditCardLedgerLinks.creditCardId, card.id),
+				),
+			)
+			.limit(1);
+
+		let liveLiabilityBalance = "0.00";
+		if (link) {
+			const bal = await getLedgerAccountBalanceInTransaction({
+				tx: params.db as unknown as DatabaseTransaction,
+				userId,
+				accountId: link.liabilityAccountId,
+			});
+			liveLiabilityBalance = bal.balance;
+		}
+
 		return {
 			cardId: card.id,
 			userId,
@@ -1468,6 +1572,8 @@ export async function getCreditCard(
 			lastFour: latest.lastFour,
 			note: latest.note,
 			createdAt: card.createdAt,
+			liabilityAccountId: link?.liabilityAccountId,
+			liveLiabilityBalance,
 		};
 	} catch (err: unknown) {
 		mapDbError(err);
@@ -1513,6 +1619,29 @@ export async function listCreditCards(
 			if (!latest) continue;
 			if (statusFilter && latest.status !== statusFilter) continue;
 
+			const [link] = await params.db
+				.select({
+					liabilityAccountId: creditCardLedgerLinks.liabilityAccountId,
+				})
+				.from(creditCardLedgerLinks)
+				.where(
+					and(
+						eq(creditCardLedgerLinks.userId, userId),
+						eq(creditCardLedgerLinks.creditCardId, card.id),
+					),
+				)
+				.limit(1);
+
+			let liveLiabilityBalance = "0.00";
+			if (link) {
+				const bal = await getLedgerAccountBalanceInTransaction({
+					tx: params.db as unknown as DatabaseTransaction,
+					userId,
+					accountId: link.liabilityAccountId,
+				});
+				liveLiabilityBalance = bal.balance;
+			}
+
 			results.push({
 				cardId: card.id,
 				userId,
@@ -1527,6 +1656,8 @@ export async function listCreditCards(
 				lastFour: latest.lastFour,
 				note: latest.note,
 				createdAt: card.createdAt,
+				liabilityAccountId: link?.liabilityAccountId,
+				liveLiabilityBalance,
 			});
 		}
 
@@ -2650,6 +2781,13 @@ export async function getCreditCardStatementInTransaction(
 					`VOID statement ${canonicalStatementId} has non-zero reserve bucket balance: ${bucket.balance}`,
 				);
 			}
+		} else if (latest.status === "PAID") {
+			if (parsedBal.cents !== 0n) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					`PAID statement ${canonicalStatementId} has non-zero reserve bucket balance: ${bucket.balance}`,
+				);
+			}
 		} else if (placement === "MIDAS_FUND") {
 			if (parsedBal.cents !== stmtAmountCents) {
 				throw new CreditCardError(
@@ -2891,6 +3029,13 @@ export async function listCreditCardStatementsInTransaction(
 					throw new CreditCardError(
 						"CREDIT_CARD_INVALID_STATE",
 						`VOID statement ${stmt.id} has non-zero reserve bucket balance: ${bucket.balance}`,
+					);
+				}
+			} else if (latest.status === "PAID") {
+				if (parsedBal.cents !== 0n) {
+					throw new CreditCardError(
+						"CREDIT_CARD_INVALID_STATE",
+						`PAID statement ${stmt.id} has non-zero reserve bucket balance: ${bucket.balance}`,
 					);
 				}
 			} else if (placement === "MIDAS_FUND") {

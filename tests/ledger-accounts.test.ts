@@ -207,6 +207,20 @@ describe("Ledger Accounts Service (Phase 4A)", () => {
 								limit: vi.fn().mockResolvedValue([]),
 							}),
 						}),
+					})
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([]),
+							}),
+						}),
+					})
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([]),
+							}),
+						}),
 					}),
 				update: vi.fn().mockReturnValue({
 					set: vi.fn().mockReturnValue({
@@ -322,6 +336,22 @@ describe("Ledger Accounts Service (Phase 4A)", () => {
 						}),
 					})
 					// 2. Pre-check sees no Midas link (racing window)
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([]),
+							}),
+						}),
+					})
+					// 3. Pre-check sees no card link
+					.mockReturnValueOnce({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								limit: vi.fn().mockResolvedValue([]),
+							}),
+						}),
+					})
+					// 4. Pre-check sees no system role link
 					.mockReturnValueOnce({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({

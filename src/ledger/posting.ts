@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import { users } from "../db/schema/auth";
 import {
@@ -6,6 +6,11 @@ import {
 	journalLines,
 	ledgerAccounts,
 } from "../db/schema/ledger";
+import type {
+	AccountType,
+	LedgerAccountRecord,
+	NormalBalance,
+} from "./accounts";
 import { LedgerError } from "./errors";
 import { formatCentsToMoney, parsePositiveMoneyString } from "./money";
 
@@ -550,4 +555,74 @@ export async function postJournalEntry(
 			lines: params.lines,
 		});
 	});
+}
+
+export interface LockLedgerAccountsParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	accountIds: string[];
+}
+
+/**
+ * Deterministically locks the requested ledger accounts in ascending UUID order (FOR UPDATE).
+ * Validates ownership, existence, and non-archived status.
+ */
+export async function lockLedgerAccountsInTransaction({
+	tx,
+	userId,
+	accountIds,
+}: LockLedgerAccountsParams): Promise<LedgerAccountRecord[]> {
+	if (!userId || userId.trim() === "") {
+		throw new LedgerError("LEDGER_USER_NOT_FOUND", "User ID is required");
+	}
+
+	if (!Array.isArray(accountIds) || accountIds.length === 0) {
+		return [];
+	}
+
+	const sortedUniqueIds = Array.from(
+		new Set(accountIds.map((id) => id.trim().toLowerCase())),
+	).sort();
+
+	const rows = await tx
+		.select()
+		.from(ledgerAccounts)
+		.where(
+			and(
+				eq(ledgerAccounts.userId, userId),
+				inArray(ledgerAccounts.id, sortedUniqueIds),
+			),
+		)
+		.orderBy(asc(ledgerAccounts.id))
+		.for("update");
+
+	if (rows.length !== sortedUniqueIds.length) {
+		const foundIds = new Set(rows.map((r) => r.id.toLowerCase()));
+		const missing = sortedUniqueIds.filter((id) => !foundIds.has(id));
+		throw new LedgerError(
+			"LEDGER_ACCOUNT_NOT_FOUND",
+			`Ledger account(s) not found: ${missing.join(", ")}`,
+		);
+	}
+
+	for (const row of rows) {
+		if (row.archivedAt !== null) {
+			throw new LedgerError(
+				"LEDGER_ACCOUNT_ARCHIVED",
+				`Account "${row.code}" is archived and cannot receive postings`,
+			);
+		}
+	}
+
+	return rows.map((r) => ({
+		id: r.id,
+		userId: r.userId,
+		code: r.code,
+		name: r.name,
+		accountType: r.accountType as AccountType,
+		normalBalance: r.normalBalance as NormalBalance,
+		currency: r.currency,
+		createdAt: r.createdAt,
+		archivedAt: r.archivedAt,
+	}));
 }

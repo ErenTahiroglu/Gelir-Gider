@@ -266,9 +266,10 @@ describe("validateStatementStatusFilter", () => {
 		expect(validateStatementStatusFilter(null)).toBeUndefined();
 	});
 
-	it("accepts OPEN and VOID", () => {
+	it("accepts OPEN, VOID, and PAID", () => {
 		expect(validateStatementStatusFilter("OPEN")).toBe("OPEN");
 		expect(validateStatementStatusFilter("VOID")).toBe("VOID");
+		expect(validateStatementStatusFilter("PAID")).toBe("PAID");
 	});
 
 	it("rejects invalid statement statuses", () => {
@@ -276,9 +277,6 @@ describe("validateStatementStatusFilter", () => {
 			CreditCardError,
 		);
 		expect(() => validateStatementStatusFilter("ARCHIVED")).toThrow(
-			CreditCardError,
-		);
-		expect(() => validateStatementStatusFilter("PAID")).toThrow(
 			CreditCardError,
 		);
 		expect(() => validateStatementStatusFilter("")).toThrow(CreditCardError);

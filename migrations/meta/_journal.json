@@ -183,6 +183,13 @@
       "when": 1788528362742,
       "tag": "0025_classy_shinobi_shaw",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1788535532621,
+      "tag": "0026_foamy_black_bolt",
+      "breakpoints": true
     }
   ]
 }

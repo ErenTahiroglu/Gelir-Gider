@@ -93,6 +93,8 @@ export function isLedgerAccountInUseDbError(err: unknown): boolean {
 
 	return (
 		chain.includes("because it is linked to Midas liquidity account") ||
+		chain.includes("because it is linked to credit card") ||
+		chain.includes("because it is linked to credit card system account role") ||
 		chain.includes("trg_fn_guard_ledger_accounts_archive") ||
 		chain.includes("trg_guard_ledger_accounts_archive")
 	);
