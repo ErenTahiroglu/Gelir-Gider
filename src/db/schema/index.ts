@@ -8,6 +8,7 @@ export * from "./income-entitlements";
 export * from "./ledger";
 export * from "./long-term";
 export * from "./midas";
+export * from "./month-close";
 export * from "./people";
 export * from "./rewards";
 export * from "./short-term-goals";
