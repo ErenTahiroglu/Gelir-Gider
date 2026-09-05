@@ -417,6 +417,11 @@ export const personSettlementRevisions = pgTable(
 		uniqueIndex("person_settlement_revisions_canonical_rev_idx").on(
 			table.canonicalRevisionId,
 		),
+		uniqueIndex("person_settlement_revisions_overpayment_receipt_create_idx")
+			.on(table.overpaymentIncomeReceiptId)
+			.where(
+				sql`${table.operation} = 'CREATE' AND ${table.overpaymentIncomeReceiptId} IS NOT NULL`,
+			),
 		index("person_settlement_revisions_settle_idx").on(table.settlementId),
 		index("person_settlement_revisions_user_idx").on(table.userId),
 		check(

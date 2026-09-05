@@ -169,6 +169,25 @@ describe("mapDbError", () => {
 		}
 	});
 
+	it("maps overpayment receipt unique index collision to PEOPLE_INVALID_STATE", () => {
+		const dbErr = {
+			code: "23505",
+			constraint: "person_settlement_revisions_overpayment_receipt_create_idx",
+			message:
+				'duplicate key value violates unique constraint "person_settlement_revisions_overpayment_receipt_create_idx"',
+		};
+		try {
+			mapDbError(dbErr);
+		} catch (e) {
+			expect(e).toBeInstanceOf(PeopleError);
+			expect((e as PeopleError).code).toBe("PEOPLE_INVALID_STATE");
+			expect((e as PeopleError).message).not.toContain("23505");
+			expect((e as PeopleError).message).not.toContain(
+				"person_settlement_revisions_overpayment_receipt_create_idx",
+			);
+		}
+	});
+
 	it("rethrows programmer errors (e.g. TypeError) unchanged", () => {
 		const bug = new TypeError("Cannot read properties of undefined");
 		expect(() => mapDbError(bug)).toThrow(TypeError);

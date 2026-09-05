@@ -33,6 +33,7 @@ import {
 import { runPeopleReadTransaction, runPeopleTransaction } from "./boundary";
 import {
 	validateOccurredAt,
+	validateOptionalDateFilter,
 	validateOptionalIsoCalendarDate,
 } from "./calendar";
 import { PeopleError } from "./errors";
@@ -1504,14 +1505,14 @@ export async function listPersonObligations({
 		OBLIGATION_STATUS_VALUES,
 		"status",
 	);
-	const validDueDateFrom =
-		dueDateFrom !== undefined
-			? (validateDueDate(dueDateFrom) ?? undefined)
-			: undefined;
-	const validDueDateUntil =
-		dueDateUntil !== undefined
-			? (validateDueDate(dueDateUntil) ?? undefined)
-			: undefined;
+	const validDueDateFrom = validateOptionalDateFilter(
+		dueDateFrom,
+		"dueDateFrom",
+	);
+	const validDueDateUntil = validateOptionalDateFilter(
+		dueDateUntil,
+		"dueDateUntil",
+	);
 
 	if (
 		validDueDateFrom !== undefined &&

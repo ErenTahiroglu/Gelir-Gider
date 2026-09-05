@@ -250,12 +250,6 @@ export function mapLedgerError(err: LedgerError, _context?: string): never {
 				"CREDIT_CARD_INVALID_INPUT",
 				"Credit card ledger entry input is invalid",
 			);
-		case "LEDGER_UNBALANCED":
-		case "LEDGER_INCOMPLETE_STATE":
-		case "LEDGER_ENTRY_NOT_FOUND":
-		case "LEDGER_ALREADY_REVERSED":
-		case "LEDGER_INVALID_REVERSAL":
-		case "LEDGER_ACCOUNT_CODE_CONFLICT":
 		default:
 			throw new CreditCardError(
 				"CREDIT_CARD_INVALID_STATE",

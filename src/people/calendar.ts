@@ -109,3 +109,31 @@ export function validateOccurredAt(value: Date): Date {
 	}
 	return value;
 }
+
+/**
+ * Validates an optional date filter.
+ * Only `undefined` means filter omitted (returns undefined).
+ * If supplied, must be a string in strict YYYY-MM-DD format representing a valid Gregorian date.
+ * Any other value (null, empty string, whitespace, non-string, invalid Gregorian date) throws PeopleError("PEOPLE_INVALID_INPUT", ...).
+ */
+export function validateOptionalDateFilter(
+	value: string | undefined,
+	fieldName: string,
+): string | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	if (typeof value !== "string") {
+		throw new PeopleError(
+			"PEOPLE_INVALID_INPUT",
+			`${fieldName} must be a string in YYYY-MM-DD format`,
+		);
+	}
+	if (!DATE_FORMAT_REGEX.test(value)) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_INPUT",
+			`Invalid date format for ${fieldName}: "${value}". Expected strict YYYY-MM-DD`,
+		);
+	}
+	return validateIsoCalendarDate(value);
+}

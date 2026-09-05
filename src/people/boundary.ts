@@ -340,6 +340,17 @@ export function mapDbError(err: unknown, _context?: string): never {
 		);
 	}
 	if (
+		causeChain.includes(
+			"person_settlement_revisions_overpayment_receipt_create_idx",
+		) ||
+		causeChain.includes("overpayment_income_receipt_id")
+	) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_STATE",
+			"People settlement overpayment receipt is already associated with another settlement",
+		);
+	}
+	if (
 		causeChain.includes("does not reconcile") ||
 		causeChain.includes("cannot become negative")
 	) {

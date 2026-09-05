@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	validateIsoCalendarDate,
 	validateOccurredAt,
+	validateOptionalDateFilter,
 	validateOptionalIsoCalendarDate,
 } from "../src/people/calendar";
 import { PeopleError } from "../src/people/errors";
@@ -63,5 +64,64 @@ describe("validateOccurredAt", () => {
 		expect(() => validateOccurredAt("2026-09-05" as unknown as Date)).toThrow(
 			PeopleError,
 		);
+	});
+});
+
+describe("validateOptionalDateFilter", () => {
+	it("returns undefined ONLY when value is undefined", () => {
+		expect(
+			validateOptionalDateFilter(undefined, "dueDateFrom"),
+		).toBeUndefined();
+	});
+
+	it("accepts a valid strict YYYY-MM-DD date", () => {
+		expect(validateOptionalDateFilter("2026-09-05", "dueDateFrom")).toBe(
+			"2026-09-05",
+		);
+	});
+
+	it("rejects null with PEOPLE_INVALID_INPUT", () => {
+		expect(() =>
+			validateOptionalDateFilter(null as unknown as string, "dueDateFrom"),
+		).toThrow(PeopleError);
+		try {
+			validateOptionalDateFilter(null as unknown as string, "dueDateFrom");
+		} catch (e) {
+			expect(e).toBeInstanceOf(PeopleError);
+			expect((e as PeopleError).code).toBe("PEOPLE_INVALID_INPUT");
+		}
+	});
+
+	it("rejects empty string and whitespace-only strings with PEOPLE_INVALID_INPUT", () => {
+		expect(() => validateOptionalDateFilter("", "dueDateFrom")).toThrow(
+			PeopleError,
+		);
+		expect(() => validateOptionalDateFilter("   ", "dueDateFrom")).toThrow(
+			PeopleError,
+		);
+	});
+
+	it("rejects non-strict strings with leading or trailing whitespace", () => {
+		expect(() =>
+			validateOptionalDateFilter(" 2026-09-05 ", "dueDateFrom"),
+		).toThrow(PeopleError);
+	});
+
+	it("rejects impossible Gregorian dates", () => {
+		expect(() =>
+			validateOptionalDateFilter("2026-02-30", "dueDateFrom"),
+		).toThrow(PeopleError);
+		expect(() =>
+			validateOptionalDateFilter("2025-02-29", "dueDateFrom"),
+		).toThrow(PeopleError);
+	});
+
+	it("rejects non-string runtime values", () => {
+		expect(() =>
+			validateOptionalDateFilter(12345 as unknown as string, "dueDateFrom"),
+		).toThrow(PeopleError);
+		expect(() =>
+			validateOptionalDateFilter({} as unknown as string, "dueDateFrom"),
+		).toThrow(PeopleError);
 	});
 });

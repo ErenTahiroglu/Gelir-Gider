@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "person_settlement_revisions_overpayment_receipt_create_idx" ON "person_settlement_revisions" USING btree ("overpayment_income_receipt_id") WHERE "person_settlement_revisions"."operation" = 'CREATE' AND "person_settlement_revisions"."overpayment_income_receipt_id" IS NOT NULL;

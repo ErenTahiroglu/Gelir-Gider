@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Database } from "../src/db/client";
 import { PeopleError } from "../src/people/errors";
 import {
+	listPersonObligations,
 	recordPersonPayableExpense,
 	recordPersonReceivable,
 	updatePersonPayableExpense,
@@ -179,5 +180,138 @@ describe("voidPersonObligation input validation", () => {
 				idempotencyKey: "",
 			}),
 		).rejects.toThrow(PeopleError);
+	});
+});
+
+describe("listPersonObligations strict date filter validation", () => {
+	const validUserId = "11111111-1111-1111-1111-111111111111";
+
+	function createSpiedDb() {
+		return {
+			transaction: vi.fn(),
+			select: vi.fn(),
+		} as unknown as Database;
+	}
+
+	it("rejects dueDateFrom: null before querying DB", async () => {
+		const db = createSpiedDb();
+		await expect(
+			listPersonObligations({
+				db,
+				userId: validUserId,
+				dueDateFrom: null as unknown as string,
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof PeopleError &&
+				e.code === "PEOPLE_INVALID_INPUT" &&
+				e.message.includes("dueDateFrom"),
+		);
+		expect(db.transaction).not.toHaveBeenCalled();
+		expect(db.select).not.toHaveBeenCalled();
+	});
+
+	it("rejects dueDateUntil: null before querying DB", async () => {
+		const db = createSpiedDb();
+		await expect(
+			listPersonObligations({
+				db,
+				userId: validUserId,
+				dueDateUntil: null as unknown as string,
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof PeopleError &&
+				e.code === "PEOPLE_INVALID_INPUT" &&
+				e.message.includes("dueDateUntil"),
+		);
+		expect(db.transaction).not.toHaveBeenCalled();
+		expect(db.select).not.toHaveBeenCalled();
+	});
+
+	it("rejects empty string and whitespace filters before querying DB", async () => {
+		const db = createSpiedDb();
+		await expect(
+			listPersonObligations({
+				db,
+				userId: validUserId,
+				dueDateFrom: "",
+			}),
+		).rejects.toThrow(PeopleError);
+
+		await expect(
+			listPersonObligations({
+				db,
+				userId: validUserId,
+				dueDateUntil: "   ",
+			}),
+		).rejects.toThrow(PeopleError);
+
+		expect(db.transaction).not.toHaveBeenCalled();
+		expect(db.select).not.toHaveBeenCalled();
+	});
+
+	it("rejects invalid Gregorian dates (2026-02-30, 2025-02-29) before querying DB", async () => {
+		const db = createSpiedDb();
+		await expect(
+			listPersonObligations({
+				db,
+				userId: validUserId,
+				dueDateFrom: "2026-02-30",
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof PeopleError && e.code === "PEOPLE_INVALID_INPUT",
+		);
+
+		await expect(
+			listPersonObligations({
+				db,
+				userId: validUserId,
+				dueDateUntil: "2025-02-29",
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof PeopleError && e.code === "PEOPLE_INVALID_INPUT",
+		);
+
+		expect(db.transaction).not.toHaveBeenCalled();
+		expect(db.select).not.toHaveBeenCalled();
+	});
+
+	it("rejects non-string runtime filter values before querying DB", async () => {
+		const db = createSpiedDb();
+		await expect(
+			listPersonObligations({
+				db,
+				userId: validUserId,
+				dueDateFrom: 20260905 as unknown as string,
+			}),
+		).rejects.toThrow(PeopleError);
+
+		expect(db.transaction).not.toHaveBeenCalled();
+		expect(db.select).not.toHaveBeenCalled();
+	});
+
+	it("rejects reversed date range (dueDateFrom > dueDateUntil) before querying DB", async () => {
+		const db = createSpiedDb();
+		await expect(
+			listPersonObligations({
+				db,
+				userId: validUserId,
+				dueDateFrom: "2026-10-01",
+				dueDateUntil: "2026-09-30",
+			}),
+		).rejects.toSatisfy(
+			(e: unknown) =>
+				e instanceof PeopleError &&
+				e.code === "PEOPLE_INVALID_INPUT" &&
+				e.message.includes(
+					"dueDateFrom must be less than or equal to dueDateUntil",
+				),
+		);
+
+		expect(db.transaction).not.toHaveBeenCalled();
+		expect(db.select).not.toHaveBeenCalled();
 	});
 });
