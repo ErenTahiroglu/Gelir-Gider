@@ -216,3 +216,79 @@ export function validateRewardAccountStatusFilter(
 	}
 	return value;
 }
+
+const REWARD_EVENT_TYPE_VALUES = new Set([
+	"OPENING_BALANCE",
+	"EARN",
+	"EXPIRE",
+	"ADJUSTMENT_CREDIT",
+	"ADJUSTMENT_DEBIT",
+	"REDEEM_PURCHASE",
+]);
+
+/**
+ * Validates an optional reward event type filter. Accepts `unknown`. Only
+ * `undefined` means omitted -- `null`, `""`, whitespace, and unknown strings
+ * are all rejected rather than silently treated as "no filter".
+ */
+export function validateRewardEventTypeFilter(
+	value: unknown,
+):
+	| "OPENING_BALANCE"
+	| "EARN"
+	| "EXPIRE"
+	| "ADJUSTMENT_CREDIT"
+	| "ADJUSTMENT_DEBIT"
+	| "REDEEM_PURCHASE"
+	| undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || !REWARD_EVENT_TYPE_VALUES.has(value)) {
+		throw new RewardError(
+			"REWARD_INVALID_INPUT",
+			`Invalid reward event type filter: "${String(value)}"`,
+		);
+	}
+	return value as
+		| "OPENING_BALANCE"
+		| "EARN"
+		| "EXPIRE"
+		| "ADJUSTMENT_CREDIT"
+		| "ADJUSTMENT_DEBIT"
+		| "REDEEM_PURCHASE";
+}
+
+/**
+ * Validates an optional reward event status filter. Accepts `unknown`. Only
+ * `undefined` means omitted.
+ */
+export function validateRewardEventStatusFilter(
+	value: unknown,
+): "ACTIVE" | "VOID" | undefined {
+	if (value === undefined) return undefined;
+	if (value !== "ACTIVE" && value !== "VOID") {
+		throw new RewardError(
+			"REWARD_INVALID_INPUT",
+			`Invalid reward event status filter: "${String(value)}"`,
+		);
+	}
+	return value;
+}
+
+const REWARD_SOURCE_TYPE_VALUES = new Set(["MANUAL", "CAMPAIGN", "IMPORT"]);
+
+/**
+ * Validates a reward event provenance source type. Accepts `unknown`. Never
+ * treats MANUAL/CAMPAIGN/IMPORT as interchangeable -- an unrecognized value
+ * is rejected rather than coerced.
+ */
+export function validateRewardSourceType(
+	value: unknown,
+): "MANUAL" | "CAMPAIGN" | "IMPORT" {
+	if (typeof value !== "string" || !REWARD_SOURCE_TYPE_VALUES.has(value)) {
+		throw new RewardError(
+			"REWARD_INVALID_INPUT",
+			`Invalid reward event sourceType: "${String(value)}". Must be MANUAL, CAMPAIGN, or IMPORT`,
+		);
+	}
+	return value as "MANUAL" | "CAMPAIGN" | "IMPORT";
+}

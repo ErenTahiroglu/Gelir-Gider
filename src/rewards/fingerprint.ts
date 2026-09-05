@@ -103,14 +103,25 @@ export interface RewardEventCreateFingerprintParams {
 	shortTermGoalId: string | null;
 	merchant: string | null;
 	description: string | null;
+	reasonNote: string | null;
+	sourceType: string;
+	sourceRef: string | null;
 	occurredAt: Date;
 }
 
+/**
+ * Fingerprint V2: also binds reasonNote/sourceType/sourceRef so a same-key
+ * retry that silently changes provenance (e.g. MANUAL -> CAMPAIGN, or a
+ * changed reasonNote/sourceRef) is rejected as REWARD_IDEMPOTENCY_CONFLICT
+ * instead of incorrectly replaying. This matters most for the future Phase
+ * 16 campaign primitive, where MANUAL/CAMPAIGN/IMPORT must never be treated
+ * as interchangeable.
+ */
 export async function calculateRewardEventCreateFingerprint(
 	params: RewardEventCreateFingerprintParams,
 ): Promise<string> {
 	return sha256Hex([
-		"reward-event-revision-v1",
+		"reward-event-revision-v2",
 		params.userId.trim().toLowerCase(),
 		params.rewardAccountId.trim().toLowerCase(),
 		params.eventType,
@@ -122,6 +133,9 @@ export async function calculateRewardEventCreateFingerprint(
 		params.shortTermGoalId?.trim().toLowerCase() ?? null,
 		params.merchant,
 		params.description,
+		params.reasonNote,
+		params.sourceType,
+		params.sourceRef,
 		params.occurredAt.toISOString(),
 	]);
 }

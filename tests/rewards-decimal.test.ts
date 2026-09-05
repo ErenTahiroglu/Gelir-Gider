@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	calculateRewardEconomicAmount,
+	deriveAndValidateEconomicAmount,
 	formatUnitsToDecimal,
 	parseConversionRate,
 	parsePointQuantity,
@@ -165,6 +166,51 @@ describe("roundHalfUpToEconomicCents (deterministic ROUND HALF UP, non-trivial f
 		const points = parsePointQuantity("99999999999999.9999").units;
 		const rate = parseConversionRate("999999.999999").units;
 		expect(() => roundHalfUpToEconomicCents(points, rate)).not.toThrow();
+	});
+});
+
+describe("numeric precision contract boundaries (matches DB NUMERIC limits)", () => {
+	it("accepts a point quantity at exactly the 16 integer digit boundary (NUMERIC(20,4))", () => {
+		expect(() => parsePointQuantity("9999999999999999.9999")).not.toThrow();
+	});
+
+	it("rejects a point quantity exceeding the 16 integer digit boundary", () => {
+		expect(() => parsePointQuantity("99999999999999999")).toThrow(RewardError);
+	});
+
+	it("accepts a conversion rate at exactly the 12 integer digit boundary (NUMERIC(18,6))", () => {
+		expect(() => parseConversionRate("999999999999.999999")).not.toThrow();
+	});
+
+	it("rejects a conversion rate exceeding the 12 integer digit boundary", () => {
+		expect(() => parseConversionRate("9999999999999")).toThrow(RewardError);
+	});
+
+	it("rejects a derived economic amount that would exceed the NUMERIC(18,2) money contract", () => {
+		expect(() =>
+			deriveAndValidateEconomicAmount(
+				"9999999999999999.9999",
+				"999999999999.999999",
+			),
+		).toThrow(RewardError);
+	});
+});
+
+describe("deriveAndValidateEconomicAmount (pre-DB zero-value redemption rejection)", () => {
+	it("rejects an economic amount that rounds down to exactly 0.00", () => {
+		expect(() => deriveAndValidateEconomicAmount("1", "0.001")).toThrow(
+			RewardError,
+		);
+	});
+
+	it("accepts an economic amount that rounds to a non-zero value", () => {
+		const result = deriveAndValidateEconomicAmount("100", "1");
+		expect(result.normalized).toBe("100.00");
+	});
+
+	it("accepts the smallest possible non-zero economic amount (0.01)", () => {
+		const result = deriveAndValidateEconomicAmount("1", "0.01");
+		expect(result.normalized).toBe("0.01");
 	});
 });
 

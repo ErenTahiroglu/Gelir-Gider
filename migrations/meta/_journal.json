@@ -274,6 +274,13 @@
       "when": 1788624163415,
       "tag": "0038_add_rewards_domain",
       "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1788629292011,
+      "tag": "0039_harden_rewards_domain_integrity",
+      "breakpoints": true
     }
   ]
 }

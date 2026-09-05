@@ -25,14 +25,18 @@ import {
 import { runRewardsReadTransaction, runRewardsTransaction } from "./boundary";
 import {
 	validateRewardCanonicalUuid,
+	validateRewardEventStatusFilter,
+	validateRewardEventTypeFilter,
 	validateRewardExpectedRevisionNo,
 	validateRewardIdempotencyKey,
 	validateRewardOccurredAt,
 	validateRewardOptionalText,
 	validateRewardPurchaseCategory,
+	validateRewardSourceType,
 } from "./calendar";
 import {
 	calculateRewardEconomicAmount,
+	deriveAndValidateEconomicAmount,
 	formatUnitsToDecimal,
 	parseConversionRate,
 	parsePointQuantity,
@@ -306,6 +310,9 @@ async function tryReplaySimpleEventCreate(
 		shortTermGoalId: null,
 		merchant: null,
 		description: null,
+		reasonNote: args.reasonNote,
+		sourceType: args.sourceType,
+		sourceRef: args.sourceRef,
 		occurredAt: args.occurredAt,
 	});
 
@@ -406,6 +413,9 @@ async function createSimpleRewardEventInTransaction(
 		shortTermGoalId: null,
 		merchant: null,
 		description: null,
+		reasonNote: args.reasonNote,
+		sourceType: args.sourceType,
+		sourceRef: args.sourceRef,
 		occurredAt: args.occurredAt,
 	});
 
@@ -464,6 +474,12 @@ export async function recordRewardEarnInTransaction(
 		sourceRef?: string | null | undefined;
 	},
 ): Promise<{ event: RewardEventReadModel; idempotentReplay: boolean }> {
+	const sourceType = validateRewardSourceType(args.sourceType ?? "MANUAL");
+	const sourceRef = validateRewardOptionalText(
+		args.sourceRef ?? null,
+		"sourceRef",
+		128,
+	);
 	return createSimpleRewardEventInTransaction(tx, {
 		userId: args.userId,
 		rewardAccountId: args.rewardAccountId,
@@ -473,8 +489,8 @@ export async function recordRewardEarnInTransaction(
 		reasonNote: args.reasonNote,
 		occurredAt: args.occurredAt,
 		idempotencyKey: args.idempotencyKey,
-		sourceType: args.sourceType ?? "MANUAL",
-		sourceRef: args.sourceRef ?? null,
+		sourceType,
+		sourceRef,
 	});
 }
 
@@ -615,6 +631,9 @@ async function tryReplayRewardPurchase(
 		shortTermGoalId: args.shortTermGoalId,
 		merchant: args.merchant,
 		description: args.description,
+		reasonNote: null,
+		sourceType: "MANUAL",
+		sourceRef: null,
 		occurredAt: args.occurredAt,
 	});
 
@@ -682,21 +701,10 @@ async function createRewardPurchaseInTransaction(
 		);
 	}
 
-	if (
-		args.purchaseCategory === "SHORT_TERM_PURCHASE" &&
-		!args.shortTermGoalId
-	) {
-		throw new RewardError(
-			"REWARD_INVALID_INPUT",
-			"shortTermGoalId is required when purchaseCategory is SHORT_TERM_PURCHASE",
-		);
-	}
-	if (args.purchaseCategory !== "SHORT_TERM_PURCHASE" && args.shortTermGoalId) {
-		throw new RewardError(
-			"REWARD_INVALID_INPUT",
-			"shortTermGoalId is only allowed for SHORT_TERM_PURCHASE category",
-		);
-	}
+	// Shape validation (SHORT_TERM_PURCHASE requires/forbids shortTermGoalId
+	// per category) is pure and already enforced pre-DB in recordRewardPurchase
+	// before this transaction ever started. Only the DB-dependent
+	// ownership/ACTIVE-status lookup remains here.
 	if (args.shortTermGoalId) {
 		const [goal] = await tx
 			.select({ id: shortTermGoals.id, status: shortTermGoalRevisions.status })
@@ -727,7 +735,10 @@ async function createRewardPurchaseInTransaction(
 		}
 	}
 
-	const economicAmount = calculateRewardEconomicAmount(
+	// Authoritative economic derivation: rejects a zero-value redemption and
+	// a value that would overflow the NUMERIC(18,2) money contract, before
+	// any ledger/canonical work is attempted.
+	const economicAmount = deriveAndValidateEconomicAmount(
 		points.normalized,
 		rate.normalized,
 	);
@@ -822,6 +833,9 @@ async function createRewardPurchaseInTransaction(
 		shortTermGoalId: args.shortTermGoalId,
 		merchant: args.merchant,
 		description: args.description,
+		reasonNote: null,
+		sourceType: "MANUAL",
+		sourceRef: null,
 		occurredAt: args.occurredAt,
 	});
 
@@ -888,6 +902,30 @@ export async function recordRewardPurchase(
 	);
 	const occurredAt = validateRewardOccurredAt(params.occurredAt);
 	const idempotencyKey = validateRewardIdempotencyKey(params.idempotencyKey);
+
+	// Pure, DB-independent shape validation: SHORT_TERM_PURCHASE requires a
+	// goal, every other category forbids one. Runs before any DB work.
+	if (purchaseCategory === "SHORT_TERM_PURCHASE" && !shortTermGoalId) {
+		throw new RewardError(
+			"REWARD_INVALID_INPUT",
+			"shortTermGoalId is required when purchaseCategory is SHORT_TERM_PURCHASE",
+		);
+	}
+	if (purchaseCategory !== "SHORT_TERM_PURCHASE" && shortTermGoalId) {
+		throw new RewardError(
+			"REWARD_INVALID_INPUT",
+			"shortTermGoalId is only allowed for SHORT_TERM_PURCHASE category",
+		);
+	}
+
+	// If the caller supplied an explicit rate, the economic value is fully
+	// derivable pre-DB -- reject an overflow or a value that rounds to
+	// 0.00 before any transaction is opened. When the rate is omitted, the
+	// account's default rate is only known inside the transaction, so this
+	// same check is repeated there before any ledger/canonical work.
+	if (conversionRateOverride !== undefined) {
+		deriveAndValidateEconomicAmount(pointAmount, conversionRateOverride);
+	}
 
 	return runRewardsTransaction(params.db, (tx) =>
 		createRewardPurchaseInTransaction(tx, {
@@ -1209,14 +1247,16 @@ export async function listRewardEvents(
 		params.rewardAccountId === undefined
 			? undefined
 			: validateRewardCanonicalUuid(params.rewardAccountId, "rewardAccountId");
+	const eventType = validateRewardEventTypeFilter(params.eventType);
+	const status = validateRewardEventStatusFilter(params.status);
 
 	return runRewardsReadTransaction(params.db, async (tx) => {
 		const conditions = [eq(rewardEvents.userId, userId)];
-		if (rewardAccountId) {
+		if (rewardAccountId !== undefined) {
 			conditions.push(eq(rewardEvents.rewardAccountId, rewardAccountId));
 		}
-		if (params.eventType !== undefined) {
-			conditions.push(eq(rewardEvents.eventType, params.eventType));
+		if (eventType !== undefined) {
+			conditions.push(eq(rewardEvents.eventType, eventType));
 		}
 
 		const events = await tx
@@ -1232,7 +1272,7 @@ export async function listRewardEvents(
 				event.id,
 			);
 			if (!readModel) continue;
-			if (params.status && readModel.status !== params.status) continue;
+			if (status !== undefined && readModel.status !== status) continue;
 			results.push(readModel);
 		}
 		return results;

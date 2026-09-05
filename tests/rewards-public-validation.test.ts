@@ -6,6 +6,7 @@ import {
 } from "../src/rewards/accounts";
 import { RewardError } from "../src/rewards/errors";
 import {
+	listRewardEvents,
 	recordRewardEarn,
 	recordRewardPurchase,
 	voidRewardEvent,
@@ -256,6 +257,39 @@ describe("recordRewardEarn: zero-DB-call rejection", () => {
 			transaction,
 		);
 	});
+
+	it("rejects a point amount exceeding the NUMERIC(20,4) integer digit boundary", async () => {
+		const { db, transaction } = makeDbStub();
+		await expectInvalidInputWithoutDb(
+			() =>
+				recordRewardEarn({
+					db,
+					userId: USER_ID,
+					rewardAccountId: ACCOUNT_ID,
+					pointAmount: "99999999999999999",
+					occurredAt: new Date(),
+					idempotencyKey: "key-1",
+				}),
+			transaction,
+		);
+	});
+
+	it("rejects a conversionRateOverride exceeding the NUMERIC(18,6) integer digit boundary", async () => {
+		const { db, transaction } = makeDbStub();
+		await expectInvalidInputWithoutDb(
+			() =>
+				recordRewardEarn({
+					db,
+					userId: USER_ID,
+					rewardAccountId: ACCOUNT_ID,
+					pointAmount: "100",
+					conversionRateOverride: "9999999999999",
+					occurredAt: new Date(),
+					idempotencyKey: "key-1",
+				}),
+			transaction,
+		);
+	});
 });
 
 describe("recordRewardPurchase: zero-DB-call rejection", () => {
@@ -328,6 +362,77 @@ describe("recordRewardPurchase: zero-DB-call rejection", () => {
 			transaction,
 		);
 	});
+
+	it("rejects a derived economic amount that would overflow the NUMERIC(18,2) money contract", async () => {
+		const { db, transaction } = makeDbStub();
+		await expectInvalidInputWithoutDb(
+			() =>
+				recordRewardPurchase({
+					db,
+					userId: USER_ID,
+					rewardAccountId: ACCOUNT_ID,
+					pointAmount: "9999999999999999.9999",
+					conversionRateOverride: "999999999999.999999",
+					purchaseCategory: "UNCLASSIFIED",
+					occurredAt: new Date(),
+					idempotencyKey: "key-1",
+				}),
+			transaction,
+		);
+	});
+
+	it("rejects a reward purchase whose economic value rounds to exactly 0.00", async () => {
+		const { db, transaction } = makeDbStub();
+		await expectInvalidInputWithoutDb(
+			() =>
+				recordRewardPurchase({
+					db,
+					userId: USER_ID,
+					rewardAccountId: ACCOUNT_ID,
+					pointAmount: "1",
+					conversionRateOverride: "0.001",
+					purchaseCategory: "UNCLASSIFIED",
+					occurredAt: new Date(),
+					idempotencyKey: "key-1",
+				}),
+			transaction,
+		);
+	});
+
+	it("rejects SHORT_TERM_PURCHASE without a shortTermGoalId", async () => {
+		const { db, transaction } = makeDbStub();
+		await expectInvalidInputWithoutDb(
+			() =>
+				recordRewardPurchase({
+					db,
+					userId: USER_ID,
+					rewardAccountId: ACCOUNT_ID,
+					pointAmount: "100",
+					purchaseCategory: "SHORT_TERM_PURCHASE",
+					occurredAt: new Date(),
+					idempotencyKey: "key-1",
+				}),
+			transaction,
+		);
+	});
+
+	it("rejects a non-SHORT_TERM_PURCHASE category with a shortTermGoalId supplied", async () => {
+		const { db, transaction } = makeDbStub();
+		await expectInvalidInputWithoutDb(
+			() =>
+				recordRewardPurchase({
+					db,
+					userId: USER_ID,
+					rewardAccountId: ACCOUNT_ID,
+					pointAmount: "100",
+					purchaseCategory: "UNCLASSIFIED",
+					shortTermGoalId: "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee",
+					occurredAt: new Date(),
+					idempotencyKey: "key-1",
+				}),
+			transaction,
+		);
+	});
 });
 
 describe("voidRewardEvent: zero-DB-call rejection", () => {
@@ -371,6 +476,60 @@ describe("voidRewardEvent: zero-DB-call rejection", () => {
 					rewardEventId: "not-a-uuid",
 					expectedRevisionNo: 1,
 					idempotencyKey: "key-1",
+				}),
+			transaction,
+		);
+	});
+});
+
+describe("listRewardEvents: zero-DB-call filter rejection (strict, no truthiness)", () => {
+	it("rejects eventType = null", async () => {
+		const { db, transaction } = makeDbStub();
+		await expectInvalidInputWithoutDb(
+			() =>
+				listRewardEvents({
+					db,
+					userId: USER_ID,
+					eventType: null as unknown as undefined,
+				}),
+			transaction,
+		);
+	});
+
+	it("rejects eventType = BOGUS", async () => {
+		const { db, transaction } = makeDbStub();
+		await expectInvalidInputWithoutDb(
+			() =>
+				listRewardEvents({
+					db,
+					userId: USER_ID,
+					eventType: "BOGUS" as unknown as undefined,
+				}),
+			transaction,
+		);
+	});
+
+	it("rejects status = null", async () => {
+		const { db, transaction } = makeDbStub();
+		await expectInvalidInputWithoutDb(
+			() =>
+				listRewardEvents({
+					db,
+					userId: USER_ID,
+					status: null as unknown as undefined,
+				}),
+			transaction,
+		);
+	});
+
+	it("rejects status = BOGUS", async () => {
+		const { db, transaction } = makeDbStub();
+		await expectInvalidInputWithoutDb(
+			() =>
+				listRewardEvents({
+					db,
+					userId: USER_ID,
+					status: "BOGUS" as unknown as undefined,
 				}),
 			transaction,
 		);

@@ -9,6 +9,7 @@ import { rewardAccountRevisions, rewardAccounts } from "../db/schema/rewards";
 import { runRewardsReadTransaction, runRewardsTransaction } from "./boundary";
 import {
 	validateRewardAccountCode,
+	validateRewardAccountStatusFilter,
 	validateRewardCanonicalUuid,
 	validateRewardExpectedRevisionNo,
 	validateRewardIdempotencyKey,
@@ -100,8 +101,22 @@ export interface ListRewardAccountsParams {
 // Pure, DB-independent validation helpers
 // ============================================================================
 
-function validateDefaultConversionRate(value: unknown): string {
+/** CREATE only: an omitted rate defaults to 1.000000. */
+function validateDefaultConversionRateForCreate(value: unknown): string {
 	if (value === undefined) return DEFAULT_CONVERSION_RATE;
+	return parseConversionRate(value, "defaultConversionRate").normalized;
+}
+
+/**
+ * UPDATE only: an omitted rate must NOT silently reset to 1.000000 -- it
+ * must preserve whatever the account's current rate already is. Returns
+ * `undefined` when omitted so the caller can resolve the effective rate
+ * against the correct historical/current revision.
+ */
+function validateDefaultConversionRateOverrideForUpdate(
+	value: unknown,
+): string | undefined {
+	if (value === undefined) return undefined;
 	return parseConversionRate(value, "defaultConversionRate").normalized;
 }
 
@@ -359,7 +374,9 @@ export async function createRewardAccount(
 		params.creditCardId === undefined || params.creditCardId === null
 			? null
 			: validateRewardCanonicalUuid(params.creditCardId, "creditCardId");
-	const validRate = validateDefaultConversionRate(params.defaultConversionRate);
+	const validRate = validateDefaultConversionRateForCreate(
+		params.defaultConversionRate,
+	);
 	const validNote = validateRewardOptionalText(params.note, "note", 500);
 	const validOccurredAt = validateRewardOccurredAt(params.occurredAt);
 	const validIdempotencyKey = validateRewardIdempotencyKey(
@@ -404,7 +421,10 @@ export async function updateRewardAccount(
 	);
 	const provider = validateRewardRequiredText(params.provider, "provider", 120);
 	const unitName = validateRewardRequiredText(params.unitName, "unitName", 40);
-	const defaultConversionRate = validateDefaultConversionRate(
+	// Only CREATE defaults an omitted rate to 1.000000. UPDATE must preserve
+	// whatever the account's current/historical rate already is -- resolved
+	// below, once the target revision (fresh or historical replay) is known.
+	const rateOverride = validateDefaultConversionRateOverrideForUpdate(
 		params.defaultConversionRate,
 	);
 	const note = validateRewardOptionalText(params.note, "note", 500);
@@ -421,6 +441,11 @@ export async function updateRewardAccount(
 					"Idempotency key was already used for a different reward account operation",
 				);
 			}
+			// Historical replay: if the caller omitted the rate this time,
+			// reconstruct the candidate fingerprint using THAT historical
+			// UPDATE revision's own stored rate, not the account's current
+			// latest rate (which may have changed since).
+			const defaultConversionRate = rateOverride ?? rev.defaultConversionRate;
 			const candidateFingerprint =
 				await calculateRewardAccountUpdateFingerprint({
 					userId,
@@ -518,6 +543,11 @@ export async function updateRewardAccount(
 			);
 		}
 
+		// Fresh UPDATE: an omitted rate preserves the account's current latest
+		// rate -- it must never silently reset to the CREATE default.
+		const effectiveDefaultConversionRate =
+			rateOverride ?? latestRev.defaultConversionRate;
+
 		const fingerprint = await calculateRewardAccountUpdateFingerprint({
 			userId,
 			rewardAccountId,
@@ -525,7 +555,7 @@ export async function updateRewardAccount(
 			displayName,
 			provider,
 			unitName,
-			defaultConversionRate,
+			defaultConversionRate: effectiveDefaultConversionRate,
 			note,
 			occurredAt,
 		});
@@ -540,7 +570,7 @@ export async function updateRewardAccount(
 			displayName,
 			provider,
 			unitName,
-			defaultConversionRate,
+			defaultConversionRate: effectiveDefaultConversionRate,
 			note,
 			occurredAt,
 			idempotencyKey,
@@ -763,17 +793,7 @@ export async function listRewardAccounts(
 	params: ListRewardAccountsParams,
 ): Promise<RewardAccountReadModel[]> {
 	const userId = validateRewardCanonicalUuid(params.userId, "userId");
-	const status =
-		params.status === undefined
-			? undefined
-			: params.status === "ACTIVE" || params.status === "ARCHIVED"
-				? params.status
-				: (() => {
-						throw new RewardError(
-							"REWARD_INVALID_INPUT",
-							`Invalid reward account status filter: "${String(params.status)}"`,
-						);
-					})();
+	const status = validateRewardAccountStatusFilter(params.status);
 
 	return runRewardsReadTransaction(params.db, async (tx) => {
 		const accounts = await tx
@@ -789,7 +809,7 @@ export async function listRewardAccounts(
 				account.id,
 			);
 			if (!readModel) continue;
-			if (status && readModel.status !== status) continue;
+			if (status !== undefined && readModel.status !== status) continue;
 			results.push(readModel);
 		}
 		return results;
