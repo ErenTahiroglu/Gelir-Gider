@@ -243,6 +243,95 @@ export interface NormalizedParticipantInput {
 }
 
 /**
+ * Validates that participant/userWeight fields are exactly the set the
+ * chosen method allows -- no incompatible field is silently ignored.
+ * EQUAL: personId/dueDate/description only (no shareAmount, no weight, no
+ * caller-level userWeight). MANUAL: requires shareAmount, rejects weight and
+ * userWeight. RATIO: requires a safe non-negative integer userWeight and a
+ * safe positive integer weight per participant, rejects shareAmount.
+ */
+export function validateMethodSpecificParticipantFields(
+	method: SplitMethod,
+	userWeight: number | undefined,
+	participants: NormalizedParticipantInput[],
+): void {
+	if (method === "EQUAL") {
+		if (userWeight !== undefined && userWeight !== null) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_INPUT",
+				"userWeight must not be supplied for EQUAL split",
+			);
+		}
+		participants.forEach((p, index) => {
+			if (p.shareAmount !== undefined && p.shareAmount !== null) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_INPUT",
+					`participants[${index}].shareAmount must not be supplied for EQUAL split`,
+				);
+			}
+			if (p.weight !== undefined && p.weight !== null) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_INPUT",
+					`participants[${index}].weight must not be supplied for EQUAL split`,
+				);
+			}
+		});
+	} else if (method === "MANUAL") {
+		if (userWeight !== undefined && userWeight !== null) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_INPUT",
+				"userWeight must not be supplied for MANUAL split",
+			);
+		}
+		participants.forEach((p, index) => {
+			if (p.shareAmount === undefined || p.shareAmount === null) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_INPUT",
+					`participants[${index}].shareAmount is required for MANUAL split`,
+				);
+			}
+			if (p.weight !== undefined && p.weight !== null) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_INPUT",
+					`participants[${index}].weight must not be supplied for MANUAL split`,
+				);
+			}
+		});
+	} else if (method === "RATIO") {
+		if (
+			userWeight === undefined ||
+			userWeight === null ||
+			!Number.isSafeInteger(userWeight) ||
+			userWeight < 0
+		) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_INPUT",
+				"userWeight must be a safe integer >= 0 for RATIO split",
+			);
+		}
+		participants.forEach((p, index) => {
+			if (p.shareAmount !== undefined && p.shareAmount !== null) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_INPUT",
+					`participants[${index}].shareAmount must not be supplied for RATIO split`,
+				);
+			}
+			if (
+				p.weight === undefined ||
+				p.weight === null ||
+				!Number.isSafeInteger(p.weight) ||
+				p.weight <= 0
+			) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_INPUT",
+					`participants[${index}].weight must be a safe integer > 0 for RATIO split`,
+				);
+			}
+		});
+	}
+}
+
+/**
  * Validates the participants array shape and normalizes each participant's
  * personId (canonical lowercase UUID), dueDate, and description BEFORE any
  * DB query or allocation math, so the normalized values are used identically
@@ -498,11 +587,22 @@ async function buildSplitReadModelFromRevisionInTransaction(
 		.orderBy(asc(creditCardPurchaseSplitRevisionItems.personId));
 
 	if (items.length === 0) {
+		// A zero-item snapshot is only ever legitimate for a VOID revision (the
+		// canonical "no external participants" terminal state). An ACTIVE/
+		// CREATE/UPDATE revision must always carry 1-9 items; returning an
+		// empty participants array for one would silently hide an impossible
+		// split state instead of failing closed.
+		if (revision.operation !== "VOID") {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_STATE",
+				`Split revision ${revision.id} has operation ${revision.operation} but zero revision items`,
+			);
+		}
 		return {
 			splitId: split.id,
 			userId: split.userId,
 			purchaseEventId: split.purchaseEventId,
-			status: revision.operation === "VOID" ? "VOID" : "ACTIVE",
+			status: "VOID",
 			revisionNo: revision.revisionNo,
 			method: revision.method as SplitMethod,
 			grossAmount: revision.grossAmount,
@@ -724,6 +824,123 @@ async function buildSplitReadModelAtRevisionInTransaction(
 	return buildSplitReadModelFromRevisionInTransaction(tx, split, revision);
 }
 
+/**
+ * Attempts an exact-payload idempotent replay of a split CREATE. Returns the
+ * replayed read model if the given idempotencyKey matches a historical
+ * revision #1 AND the candidate fingerprint (recomputed against that
+ * revision's own HISTORICAL economic snapshot, not any current mutable
+ * state) matches exactly; returns null if no split/key match exists yet
+ * (caller should proceed to a fresh mutation). Throws
+ * CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT if the key matches but the payload
+ * differs, or if the key belongs to a different split operation (UPDATE/
+ * VOID) entirely -- a key is never reinterpreted across operation types.
+ * Intentionally does NOT perform any mutable-state check (card ACTIVE,
+ * purchase POSTED, split ACTIVE): a genuine historical replay must succeed
+ * even after later lifecycle changes.
+ */
+async function tryReplayCreateSplit(
+	tx: DatabaseTransaction,
+	args: {
+		userId: string;
+		purchaseEventId: string;
+		method: SplitMethod;
+		userWeight: number | undefined;
+		normalizedParticipants: NormalizedParticipantInput[];
+		idempotencyKey: string;
+		callerOccurredAt: Date | undefined;
+		preloadedSplit?: typeof creditCardPurchaseSplits.$inferSelect;
+	},
+): Promise<CreditCardPurchaseSplitReadModel | null> {
+	const {
+		userId,
+		purchaseEventId,
+		method,
+		userWeight,
+		normalizedParticipants,
+		idempotencyKey,
+		callerOccurredAt,
+	} = args;
+
+	const existingSplit =
+		args.preloadedSplit ??
+		(
+			await tx
+				.select()
+				.from(creditCardPurchaseSplits)
+				.where(eq(creditCardPurchaseSplits.purchaseEventId, purchaseEventId))
+				.limit(1)
+		)[0];
+
+	if (!existingSplit) return null;
+
+	const [firstRev] = await tx
+		.select()
+		.from(creditCardPurchaseSplitRevisions)
+		.where(
+			and(
+				eq(creditCardPurchaseSplitRevisions.splitId, existingSplit.id),
+				eq(creditCardPurchaseSplitRevisions.idempotencyKey, idempotencyKey),
+			),
+		)
+		.limit(1);
+
+	if (!firstRev) return null;
+
+	// Operation-type binding: a key minted for CREATE (revisionNo 1) can never
+	// be reinterpreted as belonging to any other split operation.
+	if (firstRev.revisionNo !== 1 || firstRev.operation !== "CREATE") {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+			"Idempotency key was already used for a different split operation",
+		);
+	}
+
+	const historicalGrossCents = parsePositiveMoneyString(
+		firstRev.grossAmount,
+	).cents;
+	const candidateAllocation = calculateAllocations({
+		method,
+		grossAmount: historicalGrossCents,
+		userWeight,
+		participants: normalizedParticipants,
+	});
+	const candidateOccurredAt = callerOccurredAt ?? firstRev.occurredAt;
+	const candidateFingerprintItems: SplitParticipantItemFingerprint[] =
+		candidateAllocation.participants.map((p) => ({
+			personId: p.personId,
+			shareAmount: formatCentsToMoney(p.shareAmount),
+			weight: p.weight ?? null,
+			dueDate: p.dueDate ? p.dueDate.toISOString().slice(0, 10) : null,
+			description: p.description ?? null,
+		}));
+	const candidateFingerprint = await calculateSplitCreateFingerprint({
+		userId,
+		purchaseEventId,
+		method,
+		grossAmount: formatCentsToMoney(candidateAllocation.grossAmount),
+		userShareAmount: formatCentsToMoney(candidateAllocation.userShareAmount),
+		externalShareAmount: formatCentsToMoney(
+			candidateAllocation.externalShareAmount,
+		),
+		userWeight: candidateAllocation.userWeight ?? null,
+		items: candidateFingerprintItems,
+		occurredAt: candidateOccurredAt,
+	});
+
+	if (candidateFingerprint !== firstRev.revisionFingerprint) {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+			"Idempotency key reused with a different split CREATE payload",
+		);
+	}
+
+	return buildSplitReadModelAtRevisionInTransaction(
+		tx,
+		existingSplit.id,
+		firstRev.id,
+	);
+}
+
 // ============================================================================
 // Core Transaction Handlers (Composing Split + People Obligations)
 // ============================================================================
@@ -746,10 +963,15 @@ export async function createSplitInTransaction(
 	const { userId, purchaseEventId, method, userWeight, idempotencyKey } =
 		params;
 	const normalizedParticipants = validateParticipantsInput(params.participants);
+	validateMethodSpecificParticipantFields(
+		method,
+		userWeight,
+		normalizedParticipants,
+	);
 
-	// Global lock order: card -> purchase event -> split -> people -> obligations.
-	// Pre-read the immutable purchase event anchor WITHOUT a lock to resolve
-	// cardId, then lock card first, THEN lock the purchase event.
+	// Pre-read the immutable purchase event identity (unlocked): this resolves
+	// existence/eventType, which never change, so it is safe to check before
+	// any replay or mutable-state logic.
 	const [purchaseEventPeek] = await tx
 		.select()
 		.from(creditCardLiabilityEvents)
@@ -775,6 +997,26 @@ export async function createSplitInTransaction(
 		);
 	}
 
+	// EARLY REPLAY (before any mutable-state check): a historical CREATE
+	// idempotency key must replay even if the card has since been archived or
+	// the purchase has since been voided -- a committed historical operation
+	// is immutable and its exact retry must always succeed.
+	const earlyReplayResult = await tryReplayCreateSplit(tx, {
+		userId,
+		purchaseEventId,
+		method,
+		userWeight,
+		normalizedParticipants,
+		idempotencyKey,
+		callerOccurredAt: params.occurredAt,
+	});
+	if (earlyReplayResult) {
+		return { split: earlyReplayResult, idempotentReplay: true };
+	}
+
+	// No historical match: proceed to a FRESH mutation. From here on, all
+	// mutable-state checks apply, and locking follows the global order:
+	// card -> purchase event -> split -> people -> obligations.
 	await lockCardAndVerifyActive(tx, userId, purchaseEventPeek.creditCardId);
 
 	const [purchaseEvent] = await tx
@@ -802,7 +1044,8 @@ export async function createSplitInTransaction(
 		);
 	}
 
-	// Check if a split already exists for this purchase
+	// Second replay check under lock (race-safety): a concurrent CREATE may
+	// have inserted the historical revision between the early check and now.
 	const [existingSplit] = await tx
 		.select()
 		.from(creditCardPurchaseSplits)
@@ -810,6 +1053,20 @@ export async function createSplitInTransaction(
 		.for("update");
 
 	if (existingSplit) {
+		const secondReplayResult = await tryReplayCreateSplit(tx, {
+			userId,
+			purchaseEventId,
+			method,
+			userWeight,
+			normalizedParticipants,
+			idempotencyKey,
+			callerOccurredAt: params.occurredAt,
+			preloadedSplit: existingSplit,
+		});
+		if (secondReplayResult) {
+			return { split: secondReplayResult, idempotentReplay: true };
+		}
+
 		const [firstRev] = await tx
 			.select()
 			.from(creditCardPurchaseSplitRevisions)
@@ -820,62 +1077,6 @@ export async function createSplitInTransaction(
 				),
 			)
 			.limit(1);
-
-		if (firstRev && firstRev.idempotencyKey === idempotencyKey) {
-			// Exact-payload replay verification: recompute the candidate
-			// fingerprint against the HISTORICAL CREATE economic snapshot
-			// (the historical grossAmount, not any current purchase amount),
-			// so a replay is still recognized after the purchase or split has
-			// since been mutated further, but a changed payload under the same
-			// key is rejected rather than silently returning stale state.
-			const historicalGrossCents = parsePositiveMoneyString(
-				firstRev.grossAmount,
-			).cents;
-			const candidateAllocation = calculateAllocations({
-				method,
-				grossAmount: historicalGrossCents,
-				userWeight,
-				participants: normalizedParticipants,
-			});
-			const candidateOccurredAt = params.occurredAt ?? firstRev.occurredAt;
-			const candidateFingerprintItems: SplitParticipantItemFingerprint[] =
-				candidateAllocation.participants.map((p) => ({
-					personId: p.personId,
-					shareAmount: formatCentsToMoney(p.shareAmount),
-					weight: p.weight ?? null,
-					dueDate: p.dueDate ? p.dueDate.toISOString().slice(0, 10) : null,
-					description: p.description ?? null,
-				}));
-			const candidateFingerprint = await calculateSplitCreateFingerprint({
-				userId,
-				purchaseEventId,
-				method,
-				grossAmount: formatCentsToMoney(candidateAllocation.grossAmount),
-				userShareAmount: formatCentsToMoney(
-					candidateAllocation.userShareAmount,
-				),
-				externalShareAmount: formatCentsToMoney(
-					candidateAllocation.externalShareAmount,
-				),
-				userWeight: candidateAllocation.userWeight ?? null,
-				items: candidateFingerprintItems,
-				occurredAt: candidateOccurredAt,
-			});
-
-			if (candidateFingerprint !== firstRev.revisionFingerprint) {
-				throw new CreditCardError(
-					"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
-					"Idempotency key reused with a different split CREATE payload",
-				);
-			}
-
-			const readModel = await buildSplitReadModelAtRevisionInTransaction(
-				tx,
-				existingSplit.id,
-				firstRev.id,
-			);
-			return { split: readModel, idempotentReplay: true };
-		}
 
 		if (firstRev) {
 			throw new CreditCardError(
@@ -1035,6 +1236,119 @@ export async function createSplitInTransaction(
 	return { split: readModel, idempotentReplay: false };
 }
 
+/**
+ * Attempts an exact-payload idempotent replay of a split UPDATE. Mirrors
+ * tryReplayCreateSplit but for UPDATE: the candidate fingerprint uses the
+ * CALLER's own expectedRevisionNo (not any value derived from the matched
+ * historical revision), so a genuine retry (same key, same payload, same
+ * expectedRevisionNo) replays, while the same key reused with a DIFFERENT
+ * expectedRevisionNo is treated as a changed payload and rejected as a
+ * conflict rather than silently replayed. Returns null if no key match
+ * exists yet. Never performs a mutable-state check.
+ */
+async function tryReplayUpdateSplit(
+	tx: DatabaseTransaction,
+	args: {
+		userId: string;
+		splitId: string;
+		expectedRevisionNo: number;
+		method: SplitMethod;
+		userWeight: number | undefined;
+		normalizedParticipants: NormalizedParticipantInput[];
+		idempotencyKey: string;
+		callerOccurredAt: Date | undefined;
+		preloadedRev?:
+			| typeof creditCardPurchaseSplitRevisions.$inferSelect
+			| undefined;
+	},
+): Promise<CreditCardPurchaseSplitReadModel | null> {
+	const {
+		userId,
+		splitId,
+		expectedRevisionNo,
+		method,
+		userWeight,
+		normalizedParticipants,
+		idempotencyKey,
+		callerOccurredAt,
+	} = args;
+
+	const existingRevWithKey =
+		args.preloadedRev ??
+		(
+			await tx
+				.select()
+				.from(creditCardPurchaseSplitRevisions)
+				.where(
+					and(
+						eq(creditCardPurchaseSplitRevisions.splitId, splitId),
+						eq(creditCardPurchaseSplitRevisions.idempotencyKey, idempotencyKey),
+					),
+				)
+				.limit(1)
+		)[0];
+
+	if (!existingRevWithKey) return null;
+
+	// Operation-type binding: a key minted for UPDATE can never be
+	// reinterpreted as belonging to CREATE or VOID.
+	if (existingRevWithKey.operation !== "UPDATE") {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+			"Idempotency key was already used for a different split operation",
+		);
+	}
+
+	const historicalGrossCents = parsePositiveMoneyString(
+		existingRevWithKey.grossAmount,
+	).cents;
+	const candidateAllocation = calculateAllocations({
+		method,
+		grossAmount: historicalGrossCents,
+		userWeight,
+		participants: normalizedParticipants,
+	});
+	const candidateOccurredAt = callerOccurredAt ?? existingRevWithKey.occurredAt;
+	const candidateFingerprintItems: SplitParticipantItemFingerprint[] =
+		candidateAllocation.participants.map((p) => ({
+			personId: p.personId,
+			shareAmount: formatCentsToMoney(p.shareAmount),
+			weight: p.weight ?? null,
+			dueDate: p.dueDate ? p.dueDate.toISOString().slice(0, 10) : null,
+			description: p.description ?? null,
+		}));
+	// Use the CALLER's own expectedRevisionNo (not a value derived from the
+	// matched revision) -- a retry with a different expectedRevisionNo under
+	// the same key is a changed payload, not a valid replay.
+	const candidateFingerprint = await calculateSplitUpdateFingerprint({
+		userId,
+		splitId,
+		expectedRevisionNo,
+		method,
+		grossAmount: formatCentsToMoney(candidateAllocation.grossAmount),
+		userShareAmount: formatCentsToMoney(candidateAllocation.userShareAmount),
+		externalShareAmount: formatCentsToMoney(
+			candidateAllocation.externalShareAmount,
+		),
+		userWeight: candidateAllocation.userWeight ?? null,
+		items: candidateFingerprintItems,
+		occurredAt: candidateOccurredAt,
+	});
+
+	if (candidateFingerprint !== existingRevWithKey.revisionFingerprint) {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+			"Idempotency key reused with a different split UPDATE payload",
+		);
+	}
+
+	return buildSplitReadModelAtRevisionInTransaction(
+		tx,
+		splitId,
+		existingRevWithKey.id,
+	);
+}
+
 export async function updateSplitInTransaction(
 	tx: DatabaseTransaction,
 	params: {
@@ -1064,10 +1378,14 @@ export async function updateSplitInTransaction(
 		overridePurchaseRevision,
 	} = params;
 	const normalizedParticipants = validateParticipantsInput(params.participants);
+	validateMethodSpecificParticipantFields(
+		method,
+		userWeight,
+		normalizedParticipants,
+	);
 
-	// Pre-read the immutable split -> purchaseEventId, and purchase event ->
-	// cardId, WITHOUT locks, so the global lock order (card -> purchase event
-	// -> split) can be honored without a wrong-order deadlock-prone lock.
+	// Pre-read the immutable split -> purchaseEventId, WITHOUT a lock, purely
+	// to resolve identity (needed even for a replay lookup).
 	const [splitPeek] = await tx
 		.select()
 		.from(creditCardPurchaseSplits)
@@ -1086,19 +1404,27 @@ export async function updateSplitInTransaction(
 		);
 	}
 
-	// Early idempotency replay (unlocked read) before acquiring authoritative
-	// locks; a second replay check happens again below after locking.
-	const [earlyReplay] = await tx
-		.select()
-		.from(creditCardPurchaseSplitRevisions)
-		.where(
-			and(
-				eq(creditCardPurchaseSplitRevisions.splitId, splitId),
-				eq(creditCardPurchaseSplitRevisions.idempotencyKey, idempotencyKey),
-			),
-		)
-		.limit(1);
+	// EARLY REPLAY (before any mutable-state check): a historical UPDATE
+	// idempotency key must replay even if the card has since been archived,
+	// the purchase has since been voided, or the split has since moved to a
+	// later revision.
+	const earlyReplayResult = await tryReplayUpdateSplit(tx, {
+		userId,
+		splitId,
+		expectedRevisionNo,
+		method,
+		userWeight,
+		normalizedParticipants,
+		idempotencyKey,
+		callerOccurredAt: params.occurredAt,
+	});
+	if (earlyReplayResult) {
+		return { split: earlyReplayResult, idempotentReplay: true };
+	}
 
+	// No historical match: proceed to a FRESH mutation. From here on, all
+	// mutable-state checks apply, and locking follows the global order:
+	// card -> purchase event -> split -> people -> obligations.
 	const [purchaseEventPeek] = await tx
 		.select()
 		.from(creditCardLiabilityEvents)
@@ -1148,77 +1474,18 @@ export async function updateSplitInTransaction(
 	}
 
 	// Second replay check under lock (races must never double-post).
-	const [existingRevWithKey] =
-		earlyReplay !== undefined
-			? [earlyReplay]
-			: await tx
-					.select()
-					.from(creditCardPurchaseSplitRevisions)
-					.where(
-						and(
-							eq(creditCardPurchaseSplitRevisions.splitId, splitId),
-							eq(
-								creditCardPurchaseSplitRevisions.idempotencyKey,
-								idempotencyKey,
-							),
-						),
-					)
-					.limit(1);
-
-	if (existingRevWithKey) {
-		// Exact-payload replay verification against the HISTORICAL economic
-		// snapshot owned by this key (its own stored grossAmount/occurredAt),
-		// not any current mutable purchase/split state, so a genuine retry
-		// still replays after later lifecycle changes but a changed payload
-		// under the same key is rejected.
-		const historicalGrossCents = parsePositiveMoneyString(
-			existingRevWithKey.grossAmount,
-		).cents;
-		const historicalExpectedRevisionNo = existingRevWithKey.revisionNo - 1;
-		const candidateAllocation = calculateAllocations({
-			method,
-			grossAmount: historicalGrossCents,
-			userWeight,
-			participants: normalizedParticipants,
-		});
-		const candidateOccurredAt =
-			params.occurredAt ?? existingRevWithKey.occurredAt;
-		const candidateFingerprintItems: SplitParticipantItemFingerprint[] =
-			candidateAllocation.participants.map((p) => ({
-				personId: p.personId,
-				shareAmount: formatCentsToMoney(p.shareAmount),
-				weight: p.weight ?? null,
-				dueDate: p.dueDate ? p.dueDate.toISOString().slice(0, 10) : null,
-				description: p.description ?? null,
-			}));
-		const candidateFingerprint = await calculateSplitUpdateFingerprint({
-			userId,
-			splitId,
-			expectedRevisionNo: historicalExpectedRevisionNo,
-			method,
-			grossAmount: formatCentsToMoney(candidateAllocation.grossAmount),
-			userShareAmount: formatCentsToMoney(candidateAllocation.userShareAmount),
-			externalShareAmount: formatCentsToMoney(
-				candidateAllocation.externalShareAmount,
-			),
-			userWeight: candidateAllocation.userWeight ?? null,
-			items: candidateFingerprintItems,
-			occurredAt: candidateOccurredAt,
-		});
-
-		if (candidateFingerprint !== existingRevWithKey.revisionFingerprint) {
-			throw new CreditCardError(
-				"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
-				"Idempotency key reused with a different split UPDATE payload",
-			);
-		}
-
-		const readModel = await buildSplitReadModelAtRevisionInTransaction(
-			tx,
-			splitId,
-			existingRevWithKey.id,
-		);
-		return { split: readModel, idempotentReplay: true };
+	const secondReplayResult = await tryReplayUpdateSplit(tx, {
+		userId,
+		splitId,
+		expectedRevisionNo,
+		method,
+		userWeight,
+		normalizedParticipants,
+		idempotencyKey,
+		callerOccurredAt: params.occurredAt,
+	});
+	if (secondReplayResult) {
+		return { split: secondReplayResult, idempotentReplay: true };
 	}
 
 	// Get latest purchase revision
@@ -1527,6 +1794,86 @@ export async function updateSplitInTransaction(
 	return { split: readModel, idempotentReplay: false };
 }
 
+/**
+ * Attempts an exact-payload idempotent replay of a split VOID. Mirrors
+ * tryReplayUpdateSplit: the candidate fingerprint uses the CALLER's own
+ * expectedRevisionNo and occurredAt, so a genuine retry replays while a
+ * retry with a changed expectedRevisionNo or occurredAt under the same key
+ * is rejected as a conflict. Never performs a mutable-state check (a
+ * historical VOID replay must not require the card to still be ACTIVE).
+ */
+async function tryReplayVoidSplit(
+	tx: DatabaseTransaction,
+	args: {
+		userId: string;
+		splitId: string;
+		expectedRevisionNo: number;
+		idempotencyKey: string;
+		callerOccurredAt: Date | undefined;
+		preloadedRev?:
+			| typeof creditCardPurchaseSplitRevisions.$inferSelect
+			| undefined;
+	},
+): Promise<CreditCardPurchaseSplitReadModel | null> {
+	const {
+		userId,
+		splitId,
+		expectedRevisionNo,
+		idempotencyKey,
+		callerOccurredAt,
+	} = args;
+
+	const existingRevWithKey =
+		args.preloadedRev ??
+		(
+			await tx
+				.select()
+				.from(creditCardPurchaseSplitRevisions)
+				.where(
+					and(
+						eq(creditCardPurchaseSplitRevisions.splitId, splitId),
+						eq(creditCardPurchaseSplitRevisions.idempotencyKey, idempotencyKey),
+					),
+				)
+				.limit(1)
+		)[0];
+
+	if (!existingRevWithKey) return null;
+
+	// Operation-type binding: a key minted for VOID can never be
+	// reinterpreted as belonging to CREATE or UPDATE.
+	if (existingRevWithKey.operation !== "VOID") {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+			"Idempotency key was already used for a different split operation",
+		);
+	}
+
+	const candidateOccurredAt = callerOccurredAt ?? existingRevWithKey.occurredAt;
+	// Use the CALLER's own expectedRevisionNo -- a retry with a different
+	// expectedRevisionNo or occurredAt under the same key is a changed
+	// payload, not a valid replay.
+	const candidateFingerprint = await calculateSplitVoidFingerprint({
+		userId,
+		splitId,
+		expectedRevisionNo,
+		occurredAt: candidateOccurredAt,
+	});
+
+	if (candidateFingerprint !== existingRevWithKey.revisionFingerprint) {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+			"Idempotency key reused with a different split VOID payload",
+		);
+	}
+
+	return buildSplitReadModelAtRevisionInTransaction(
+		tx,
+		splitId,
+		existingRevWithKey.id,
+	);
+}
+
 export async function voidSplitInTransaction(
 	tx: DatabaseTransaction,
 	params: {
@@ -1542,8 +1889,8 @@ export async function voidSplitInTransaction(
 }> {
 	const { userId, splitId, expectedRevisionNo, idempotencyKey } = params;
 
-	// Pre-read split -> purchaseEventId and purchase event -> cardId WITHOUT
-	// locks, to honor the global lock order (card -> purchase event -> split).
+	// Pre-read split -> purchaseEventId WITHOUT a lock, purely to resolve
+	// identity (needed even for a replay lookup).
 	const [splitPeek] = await tx
 		.select()
 		.from(creditCardPurchaseSplits)
@@ -1562,18 +1909,23 @@ export async function voidSplitInTransaction(
 		);
 	}
 
-	// Early idempotency replay (unlocked read).
-	const [earlyReplay] = await tx
-		.select()
-		.from(creditCardPurchaseSplitRevisions)
-		.where(
-			and(
-				eq(creditCardPurchaseSplitRevisions.splitId, splitId),
-				eq(creditCardPurchaseSplitRevisions.idempotencyKey, idempotencyKey),
-			),
-		)
-		.limit(1);
+	// EARLY REPLAY (before any mutable-state check): a historical VOID
+	// idempotency key must replay even if the card has since been archived --
+	// a historical VOID replay must not require the card to still be ACTIVE.
+	const earlyReplayResult = await tryReplayVoidSplit(tx, {
+		userId,
+		splitId,
+		expectedRevisionNo,
+		idempotencyKey,
+		callerOccurredAt: params.occurredAt,
+	});
+	if (earlyReplayResult) {
+		return { split: earlyReplayResult, idempotentReplay: true };
+	}
 
+	// No historical match: proceed to a FRESH mutation. From here on, all
+	// mutable-state checks apply, and locking follows the global order:
+	// card -> purchase event -> split -> people -> obligations.
 	const [purchaseEventPeek] = await tx
 		.select()
 		.from(creditCardLiabilityEvents)
@@ -1608,48 +1960,16 @@ export async function voidSplitInTransaction(
 		);
 	}
 
-	// Second replay check under lock.
-	const [existingRevWithKey] =
-		earlyReplay !== undefined
-			? [earlyReplay]
-			: await tx
-					.select()
-					.from(creditCardPurchaseSplitRevisions)
-					.where(
-						and(
-							eq(creditCardPurchaseSplitRevisions.splitId, splitId),
-							eq(
-								creditCardPurchaseSplitRevisions.idempotencyKey,
-								idempotencyKey,
-							),
-						),
-					)
-					.limit(1);
-
-	if (existingRevWithKey) {
-		const historicalExpectedRevisionNo = existingRevWithKey.revisionNo - 1;
-		const candidateOccurredAt =
-			params.occurredAt ?? existingRevWithKey.occurredAt;
-		const candidateFingerprint = await calculateSplitVoidFingerprint({
-			userId,
-			splitId,
-			expectedRevisionNo: historicalExpectedRevisionNo,
-			occurredAt: candidateOccurredAt,
-		});
-
-		if (candidateFingerprint !== existingRevWithKey.revisionFingerprint) {
-			throw new CreditCardError(
-				"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
-				"Idempotency key reused with a different split VOID payload",
-			);
-		}
-
-		const readModel = await buildSplitReadModelAtRevisionInTransaction(
-			tx,
-			splitId,
-			existingRevWithKey.id,
-		);
-		return { split: readModel, idempotentReplay: true };
+	// Second replay check under lock (races must never double-post).
+	const secondReplayResult = await tryReplayVoidSplit(tx, {
+		userId,
+		splitId,
+		expectedRevisionNo,
+		idempotencyKey,
+		callerOccurredAt: params.occurredAt,
+	});
+	if (secondReplayResult) {
+		return { split: secondReplayResult, idempotentReplay: true };
 	}
 
 	// Get latest split revision
@@ -1788,9 +2108,10 @@ export async function createCreditCardPurchaseSplit(
 	const validPurchaseEventId = validatePurchaseEventId(params.purchaseEventId);
 	const validMethod = validateSplitMethod(params.method);
 	const validIdempotencyKey = validateIdempotencyKey(params.idempotencyKey);
-	const validOccurredAt = params.occurredAt
-		? validateCcOccurredAt(params.occurredAt)
-		: undefined;
+	const validOccurredAt =
+		params.occurredAt === undefined
+			? undefined
+			: validateCcOccurredAt(params.occurredAt);
 
 	return runCreditCardTransaction(params.db, async (tx) => {
 		return createSplitInTransaction(tx, {
@@ -1818,9 +2139,10 @@ export async function updateCreditCardPurchaseSplit(
 	);
 	const validMethod = validateSplitMethod(params.method);
 	const validIdempotencyKey = validateIdempotencyKey(params.idempotencyKey);
-	const validOccurredAt = params.occurredAt
-		? validateCcOccurredAt(params.occurredAt)
-		: undefined;
+	const validOccurredAt =
+		params.occurredAt === undefined
+			? undefined
+			: validateCcOccurredAt(params.occurredAt);
 
 	return runCreditCardTransaction(params.db, async (tx) => {
 		return updateSplitInTransaction(tx, {
@@ -1848,9 +2170,10 @@ export async function voidCreditCardPurchaseSplit(
 		params.expectedRevisionNo,
 	);
 	const validIdempotencyKey = validateIdempotencyKey(params.idempotencyKey);
-	const validOccurredAt = params.occurredAt
-		? validateCcOccurredAt(params.occurredAt)
-		: undefined;
+	const validOccurredAt =
+		params.occurredAt === undefined
+			? undefined
+			: validateCcOccurredAt(params.occurredAt);
 
 	return runCreditCardTransaction(params.db, async (tx) => {
 		return voidSplitInTransaction(tx, {

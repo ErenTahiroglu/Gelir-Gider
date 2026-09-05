@@ -1860,6 +1860,14 @@ export async function voidCreditCardPurchaseWithSplit(
 	split: CreditCardPurchaseSplitReadModel;
 	idempotentReplay: boolean;
 }> {
+	// Strict optional occurredAt: only `undefined` means omitted -- null,
+	// strings, numbers, and invalid Date objects must reject before any DB
+	// work, never be silently coerced.
+	const validOccurredAt =
+		params.occurredAt === undefined
+			? undefined
+			: validateCcOccurredAt(params.occurredAt);
+
 	return runCreditCardTransaction(params.db, async (tx) => {
 		const [split] = await tx
 			.select()
@@ -1884,7 +1892,7 @@ export async function voidCreditCardPurchaseWithSplit(
 			splitId: split.id,
 			expectedRevisionNo: params.splitExpectedRevisionNo,
 			idempotencyKey: params.splitIdempotencyKey,
-			occurredAt: params.occurredAt,
+			occurredAt: validOccurredAt,
 		});
 
 		const purchaseRes = await voidCreditCardPurchaseInTransaction({
@@ -1893,7 +1901,7 @@ export async function voidCreditCardPurchaseWithSplit(
 			eventId: params.purchaseEventId,
 			expectedRevisionNo: params.purchaseExpectedRevisionNo,
 			reasonNote: params.reasonNote ?? null,
-			occurredAt: params.occurredAt ?? new Date(),
+			occurredAt: validOccurredAt ?? new Date(),
 			idempotencyKey: params.purchaseIdempotencyKey,
 			isCoordinatedWithSplit: true,
 		});

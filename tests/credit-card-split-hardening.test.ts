@@ -5,6 +5,7 @@ import {
 	deriveCreditCardSplitChildIdempotencyKey,
 } from "../src/credit-cards/fingerprint";
 import {
+	validateMethodSpecificParticipantFields,
 	validateParticipantDescription,
 	validateParticipantDueDate,
 	validateParticipantsInput,
@@ -182,6 +183,108 @@ describe("validateParticipantsInput", () => {
 
 	it("rejects a non-object array entry", () => {
 		expect(() => validateParticipantsInput([null])).toThrow(CreditCardError);
+	});
+});
+
+describe("validateMethodSpecificParticipantFields", () => {
+	const base = { personId: UUID_A, dueDate: null, description: null };
+
+	it("EQUAL: rejects a supplied shareAmount", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("EQUAL", undefined, [
+				{ ...base, shareAmount: "10.00" },
+			]),
+		).toThrow(CreditCardError);
+	});
+
+	it("EQUAL: rejects a supplied weight", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("EQUAL", undefined, [
+				{ ...base, weight: 2 },
+			]),
+		).toThrow(CreditCardError);
+	});
+
+	it("EQUAL: rejects a supplied caller-level userWeight", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("EQUAL", 3, [base]),
+		).toThrow(CreditCardError);
+	});
+
+	it("EQUAL: accepts personId/dueDate/description only", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("EQUAL", undefined, [base]),
+		).not.toThrow();
+	});
+
+	it("MANUAL: requires shareAmount", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("MANUAL", undefined, [base]),
+		).toThrow(CreditCardError);
+	});
+
+	it("MANUAL: rejects a supplied weight", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("MANUAL", undefined, [
+				{ ...base, shareAmount: "10.00", weight: 1 },
+			]),
+		).toThrow(CreditCardError);
+	});
+
+	it("MANUAL: rejects a supplied caller-level userWeight", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("MANUAL", 1, [
+				{ ...base, shareAmount: "10.00" },
+			]),
+		).toThrow(CreditCardError);
+	});
+
+	it("MANUAL: accepts shareAmount without weight", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("MANUAL", undefined, [
+				{ ...base, shareAmount: "10.00" },
+			]),
+		).not.toThrow();
+	});
+
+	it("RATIO: requires a safe non-negative integer userWeight", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("RATIO", undefined, [
+				{ ...base, weight: 1 },
+			]),
+		).toThrow(CreditCardError);
+		expect(() =>
+			validateMethodSpecificParticipantFields("RATIO", -1, [
+				{ ...base, weight: 1 },
+			]),
+		).toThrow(CreditCardError);
+	});
+
+	it("RATIO: rejects a missing or non-positive participant weight", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("RATIO", 1, [base]),
+		).toThrow(CreditCardError);
+		expect(() =>
+			validateMethodSpecificParticipantFields("RATIO", 1, [
+				{ ...base, weight: 0 },
+			]),
+		).toThrow(CreditCardError);
+	});
+
+	it("RATIO: rejects a supplied participant shareAmount", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("RATIO", 1, [
+				{ ...base, weight: 1, shareAmount: "10.00" },
+			]),
+		).toThrow(CreditCardError);
+	});
+
+	it("RATIO: accepts userWeight >= 0 and positive integer weights", () => {
+		expect(() =>
+			validateMethodSpecificParticipantFields("RATIO", 0, [
+				{ ...base, weight: 1 },
+			]),
+		).not.toThrow();
 	});
 });
 
