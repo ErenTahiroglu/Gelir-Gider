@@ -71,6 +71,7 @@ import {
 	buildSplitReadModelInTransaction,
 	type CreditCardPurchaseSplitReadModel,
 	createSplitInTransaction,
+	normalizeCreditCardSplitMutationInput,
 	type ParticipantAllocationInput,
 	updateSplitInTransaction,
 	voidSplitInTransaction,
@@ -393,6 +394,97 @@ export function normalizePurchaseBudgetCategory(
 // Purchase Lifecycle
 // ============================================================================
 
+interface NormalizedRecordPurchaseInput {
+	validUserId: string;
+	validCardId: string;
+	validAmount: string;
+	validCategory: CreditCardPurchaseBudgetCategory;
+	validOccurredAt: Date;
+	validKey: string;
+	validMerchant: string | null;
+	validDesc: string | null;
+	validInstallmentCount: number | null;
+	validGoalId: string | null;
+}
+
+/**
+ * Pure, DB-independent validation for a "record purchase" mutation. Shared
+ * between the internal transaction handler and the coordinated public
+ * `recordSharedCreditCardPurchase` so the exact same rules are never
+ * duplicated -- the coordinated caller runs this BEFORE opening a
+ * transaction, so a malformed purchase payload can never let the split path
+ * begin any DB work.
+ */
+function normalizeRecordPurchaseInput(params: {
+	userId: string;
+	cardId: string;
+	amount: string;
+	purchaseCategory: string;
+	shortTermGoalId?: string | null | undefined;
+	merchant?: string | null | undefined;
+	description?: string | null | undefined;
+	installmentCount?: number | null | undefined;
+	occurredAt: Date;
+	idempotencyKey: string;
+}): NormalizedRecordPurchaseInput {
+	const validUserId = validateCcCanonicalUuid(params.userId, "userId");
+	const validCardId = validateCcCanonicalUuid(params.cardId, "cardId");
+	const validAmount = validateCcPositiveMoneyString(
+		params.amount,
+		"amount",
+	).normalized;
+	const parsedCat = validatePurchaseCategory(params.purchaseCategory);
+	const validCategory = normalizePurchaseBudgetCategory(parsedCat);
+	const validOccurredAt = validateCcOccurredAt(params.occurredAt);
+	const validKey = validateCcRequiredText(
+		params.idempotencyKey,
+		"idempotencyKey",
+		128,
+	);
+	const validMerchant = validateCcOptionalText(
+		params.merchant,
+		"merchant",
+		200,
+	);
+	const validDesc = validateCcOptionalText(
+		params.description,
+		"description",
+		500,
+	);
+	const validInstallmentCount = validateInstallmentCount(
+		params.installmentCount,
+	);
+	const validGoalId = params.shortTermGoalId
+		? validateCcCanonicalUuid(params.shortTermGoalId, "shortTermGoalId")
+		: null;
+
+	if (validCategory === "SHORT_TERM_PURCHASE" && !validGoalId) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"shortTermGoalId is required when purchaseCategory is SHORT_TERM_PURCHASE",
+		);
+	}
+	if (validCategory !== "SHORT_TERM_PURCHASE" && validGoalId) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"shortTermGoalId is only allowed for SHORT_TERM_PURCHASE category",
+		);
+	}
+
+	return {
+		validUserId,
+		validCardId,
+		validAmount,
+		validCategory,
+		validOccurredAt,
+		validKey,
+		validMerchant,
+		validDesc,
+		validInstallmentCount,
+		validGoalId,
+	};
+}
+
 /**
  * Records a fresh credit card purchase inside a transaction with double-entry accounting.
  * DR Expense Account, CR Credit Card Liability Account.
@@ -411,39 +503,29 @@ export async function recordCreditCardPurchaseInTransaction({
 	idempotencyKey,
 }: RecordCreditCardPurchaseInTransactionParams): Promise<CreditCardLiabilityEventLifecycleResult> {
 	// 1. Input Validation
-	const validUserId = validateCcCanonicalUuid(userId, "userId");
-	const validCardId = validateCcCanonicalUuid(cardId, "cardId");
-	const validAmount = validateCcPositiveMoneyString(
+	const {
+		validUserId,
+		validCardId,
+		validAmount,
+		validCategory,
+		validOccurredAt,
+		validKey,
+		validMerchant,
+		validDesc,
+		validInstallmentCount,
+		validGoalId,
+	} = normalizeRecordPurchaseInput({
+		userId,
+		cardId,
 		amount,
-		"amount",
-	).normalized;
-	const parsedCat = validatePurchaseCategory(purchaseCategory);
-	const validCategory = normalizePurchaseBudgetCategory(parsedCat);
-	const validOccurredAt = validateCcOccurredAt(occurredAt);
-	const validKey = validateCcRequiredText(
+		purchaseCategory,
+		shortTermGoalId,
+		merchant,
+		description,
+		installmentCount,
+		occurredAt,
 		idempotencyKey,
-		"idempotencyKey",
-		128,
-	);
-	const validMerchant = validateCcOptionalText(merchant, "merchant", 200);
-	const validDesc = validateCcOptionalText(description, "description", 500);
-	const validInstallmentCount = validateInstallmentCount(installmentCount);
-	const validGoalId = shortTermGoalId
-		? validateCcCanonicalUuid(shortTermGoalId, "shortTermGoalId")
-		: null;
-
-	if (validCategory === "SHORT_TERM_PURCHASE" && !validGoalId) {
-		throw new CreditCardError(
-			"CREDIT_CARD_INVALID_INPUT",
-			"shortTermGoalId is required when purchaseCategory is SHORT_TERM_PURCHASE",
-		);
-	}
-	if (validCategory !== "SHORT_TERM_PURCHASE" && validGoalId) {
-		throw new CreditCardError(
-			"CREDIT_CARD_INVALID_INPUT",
-			"shortTermGoalId is only allowed for SHORT_TERM_PURCHASE category",
-		);
-	}
+	});
 
 	// 1.1 EARLY IDEMPOTENCY REPLAY CHECK
 	const [earlyRev] = await tx
@@ -793,6 +875,110 @@ export async function recordCreditCardPurchase(
 	});
 }
 
+interface NormalizedUpdatePurchaseInput {
+	validUserId: string;
+	validEventId: string;
+	validExpectedRev: number;
+	validAmount: string;
+	validCategory: CreditCardPurchaseBudgetCategory;
+	validOccurredAt: Date;
+	validKey: string;
+	validMerchant: string | null;
+	validDesc: string | null;
+	validReason: string | null;
+	validInstallmentCount: number | null;
+	validGoalId: string | null;
+}
+
+/**
+ * Pure, DB-independent validation for an "update purchase" mutation. Shared
+ * between the internal transaction handler and the coordinated public
+ * `updateCreditCardPurchaseWithSplit` so the exact same rules are never
+ * duplicated -- the coordinated caller runs this BEFORE opening a
+ * transaction.
+ */
+function normalizeUpdatePurchaseInput(params: {
+	userId: string;
+	eventId: string;
+	expectedRevisionNo: number;
+	amount: string;
+	purchaseCategory: string;
+	shortTermGoalId?: string | null | undefined;
+	merchant?: string | null | undefined;
+	description?: string | null | undefined;
+	installmentCount?: number | null | undefined;
+	reasonNote?: string | null | undefined;
+	occurredAt: Date;
+	idempotencyKey: string;
+}): NormalizedUpdatePurchaseInput {
+	const validUserId = validateCcCanonicalUuid(params.userId, "userId");
+	const validEventId = validateCcCanonicalUuid(params.eventId, "eventId");
+	const validExpectedRev = validateCcExpectedRevisionNo(
+		params.expectedRevisionNo,
+	);
+	const validAmount = validateCcPositiveMoneyString(
+		params.amount,
+		"amount",
+	).normalized;
+	const parsedCat = validatePurchaseCategory(params.purchaseCategory);
+	const validCategory = normalizePurchaseBudgetCategory(parsedCat);
+	const validOccurredAt = validateCcOccurredAt(params.occurredAt);
+	const validKey = validateCcRequiredText(
+		params.idempotencyKey,
+		"idempotencyKey",
+		128,
+	);
+	const validMerchant = validateCcOptionalText(
+		params.merchant,
+		"merchant",
+		200,
+	);
+	const validDesc = validateCcOptionalText(
+		params.description,
+		"description",
+		500,
+	);
+	const validReason = validateCcOptionalText(
+		params.reasonNote,
+		"reasonNote",
+		500,
+	);
+	const validInstallmentCount = validateInstallmentCount(
+		params.installmentCount,
+	);
+	const validGoalId = params.shortTermGoalId
+		? validateCcCanonicalUuid(params.shortTermGoalId, "shortTermGoalId")
+		: null;
+
+	if (validCategory === "SHORT_TERM_PURCHASE" && !validGoalId) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"shortTermGoalId is required when purchaseCategory is SHORT_TERM_PURCHASE",
+		);
+	}
+	if (validCategory !== "SHORT_TERM_PURCHASE" && validGoalId) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"shortTermGoalId is only allowed for SHORT_TERM_PURCHASE category",
+		);
+	}
+
+	return {
+		validUserId,
+		validEventId,
+		validExpectedRev,
+		validAmount,
+		validCategory,
+		validOccurredAt,
+		validKey,
+		validMerchant,
+		validDesc,
+		validReason,
+		validInstallmentCount,
+		validGoalId,
+	};
+}
+
 /**
  * Updates an existing credit card purchase.
  */
@@ -812,41 +998,33 @@ export async function updateCreditCardPurchaseInTransaction({
 	idempotencyKey,
 	isCoordinatedWithSplit,
 }: UpdateCreditCardPurchaseInTransactionParams): Promise<CreditCardLiabilityEventLifecycleResult> {
-	const validUserId = validateCcCanonicalUuid(userId, "userId");
-	const validEventId = validateCcCanonicalUuid(eventId, "eventId");
-	const validExpectedRev = validateCcExpectedRevisionNo(expectedRevisionNo);
-	const validAmount = validateCcPositiveMoneyString(
+	const {
+		validUserId,
+		validEventId,
+		validExpectedRev,
+		validAmount,
+		validCategory,
+		validOccurredAt,
+		validKey,
+		validMerchant,
+		validDesc,
+		validReason,
+		validInstallmentCount,
+		validGoalId,
+	} = normalizeUpdatePurchaseInput({
+		userId,
+		eventId,
+		expectedRevisionNo,
 		amount,
-		"amount",
-	).normalized;
-	const parsedCat = validatePurchaseCategory(purchaseCategory);
-	const validCategory = normalizePurchaseBudgetCategory(parsedCat);
-	const validOccurredAt = validateCcOccurredAt(occurredAt);
-	const validKey = validateCcRequiredText(
+		purchaseCategory,
+		shortTermGoalId,
+		merchant,
+		description,
+		installmentCount,
+		reasonNote,
+		occurredAt,
 		idempotencyKey,
-		"idempotencyKey",
-		128,
-	);
-	const validMerchant = validateCcOptionalText(merchant, "merchant", 200);
-	const validDesc = validateCcOptionalText(description, "description", 500);
-	const validReason = validateCcOptionalText(reasonNote, "reasonNote", 500);
-	const validInstallmentCount = validateInstallmentCount(installmentCount);
-	const validGoalId = shortTermGoalId
-		? validateCcCanonicalUuid(shortTermGoalId, "shortTermGoalId")
-		: null;
-
-	if (validCategory === "SHORT_TERM_PURCHASE" && !validGoalId) {
-		throw new CreditCardError(
-			"CREDIT_CARD_INVALID_INPUT",
-			"shortTermGoalId is required when purchaseCategory is SHORT_TERM_PURCHASE",
-		);
-	}
-	if (validCategory !== "SHORT_TERM_PURCHASE" && validGoalId) {
-		throw new CreditCardError(
-			"CREDIT_CARD_INVALID_INPUT",
-			"shortTermGoalId is only allowed for SHORT_TERM_PURCHASE category",
-		);
-	}
+	});
 
 	// 1. EARLY IDEMPOTENCY REPLAY CHECK
 	const [earlyRev] = await tx
@@ -1743,6 +1921,32 @@ export async function recordSharedCreditCardPurchase(
 	split: CreditCardPurchaseSplitReadModel;
 	idempotentReplay: boolean;
 }> {
+	// All DB-independent validation -- BOTH the purchase-side fields and the
+	// split-side fields -- runs here, BEFORE runCreditCardTransaction is ever
+	// called. An invalid split payload must never let the purchase-side path
+	// begin any DB work; relying on the outer transaction's rollback as input
+	// validation is exactly the defect this closes.
+	const validUserId = validateCcCanonicalUuid(params.userId, "userId");
+	normalizeRecordPurchaseInput({
+		userId: params.userId,
+		cardId: params.cardId,
+		amount: params.amount,
+		purchaseCategory: params.purchaseCategory,
+		shortTermGoalId: params.shortTermGoalId,
+		merchant: params.merchant,
+		description: params.description,
+		installmentCount: params.installmentCount,
+		occurredAt: params.occurredAt,
+		idempotencyKey: params.purchaseIdempotencyKey,
+	});
+	const normalizedSplit = normalizeCreditCardSplitMutationInput({
+		method: params.splitMethod,
+		userWeight: params.userWeight,
+		participants: params.participants,
+		idempotencyKey: params.splitIdempotencyKey,
+		occurredAt: params.occurredAt,
+	});
+
 	return runCreditCardTransaction(params.db, async (tx) => {
 		const purchaseRes = await recordCreditCardPurchaseInTransaction({
 			tx,
@@ -1759,13 +1963,13 @@ export async function recordSharedCreditCardPurchase(
 		});
 
 		const splitRes = await createSplitInTransaction(tx, {
-			userId: params.userId,
+			userId: validUserId,
 			purchaseEventId: purchaseRes.eventId,
-			method: params.splitMethod,
-			userWeight: params.userWeight,
-			participants: params.participants,
-			idempotencyKey: params.splitIdempotencyKey,
-			occurredAt: params.occurredAt,
+			method: normalizedSplit.method,
+			userWeight: normalizedSplit.userWeight,
+			participants: normalizedSplit.participants,
+			idempotencyKey: normalizedSplit.idempotencyKey,
+			occurredAt: normalizedSplit.occurredAt,
 		});
 
 		return {
@@ -1787,6 +1991,35 @@ export async function updateCreditCardPurchaseWithSplit(
 	split: CreditCardPurchaseSplitReadModel;
 	idempotentReplay: boolean;
 }> {
+	// All DB-independent validation -- BOTH the purchase-side fields and the
+	// split-side fields -- runs here, BEFORE runCreditCardTransaction is ever
+	// called. See the identical note on recordSharedCreditCardPurchase.
+	const validUserId = validateCcCanonicalUuid(params.userId, "userId");
+	const validSplitExpectedRevisionNo = validateCcExpectedRevisionNo(
+		params.splitExpectedRevisionNo,
+	);
+	normalizeUpdatePurchaseInput({
+		userId: params.userId,
+		eventId: params.purchaseEventId,
+		expectedRevisionNo: params.purchaseExpectedRevisionNo,
+		amount: params.amount,
+		purchaseCategory: params.purchaseCategory,
+		shortTermGoalId: params.shortTermGoalId,
+		merchant: params.merchant,
+		description: params.description,
+		installmentCount: params.installmentCount,
+		reasonNote: params.reasonNote,
+		occurredAt: params.occurredAt,
+		idempotencyKey: params.purchaseIdempotencyKey,
+	});
+	const normalizedSplit = normalizeCreditCardSplitMutationInput({
+		method: params.splitMethod,
+		userWeight: params.userWeight,
+		participants: params.participants,
+		idempotencyKey: params.splitIdempotencyKey,
+		occurredAt: params.occurredAt,
+	});
+
 	return runCreditCardTransaction(params.db, async (tx) => {
 		const purchaseRes = await updateCreditCardPurchaseInTransaction({
 			tx,
@@ -1830,14 +2063,14 @@ export async function updateCreditCardPurchaseWithSplit(
 		}
 
 		const splitRes = await updateSplitInTransaction(tx, {
-			userId: params.userId,
+			userId: validUserId,
 			splitId: split.id,
-			expectedRevisionNo: params.splitExpectedRevisionNo,
-			method: params.splitMethod,
-			userWeight: params.userWeight,
-			participants: params.participants,
-			idempotencyKey: params.splitIdempotencyKey,
-			occurredAt: params.occurredAt,
+			expectedRevisionNo: validSplitExpectedRevisionNo,
+			method: normalizedSplit.method,
+			userWeight: normalizedSplit.userWeight,
+			participants: normalizedSplit.participants,
+			idempotencyKey: normalizedSplit.idempotencyKey,
+			occurredAt: normalizedSplit.occurredAt,
 			overridePurchaseRevision: newPurchaseRev,
 		});
 

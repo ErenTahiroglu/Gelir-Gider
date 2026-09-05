@@ -187,7 +187,19 @@ describe("validateParticipantsInput", () => {
 });
 
 describe("validateMethodSpecificParticipantFields", () => {
-	const base = { personId: UUID_A, dueDate: null, description: null };
+	const base: {
+		personId: string;
+		dueDate: null;
+		description: null;
+		shareAmount?: unknown;
+		weight?: unknown;
+	} = {
+		personId: UUID_A,
+		dueDate: null,
+		description: null,
+		shareAmount: undefined,
+		weight: undefined,
+	};
 
 	it("EQUAL: rejects a supplied shareAmount", () => {
 		expect(() =>

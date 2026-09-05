@@ -41,6 +41,7 @@ import {
 	validateCcCanonicalUuid,
 	validateCcExpectedRevisionNo,
 	validateCcOccurredAt,
+	validateCcPositiveMoneyString,
 	validateGregorianDateString,
 } from "./calendar";
 import { CreditCardError } from "./errors";
@@ -171,9 +172,21 @@ function validateSplitId(value: string): string {
 	return validateCcCanonicalUuid(value, "splitId");
 }
 
-function validateIdempotencyKey(value: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed || trimmed.length > 128) {
+/**
+ * Hardened against arbitrary runtime input: accepts `unknown` rather than
+ * trusting the TypeScript-declared `string` type, since a real caller at the
+ * JS boundary (deserialized JSON, etc.) can hand this any value. Never calls
+ * `.trim()` on an unverified value.
+ */
+function validateIdempotencyKey(value: unknown): string {
+	if (typeof value !== "string") {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"idempotencyKey must be a string",
+		);
+	}
+	const trimmed = value.trim();
+	if (trimmed.length < 1 || trimmed.length > 128) {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",
 			"idempotencyKey must be between 1 and 128 characters",
@@ -182,8 +195,19 @@ function validateIdempotencyKey(value: string): string {
 	return trimmed;
 }
 
-function validateSplitMethod(value: string): SplitMethod {
-	const upper = value?.trim().toUpperCase();
+/**
+ * Hardened against arbitrary runtime input: accepts `unknown` rather than
+ * trusting the TypeScript-declared `string` type. Never calls `.trim()` on
+ * an unverified value.
+ */
+function validateSplitMethod(value: unknown): SplitMethod {
+	if (typeof value !== "string") {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"method must be a string",
+		);
+	}
+	const upper = value.trim().toUpperCase();
 	if (upper !== "EQUAL" && upper !== "MANUAL" && upper !== "RATIO") {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",
@@ -249,27 +273,31 @@ export interface NormalizedParticipantInput {
  * caller-level userWeight). MANUAL: requires shareAmount, rejects weight and
  * userWeight. RATIO: requires a safe non-negative integer userWeight and a
  * safe positive integer weight per participant, rejects shareAmount.
+ *
+ * "Must not be supplied" means exactly `undefined` -- a JSON `null` IS a
+ * supplied value and must be rejected too, so every such check below tests
+ * `!== undefined` only, never `!== undefined && !== null`.
  */
 export function validateMethodSpecificParticipantFields(
 	method: SplitMethod,
-	userWeight: number | undefined,
-	participants: NormalizedParticipantInput[],
+	userWeight: unknown,
+	participants: readonly { shareAmount?: unknown; weight?: unknown }[],
 ): void {
 	if (method === "EQUAL") {
-		if (userWeight !== undefined && userWeight !== null) {
+		if (userWeight !== undefined) {
 			throw new CreditCardError(
 				"CREDIT_CARD_INVALID_INPUT",
 				"userWeight must not be supplied for EQUAL split",
 			);
 		}
 		participants.forEach((p, index) => {
-			if (p.shareAmount !== undefined && p.shareAmount !== null) {
+			if (p.shareAmount !== undefined) {
 				throw new CreditCardError(
 					"CREDIT_CARD_INVALID_INPUT",
 					`participants[${index}].shareAmount must not be supplied for EQUAL split`,
 				);
 			}
-			if (p.weight !== undefined && p.weight !== null) {
+			if (p.weight !== undefined) {
 				throw new CreditCardError(
 					"CREDIT_CARD_INVALID_INPUT",
 					`participants[${index}].weight must not be supplied for EQUAL split`,
@@ -277,7 +305,7 @@ export function validateMethodSpecificParticipantFields(
 			}
 		});
 	} else if (method === "MANUAL") {
-		if (userWeight !== undefined && userWeight !== null) {
+		if (userWeight !== undefined) {
 			throw new CreditCardError(
 				"CREDIT_CARD_INVALID_INPUT",
 				"userWeight must not be supplied for MANUAL split",
@@ -290,7 +318,7 @@ export function validateMethodSpecificParticipantFields(
 					`participants[${index}].shareAmount is required for MANUAL split`,
 				);
 			}
-			if (p.weight !== undefined && p.weight !== null) {
+			if (p.weight !== undefined) {
 				throw new CreditCardError(
 					"CREDIT_CARD_INVALID_INPUT",
 					`participants[${index}].weight must not be supplied for MANUAL split`,
@@ -301,6 +329,7 @@ export function validateMethodSpecificParticipantFields(
 		if (
 			userWeight === undefined ||
 			userWeight === null ||
+			typeof userWeight !== "number" ||
 			!Number.isSafeInteger(userWeight) ||
 			userWeight < 0
 		) {
@@ -310,7 +339,7 @@ export function validateMethodSpecificParticipantFields(
 			);
 		}
 		participants.forEach((p, index) => {
-			if (p.shareAmount !== undefined && p.shareAmount !== null) {
+			if (p.shareAmount !== undefined) {
 				throw new CreditCardError(
 					"CREDIT_CARD_INVALID_INPUT",
 					`participants[${index}].shareAmount must not be supplied for RATIO split`,
@@ -319,6 +348,7 @@ export function validateMethodSpecificParticipantFields(
 			if (
 				p.weight === undefined ||
 				p.weight === null ||
+				typeof p.weight !== "number" ||
 				!Number.isSafeInteger(p.weight) ||
 				p.weight <= 0
 			) {
@@ -328,6 +358,27 @@ export function validateMethodSpecificParticipantFields(
 				);
 			}
 		});
+	}
+}
+
+/**
+ * Rejects duplicate participants by canonical (lowercase) personId, purely
+ * and before any DB/allocation work -- the same UUID supplied once uppercase
+ * and once lowercase must be caught here, not left for a DB UNIQUE
+ * constraint or the allocation calculator to discover later.
+ */
+export function validateNoDuplicatePersonIds(
+	participants: readonly { personId: string }[],
+): void {
+	const seen = new Set<string>();
+	for (const p of participants) {
+		if (seen.has(p.personId)) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_INPUT",
+				`Duplicate participant personId: ${p.personId}`,
+			);
+		}
+		seen.add(p.personId);
 	}
 }
 
@@ -374,6 +425,76 @@ export function validateParticipantsInput(
 			description: validateParticipantDescription(p.description),
 		};
 	});
+}
+
+export interface NormalizedCreditCardSplitMutationInput {
+	method: SplitMethod;
+	userWeight: number | undefined;
+	participants: NormalizedParticipantInput[];
+	idempotencyKey: string;
+	occurredAt: Date | undefined;
+}
+
+/**
+ * The single pure, DB-independent entry point for validating a split
+ * CREATE/UPDATE mutation's runtime input. Performs ALL validation that does
+ * not require database state -- method/idempotencyKey runtime-type
+ * hardening, strict optional occurredAt, participants array/shape/personId
+ * canonicalization, duplicate-personId rejection, method-specific field
+ * compatibility (with correct null semantics -- `null` IS a supplied value),
+ * and MANUAL shareAmount exact money parsing -- and returns normalized
+ * values. Must be called BEFORE `runCreditCardTransaction(...)` /
+ * `db.transaction(...)` / any query. Accepts no Database or transaction and
+ * performs no I/O of any kind, so it can never itself open a DB connection.
+ *
+ * The values it returns are the SAME normalized values threaded through to
+ * allocation, fingerprinting, and DB writes -- input is never normalized one
+ * way before the transaction and a different way inside it.
+ */
+export function normalizeCreditCardSplitMutationInput(params: {
+	method: unknown;
+	userWeight: unknown;
+	participants: unknown;
+	idempotencyKey: unknown;
+	occurredAt: unknown;
+}): NormalizedCreditCardSplitMutationInput {
+	const method = validateSplitMethod(params.method);
+	const idempotencyKey = validateIdempotencyKey(params.idempotencyKey);
+	const occurredAt =
+		params.occurredAt === undefined
+			? undefined
+			: validateCcOccurredAt(params.occurredAt);
+
+	const normalizedParticipants = validateParticipantsInput(params.participants);
+	validateNoDuplicatePersonIds(normalizedParticipants);
+	validateMethodSpecificParticipantFields(
+		method,
+		params.userWeight,
+		normalizedParticipants,
+	);
+
+	// MANUAL shareAmount must be parsed/validated as strict positive exact-cent
+	// money HERE, before any DB work -- never floating point, never deferred
+	// to the allocation calculator inside the transaction.
+	if (method === "MANUAL") {
+		for (const [index, p] of normalizedParticipants.entries()) {
+			p.shareAmount = validateCcPositiveMoneyString(
+				p.shareAmount,
+				`participants[${index}].shareAmount`,
+			).normalized;
+		}
+	}
+
+	const userWeight =
+		params.userWeight === undefined ? undefined : (params.userWeight as number);
+
+	return {
+		method,
+		userWeight,
+		participants: normalizedParticipants,
+		idempotencyKey,
+		occurredAt,
+	};
 }
 
 // ============================================================================
@@ -945,6 +1066,15 @@ async function tryReplayCreateSplit(
 // Core Transaction Handlers (Composing Split + People Obligations)
 // ============================================================================
 
+/**
+ * Composes and commits a split CREATE. Callers MUST have already run
+ * `normalizeCreditCardSplitMutationInput` (or an equivalent pure check) on
+ * `method`/`userWeight`/`participants`/`idempotencyKey`/`occurredAt` BEFORE
+ * starting the transaction this runs in -- this function trusts its
+ * `participants` are already-normalized (canonical personId, validated
+ * dueDate/description, method-compatible shareAmount/weight, no duplicates)
+ * and performs no redundant re-validation of those DB-independent rules.
+ */
 export async function createSplitInTransaction(
 	tx: DatabaseTransaction,
 	params: {
@@ -952,7 +1082,7 @@ export async function createSplitInTransaction(
 		purchaseEventId: string;
 		method: SplitMethod;
 		userWeight?: number | undefined;
-		participants: ParticipantAllocationInput[];
+		participants: NormalizedParticipantInput[];
 		idempotencyKey: string;
 		occurredAt?: Date | undefined;
 	},
@@ -962,12 +1092,7 @@ export async function createSplitInTransaction(
 }> {
 	const { userId, purchaseEventId, method, userWeight, idempotencyKey } =
 		params;
-	const normalizedParticipants = validateParticipantsInput(params.participants);
-	validateMethodSpecificParticipantFields(
-		method,
-		userWeight,
-		normalizedParticipants,
-	);
+	const normalizedParticipants = params.participants;
 
 	// Pre-read the immutable purchase event identity (unlocked): this resolves
 	// existence/eventType, which never change, so it is safe to check before
@@ -1349,6 +1474,12 @@ async function tryReplayUpdateSplit(
 	);
 }
 
+/**
+ * Composes and commits a split UPDATE. Callers MUST have already run
+ * `normalizeCreditCardSplitMutationInput` (or an equivalent pure check)
+ * BEFORE starting the transaction this runs in -- see the identical note on
+ * `createSplitInTransaction`.
+ */
 export async function updateSplitInTransaction(
 	tx: DatabaseTransaction,
 	params: {
@@ -1357,7 +1488,7 @@ export async function updateSplitInTransaction(
 		expectedRevisionNo: number;
 		method: SplitMethod;
 		userWeight?: number | undefined;
-		participants: ParticipantAllocationInput[];
+		participants: NormalizedParticipantInput[];
 		idempotencyKey: string;
 		occurredAt?: Date | undefined;
 		overridePurchaseRevision?:
@@ -1377,12 +1508,7 @@ export async function updateSplitInTransaction(
 		idempotencyKey,
 		overridePurchaseRevision,
 	} = params;
-	const normalizedParticipants = validateParticipantsInput(params.participants);
-	validateMethodSpecificParticipantFields(
-		method,
-		userWeight,
-		normalizedParticipants,
-	);
+	const normalizedParticipants = params.participants;
 
 	// Pre-read the immutable split -> purchaseEventId, WITHOUT a lock, purely
 	// to resolve identity (needed even for a replay lookup).
@@ -2104,24 +2230,29 @@ export async function createCreditCardPurchaseSplit(
 	split: CreditCardPurchaseSplitReadModel;
 	idempotentReplay: boolean;
 }> {
+	// All DB-independent validation runs here, BEFORE runCreditCardTransaction
+	// is ever called -- malformed input (bad method, bad idempotency key,
+	// malformed participants, incompatible method-specific fields, duplicate
+	// personIds, invalid MANUAL money) must never open a database transaction.
 	const validUserId = validateUserId(params.userId);
 	const validPurchaseEventId = validatePurchaseEventId(params.purchaseEventId);
-	const validMethod = validateSplitMethod(params.method);
-	const validIdempotencyKey = validateIdempotencyKey(params.idempotencyKey);
-	const validOccurredAt =
-		params.occurredAt === undefined
-			? undefined
-			: validateCcOccurredAt(params.occurredAt);
+	const normalized = normalizeCreditCardSplitMutationInput({
+		method: params.method,
+		userWeight: params.userWeight,
+		participants: params.participants,
+		idempotencyKey: params.idempotencyKey,
+		occurredAt: params.occurredAt,
+	});
 
 	return runCreditCardTransaction(params.db, async (tx) => {
 		return createSplitInTransaction(tx, {
 			userId: validUserId,
 			purchaseEventId: validPurchaseEventId,
-			method: validMethod,
-			userWeight: params.userWeight,
-			participants: params.participants,
-			idempotencyKey: validIdempotencyKey,
-			occurredAt: validOccurredAt,
+			method: normalized.method,
+			userWeight: normalized.userWeight,
+			participants: normalized.participants,
+			idempotencyKey: normalized.idempotencyKey,
+			occurredAt: normalized.occurredAt,
 		});
 	});
 }
@@ -2132,28 +2263,31 @@ export async function updateCreditCardPurchaseSplit(
 	split: CreditCardPurchaseSplitReadModel;
 	idempotentReplay: boolean;
 }> {
+	// All DB-independent validation runs here, BEFORE runCreditCardTransaction
+	// is ever called -- see the identical note on createCreditCardPurchaseSplit.
 	const validUserId = validateUserId(params.userId);
 	const validSplitId = validateSplitId(params.splitId);
 	const validExpectedRevisionNo = validateCcExpectedRevisionNo(
 		params.expectedRevisionNo,
 	);
-	const validMethod = validateSplitMethod(params.method);
-	const validIdempotencyKey = validateIdempotencyKey(params.idempotencyKey);
-	const validOccurredAt =
-		params.occurredAt === undefined
-			? undefined
-			: validateCcOccurredAt(params.occurredAt);
+	const normalized = normalizeCreditCardSplitMutationInput({
+		method: params.method,
+		userWeight: params.userWeight,
+		participants: params.participants,
+		idempotencyKey: params.idempotencyKey,
+		occurredAt: params.occurredAt,
+	});
 
 	return runCreditCardTransaction(params.db, async (tx) => {
 		return updateSplitInTransaction(tx, {
 			userId: validUserId,
 			splitId: validSplitId,
 			expectedRevisionNo: validExpectedRevisionNo,
-			method: validMethod,
-			userWeight: params.userWeight,
-			participants: params.participants,
-			idempotencyKey: validIdempotencyKey,
-			occurredAt: validOccurredAt,
+			method: normalized.method,
+			userWeight: normalized.userWeight,
+			participants: normalized.participants,
+			idempotencyKey: normalized.idempotencyKey,
+			occurredAt: normalized.occurredAt,
 		});
 	});
 }
