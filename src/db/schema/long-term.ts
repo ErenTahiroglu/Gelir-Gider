@@ -121,6 +121,9 @@ export const longTermSendTaskRevisions = pgTable(
 		uniqueIndex("long_term_task_revisions_transfer_idx").on(
 			table.midasAllocationTransferId,
 		),
+		uniqueIndex("long_term_task_revisions_canonical_rev_idx")
+			.on(table.canonicalRevisionId)
+			.where(sql`${table.canonicalRevisionId} IS NOT NULL`),
 		index("long_term_task_revisions_task_idx").on(table.taskId),
 		index("long_term_task_revisions_user_idx").on(table.userId),
 		check(

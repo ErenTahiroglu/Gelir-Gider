@@ -110,9 +110,18 @@ export interface ListLongTermInvestmentTasksParams {
 // Read Model Construction
 // ============================================================================
 
-async function buildLongTermTaskReadModelInTransaction(
+/**
+ * Builds the task read model AS OF a specific revision -- not the latest
+ * state. This is the authoritative snapshot builder: both the live
+ * (latest-revision) read path and historical idempotency replay funnel
+ * through this same function, so a replay of an old key can never
+ * accidentally surface current/latest state instead of the historical
+ * operation's own snapshot.
+ */
+async function buildLongTermTaskReadModelForRevisionInTransaction(
 	tx: DatabaseTransaction,
 	taskId: string,
+	revision: typeof longTermSendTaskRevisions.$inferSelect,
 ): Promise<LongTermTaskReadModel | null> {
 	const [task] = await tx
 		.select()
@@ -120,14 +129,6 @@ async function buildLongTermTaskReadModelInTransaction(
 		.where(eq(longTermSendTasks.id, taskId))
 		.limit(1);
 	if (!task) return null;
-
-	const [latestRev] = await tx
-		.select()
-		.from(longTermSendTaskRevisions)
-		.where(eq(longTermSendTaskRevisions.taskId, taskId))
-		.orderBy(desc(longTermSendTaskRevisions.revisionNo))
-		.limit(1);
-	if (!latestRev) return null;
 
 	const [createRev] = await tx
 		.select({ occurredAt: longTermSendTaskRevisions.occurredAt })
@@ -140,18 +141,18 @@ async function buildLongTermTaskReadModelInTransaction(
 		)
 		.limit(1);
 
-	const status = latestRev.status as LongTermTaskStatus;
+	const status = revision.status as LongTermTaskStatus;
 	let currentSendCanonicalTransactionId: string | null = null;
 	let currentSendCanonicalRevisionId: string | null = null;
 	let sentAt: Date | null = null;
 
-	if (status === "SENT" && latestRev.canonicalRevisionId) {
-		sentAt = latestRev.occurredAt;
-		currentSendCanonicalRevisionId = latestRev.canonicalRevisionId;
+	if (status === "SENT" && revision.canonicalRevisionId) {
+		sentAt = revision.occurredAt;
+		currentSendCanonicalRevisionId = revision.canonicalRevisionId;
 		const [canRev] = await tx
 			.select({ transactionId: transactionRevisions.transactionId })
 			.from(transactionRevisions)
-			.where(eq(transactionRevisions.id, latestRev.canonicalRevisionId))
+			.where(eq(transactionRevisions.id, revision.canonicalRevisionId))
 			.limit(1);
 		currentSendCanonicalTransactionId = canRev?.transactionId ?? null;
 	}
@@ -159,19 +160,38 @@ async function buildLongTermTaskReadModelInTransaction(
 	return {
 		taskId: task.id,
 		status,
-		revisionNo: latestRev.revisionNo,
-		amount: latestRev.amount,
-		destinationLabel: latestRev.destinationLabel,
-		note: latestRev.note,
+		revisionNo: revision.revisionNo,
+		amount: revision.amount,
+		destinationLabel: revision.destinationLabel,
+		note: revision.note,
 		midasAccountId: task.midasAccountId,
 		pendingBucketId: task.pendingBucketId,
 		allocatedAt: createRev?.occurredAt ?? task.createdAt,
 		sentAt,
-		latestMidasAllocationTransferId: latestRev.midasAllocationTransferId,
+		latestMidasAllocationTransferId: revision.midasAllocationTransferId,
 		currentSendCanonicalTransactionId,
 		currentSendCanonicalRevisionId,
 		createdAt: task.createdAt,
 	};
+}
+
+async function buildLongTermTaskReadModelInTransaction(
+	tx: DatabaseTransaction,
+	taskId: string,
+): Promise<LongTermTaskReadModel | null> {
+	const [latestRev] = await tx
+		.select()
+		.from(longTermSendTaskRevisions)
+		.where(eq(longTermSendTaskRevisions.taskId, taskId))
+		.orderBy(desc(longTermSendTaskRevisions.revisionNo))
+		.limit(1);
+	if (!latestRev) return null;
+
+	return buildLongTermTaskReadModelForRevisionInTransaction(
+		tx,
+		taskId,
+		latestRev,
+	);
 }
 
 // ============================================================================
@@ -231,7 +251,15 @@ async function tryReplayLifecycleInTransaction(
 			`Idempotency key reused with a different long-term ${args.operation} payload`,
 		);
 	}
-	const task = await buildLongTermTaskReadModelInTransaction(tx, args.taskId);
+	// Return the HISTORICAL snapshot owned by this key -- not whatever the
+	// task's current/latest state happens to be. A SENT #1 key retried
+	// after a REOPEN must still report SENT/rev2, never the task's current
+	// PENDING state.
+	const task = await buildLongTermTaskReadModelForRevisionInTransaction(
+		tx,
+		args.taskId,
+		existingRev,
+	);
 	if (!task) {
 		throw new LongTermError(
 			"LONG_TERM_INVALID_STATE",
@@ -294,9 +322,12 @@ export async function allocateLongTermInvestmentInTransaction(
 				"Idempotency key reused with a different long-term CREATE payload",
 			);
 		}
-		const task = await buildLongTermTaskReadModelInTransaction(
+		// Historical CREATE snapshot (revision #1/PENDING) -- even if the
+		// task has since been SENT/REOPENED/CANCELLED.
+		const task = await buildLongTermTaskReadModelForRevisionInTransaction(
 			tx,
 			existingRev.taskId,
+			existingRev,
 		);
 		if (!task) {
 			throw new LongTermError(
