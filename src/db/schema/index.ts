@@ -6,6 +6,7 @@ export * from "./credit-cards";
 export * from "./income";
 export * from "./income-entitlements";
 export * from "./ledger";
+export * from "./long-term";
 export * from "./midas";
 export * from "./people";
 export * from "./rewards";

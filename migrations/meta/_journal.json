@@ -288,6 +288,13 @@
       "when": 1788631341441,
       "tag": "0040_giant_power_pack",
       "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1788635334239,
+      "tag": "0041_add_long_term_investment_domain",
+      "breakpoints": true
     }
   ]
 }

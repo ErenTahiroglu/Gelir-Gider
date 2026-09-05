@@ -12,6 +12,7 @@ export type MidasErrorCode =
 	| "MIDAS_TRANSFER_ALREADY_REVERSED"
 	| "MIDAS_BUCKET_INACTIVE"
 	| "MIDAS_BUCKET_CAP_EXCEEDED"
+	| "MIDAS_LONG_TERM_BUCKET_RESTRICTED"
 	| "MIDAS_INVALID_STATE";
 
 export class MidasError extends Error {

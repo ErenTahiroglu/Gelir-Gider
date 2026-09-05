@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import { users } from "../db/schema/auth";
 import {
@@ -1111,6 +1111,38 @@ export async function createMidasAllocationTransferInTransaction({
 }
 
 /**
+ * Rejects an attempt to use a PENDING_LONG_TERM bucket as a transfer
+ * endpoint through the generic public Midas allocation API. PENDING_LONG_TERM
+ * is exclusively managed by the Long-Term Investment Send Task domain, whose
+ * internal service reuses the transaction-scoped
+ * `createMidasAllocationTransferInTransaction` primitive directly (bypassing
+ * this public-only guard) so its task-companion invariants remain the sole
+ * authority over that bucket. Every other bucket type (CREDIT_CARD_RESERVE,
+ * SHORT_TERM_GOAL, MEDIUM_TERM_RESERVE, INCOME_BUFFER) is unaffected.
+ */
+async function assertNoLongTermBucketEndpointInTransaction(
+	tx: DatabaseTransaction,
+	bucketIds: (string | null)[],
+): Promise<void> {
+	const ids = bucketIds.filter((id): id is string => id !== null);
+	if (ids.length === 0) return;
+
+	const rows = await tx
+		.select({ id: midasBuckets.id, bucketType: midasBuckets.bucketType })
+		.from(midasBuckets)
+		.where(inArray(midasBuckets.id, ids));
+
+	for (const row of rows) {
+		if (row.bucketType === "PENDING_LONG_TERM") {
+			throw new MidasError(
+				"MIDAS_LONG_TERM_BUCKET_RESTRICTED",
+				"PENDING_LONG_TERM cannot be used as a transfer endpoint through the generic Midas allocation API; use the Long-Term Investment Send Task workflow instead",
+			);
+		}
+	}
+}
+
+/**
  * Creates an allocation transfer within a new database transaction.
  */
 export async function createMidasAllocationTransfer(
@@ -1118,6 +1150,10 @@ export async function createMidasAllocationTransfer(
 ): Promise<MidasAllocationTransferResult> {
 	validateTransferInput(params);
 	return await params.db.transaction(async (tx) => {
+		await assertNoLongTermBucketEndpointInTransaction(tx, [
+			params.fromBucketId ?? null,
+			params.toBucketId ?? null,
+		]);
 		return await createMidasAllocationTransferInTransaction({
 			tx,
 			userId: params.userId,
@@ -1183,6 +1219,11 @@ export async function reverseMidasAllocationTransfer({
 				"Cannot reverse a reversal transfer",
 			);
 		}
+
+		await assertNoLongTermBucketEndpointInTransaction(tx, [
+			target.fromBucketId,
+			target.toBucketId,
+		]);
 
 		return await createMidasAllocationTransferInTransaction({
 			tx,
