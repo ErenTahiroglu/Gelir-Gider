@@ -1,5 +1,5 @@
 import { and, desc, eq, isNull } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { Database, DatabaseTransaction } from "../db/client";
 import { users } from "../db/schema/auth";
 import { incomeSources } from "../db/schema/income";
 import { ledgerAccounts } from "../db/schema/ledger";
@@ -46,6 +46,21 @@ export interface CreateIncomeSourceParams {
 	activeUntil?: string | null | undefined;
 }
 
+export interface CreateIncomeSourceInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	code: string;
+	name: string;
+	nature: IncomeNature;
+	referenceMethod: IncomeReferenceMethod;
+	expectedMonthlyAmount?: string | null | undefined;
+	seasonalMonthsPerYear?: number | null | undefined;
+	rollingMedianMonths?: number | null | undefined;
+	incomeLedgerAccountId: string;
+	activeFrom: string;
+	activeUntil?: string | null | undefined;
+}
+
 export interface ArchiveIncomeSourceParams {
 	db: Database;
 	userId: string;
@@ -67,12 +82,15 @@ export interface ListIncomeSourcesParams {
 const SOURCE_CODE_REGEX = /^[A-Z][A-Z0-9_]{1,63}$/;
 
 /**
- * Creates an immutable income source definition.
+ * Internal transaction-scoped helper for creating an immutable income source definition.
+ * DOES NOT call db.transaction(). Callers that need the source provisioned atomically
+ * alongside other domain effects (e.g. Phase 11 People overpayment income) should use this
+ * within their own outer transaction.
  */
-export async function createIncomeSource(
-	params: CreateIncomeSourceParams,
+export async function createIncomeSourceInTransaction(
+	params: CreateIncomeSourceInTransactionParams,
 ): Promise<IncomeSourceItem> {
-	const { db, userId, nature, referenceMethod, incomeLedgerAccountId } = params;
+	const { tx, userId, nature, referenceMethod, incomeLedgerAccountId } = params;
 
 	if (!userId || userId.trim() === "") {
 		throw new IncomeError("INCOME_INVALID_INPUT", "User ID is required");
@@ -269,7 +287,7 @@ export async function createIncomeSource(
 	}
 
 	// Check user existence
-	const [user] = await db
+	const [user] = await tx
 		.select({ currency: users.currency })
 		.from(users)
 		.where(eq(users.id, userId))
@@ -288,7 +306,7 @@ export async function createIncomeSource(
 		);
 	}
 
-	const [account] = await db
+	const [account] = await tx
 		.select({
 			id: ledgerAccounts.id,
 			userId: ledgerAccounts.userId,
@@ -335,7 +353,7 @@ export async function createIncomeSource(
 	}
 
 	// Insert income source with unique conflict protection
-	const [insertedSource] = await db
+	const [insertedSource] = await tx
 		.insert(incomeSources)
 		.values({
 			userId,
@@ -378,6 +396,19 @@ export async function createIncomeSource(
 		createdAt: insertedSource.createdAt,
 		archivedAt: insertedSource.archivedAt,
 	};
+}
+
+/**
+ * Creates an immutable income source definition.
+ */
+export async function createIncomeSource(
+	params: CreateIncomeSourceParams,
+): Promise<IncomeSourceItem> {
+	const { db, ...rest } = params;
+	return await createIncomeSourceInTransaction({
+		tx: db as unknown as DatabaseTransaction,
+		...rest,
+	});
 }
 
 /**

@@ -1,5 +1,5 @@
 import { and, desc, eq } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { Database, DatabaseTransaction } from "../db/client";
 import { users } from "../db/schema/auth";
 import {
 	incomeReceiptRevisions,
@@ -54,6 +54,18 @@ export interface CreateIncomeReceiptParams {
 	provenance: TransactionSourceInput;
 }
 
+export interface CreateIncomeReceiptInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	sourceId: string;
+	idempotencyKey: string;
+	receivedAt: Date;
+	amount: string;
+	destinationAccountId: string;
+	note?: string | null | undefined;
+	provenance: TransactionSourceInput;
+}
+
 export interface ReviseIncomeReceiptParams {
 	db: Database;
 	userId: string;
@@ -80,6 +92,17 @@ export interface VoidIncomeReceiptParams {
 	provenance: TransactionSourceInput;
 }
 
+export interface VoidIncomeReceiptInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	incomeReceiptId: string;
+	expectedRevisionNo: number;
+	idempotencyKey: string;
+	reasonCode: string;
+	reasonNote?: string | null | undefined;
+	provenance: TransactionSourceInput;
+}
+
 export interface GetIncomeReceiptParams {
 	db: Database;
 	userId: string;
@@ -96,16 +119,19 @@ export interface ListIncomeReceiptsParams {
 }
 
 /**
- * Creates an actual cash income receipt with canonical revision, double-entry ledger posting, and domain projection in ONE transaction.
+ * Internal transaction-scoped helper for creating an actual cash income receipt with canonical
+ * revision, double-entry ledger posting, and domain projection. DOES NOT call db.transaction().
+ * Callers that need the receipt created atomically alongside other domain effects (e.g. Phase 11
+ * People overpayment income) should use this within their own outer transaction.
  */
-export async function createIncomeReceipt(
-	params: CreateIncomeReceiptParams,
+export async function createIncomeReceiptInTransaction(
+	params: CreateIncomeReceiptInTransactionParams,
 ): Promise<{
 	incomeReceipt: IncomeReceiptItem;
 	idempotentReplay: boolean;
 }> {
 	const {
-		db,
+		tx,
 		userId,
 		sourceId,
 		idempotencyKey,
@@ -176,7 +202,7 @@ export async function createIncomeReceipt(
 		normalizedNote = trimmedNote.length > 0 ? trimmedNote : null;
 	}
 
-	return await db.transaction(async (tx) => {
+	{
 		// 1. Fetch user for currency
 		const [user] = await tx
 			.select({ currency: users.currency })
@@ -446,6 +472,21 @@ export async function createIncomeReceipt(
 			},
 			idempotentReplay: false,
 		};
+	}
+}
+
+/**
+ * Creates an actual cash income receipt with canonical revision, double-entry ledger posting, and domain projection in ONE transaction.
+ */
+export async function createIncomeReceipt(
+	params: CreateIncomeReceiptParams,
+): Promise<{
+	incomeReceipt: IncomeReceiptItem;
+	idempotentReplay: boolean;
+}> {
+	const { db, ...rest } = params;
+	return await db.transaction(async (tx) => {
+		return await createIncomeReceiptInTransaction({ tx, ...rest });
 	});
 }
 
@@ -795,16 +836,19 @@ export async function reviseIncomeReceipt(
 }
 
 /**
- * Voids an income receipt: reverses active ledger entry and marks voided in ONE transaction.
+ * Internal transaction-scoped helper for voiding an income receipt: reverses active ledger entry
+ * and marks voided. DOES NOT call db.transaction(). Callers that need the void to happen atomically
+ * alongside other domain effects (e.g. Phase 11 People overpayment settlement void) should use this
+ * within their own outer transaction.
  */
-export async function voidIncomeReceipt(
-	params: VoidIncomeReceiptParams,
+export async function voidIncomeReceiptInTransaction(
+	params: VoidIncomeReceiptInTransactionParams,
 ): Promise<{
 	incomeReceipt: IncomeReceiptItem;
 	idempotentReplay: boolean;
 }> {
 	const {
-		db,
+		tx,
 		userId,
 		incomeReceiptId,
 		expectedRevisionNo,
@@ -834,7 +878,7 @@ export async function voidIncomeReceipt(
 		);
 	}
 
-	return await db.transaction(async (tx) => {
+	{
 		// 1. Fetch and lock receipt
 		const receipt = await lockIncomeReceiptForSettlementStateInTransaction(
 			tx,
@@ -992,6 +1036,21 @@ export async function voidIncomeReceipt(
 			},
 			idempotentReplay: false,
 		};
+	}
+}
+
+/**
+ * Voids an income receipt: reverses active ledger entry and marks voided in ONE transaction.
+ */
+export async function voidIncomeReceipt(
+	params: VoidIncomeReceiptParams,
+): Promise<{
+	incomeReceipt: IncomeReceiptItem;
+	idempotentReplay: boolean;
+}> {
+	const { db, ...rest } = params;
+	return await db.transaction(async (tx) => {
+		return await voidIncomeReceiptInTransaction({ tx, ...rest });
 	});
 }
 

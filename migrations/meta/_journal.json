@@ -218,6 +218,13 @@
       "when": 1788596350000,
       "tag": "0030_enforce_credit_card_canonical_anchor_completeness",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1788597872536,
+      "tag": "0031_people_obligations_and_settlements",
+      "breakpoints": true
     }
   ]
 }
