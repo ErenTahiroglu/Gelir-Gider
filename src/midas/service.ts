@@ -1110,6 +1110,135 @@ export async function createMidasAllocationTransferInTransaction({
 	};
 }
 
+export interface EnsureMidasSingletonBucketInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	midasAccountId: string;
+	bucketType: MidasBucketType;
+	code: string;
+	name: string;
+}
+
+/**
+ * Ensures a per-Midas-account singleton bucket (e.g. MEDIUM_TERM_RESERVE,
+ * INCOME_BUFFER, PENDING_LONG_TERM) exists at a deterministic code, without
+ * ever relying on catching a raw unique-constraint violation inside the
+ * current transaction. Uses `ON CONFLICT ... DO NOTHING` against the partial
+ * singleton-type unique index (`midas_buckets_singleton_type_idx`) -- which
+ * never raises a Postgres error and therefore never aborts the surrounding
+ * transaction -- then re-reads and independently validates the existing row
+ * (same user, same Midas account, same bucket type, same deterministic
+ * code/name contract) before returning it. Mirrors
+ * `ensureDeterministicLedgerAccountInTransaction`'s safe-provisioning shape.
+ */
+export async function ensureMidasSingletonBucketInTransaction({
+	tx,
+	userId,
+	midasAccountId,
+	bucketType,
+	code,
+	name,
+}: EnsureMidasSingletonBucketInTransactionParams): Promise<MidasBucketRecord> {
+	const canonicalUserId = normalizeCanonicalUuid(userId, "userId");
+	const canonicalMidasAccountId = normalizeCanonicalUuid(
+		midasAccountId,
+		"midasAccountId",
+	);
+
+	if (!SINGLETON_BUCKET_TYPES_SET.has(bucketType)) {
+		throw new MidasError(
+			"MIDAS_INVALID_INPUT",
+			`Bucket type "${bucketType}" is not a singleton bucket type`,
+		);
+	}
+
+	const trimmedCode = code?.trim();
+	if (!trimmedCode || !BUCKET_CODE_PATTERN.test(trimmedCode)) {
+		throw new MidasError(
+			"MIDAS_INVALID_INPUT",
+			"Bucket code must match ^[A-Z][A-Z0-9_]{1,63}$",
+		);
+	}
+	const trimmedName = name?.trim();
+	if (!trimmedName || trimmedName.length < 1 || trimmedName.length > 120) {
+		throw new MidasError(
+			"MIDAS_INVALID_INPUT",
+			"Bucket name must be between 1 and 120 characters",
+		);
+	}
+
+	const [account] = await tx
+		.select({ id: midasAccounts.id, userId: midasAccounts.userId })
+		.from(midasAccounts)
+		.where(
+			and(
+				eq(midasAccounts.id, canonicalMidasAccountId),
+				eq(midasAccounts.userId, canonicalUserId),
+			),
+		)
+		.limit(1);
+	if (!account) {
+		throw new MidasError("MIDAS_ACCOUNT_NOT_FOUND", "Midas account not found");
+	}
+
+	const [inserted] = await tx
+		.insert(midasBuckets)
+		.values({
+			userId: canonicalUserId,
+			midasAccountId: canonicalMidasAccountId,
+			code: trimmedCode,
+			name: trimmedName,
+			bucketType,
+		})
+		.onConflictDoNothing({
+			target: [midasBuckets.midasAccountId, midasBuckets.bucketType],
+			where: sql`${midasBuckets.bucketType} IN ('MEDIUM_TERM_RESERVE', 'INCOME_BUFFER', 'PENDING_LONG_TERM')`,
+		})
+		.returning();
+
+	const row =
+		inserted ??
+		(
+			await tx
+				.select()
+				.from(midasBuckets)
+				.where(
+					and(
+						eq(midasBuckets.midasAccountId, canonicalMidasAccountId),
+						eq(midasBuckets.bucketType, bucketType),
+					),
+				)
+				.limit(1)
+		)[0];
+
+	if (!row) {
+		throw new MidasError(
+			"MIDAS_INVALID_STATE",
+			`Failed to provision singleton bucket type "${bucketType}"`,
+		);
+	}
+	if (
+		row.userId !== canonicalUserId ||
+		row.midasAccountId !== canonicalMidasAccountId ||
+		row.bucketType !== bucketType
+	) {
+		throw new MidasError(
+			"MIDAS_INVALID_STATE",
+			`Existing singleton bucket "${row.id}" does not match the expected user/account/type contract`,
+		);
+	}
+
+	return {
+		id: row.id,
+		userId: row.userId,
+		midasAccountId: row.midasAccountId,
+		code: row.code,
+		name: row.name,
+		bucketType: row.bucketType as MidasBucketType,
+		createdAt: row.createdAt,
+	};
+}
+
 /**
  * Rejects an attempt to use a PENDING_LONG_TERM bucket as a transfer
  * endpoint through the generic public Midas allocation API. PENDING_LONG_TERM
