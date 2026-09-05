@@ -181,6 +181,13 @@ export interface SettlementVoidFingerprintParams {
 	expectedRevisionNo: number;
 }
 
+export interface SettlementVoidFingerprintV2Params {
+	userId: string;
+	settlementId: string;
+	expectedRevisionNo: number;
+	reason: string;
+}
+
 export async function calculateSettlementCreateFingerprint(
 	params: SettlementCreateFingerprintParams,
 ): Promise<string> {
@@ -197,7 +204,12 @@ export async function calculateSettlementCreateFingerprint(
 	]);
 }
 
-export async function calculateSettlementVoidFingerprint(
+/**
+ * Legacy (v1) settlement VOID fingerprint. Does not include `reason`.
+ * Retained only to validate replay of settlements voided before v2 existed;
+ * new writes must use `calculateSettlementVoidFingerprint` (v2).
+ */
+export async function calculateSettlementVoidFingerprintV1(
 	params: SettlementVoidFingerprintParams,
 ): Promise<string> {
 	return sha256Hex([
@@ -207,4 +219,46 @@ export async function calculateSettlementVoidFingerprint(
 		"VOID",
 		params.expectedRevisionNo,
 	]);
+}
+
+/**
+ * Current (v2) settlement VOID fingerprint. Includes the caller-supplied
+ * `reason`, since the reason is part of caller intent and a replay with a
+ * changed reason must be treated as an idempotency conflict.
+ */
+export async function calculateSettlementVoidFingerprint(
+	params: SettlementVoidFingerprintV2Params,
+): Promise<string> {
+	return sha256Hex([
+		"person-settlement-revision-v2",
+		params.userId.trim().toLowerCase(),
+		params.settlementId.trim().toLowerCase(),
+		"VOID",
+		params.expectedRevisionNo,
+		params.reason,
+	]);
+}
+
+export type PeopleIncomeIdempotencyOperation =
+	| "OVERPAYMENT_CREATE"
+	| "OVERPAYMENT_VOID";
+
+/**
+ * Derives a bounded (<=128 char), deterministic Income-domain idempotency key
+ * from a People-domain idempotency key via SHA-256, so a near-128-char caller
+ * key can never overflow the Income domain's own key length limit when a
+ * suffix would otherwise be concatenated onto it.
+ */
+export async function derivePeopleIncomeIdempotencyKey(
+	peopleIdempotencyKey: string,
+	settlementId: string,
+	operation: PeopleIncomeIdempotencyOperation,
+): Promise<string> {
+	const hash = await sha256Hex([
+		"people-income-idempotency-v1",
+		peopleIdempotencyKey,
+		settlementId.trim().toLowerCase(),
+		operation,
+	]);
+	return `PPL_${operation}_${hash}`.slice(0, 128);
 }

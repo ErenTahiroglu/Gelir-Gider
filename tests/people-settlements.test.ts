@@ -15,10 +15,10 @@ describe("recordPersonReceivableSettlement input validation", () => {
 		await expect(
 			recordPersonReceivableSettlement({
 				db: untouchedDb,
-				userId: "user-1",
-				obligationId: "obligation-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				obligationId: "33333333-3333-3333-3333-333333333333",
 				cashAmount: "0.00",
-				destinationAssetAccountId: "acct-1",
+				destinationAssetAccountId: "44444444-4444-4444-4444-444444444444",
 				occurredAt: OCCURRED_AT,
 				idempotencyKey: "key-1",
 			}),
@@ -32,8 +32,8 @@ describe("recordPersonReceivableSettlement input validation", () => {
 		await expect(
 			recordPersonReceivableSettlement({
 				db: untouchedDb,
-				userId: "user-1",
-				obligationId: "obligation-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				obligationId: "33333333-3333-3333-3333-333333333333",
 				cashAmount: "2745.00",
 				destinationAssetAccountId: "",
 				occurredAt: OCCURRED_AT,
@@ -46,10 +46,10 @@ describe("recordPersonReceivableSettlement input validation", () => {
 		await expect(
 			recordPersonReceivableSettlement({
 				db: untouchedDb,
-				userId: "user-1",
-				obligationId: "obligation-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				obligationId: "33333333-3333-3333-3333-333333333333",
 				cashAmount: "2745.00",
-				destinationAssetAccountId: "acct-1",
+				destinationAssetAccountId: "44444444-4444-4444-4444-444444444444",
 				note: "a".repeat(501),
 				occurredAt: OCCURRED_AT,
 				idempotencyKey: "key-1",
@@ -63,10 +63,10 @@ describe("recordPersonPayableSettlement input validation", () => {
 		await expect(
 			recordPersonPayableSettlement({
 				db: untouchedDb,
-				userId: "user-1",
-				obligationId: "obligation-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				obligationId: "33333333-3333-3333-3333-333333333333",
 				amount: "-1.00",
-				sourceAssetAccountId: "acct-1",
+				sourceAssetAccountId: "44444444-4444-4444-4444-444444444444",
 				occurredAt: OCCURRED_AT,
 				idempotencyKey: "key-1",
 			}),
@@ -79,8 +79,8 @@ describe("voidPersonSettlement input validation", () => {
 		await expect(
 			voidPersonSettlement({
 				db: untouchedDb,
-				userId: "user-1",
-				settlementId: "settlement-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				settlementId: "55555555-5555-5555-5555-555555555555",
 				expectedRevisionNo: 1,
 				reason: "",
 				idempotencyKey: "key-1",
@@ -95,8 +95,8 @@ describe("voidPersonSettlement input validation", () => {
 		await expect(
 			voidPersonSettlement({
 				db: untouchedDb,
-				userId: "user-1",
-				settlementId: "settlement-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				settlementId: "55555555-5555-5555-5555-555555555555",
 				expectedRevisionNo: 1,
 				reason: "a".repeat(501),
 				idempotencyKey: "key-1",

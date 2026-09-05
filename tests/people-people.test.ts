@@ -31,7 +31,7 @@ describe("createPerson input validation", () => {
 		await expect(
 			createPerson({
 				db: untouchedDb,
-				userId: "user-1",
+				userId: "11111111-1111-1111-1111-111111111111",
 				displayName: "a".repeat(121),
 				relationship: "FRIEND",
 				occurredAt: OCCURRED_AT,
@@ -44,7 +44,7 @@ describe("createPerson input validation", () => {
 		await expect(
 			createPerson({
 				db: untouchedDb,
-				userId: "user-1",
+				userId: "11111111-1111-1111-1111-111111111111",
 				displayName: "   ",
 				relationship: "FRIEND",
 				occurredAt: OCCURRED_AT,
@@ -57,7 +57,7 @@ describe("createPerson input validation", () => {
 		await expect(
 			createPerson({
 				db: untouchedDb,
-				userId: "user-1",
+				userId: "11111111-1111-1111-1111-111111111111",
 				displayName: "Ayşe",
 				relationship: "COWORKER" as never,
 				occurredAt: OCCURRED_AT,
@@ -70,7 +70,7 @@ describe("createPerson input validation", () => {
 		await expect(
 			createPerson({
 				db: untouchedDb,
-				userId: "user-1",
+				userId: "11111111-1111-1111-1111-111111111111",
 				displayName: "Ayşe",
 				relationship: "FRIEND",
 				note: "a".repeat(501),
@@ -84,7 +84,7 @@ describe("createPerson input validation", () => {
 		await expect(
 			createPerson({
 				db: untouchedDb,
-				userId: "user-1",
+				userId: "11111111-1111-1111-1111-111111111111",
 				displayName: "Ayşe",
 				relationship: "FRIEND",
 				occurredAt: new Date("invalid"),
@@ -97,7 +97,7 @@ describe("createPerson input validation", () => {
 		await expect(
 			createPerson({
 				db: untouchedDb,
-				userId: "user-1",
+				userId: "11111111-1111-1111-1111-111111111111",
 				displayName: "Ayşe",
 				relationship: "FRIEND",
 				occurredAt: OCCURRED_AT,
@@ -112,7 +112,7 @@ describe("updatePerson input validation", () => {
 		await expect(
 			updatePerson({
 				db: untouchedDb,
-				userId: "user-1",
+				userId: "11111111-1111-1111-1111-111111111111",
 				personId: "",
 				expectedRevisionNo: 1,
 				displayName: "Ayşe",
@@ -132,8 +132,8 @@ describe("archivePerson input validation", () => {
 		await expect(
 			archivePerson({
 				db: untouchedDb,
-				userId: "user-1",
-				personId: "person-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				personId: "22222222-2222-2222-2222-222222222222",
 				expectedRevisionNo: 1,
 				occurredAt: OCCURRED_AT,
 				idempotencyKey: "",

@@ -17,10 +17,10 @@ describe("recordPersonReceivable input validation", () => {
 		await expect(
 			recordPersonReceivable({
 				db: untouchedDb,
-				userId: "user-1",
-				personId: "person-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				personId: "22222222-2222-2222-2222-222222222222",
 				amount: "0.00",
-				fundingAssetAccountId: "acct-1",
+				fundingAssetAccountId: "44444444-4444-4444-4444-444444444444",
 				occurredAt: OCCURRED_AT,
 				idempotencyKey: "key-1",
 			}),
@@ -34,10 +34,10 @@ describe("recordPersonReceivable input validation", () => {
 		await expect(
 			recordPersonReceivable({
 				db: untouchedDb,
-				userId: "user-1",
-				personId: "person-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				personId: "22222222-2222-2222-2222-222222222222",
 				amount: "-100.00",
-				fundingAssetAccountId: "acct-1",
+				fundingAssetAccountId: "44444444-4444-4444-4444-444444444444",
 				occurredAt: OCCURRED_AT,
 				idempotencyKey: "key-1",
 			}),
@@ -48,8 +48,8 @@ describe("recordPersonReceivable input validation", () => {
 		await expect(
 			recordPersonReceivable({
 				db: untouchedDb,
-				userId: "user-1",
-				personId: "person-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				personId: "22222222-2222-2222-2222-222222222222",
 				amount: "1000.00",
 				fundingAssetAccountId: "",
 				occurredAt: OCCURRED_AT,
@@ -62,10 +62,10 @@ describe("recordPersonReceivable input validation", () => {
 		await expect(
 			recordPersonReceivable({
 				db: untouchedDb,
-				userId: "user-1",
-				personId: "person-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				personId: "22222222-2222-2222-2222-222222222222",
 				amount: "1000.00",
-				fundingAssetAccountId: "acct-1",
+				fundingAssetAccountId: "44444444-4444-4444-4444-444444444444",
 				dueDate: "31-12-2026",
 				occurredAt: OCCURRED_AT,
 				idempotencyKey: "key-1",
@@ -77,10 +77,10 @@ describe("recordPersonReceivable input validation", () => {
 		await expect(
 			recordPersonReceivable({
 				db: untouchedDb,
-				userId: "user-1",
-				personId: "person-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				personId: "22222222-2222-2222-2222-222222222222",
 				amount: "1000.00",
-				fundingAssetAccountId: "acct-1",
+				fundingAssetAccountId: "44444444-4444-4444-4444-444444444444",
 				description: "a".repeat(501),
 				occurredAt: OCCURRED_AT,
 				idempotencyKey: "key-1",
@@ -94,8 +94,8 @@ describe("recordPersonPayableExpense input validation", () => {
 		await expect(
 			recordPersonPayableExpense({
 				db: untouchedDb,
-				userId: "user-1",
-				personId: "person-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				personId: "22222222-2222-2222-2222-222222222222",
 				amount: "1000.00",
 				budgetCategory: "LUXURY",
 				occurredAt: OCCURRED_AT,
@@ -119,8 +119,8 @@ describe("recordPersonPayableExpense input validation", () => {
 			await expect(
 				recordPersonPayableExpense({
 					db: untouchedDb,
-					userId: "user-1",
-					personId: "person-1",
+					userId: "11111111-1111-1111-1111-111111111111",
+					personId: "22222222-2222-2222-2222-222222222222",
 					amount: "1000.00",
 					budgetCategory,
 					occurredAt: OCCURRED_AT,
@@ -141,11 +141,11 @@ describe("updatePersonReceivable / updatePersonPayableExpense input validation",
 		await expect(
 			updatePersonReceivable({
 				db: untouchedDb,
-				userId: "user-1",
+				userId: "11111111-1111-1111-1111-111111111111",
 				obligationId: "",
 				expectedRevisionNo: 1,
 				amount: "1000.00",
-				fundingAssetAccountId: "acct-1",
+				fundingAssetAccountId: "44444444-4444-4444-4444-444444444444",
 				occurredAt: OCCURRED_AT,
 				idempotencyKey: "key-1",
 			}),
@@ -156,8 +156,8 @@ describe("updatePersonReceivable / updatePersonPayableExpense input validation",
 		await expect(
 			updatePersonPayableExpense({
 				db: untouchedDb,
-				userId: "user-1",
-				obligationId: "obligation-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				obligationId: "33333333-3333-3333-3333-333333333333",
 				expectedRevisionNo: 1,
 				amount: "1000.00",
 				budgetCategory: "NOT_REAL",
@@ -173,8 +173,8 @@ describe("voidPersonObligation input validation", () => {
 		await expect(
 			voidPersonObligation({
 				db: untouchedDb,
-				userId: "user-1",
-				obligationId: "obligation-1",
+				userId: "11111111-1111-1111-1111-111111111111",
+				obligationId: "33333333-3333-3333-3333-333333333333",
 				expectedRevisionNo: 1,
 				idempotencyKey: "",
 			}),

@@ -3,15 +3,13 @@ import type { Database } from "../db/client";
 import { users } from "../db/schema/auth";
 import {
 	PERSON_RELATIONSHIPS,
+	PERSON_STATUSES,
 	type PersonRelationship,
 	people,
 	personLedgerLinks,
 	personRevisions,
 } from "../db/schema/people";
-import {
-	getLedgerAccountBalance,
-	getLedgerAccountBalanceInTransaction,
-} from "../ledger/balances";
+import { getLedgerAccountBalanceInTransaction } from "../ledger/balances";
 import { runPeopleTransaction } from "./boundary";
 import { validateOccurredAt } from "./calendar";
 import { PeopleError } from "./errors";
@@ -20,6 +18,7 @@ import {
 	calculatePersonCreateFingerprint,
 	calculatePersonUpdateFingerprint,
 } from "./fingerprint";
+import { validateCanonicalUuid, validateOptionalEnum } from "./validation";
 
 export interface PersonReadModel {
 	personId: string;
@@ -128,19 +127,11 @@ function validateIdempotencyKey(value: string): string {
 }
 
 function validateUserId(value: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed) {
-		throw new PeopleError("PEOPLE_INVALID_INPUT", "User ID is required");
-	}
-	return trimmed;
+	return validateCanonicalUuid(value, "userId");
 }
 
 function validatePersonId(value: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed) {
-		throw new PeopleError("PEOPLE_INVALID_INPUT", "Person ID is required");
-	}
-	return trimmed;
+	return validateCanonicalUuid(value, "personId");
 }
 
 /**
@@ -679,7 +670,10 @@ async function checkPersonArchiveReplay(
 }
 
 /**
- * Reads a person with live-derived receivable/payable balances.
+ * Reads a person with live-derived receivable/payable balances. Executes
+ * inside one transaction/snapshot and routes all errors through the People
+ * error boundary, so the revision and balances are never read from different
+ * committed states.
  */
 export async function getPerson({
 	db,
@@ -689,60 +683,62 @@ export async function getPerson({
 	const validUserId = validateUserId(userId);
 	const validPersonId = validatePersonId(personId);
 
-	const [person] = await db
-		.select({ id: people.id })
-		.from(people)
-		.where(and(eq(people.id, validPersonId), eq(people.userId, validUserId)))
-		.limit(1);
+	return runPeopleTransaction(db, async (tx) => {
+		const [person] = await tx
+			.select({ id: people.id })
+			.from(people)
+			.where(and(eq(people.id, validPersonId), eq(people.userId, validUserId)))
+			.limit(1);
 
-	if (!person) {
-		throw new PeopleError(
-			"PEOPLE_NOT_FOUND",
-			`Person "${validPersonId}" not found`,
-		);
-	}
+		if (!person) {
+			throw new PeopleError(
+				"PEOPLE_NOT_FOUND",
+				`Person "${validPersonId}" not found`,
+			);
+		}
 
-	const [latest] = await db
-		.select()
-		.from(personRevisions)
-		.where(eq(personRevisions.personId, validPersonId))
-		.orderBy(desc(personRevisions.revisionNo))
-		.limit(1);
+		const [latest] = await tx
+			.select()
+			.from(personRevisions)
+			.where(eq(personRevisions.personId, validPersonId))
+			.orderBy(desc(personRevisions.revisionNo))
+			.limit(1);
 
-	if (!latest) {
-		throw new PeopleError("PEOPLE_INVALID_STATE", "Person has no revisions");
-	}
+		if (!latest) {
+			throw new PeopleError("PEOPLE_INVALID_STATE", "Person has no revisions");
+		}
 
-	const base = toReadModelBase(validPersonId, latest);
+		const base = toReadModelBase(validPersonId, latest);
 
-	const [link] = await db
-		.select()
-		.from(personLedgerLinks)
-		.where(eq(personLedgerLinks.personId, validPersonId))
-		.limit(1);
+		const [link] = await tx
+			.select()
+			.from(personLedgerLinks)
+			.where(eq(personLedgerLinks.personId, validPersonId))
+			.limit(1);
 
-	if (!link) {
-		return base;
-	}
+		if (!link) {
+			return base;
+		}
 
-	const receivableBalance = await getLedgerAccountBalance({
-		db,
-		userId: validUserId,
-		accountId: link.receivableAccountId,
+		const receivableBalance = await getLedgerAccountBalanceInTransaction({
+			tx,
+			userId: validUserId,
+			accountId: link.receivableAccountId,
+		});
+		const payableBalance = await getLedgerAccountBalanceInTransaction({
+			tx,
+			userId: validUserId,
+			accountId: link.payableAccountId,
+		});
+
+		return {
+			...base,
+			receivableAccountId: link.receivableAccountId,
+			receivableBalance: receivableBalance.balance,
+			payableAccountId: link.payableAccountId,
+			payableBalance: payableBalance.balance,
+		};
 	});
-	const payableBalance = await getLedgerAccountBalance({
-		db,
-		userId: validUserId,
-		accountId: link.payableAccountId,
-	});
-
-	return {
-		...base,
-		receivableAccountId: link.receivableAccountId,
-		receivableBalance: receivableBalance.balance,
-		payableAccountId: link.payableAccountId,
-		payableBalance: payableBalance.balance,
-	};
 }
 
 /**
@@ -755,61 +751,74 @@ export async function listPeople({
 	relationship,
 }: ListPeopleParams): Promise<PersonReadModel[]> {
 	const validUserId = validateUserId(userId);
+	const validStatus = validateOptionalEnum(status, PERSON_STATUSES, "status");
+	const validRelationship = validateOptionalEnum(
+		relationship,
+		PERSON_RELATIONSHIPS,
+		"relationship",
+	);
 
-	const rows = await db
-		.select({ id: people.id })
-		.from(people)
-		.where(eq(people.userId, validUserId))
-		.orderBy(asc(people.createdAt), asc(people.id));
+	return runPeopleTransaction(db, async (tx) => {
+		const rows = await tx
+			.select({ id: people.id })
+			.from(people)
+			.where(eq(people.userId, validUserId))
+			.orderBy(asc(people.createdAt), asc(people.id));
 
-	const results: PersonReadModel[] = [];
-	for (const row of rows) {
-		const [latest] = await db
-			.select()
-			.from(personRevisions)
-			.where(eq(personRevisions.personId, row.id))
-			.orderBy(desc(personRevisions.revisionNo))
-			.limit(1);
+		const results: PersonReadModel[] = [];
+		for (const row of rows) {
+			const [latest] = await tx
+				.select()
+				.from(personRevisions)
+				.where(eq(personRevisions.personId, row.id))
+				.orderBy(desc(personRevisions.revisionNo))
+				.limit(1);
 
-		if (!latest) continue;
+			if (!latest) continue;
 
-		if (status !== undefined && latest.status !== status) continue;
-		if (relationship !== undefined && latest.relationship !== relationship) {
-			continue;
+			if (validStatus !== undefined && latest.status !== validStatus) {
+				continue;
+			}
+			if (
+				validRelationship !== undefined &&
+				latest.relationship !== validRelationship
+			) {
+				continue;
+			}
+
+			const base = toReadModelBase(row.id, latest);
+
+			const [link] = await tx
+				.select()
+				.from(personLedgerLinks)
+				.where(eq(personLedgerLinks.personId, row.id))
+				.limit(1);
+
+			if (!link) {
+				results.push(base);
+				continue;
+			}
+
+			const receivableBalance = await getLedgerAccountBalanceInTransaction({
+				tx,
+				userId: validUserId,
+				accountId: link.receivableAccountId,
+			});
+			const payableBalance = await getLedgerAccountBalanceInTransaction({
+				tx,
+				userId: validUserId,
+				accountId: link.payableAccountId,
+			});
+
+			results.push({
+				...base,
+				receivableAccountId: link.receivableAccountId,
+				receivableBalance: receivableBalance.balance,
+				payableAccountId: link.payableAccountId,
+				payableBalance: payableBalance.balance,
+			});
 		}
 
-		const base = toReadModelBase(row.id, latest);
-
-		const [link] = await db
-			.select()
-			.from(personLedgerLinks)
-			.where(eq(personLedgerLinks.personId, row.id))
-			.limit(1);
-
-		if (!link) {
-			results.push(base);
-			continue;
-		}
-
-		const receivableBalance = await getLedgerAccountBalance({
-			db,
-			userId: validUserId,
-			accountId: link.receivableAccountId,
-		});
-		const payableBalance = await getLedgerAccountBalance({
-			db,
-			userId: validUserId,
-			accountId: link.payableAccountId,
-		});
-
-		results.push({
-			...base,
-			receivableAccountId: link.receivableAccountId,
-			receivableBalance: receivableBalance.balance,
-			payableAccountId: link.payableAccountId,
-			payableBalance: payableBalance.balance,
-		});
-	}
-
-	return results;
+		return results;
+	});
 }

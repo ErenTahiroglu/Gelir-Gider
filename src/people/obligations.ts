@@ -4,12 +4,14 @@ import type {
 	DatabaseOrTransaction,
 	DatabaseTransaction,
 } from "../db/client";
+import { users } from "../db/schema/auth";
 import {
 	CREDIT_CARD_PURCHASE_BUDGET_CATEGORIES,
 	type CreditCardPurchaseBudgetCategory,
 } from "../db/schema/credit-card-ledger";
 import { ledgerAccounts } from "../db/schema/ledger";
 import {
+	PERSON_OBLIGATION_DIRECTIONS,
 	type PersonObligationDirection,
 	people,
 	personObligationRevisions,
@@ -40,6 +42,13 @@ import {
 	calculateObligationVoidFingerprint,
 } from "./fingerprint";
 import { ensurePersonLedgerLinkInTransaction } from "./ledger-provisioning";
+import {
+	validateCanonicalUuid,
+	validateOptionalCanonicalUuid,
+	validateOptionalEnum,
+} from "./validation";
+
+const OBLIGATION_STATUS_VALUES = ["OPEN", "SETTLED", "VOID"] as const;
 
 export interface ObligationReadModel {
 	obligationId: string;
@@ -133,31 +142,19 @@ export interface ListPersonObligationsParams {
 }
 
 function validateUserId(value: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed)
-		throw new PeopleError("PEOPLE_INVALID_INPUT", "User ID is required");
-	return trimmed;
+	return validateCanonicalUuid(value, "userId");
 }
 
 function validatePersonId(value: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed)
-		throw new PeopleError("PEOPLE_INVALID_INPUT", "Person ID is required");
-	return trimmed;
+	return validateCanonicalUuid(value, "personId");
 }
 
 function validateObligationId(value: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed)
-		throw new PeopleError("PEOPLE_INVALID_INPUT", "Obligation ID is required");
-	return trimmed;
+	return validateCanonicalUuid(value, "obligationId");
 }
 
 function validateAccountId(value: string, field: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed)
-		throw new PeopleError("PEOPLE_INVALID_INPUT", `${field} is required`);
-	return trimmed;
+	return validateCanonicalUuid(value, field);
 }
 
 function validateIdempotencyKey(value: string): string {
@@ -274,6 +271,14 @@ function buildObligationReadModel(
 	).cents;
 	const isVoid = latestRev.operation === "VOID";
 	const remainingCents = isVoid ? 0n : principalCents - activeSettledCents;
+
+	if (remainingCents < 0n) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_STATE",
+			`Obligation ${obligation.id} has an invalid negative derived remaining amount`,
+		);
+	}
+
 	const status: "OPEN" | "SETTLED" | "VOID" = isVoid
 		? "VOID"
 		: remainingCents === 0n
@@ -287,9 +292,7 @@ function buildObligationReadModel(
 		status,
 		principalAmount: latestRev.principalAmount,
 		settledAmount: formatCentsToMoney(activeSettledCents),
-		remainingAmount: formatCentsToMoney(
-			remainingCents < 0n ? 0n : remainingCents,
-		),
+		remainingAmount: formatCentsToMoney(remainingCents),
 		dueDate: latestRev.dueDate,
 		description: latestRev.description,
 		fundingAssetAccountId: latestRev.fundingAssetAccountId,
@@ -329,6 +332,21 @@ async function validateFundingAssetAccount(
 		throw new PeopleError(
 			"PEOPLE_LEDGER_ACCOUNT_INVALID",
 			"Funding asset account is archived",
+		);
+	}
+
+	const [user] = await tx
+		.select({ currency: users.currency })
+		.from(users)
+		.where(eq(users.id, userId))
+		.limit(1);
+	if (!user) {
+		throw new PeopleError("PEOPLE_INVALID_INPUT", "User does not exist");
+	}
+	if (account.currency !== user.currency) {
+		throw new PeopleError(
+			"PEOPLE_LEDGER_ACCOUNT_INVALID",
+			`Funding asset account currency '${account.currency}' does not match user currency '${user.currency}'`,
 		);
 	}
 }
@@ -768,11 +786,7 @@ async function updateObligationCore(
 			);
 		}
 
-		await tx
-			.select({ id: people.id })
-			.from(people)
-			.where(eq(people.id, peek.personId))
-			.for("update");
+		await lockPersonAndVerifyActive(tx, core.userId, peek.personId);
 
 		await tx
 			.select({ id: personObligations.id })
@@ -1210,11 +1224,7 @@ export async function voidPersonObligation(
 			);
 		}
 
-		await tx
-			.select({ id: people.id })
-			.from(people)
-			.where(eq(people.id, peek.personId))
-			.for("update");
+		await lockPersonAndVerifyActive(tx, userId, peek.personId);
 
 		await tx
 			.select({ id: personObligations.id })
@@ -1412,6 +1422,8 @@ async function checkObligationVoidReplay(
 
 /**
  * Reads a single obligation with live-derived settled/remaining amounts.
+ * Executes inside one transaction/snapshot and routes all errors through the
+ * People error boundary.
  */
 export async function getPersonObligation({
 	db,
@@ -1421,38 +1433,40 @@ export async function getPersonObligation({
 	const validUserId = validateUserId(userId);
 	const validObligationId = validateObligationId(obligationId);
 
-	const [obligation] = await db
-		.select()
-		.from(personObligations)
-		.where(
-			and(
-				eq(personObligations.id, validObligationId),
-				eq(personObligations.userId, validUserId),
-			),
-		)
-		.limit(1);
+	return runPeopleTransaction(db, async (tx) => {
+		const [obligation] = await tx
+			.select()
+			.from(personObligations)
+			.where(
+				and(
+					eq(personObligations.id, validObligationId),
+					eq(personObligations.userId, validUserId),
+				),
+			)
+			.limit(1);
 
-	if (!obligation) {
-		throw new PeopleError(
-			"PEOPLE_OBLIGATION_NOT_FOUND",
-			`Obligation "${validObligationId}" not found`,
+		if (!obligation) {
+			throw new PeopleError(
+				"PEOPLE_OBLIGATION_NOT_FOUND",
+				`Obligation "${validObligationId}" not found`,
+			);
+		}
+
+		const latest = await getLatestObligationRevision(tx, validObligationId);
+		if (!latest) {
+			throw new PeopleError(
+				"PEOPLE_INVALID_STATE",
+				"Obligation has no revisions",
+			);
+		}
+
+		const activeSettled = await getActiveSettledAmountCents(
+			tx,
+			validObligationId,
 		);
-	}
 
-	const latest = await getLatestObligationRevision(db, validObligationId);
-	if (!latest) {
-		throw new PeopleError(
-			"PEOPLE_INVALID_STATE",
-			"Obligation has no revisions",
-		);
-	}
-
-	const activeSettled = await getActiveSettledAmountCents(
-		db,
-		validObligationId,
-	);
-
-	return buildObligationReadModel(obligation, latest, activeSettled);
+		return buildObligationReadModel(obligation, latest, activeSettled);
+	});
 }
 
 /**
@@ -1468,39 +1482,64 @@ export async function listPersonObligations({
 	dueDateUntil,
 }: ListPersonObligationsParams): Promise<ObligationReadModel[]> {
 	const validUserId = validateUserId(userId);
+	const validPersonId = validateOptionalCanonicalUuid(personId, "personId");
+	const validDirection = validateOptionalEnum(
+		direction,
+		PERSON_OBLIGATION_DIRECTIONS,
+		"direction",
+	);
+	const validStatus = validateOptionalEnum(
+		status,
+		OBLIGATION_STATUS_VALUES,
+		"status",
+	);
+	const validDueDateFrom =
+		dueDateFrom !== undefined
+			? (validateDueDate(dueDateFrom) ?? undefined)
+			: undefined;
+	const validDueDateUntil =
+		dueDateUntil !== undefined
+			? (validateDueDate(dueDateUntil) ?? undefined)
+			: undefined;
 
-	const conditions = [eq(personObligations.userId, validUserId)];
-	if (personId !== undefined) {
-		conditions.push(eq(personObligations.personId, personId));
-	}
-	if (direction !== undefined) {
-		conditions.push(eq(personObligations.direction, direction));
-	}
-
-	const rows = await db
-		.select()
-		.from(personObligations)
-		.where(and(...conditions))
-		.orderBy(asc(personObligations.createdAt), asc(personObligations.id));
-
-	const results: ObligationReadModel[] = [];
-	for (const row of rows) {
-		const latest = await getLatestObligationRevision(db, row.id);
-		if (!latest) continue;
-
-		const activeSettled = await getActiveSettledAmountCents(db, row.id);
-		const model = buildObligationReadModel(row, latest, activeSettled);
-
-		if (status !== undefined && model.status !== status) continue;
-		if (dueDateFrom !== undefined) {
-			if (model.dueDate === null || model.dueDate < dueDateFrom) continue;
+	return runPeopleTransaction(db, async (tx) => {
+		const conditions = [eq(personObligations.userId, validUserId)];
+		if (validPersonId !== undefined) {
+			conditions.push(eq(personObligations.personId, validPersonId));
 		}
-		if (dueDateUntil !== undefined) {
-			if (model.dueDate === null || model.dueDate > dueDateUntil) continue;
+		if (validDirection !== undefined) {
+			conditions.push(eq(personObligations.direction, validDirection));
 		}
 
-		results.push(model);
-	}
+		const rows = await tx
+			.select()
+			.from(personObligations)
+			.where(and(...conditions))
+			.orderBy(asc(personObligations.createdAt), asc(personObligations.id));
 
-	return results;
+		const results: ObligationReadModel[] = [];
+		for (const row of rows) {
+			const latest = await getLatestObligationRevision(tx, row.id);
+			if (!latest) continue;
+
+			const activeSettled = await getActiveSettledAmountCents(tx, row.id);
+			const model = buildObligationReadModel(row, latest, activeSettled);
+
+			if (validStatus !== undefined && model.status !== validStatus) continue;
+			if (validDueDateFrom !== undefined) {
+				if (model.dueDate === null || model.dueDate < validDueDateFrom) {
+					continue;
+				}
+			}
+			if (validDueDateUntil !== undefined) {
+				if (model.dueDate === null || model.dueDate > validDueDateUntil) {
+					continue;
+				}
+			}
+
+			results.push(model);
+		}
+
+		return results;
+	});
 }

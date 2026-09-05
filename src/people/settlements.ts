@@ -4,6 +4,7 @@ import type {
 	DatabaseOrTransaction,
 	DatabaseTransaction,
 } from "../db/client";
+import { users } from "../db/schema/auth";
 import { incomeReceiptRevisions } from "../db/schema/income";
 import { ledgerAccounts } from "../db/schema/ledger";
 import {
@@ -11,9 +12,11 @@ import {
 	people,
 	personObligationRevisions,
 	personObligations,
+	personRevisions,
 	personSettlementRevisions,
 	personSettlements,
 } from "../db/schema/people";
+import { transactionRevisions } from "../db/schema/transactions";
 import {
 	createIncomeReceiptInTransaction,
 	voidIncomeReceiptInTransaction,
@@ -32,11 +35,20 @@ import { PeopleError } from "./errors";
 import {
 	calculateSettlementCreateFingerprint,
 	calculateSettlementVoidFingerprint,
+	calculateSettlementVoidFingerprintV1,
+	derivePeopleIncomeIdempotencyKey,
 } from "./fingerprint";
 import {
 	ensurePeopleOverpaymentIncomeSourceInTransaction,
 	ensurePersonLedgerLinkInTransaction,
 } from "./ledger-provisioning";
+import {
+	validateCanonicalUuid,
+	validateOptionalCanonicalUuid,
+	validateOptionalEnum,
+} from "./validation";
+
+const SETTLEMENT_STATUS_VALUES = ["ACTIVE", "VOIDED"] as const;
 
 export interface SettlementReadModel {
 	settlementId: string;
@@ -101,31 +113,19 @@ export interface ListPersonSettlementsParams {
 }
 
 function validateUserId(value: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed)
-		throw new PeopleError("PEOPLE_INVALID_INPUT", "User ID is required");
-	return trimmed;
+	return validateCanonicalUuid(value, "userId");
 }
 
 function validateObligationId(value: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed)
-		throw new PeopleError("PEOPLE_INVALID_INPUT", "Obligation ID is required");
-	return trimmed;
+	return validateCanonicalUuid(value, "obligationId");
 }
 
 function validateSettlementId(value: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed)
-		throw new PeopleError("PEOPLE_INVALID_INPUT", "Settlement ID is required");
-	return trimmed;
+	return validateCanonicalUuid(value, "settlementId");
 }
 
 function validateAccountId(value: string, field: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed)
-		throw new PeopleError("PEOPLE_INVALID_INPUT", `${field} is required`);
-	return trimmed;
+	return validateCanonicalUuid(value, field);
 }
 
 function validateIdempotencyKey(value: string): string {
@@ -207,6 +207,40 @@ async function validateAssetAccount(
 		throw new PeopleError(
 			"PEOPLE_LEDGER_ACCOUNT_INVALID",
 			`${field} is archived`,
+		);
+	}
+
+	const [user] = await tx
+		.select({ currency: users.currency })
+		.from(users)
+		.where(eq(users.id, userId))
+		.limit(1);
+	if (!user) {
+		throw new PeopleError("PEOPLE_INVALID_INPUT", "User does not exist");
+	}
+	if (account.currency !== user.currency) {
+		throw new PeopleError(
+			"PEOPLE_LEDGER_ACCOUNT_INVALID",
+			`${field} currency '${account.currency}' does not match user currency '${user.currency}'`,
+		);
+	}
+}
+
+async function verifyPersonActiveInTransaction(
+	tx: DatabaseTransaction,
+	personId: string,
+): Promise<void> {
+	const [latestPersonRev] = await tx
+		.select({ status: personRevisions.status })
+		.from(personRevisions)
+		.where(eq(personRevisions.personId, personId))
+		.orderBy(desc(personRevisions.revisionNo))
+		.limit(1);
+
+	if (latestPersonRev?.status !== "ACTIVE") {
+		throw new PeopleError(
+			"PEOPLE_NOT_ACTIVE",
+			`Person "${personId}" is not active`,
 		);
 	}
 }
@@ -334,6 +368,8 @@ async function createSettlementCore(
 		if (secondRev) {
 			return checkSettlementCreateReplay(tx, secondRev, core);
 		}
+
+		await verifyPersonActiveInTransaction(tx, obligationPeek.personId);
 
 		const [latestObligationRev] = await tx
 			.select()
@@ -496,11 +532,16 @@ async function createSettlementCore(
 				tx,
 				core.userId,
 			);
+			const overpaymentCreateKey = await derivePeopleIncomeIdempotencyKey(
+				core.idempotencyKey,
+				settlementId,
+				"OVERPAYMENT_CREATE",
+			);
 			const incomeRes = await createIncomeReceiptInTransaction({
 				tx,
 				userId: core.userId,
 				sourceId: sourceInfo.incomeSourceId,
-				idempotencyKey: `${core.idempotencyKey}:overpayment`,
+				idempotencyKey: overpaymentCreateKey,
 				receivedAt: core.occurredAt,
 				amount: excessNormalized,
 				destinationAccountId: core.assetAccountId,
@@ -737,6 +778,7 @@ export async function voidPersonSettlement(
 				userId,
 				settlementId,
 				expectedRevisionNo,
+				reason,
 			);
 		}
 
@@ -807,8 +849,11 @@ export async function voidPersonSettlement(
 				userId,
 				settlementId,
 				expectedRevisionNo,
+				reason,
 			);
 		}
+
+		await verifyPersonActiveInTransaction(tx, obligationPeek.personId);
 
 		const latest = await getLatestSettlementRevision(tx, settlementId);
 		if (!latest) {
@@ -905,12 +950,18 @@ export async function voidPersonSettlement(
 				);
 			}
 
+			const overpaymentVoidKey = await derivePeopleIncomeIdempotencyKey(
+				idempotencyKey,
+				settlementId,
+				"OVERPAYMENT_VOID",
+			);
+
 			await voidIncomeReceiptInTransaction({
 				tx,
 				userId,
 				incomeReceiptId: latest.overpaymentIncomeReceiptId,
 				expectedRevisionNo: incomeLatestRev.revisionNo,
-				idempotencyKey: `${idempotencyKey}:overpayment-void`,
+				idempotencyKey: overpaymentVoidKey,
 				reasonCode: "PERSON_SETTLEMENT_VOID",
 				reasonNote: reason,
 				provenance: {
@@ -924,6 +975,7 @@ export async function voidPersonSettlement(
 			userId,
 			settlementId,
 			expectedRevisionNo,
+			reason,
 		});
 
 		const [insertedRev] = await tx
@@ -972,18 +1024,45 @@ async function checkSettlementVoidReplay(
 	userId: string,
 	settlementId: string,
 	expectedRevisionNo: number,
+	reason: string,
 ): Promise<{ settlement: SettlementReadModel; idempotentReplay: boolean }> {
-	const candidateFingerprint = await calculateSettlementVoidFingerprint({
+	const candidateV2 = await calculateSettlementVoidFingerprint({
 		userId,
 		settlementId,
 		expectedRevisionNo,
+		reason,
 	});
 
-	if (existingRev.revisionFingerprint !== candidateFingerprint) {
-		throw new PeopleError(
-			"PEOPLE_IDEMPOTENCY_CONFLICT",
-			"Idempotency key already used with different settlement void payload",
-		);
+	if (existingRev.revisionFingerprint !== candidateV2) {
+		const candidateV1 = await calculateSettlementVoidFingerprintV1({
+			userId,
+			settlementId,
+			expectedRevisionNo,
+		});
+
+		if (existingRev.revisionFingerprint !== candidateV1) {
+			throw new PeopleError(
+				"PEOPLE_IDEMPOTENCY_CONFLICT",
+				"Idempotency key already used with different settlement void payload",
+			);
+		}
+
+		// Legacy v1 row predates the reason-bearing fingerprint: fall back to
+		// comparing against the historical reason stored on the canonical VOID
+		// revision itself, so a changed reason still conflicts.
+		const [canonicalRev] = await tx
+			.select({ reasonNote: transactionRevisions.reasonNote })
+			.from(transactionRevisions)
+			.where(eq(transactionRevisions.id, existingRev.canonicalRevisionId))
+			.limit(1);
+
+		const historicalReason = canonicalRev?.reasonNote ?? null;
+		if (historicalReason !== reason) {
+			throw new PeopleError(
+				"PEOPLE_IDEMPOTENCY_CONFLICT",
+				"Idempotency key already used with different settlement void reason",
+			);
+		}
 	}
 
 	const [settlement] = await tx
@@ -1027,7 +1106,9 @@ async function checkSettlementVoidReplay(
 }
 
 /**
- * Reads a single settlement.
+ * Reads a single settlement. Executes inside one transaction/snapshot so the
+ * revision and any joined state are read from the same committed state, and
+ * routes all errors through the People error boundary.
  */
 export async function getPersonSettlement({
 	db,
@@ -1037,54 +1118,56 @@ export async function getPersonSettlement({
 	const validUserId = validateUserId(userId);
 	const validSettlementId = validateSettlementId(settlementId);
 
-	const [settlement] = await db
-		.select()
-		.from(personSettlements)
-		.where(
-			and(
-				eq(personSettlements.id, validSettlementId),
-				eq(personSettlements.userId, validUserId),
-			),
-		)
-		.limit(1);
+	return runPeopleTransaction(db, async (tx) => {
+		const [settlement] = await tx
+			.select()
+			.from(personSettlements)
+			.where(
+				and(
+					eq(personSettlements.id, validSettlementId),
+					eq(personSettlements.userId, validUserId),
+				),
+			)
+			.limit(1);
 
-	if (!settlement) {
-		throw new PeopleError(
-			"PEOPLE_SETTLEMENT_NOT_FOUND",
-			`Settlement "${validSettlementId}" not found`,
+		if (!settlement) {
+			throw new PeopleError(
+				"PEOPLE_SETTLEMENT_NOT_FOUND",
+				`Settlement "${validSettlementId}" not found`,
+			);
+		}
+
+		const [obligation] = await tx
+			.select({
+				personId: personObligations.personId,
+				direction: personObligations.direction,
+			})
+			.from(personObligations)
+			.where(eq(personObligations.id, settlement.obligationId))
+			.limit(1);
+
+		if (!obligation) {
+			throw new PeopleError(
+				"PEOPLE_INVALID_STATE",
+				"Obligation missing for settlement",
+			);
+		}
+
+		const latest = await getLatestSettlementRevision(tx, validSettlementId);
+		if (!latest) {
+			throw new PeopleError(
+				"PEOPLE_INVALID_STATE",
+				"Settlement has no revisions",
+			);
+		}
+
+		return buildSettlementReadModel(
+			settlement,
+			obligation.personId,
+			obligation.direction as PersonObligationDirection,
+			latest,
 		);
-	}
-
-	const [obligation] = await db
-		.select({
-			personId: personObligations.personId,
-			direction: personObligations.direction,
-		})
-		.from(personObligations)
-		.where(eq(personObligations.id, settlement.obligationId))
-		.limit(1);
-
-	if (!obligation) {
-		throw new PeopleError(
-			"PEOPLE_INVALID_STATE",
-			"Obligation missing for settlement",
-		);
-	}
-
-	const latest = await getLatestSettlementRevision(db, validSettlementId);
-	if (!latest) {
-		throw new PeopleError(
-			"PEOPLE_INVALID_STATE",
-			"Settlement has no revisions",
-		);
-	}
-
-	return buildSettlementReadModel(
-		settlement,
-		obligation.personId,
-		obligation.direction as PersonObligationDirection,
-		latest,
-	);
+	});
 }
 
 /**
@@ -1097,48 +1180,59 @@ export async function listPersonSettlements({
 	status,
 }: ListPersonSettlementsParams): Promise<SettlementReadModel[]> {
 	const validUserId = validateUserId(userId);
+	const validObligationId = validateOptionalCanonicalUuid(
+		obligationId,
+		"obligationId",
+	);
+	const validStatus = validateOptionalEnum(
+		status,
+		SETTLEMENT_STATUS_VALUES,
+		"status",
+	);
 
-	const conditions = [eq(personSettlements.userId, validUserId)];
-	if (obligationId !== undefined) {
-		conditions.push(eq(personSettlements.obligationId, obligationId));
-	}
-
-	const rows = await db
-		.select()
-		.from(personSettlements)
-		.where(and(...conditions))
-		.orderBy(asc(personSettlements.createdAt), asc(personSettlements.id));
-
-	const results: SettlementReadModel[] = [];
-	for (const row of rows) {
-		const latest = await getLatestSettlementRevision(db, row.id);
-		if (!latest) continue;
-
-		if (status !== undefined) {
-			const rowStatus = latest.operation === "VOID" ? "VOIDED" : "ACTIVE";
-			if (rowStatus !== status) continue;
+	return runPeopleTransaction(db, async (tx) => {
+		const conditions = [eq(personSettlements.userId, validUserId)];
+		if (validObligationId !== undefined) {
+			conditions.push(eq(personSettlements.obligationId, validObligationId));
 		}
 
-		const [obligation] = await db
-			.select({
-				personId: personObligations.personId,
-				direction: personObligations.direction,
-			})
-			.from(personObligations)
-			.where(eq(personObligations.id, row.obligationId))
-			.limit(1);
+		const rows = await tx
+			.select()
+			.from(personSettlements)
+			.where(and(...conditions))
+			.orderBy(asc(personSettlements.createdAt), asc(personSettlements.id));
 
-		if (!obligation) continue;
+		const results: SettlementReadModel[] = [];
+		for (const row of rows) {
+			const latest = await getLatestSettlementRevision(tx, row.id);
+			if (!latest) continue;
 
-		results.push(
-			buildSettlementReadModel(
-				row,
-				obligation.personId,
-				obligation.direction as PersonObligationDirection,
-				latest,
-			),
-		);
-	}
+			if (validStatus !== undefined) {
+				const rowStatus = latest.operation === "VOID" ? "VOIDED" : "ACTIVE";
+				if (rowStatus !== validStatus) continue;
+			}
 
-	return results;
+			const [obligation] = await tx
+				.select({
+					personId: personObligations.personId,
+					direction: personObligations.direction,
+				})
+				.from(personObligations)
+				.where(eq(personObligations.id, row.obligationId))
+				.limit(1);
+
+			if (!obligation) continue;
+
+			results.push(
+				buildSettlementReadModel(
+					row,
+					obligation.personId,
+					obligation.direction as PersonObligationDirection,
+					latest,
+				),
+			);
+		}
+
+		return results;
+	});
 }

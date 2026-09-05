@@ -225,6 +225,13 @@
       "when": 1788597872536,
       "tag": "0031_people_obligations_and_settlements",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1788602474445,
+      "tag": "0032_harden_people_obligation_settlement_integrity",
+      "breakpoints": true
     }
   ]
 }

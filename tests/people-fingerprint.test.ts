@@ -8,6 +8,8 @@ import {
 	calculatePersonUpdateFingerprint,
 	calculateSettlementCreateFingerprint,
 	calculateSettlementVoidFingerprint,
+	calculateSettlementVoidFingerprintV1,
+	derivePeopleIncomeIdempotencyKey,
 } from "../src/people/fingerprint";
 
 const BASE_DATE = new Date("2026-09-05T10:00:00.000Z");
@@ -171,12 +173,69 @@ describe("Person settlement revision fingerprints", () => {
 		expect(fp1).not.toBe(fp3);
 	});
 
-	it("VOID returns 64-hex string", async () => {
-		const fp = await calculateSettlementVoidFingerprint({
+	it("VOID returns 64-hex string and changes with reason", async () => {
+		const fp1 = await calculateSettlementVoidFingerprint({
+			userId: USER_ID,
+			settlementId: SETTLEMENT_ID,
+			expectedRevisionNo: 1,
+			reason: "correction",
+		});
+		expect(fp1).toMatch(/^[0-9a-f]{64}$/);
+
+		const fp2 = await calculateSettlementVoidFingerprint({
+			userId: USER_ID,
+			settlementId: SETTLEMENT_ID,
+			expectedRevisionNo: 1,
+			reason: "different reason",
+		});
+		expect(fp1).not.toBe(fp2);
+	});
+
+	it("legacy VOID v1 fingerprint omits reason and differs from v2", async () => {
+		const v1 = await calculateSettlementVoidFingerprintV1({
 			userId: USER_ID,
 			settlementId: SETTLEMENT_ID,
 			expectedRevisionNo: 1,
 		});
-		expect(fp).toMatch(/^[0-9a-f]{64}$/);
+		const v2 = await calculateSettlementVoidFingerprint({
+			userId: USER_ID,
+			settlementId: SETTLEMENT_ID,
+			expectedRevisionNo: 1,
+			reason: "correction",
+		});
+		expect(v1).toMatch(/^[0-9a-f]{64}$/);
+		expect(v1).not.toBe(v2);
+	});
+});
+
+describe("derivePeopleIncomeIdempotencyKey", () => {
+	it("is deterministic and stays well under 128 characters even for a 128-char input key", async () => {
+		const maxLengthKey = "k".repeat(128);
+		const key1 = await derivePeopleIncomeIdempotencyKey(
+			maxLengthKey,
+			SETTLEMENT_ID,
+			"OVERPAYMENT_CREATE",
+		);
+		const key2 = await derivePeopleIncomeIdempotencyKey(
+			maxLengthKey,
+			SETTLEMENT_ID,
+			"OVERPAYMENT_CREATE",
+		);
+		expect(key1).toBe(key2);
+		expect(key1.length).toBeLessThanOrEqual(128);
+	});
+
+	it("produces different keys for CREATE vs VOID operations", async () => {
+		const createKey = await derivePeopleIncomeIdempotencyKey(
+			"caller-key",
+			SETTLEMENT_ID,
+			"OVERPAYMENT_CREATE",
+		);
+		const voidKey = await derivePeopleIncomeIdempotencyKey(
+			"caller-key",
+			SETTLEMENT_ID,
+			"OVERPAYMENT_VOID",
+		);
+		expect(createKey).not.toBe(voidKey);
 	});
 });

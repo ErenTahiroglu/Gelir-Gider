@@ -1,11 +1,13 @@
 import { and, eq } from "drizzle-orm";
 import type { DatabaseTransaction } from "../db/client";
 import { incomeSources } from "../db/schema/income";
+import { ledgerAccounts } from "../db/schema/ledger";
 import {
 	people,
 	peopleSystemIncomeLinks,
 	personLedgerLinks,
 } from "../db/schema/people";
+import { IncomeError } from "../income/errors";
 import { createIncomeSourceInTransaction } from "../income/sources";
 import { createLedgerAccountInTransaction } from "../ledger/accounts";
 import { LedgerError } from "../ledger/errors";
@@ -110,47 +112,47 @@ export async function ensurePersonLedgerLinkInTransaction(
 	return raceExisting;
 }
 
+/**
+ * Provisions a ledger account at a deterministic, singleton code. If a
+ * concurrent transaction already created an account at that exact code, this
+ * re-reads and reuses that row instead of retrying with a suffixed code --
+ * a code collision on one of these identities always means "this exact
+ * resource already exists", never "a different resource happened to collide",
+ * so a suffix-retry would only create a permanent orphan duplicate.
+ */
 async function provisionAccountWithRetry(
 	tx: DatabaseTransaction,
 	userId: string,
-	baseCode: string,
+	code: string,
 	name: string,
 	accountType: "ASSET" | "LIABILITY",
 ): Promise<{ id: string }> {
-	let targetCode = baseCode;
-	let attempts = 0;
-	let createdAccount: { id: string } | null = null;
-
-	while (!createdAccount && attempts < 5) {
-		try {
-			createdAccount = await createLedgerAccountInTransaction({
-				tx,
-				userId,
-				code: targetCode,
-				name,
-				accountType,
-			});
-		} catch (err: unknown) {
-			if (
-				err instanceof LedgerError &&
-				err.code === "LEDGER_ACCOUNT_CODE_CONFLICT"
-			) {
-				attempts++;
-				targetCode = `${baseCode}_${attempts}`.slice(0, 64);
-			} else {
-				throw err;
+	try {
+		return await createLedgerAccountInTransaction({
+			tx,
+			userId,
+			code,
+			name,
+			accountType,
+		});
+	} catch (err: unknown) {
+		if (
+			err instanceof LedgerError &&
+			err.code === "LEDGER_ACCOUNT_CODE_CONFLICT"
+		) {
+			const [existing] = await tx
+				.select({ id: ledgerAccounts.id })
+				.from(ledgerAccounts)
+				.where(
+					and(eq(ledgerAccounts.userId, userId), eq(ledgerAccounts.code, code)),
+				)
+				.limit(1);
+			if (existing) {
+				return existing;
 			}
 		}
+		throw err;
 	}
-
-	if (!createdAccount) {
-		throw new PeopleError(
-			"PEOPLE_INVALID_STATE",
-			`Failed to provision ledger account for code ${baseCode}`,
-		);
-	}
-
-	return createdAccount;
 }
 
 const PEOPLE_OVERPAYMENT_SOURCE_CODE = "PEOPLE_OVERPAYMENT";
@@ -232,19 +234,47 @@ export async function ensurePeopleOverpaymentIncomeSourceInTransaction(
 			"SYS_PEOPLE_OVERPAYMENT_INC",
 		);
 
-		const source = await createIncomeSourceInTransaction({
-			tx,
-			userId,
-			code: PEOPLE_OVERPAYMENT_SOURCE_CODE,
-			name: PEOPLE_OVERPAYMENT_SOURCE_NAME,
-			nature: "EXTRA",
-			referenceMethod: "EXCLUDED",
-			incomeLedgerAccountId: account.id,
-			activeFrom: PEOPLE_OVERPAYMENT_ACTIVE_FROM,
-		});
-
-		sourceId = source.id;
-		incomeLedgerAccountId = account.id;
+		try {
+			const source = await createIncomeSourceInTransaction({
+				tx,
+				userId,
+				code: PEOPLE_OVERPAYMENT_SOURCE_CODE,
+				name: PEOPLE_OVERPAYMENT_SOURCE_NAME,
+				nature: "EXTRA",
+				referenceMethod: "EXCLUDED",
+				incomeLedgerAccountId: account.id,
+				activeFrom: PEOPLE_OVERPAYMENT_ACTIVE_FROM,
+			});
+			sourceId = source.id;
+			incomeLedgerAccountId = account.id;
+		} catch (err) {
+			// A concurrent transaction (e.g. provisioning for a different person)
+			// won the race to create this singleton source first; reuse its row
+			// rather than surfacing a conflict for an otherwise-valid operation.
+			if (
+				err instanceof IncomeError &&
+				err.code === "INCOME_SOURCE_CODE_CONFLICT"
+			) {
+				const [raceSourceByCode] = await tx
+					.select({
+						id: incomeSources.id,
+						incomeLedgerAccountId: incomeSources.incomeLedgerAccountId,
+					})
+					.from(incomeSources)
+					.where(
+						and(
+							eq(incomeSources.userId, userId),
+							eq(incomeSources.code, PEOPLE_OVERPAYMENT_SOURCE_CODE),
+						),
+					)
+					.limit(1);
+				if (!raceSourceByCode) throw err;
+				sourceId = raceSourceByCode.id;
+				incomeLedgerAccountId = raceSourceByCode.incomeLedgerAccountId;
+			} else {
+				throw err;
+			}
+		}
 	}
 
 	const [insertedLink] = await tx
@@ -304,43 +334,40 @@ export async function ensurePeopleOverpaymentIncomeSourceInTransaction(
 	};
 }
 
+/**
+ * Provisions the singleton per-user overpayment income ledger account. See
+ * `provisionAccountWithRetry` for why a code conflict is resolved by re-read
+ * rather than a suffix retry.
+ */
 async function provisionIncomeAccountWithRetry(
 	tx: DatabaseTransaction,
 	userId: string,
-	baseCode: string,
+	code: string,
 ): Promise<{ id: string }> {
-	let targetCode = baseCode;
-	let attempts = 0;
-	let createdAccount: { id: string } | null = null;
-
-	while (!createdAccount && attempts < 5) {
-		try {
-			createdAccount = await createLedgerAccountInTransaction({
-				tx,
-				userId,
-				code: targetCode,
-				name: "People Overpayment Income",
-				accountType: "INCOME",
-			});
-		} catch (err: unknown) {
-			if (
-				err instanceof LedgerError &&
-				err.code === "LEDGER_ACCOUNT_CODE_CONFLICT"
-			) {
-				attempts++;
-				targetCode = `${baseCode}_${attempts}`.slice(0, 64);
-			} else {
-				throw err;
+	try {
+		return await createLedgerAccountInTransaction({
+			tx,
+			userId,
+			code,
+			name: "People Overpayment Income",
+			accountType: "INCOME",
+		});
+	} catch (err: unknown) {
+		if (
+			err instanceof LedgerError &&
+			err.code === "LEDGER_ACCOUNT_CODE_CONFLICT"
+		) {
+			const [existing] = await tx
+				.select({ id: ledgerAccounts.id })
+				.from(ledgerAccounts)
+				.where(
+					and(eq(ledgerAccounts.userId, userId), eq(ledgerAccounts.code, code)),
+				)
+				.limit(1);
+			if (existing) {
+				return existing;
 			}
 		}
+		throw err;
 	}
-
-	if (!createdAccount) {
-		throw new PeopleError(
-			"PEOPLE_INVALID_STATE",
-			"Failed to provision People overpayment income ledger account",
-		);
-	}
-
-	return createdAccount;
 }

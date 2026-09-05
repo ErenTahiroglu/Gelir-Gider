@@ -1,10 +1,11 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { DatabaseTransaction } from "../db/client";
 import {
 	CREDIT_CARD_SYSTEM_ACCOUNT_ROLES,
 	type CreditCardSystemAccountRole,
 	creditCardSystemAccounts,
 } from "../db/schema/credit-card-ledger";
+import { ledgerAccounts } from "../db/schema/ledger";
 import { type AccountType, createLedgerAccountInTransaction } from "./accounts";
 import { LedgerError } from "./errors";
 
@@ -76,49 +77,80 @@ export async function ensureUserExpenseSystemAccountsInTransaction(
 		if (roleMap.has(role)) continue;
 
 		const def = SYSTEM_ROLE_DEFINITIONS[role];
-		const baseCode = `SYS_CC_${def.defaultCodeSuffix}`.slice(0, 64);
-		let targetCode = baseCode;
-		let attempts = 0;
-		let createdAccount: { id: string } | null = null;
+		const code = `SYS_CC_${def.defaultCodeSuffix}`.slice(0, 64);
 
-		while (!createdAccount && attempts < 5) {
-			try {
-				createdAccount = await createLedgerAccountInTransaction({
-					tx,
-					userId,
-					code: targetCode,
-					name: def.name,
-					accountType: def.accountType,
-				});
-			} catch (err: unknown) {
-				if (
-					err instanceof LedgerError &&
-					err.code === "LEDGER_ACCOUNT_CODE_CONFLICT"
-				) {
-					attempts++;
-					targetCode = `SYS_CC_${def.defaultCodeSuffix}_${attempts}`.slice(
-						0,
-						64,
-					);
-				} else {
-					throw err;
-				}
+		// This is a per-user singleton identity: a code conflict always means a
+		// concurrent transaction already created this exact account, never a
+		// different resource colliding by chance. Re-read and reuse it instead
+		// of retrying with a suffixed code, which would only create a permanent
+		// orphan duplicate.
+		let ledgerAccountId: string;
+		try {
+			const created = await createLedgerAccountInTransaction({
+				tx,
+				userId,
+				code,
+				name: def.name,
+				accountType: def.accountType,
+			});
+			ledgerAccountId = created.id;
+		} catch (err: unknown) {
+			if (
+				err instanceof LedgerError &&
+				err.code === "LEDGER_ACCOUNT_CODE_CONFLICT"
+			) {
+				const [existingAccount] = await tx
+					.select({ id: ledgerAccounts.id })
+					.from(ledgerAccounts)
+					.where(
+						and(
+							eq(ledgerAccounts.userId, userId),
+							eq(ledgerAccounts.code, code),
+						),
+					)
+					.limit(1);
+				if (!existingAccount) throw err;
+				ledgerAccountId = existingAccount.id;
+			} else {
+				throw err;
 			}
 		}
 
-		if (!createdAccount) {
+		const [insertedSystemAccount] = await tx
+			.insert(creditCardSystemAccounts)
+			.values({ userId, role, ledgerAccountId })
+			.onConflictDoNothing({
+				target: [
+					creditCardSystemAccounts.userId,
+					creditCardSystemAccounts.role,
+				],
+			})
+			.returning({ ledgerAccountId: creditCardSystemAccounts.ledgerAccountId });
+
+		if (insertedSystemAccount) {
+			roleMap.set(role, insertedSystemAccount.ledgerAccountId);
+			continue;
+		}
+
+		// Concurrent race already inserted the system account row for this role.
+		const [existingSystemAccount] = await tx
+			.select({ ledgerAccountId: creditCardSystemAccounts.ledgerAccountId })
+			.from(creditCardSystemAccounts)
+			.where(
+				and(
+					eq(creditCardSystemAccounts.userId, userId),
+					eq(creditCardSystemAccounts.role, role),
+				),
+			)
+			.limit(1);
+
+		if (!existingSystemAccount) {
 			throw new Error(
 				`Failed to provision system ledger account for role ${role}`,
 			);
 		}
 
-		await tx.insert(creditCardSystemAccounts).values({
-			userId,
-			role,
-			ledgerAccountId: createdAccount.id,
-		});
-
-		roleMap.set(role, createdAccount.id);
+		roleMap.set(role, existingSystemAccount.ledgerAccountId);
 	}
 
 	const mandatory = roleMap.get("MANDATORY_EXPENSE");
