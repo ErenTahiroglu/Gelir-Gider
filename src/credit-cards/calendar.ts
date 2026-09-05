@@ -421,8 +421,7 @@ export function validatePaymentMethod(
  */
 export function validateLiabilityEventStatusFilter(
 	value: unknown,
-): "POSTED" | "VOID" | undefined {
-	if (value === undefined || value === null) return undefined;
+): "POSTED" | "VOID" {
 	if (value !== "POSTED" && value !== "VOID") {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",

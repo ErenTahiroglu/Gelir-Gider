@@ -202,6 +202,25 @@ describe("Credit Card Fingerprinting & Key Generation", () => {
 	});
 });
 
+import migration0030Sql from "../migrations/0030_enforce_credit_card_canonical_anchor_completeness.sql?raw";
+
+describe("Credit Card Migration 0030", () => {
+	it("verifies migration 0030 contains deferred canonical-anchor constraint trigger and validation logic", () => {
+		const sql = migration0030Sql;
+		expect(sql).toContain(
+			"CREATE OR REPLACE FUNCTION trg_fn_guard_cc_canonical_transaction_anchors",
+		);
+		expect(sql).toContain(
+			"CREATE CONSTRAINT TRIGGER trg_guard_cc_canonical_transaction_anchors",
+		);
+		expect(sql).toContain('AFTER INSERT ON "canonical_transactions"');
+		expect(sql).toContain("DEFERRABLE INITIALLY DEFERRED");
+		expect(sql).toContain("CREDIT_CARD_PURCHASE");
+		expect(sql).toContain("CREDIT_CARD_OPENING_BALANCE");
+		expect(sql).toContain("CREDIT_CARD_STATEMENT_PAYMENT");
+	});
+});
+
 describe("Calendar & Validation Helpers", () => {
 	it("formatIstanbulPurchaseDate formats date in Europe/Istanbul timezone", () => {
 		// 2026-09-04 22:00:00 UTC is 2026-09-05 01:00:00 UTC+3
@@ -238,10 +257,12 @@ describe("Calendar & Validation Helpers", () => {
 		);
 	});
 
-	it("validateLiabilityEventStatusFilter validates status", () => {
+	it("validateLiabilityEventStatusFilter validates status and rejects empty/invalid inputs", () => {
 		expect(validateLiabilityEventStatusFilter("POSTED")).toBe("POSTED");
 		expect(validateLiabilityEventStatusFilter("VOID")).toBe("VOID");
-		expect(validateLiabilityEventStatusFilter(undefined)).toBeUndefined();
+		expect(() => validateLiabilityEventStatusFilter("")).toThrow(
+			CreditCardError,
+		);
 		expect(() => validateLiabilityEventStatusFilter("UNKNOWN")).toThrow(
 			CreditCardError,
 		);

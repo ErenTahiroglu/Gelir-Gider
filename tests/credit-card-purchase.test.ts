@@ -522,5 +522,202 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 				}),
 			);
 		});
+
+		it("rejects empty string and invalid cardId filter", async () => {
+			const mockDb = {
+				transaction: vi.fn(async (cb) =>
+					cb({} as unknown as DatabaseTransaction),
+				),
+			} as unknown as Database;
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					cardId: "",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					cardId: "not-a-uuid",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+		});
+
+		it("rejects empty string and invalid budgetCategory filter", async () => {
+			const mockDb = {
+				transaction: vi.fn(async (cb) =>
+					cb({} as unknown as DatabaseTransaction),
+				),
+			} as unknown as Database;
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					budgetCategory: "",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					budgetCategory: "   ",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+		});
+
+		it("rejects empty string, whitespace and malformed dates", async () => {
+			const mockDb = {
+				transaction: vi.fn(async (cb) =>
+					cb({} as unknown as DatabaseTransaction),
+				),
+			} as unknown as Database;
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					purchaseDateFrom: "",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					purchaseDateUntil: " 2026-09-01 ",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					purchaseDateFrom: "2026-02-30",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+		});
+
+		it("rejects empty string and invalid status filter", async () => {
+			const mockDb = {
+				transaction: vi.fn(async (cb) =>
+					cb({} as unknown as DatabaseTransaction),
+				),
+			} as unknown as Database;
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					// @ts-expect-error test invalid runtime input
+					status: "",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+		});
+
+		it("rejects invalid limit and offset values", async () => {
+			const mockDb = {
+				transaction: vi.fn(async (cb) =>
+					cb({} as unknown as DatabaseTransaction),
+				),
+			} as unknown as Database;
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					limit: -1,
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					limit: 0,
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					limit: 1.5,
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					offset: -1,
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					offset: 2.5,
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+		});
 	});
 });

@@ -284,8 +284,14 @@ export interface ListCreditCardPurchasesParams {
 // ============================================================================
 
 export function normalizePurchaseBudgetCategory(
-	category: string,
+	category: unknown,
 ): CreditCardPurchaseBudgetCategory {
+	if (typeof category !== "string" || category.trim() === "") {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`Invalid purchase category: "${String(category)}"`,
+		);
+	}
 	const upper = category.trim().toUpperCase();
 	if (upper === "MANDATORY" || upper === "MANDATORY_EXPENSE") {
 		return "MANDATORY_EXPENSE";
@@ -2793,19 +2799,26 @@ export async function listCreditCardPurchasesInTransaction({
 	CreditCardPurchaseRecord[]
 > {
 	const validUserId = validateCcCanonicalUuid(userId, "userId");
-	const validStatus = validateLiabilityEventStatusFilter(status);
-	const validCardId = cardId
-		? validateCcCanonicalUuid(cardId, "cardId")
-		: undefined;
-	const validBudgetCategory = budgetCategory
-		? normalizePurchaseBudgetCategory(String(budgetCategory))
-		: undefined;
-	const validPurchaseDateFrom = purchaseDateFrom
-		? validateGregorianDateString(purchaseDateFrom, "purchaseDateFrom")
-		: undefined;
-	const validPurchaseDateUntil = purchaseDateUntil
-		? validateGregorianDateString(purchaseDateUntil, "purchaseDateUntil")
-		: undefined;
+	const validStatus =
+		status !== undefined
+			? validateLiabilityEventStatusFilter(status)
+			: undefined;
+	const validCardId =
+		cardId !== undefined
+			? validateCcCanonicalUuid(cardId, "cardId")
+			: undefined;
+	const validBudgetCategory =
+		budgetCategory !== undefined
+			? normalizePurchaseBudgetCategory(budgetCategory)
+			: undefined;
+	const validPurchaseDateFrom =
+		purchaseDateFrom !== undefined
+			? validateGregorianDateString(purchaseDateFrom, "purchaseDateFrom")
+			: undefined;
+	const validPurchaseDateUntil =
+		purchaseDateUntil !== undefined
+			? validateGregorianDateString(purchaseDateUntil, "purchaseDateUntil")
+			: undefined;
 
 	if (
 		validPurchaseDateFrom &&
