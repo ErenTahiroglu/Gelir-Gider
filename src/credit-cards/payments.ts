@@ -1,25 +1,20 @@
 import { and, desc, eq } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
-import {
-	creditCardLedgerLinks,
-	creditCardStatementPaymentEvents,
-} from "../db/schema/credit-card-ledger";
+import { users } from "../db/schema/auth";
+import { creditCardStatementPaymentEvents } from "../db/schema/credit-card-ledger";
 import {
 	type CreditCardReservePlacement,
-	type CreditCardStatementOperation,
-	type CreditCardStatementStatus,
 	creditCardRevisions,
 	creditCardStatementRevisions,
 	creditCardStatements,
 	creditCards,
 } from "../db/schema/credit-cards";
 import { ledgerAccounts } from "../db/schema/ledger";
-import { midasAccounts, midasBuckets } from "../db/schema/midas";
+import { midasAccounts } from "../db/schema/midas";
 import { transactionRevisions } from "../db/schema/transactions";
 import { getLedgerAccountBalanceInTransaction } from "../ledger/balances";
 import {
 	formatSignedCentsToMoney,
-	parsePositiveMoneyString,
 	parseSignedAggregateMoneyString,
 } from "../ledger/money";
 import { lockLedgerAccountsInTransaction } from "../ledger/posting";
@@ -42,7 +37,6 @@ import {
 	validateCcCanonicalUuid,
 	validateCcExpectedRevisionNo,
 	validateCcOccurredAt,
-	validateCcOptionalText,
 	validateCcPositiveMoneyString,
 	validateCcRequiredText,
 	validatePaymentMethod,
@@ -161,6 +155,28 @@ export async function payCreditCardStatementInTransaction({
 	);
 
 	// 1. EARLY IDEMPOTENCY REPLAY CHECK
+	if (
+		outsidePaymentAssetAccountId !== undefined &&
+		outsidePaymentAssetAccountId !== null &&
+		paymentAssetAccountId !== undefined &&
+		paymentAssetAccountId !== null
+	) {
+		const normOutside = validateCcCanonicalUuid(
+			outsidePaymentAssetAccountId,
+			"outsidePaymentAssetAccountId",
+		);
+		const normPayment = validateCcCanonicalUuid(
+			paymentAssetAccountId,
+			"paymentAssetAccountId",
+		);
+		if (normOutside !== normPayment) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_INPUT",
+				"outsidePaymentAssetAccountId and paymentAssetAccountId cannot differ",
+			);
+		}
+	}
+
 	const candidateAssetId =
 		outsidePaymentAssetAccountId ?? paymentAssetAccountId;
 
@@ -338,6 +354,22 @@ export async function payCreditCardStatementInTransaction({
 		}
 
 		resolvedAssetAccountId = midasAcc.ledgerAccountId;
+
+		// Symmetrical caller asset assertion validation for MIDAS_FUND
+		const callerSuppliedAsset =
+			outsidePaymentAssetAccountId ?? paymentAssetAccountId;
+		if (callerSuppliedAsset !== undefined && callerSuppliedAsset !== null) {
+			const validCallerAsset = validateCcCanonicalUuid(
+				callerSuppliedAsset,
+				"paymentAssetAccountId",
+			);
+			if (validCallerAsset !== resolvedAssetAccountId) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_INPUT",
+					`Supplied payment asset account "${validCallerAsset}" does not match MIDAS_FUND resolved asset account "${resolvedAssetAccountId}"`,
+				);
+			}
+		}
 	} else {
 		// OUTSIDE_MIDAS
 		const candidateAssetId =
@@ -405,6 +437,20 @@ export async function payCreditCardStatementInTransaction({
 			throw new CreditCardError(
 				"CREDIT_CARD_LEDGER_ACCOUNT_INVALID",
 				`Payment asset account "${validAssetId}" is linked to a Midas account and cannot be used for OUTSIDE_MIDAS payment`,
+			);
+		}
+
+		// Currency invariant check (asset account currency === user currency)
+		const [userRow] = await tx
+			.select({ currency: users.currency })
+			.from(users)
+			.where(eq(users.id, validUserId))
+			.limit(1);
+
+		if (!userRow || assetAcc.currency !== userRow.currency) {
+			throw new CreditCardError(
+				"CREDIT_CARD_LEDGER_ACCOUNT_INVALID",
+				`Payment asset account "${validAssetId}" currency "${assetAcc.currency}" must match user currency "${userRow?.currency}"`,
 			);
 		}
 

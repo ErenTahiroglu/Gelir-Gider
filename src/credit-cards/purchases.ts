@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lte, ne, sql } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	type CreditCardLiabilityEventOperation,
@@ -32,11 +32,14 @@ import {
 	validateCcCanonicalUuid,
 	validateCcExpectedRevisionNo,
 	validateCcOccurredAt,
+	validateCcOffset,
 	validateCcOptionalText,
 	validateCcPositiveMoneyString,
 	validateCcRequiredText,
+	validateGregorianDateString,
 	validateInstallmentCount,
 	validateLiabilityEventStatusFilter,
+	validatePositiveIntegerRange,
 	validatePurchaseCategory,
 } from "./calendar";
 import { CreditCardError } from "./errors";
@@ -47,7 +50,6 @@ import {
 	calculateLiabilityEventUpdateFingerprintV1,
 	calculateLiabilityEventVoidFingerprint,
 	calculateLiabilityEventVoidFingerprintV1,
-	generateCreditCardLiabilityJournalKey,
 } from "./fingerprint";
 import {
 	ensureCreditCardLedgerLinkInTransaction,
@@ -258,6 +260,9 @@ export interface ListCreditCardPurchasesInTransactionParams {
 	userId: string;
 	cardId?: string | undefined;
 	status?: "POSTED" | "VOID" | undefined;
+	budgetCategory?: CreditCardPurchaseBudgetCategory | string | undefined;
+	purchaseDateFrom?: string | undefined;
+	purchaseDateUntil?: string | undefined;
 	limit?: number | undefined;
 	offset?: number | undefined;
 }
@@ -267,6 +272,9 @@ export interface ListCreditCardPurchasesParams {
 	userId: string;
 	cardId?: string | undefined;
 	status?: "POSTED" | "VOID" | undefined;
+	budgetCategory?: CreditCardPurchaseBudgetCategory | string | undefined;
+	purchaseDateFrom?: string | undefined;
+	purchaseDateUntil?: string | undefined;
 	limit?: number | undefined;
 	offset?: number | undefined;
 }
@@ -2011,7 +2019,7 @@ export async function updateCreditCardOpeningBalanceInTransaction({
 		.orderBy(desc(creditCardRevisions.revisionNo))
 		.limit(1);
 
-	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+	if (latestCardRev?.status !== "ACTIVE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_NOT_ACTIVE",
 			`Credit card "${event.creditCardId}" is not active`,
@@ -2425,7 +2433,7 @@ export async function voidCreditCardOpeningBalanceInTransaction({
 		.orderBy(desc(creditCardRevisions.revisionNo))
 		.limit(1);
 
-	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+	if (latestCardRev?.status !== "ACTIVE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_NOT_ACTIVE",
 			`Credit card "${event.creditCardId}" is not active`,
@@ -2768,12 +2776,17 @@ export async function getCreditCardPurchase({
 
 /**
  * Lists credit card purchases and opening balances inside a transaction using bulk queries.
+ * Enforces filter-before-pagination and stable sorting:
+ * ORDER BY purchase_date DESC NULLS LAST, occurred_at DESC, event_id ASC
  */
 export async function listCreditCardPurchasesInTransaction({
 	tx,
 	userId,
 	cardId,
 	status,
+	budgetCategory,
+	purchaseDateFrom,
+	purchaseDateUntil,
 	limit = 50,
 	offset = 0,
 }: ListCreditCardPurchasesInTransactionParams): Promise<
@@ -2784,133 +2797,180 @@ export async function listCreditCardPurchasesInTransaction({
 	const validCardId = cardId
 		? validateCcCanonicalUuid(cardId, "cardId")
 		: undefined;
+	const validBudgetCategory = budgetCategory
+		? normalizePurchaseBudgetCategory(String(budgetCategory))
+		: undefined;
+	const validPurchaseDateFrom = purchaseDateFrom
+		? validateGregorianDateString(purchaseDateFrom, "purchaseDateFrom")
+		: undefined;
+	const validPurchaseDateUntil = purchaseDateUntil
+		? validateGregorianDateString(purchaseDateUntil, "purchaseDateUntil")
+		: undefined;
 
-	const conditions = [eq(creditCardLiabilityEvents.userId, validUserId)];
+	if (
+		validPurchaseDateFrom &&
+		validPurchaseDateUntil &&
+		validPurchaseDateFrom > validPurchaseDateUntil
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`purchaseDateFrom "${validPurchaseDateFrom}" must not be after purchaseDateUntil "${validPurchaseDateUntil}"`,
+		);
+	}
+
+	const validLimit =
+		limit !== undefined
+			? validatePositiveIntegerRange(limit, "limit", 1, 1000)
+			: 50;
+	const validOffset =
+		offset !== undefined ? validateCcOffset(offset, "offset") : 0;
+
+	// 1. Define subquery for latest liability revisions per event
+	const innerConditions = [eq(creditCardLiabilityEvents.userId, validUserId)];
 	if (validCardId) {
-		conditions.push(eq(creditCardLiabilityEvents.creditCardId, validCardId));
+		innerConditions.push(
+			eq(creditCardLiabilityEvents.creditCardId, validCardId),
+		);
 	}
 
-	// 1. Query event anchors
-	const events = await tx
-		.select()
-		.from(creditCardLiabilityEvents)
-		.where(and(...conditions))
-		.orderBy(desc(creditCardLiabilityEvents.createdAt))
-		.limit(limit)
-		.offset(offset);
-
-	if (events.length === 0) {
-		return [];
-	}
-
-	const eventIds = events.map((e) => e.id);
-
-	// 2. Query revisions for all events in bulk
-	const allRevisions = await tx
-		.select()
+	const latestRevsSq = tx
+		.selectDistinctOn([creditCardLiabilityEventRevisions.eventId], {
+			revisionId: creditCardLiabilityEventRevisions.id,
+			eventId: creditCardLiabilityEventRevisions.eventId,
+			userId: creditCardLiabilityEventRevisions.userId,
+			revisionNo: creditCardLiabilityEventRevisions.revisionNo,
+			canonicalRevisionId:
+				creditCardLiabilityEventRevisions.canonicalRevisionId,
+			operation: creditCardLiabilityEventRevisions.operation,
+			amount: creditCardLiabilityEventRevisions.amount,
+			budgetCategory: creditCardLiabilityEventRevisions.budgetCategory,
+			merchant: creditCardLiabilityEventRevisions.merchant,
+			description: creditCardLiabilityEventRevisions.description,
+			installmentCount: creditCardLiabilityEventRevisions.installmentCount,
+			purchaseDate: creditCardLiabilityEventRevisions.purchaseDate,
+			occurredAt: creditCardLiabilityEventRevisions.occurredAt,
+			creditCardId: creditCardLiabilityEvents.creditCardId,
+			eventType: creditCardLiabilityEvents.eventType,
+			canonicalTransactionId: creditCardLiabilityEvents.canonicalTransactionId,
+			eventCreatedAt: creditCardLiabilityEvents.createdAt,
+		})
 		.from(creditCardLiabilityEventRevisions)
-		.where(inArray(creditCardLiabilityEventRevisions.eventId, eventIds))
+		.innerJoin(
+			creditCardLiabilityEvents,
+			eq(
+				creditCardLiabilityEvents.id,
+				creditCardLiabilityEventRevisions.eventId,
+			),
+		)
+		.where(and(...innerConditions))
 		.orderBy(
 			creditCardLiabilityEventRevisions.eventId,
 			desc(creditCardLiabilityEventRevisions.revisionNo),
+		)
+		.as("latest_revs");
+
+	// 2. Build outer filter conditions on the latest revision attributes
+	const outerConditions = [];
+	if (validStatus) {
+		if (validStatus === "VOID") {
+			outerConditions.push(eq(latestRevsSq.operation, "VOID"));
+		} else {
+			outerConditions.push(ne(latestRevsSq.operation, "VOID"));
+		}
+	}
+	if (validBudgetCategory) {
+		outerConditions.push(eq(latestRevsSq.budgetCategory, validBudgetCategory));
+	}
+	if (validPurchaseDateFrom) {
+		outerConditions.push(gte(latestRevsSq.purchaseDate, validPurchaseDateFrom));
+	}
+	if (validPurchaseDateUntil) {
+		outerConditions.push(
+			lte(latestRevsSq.purchaseDate, validPurchaseDateUntil),
 		);
-
-	// Derive latest revision per event
-	const latestRevisionByEventId = new Map<
-		string,
-		typeof creditCardLiabilityEventRevisions.$inferSelect
-	>();
-	for (const rev of allRevisions) {
-		if (!latestRevisionByEventId.has(rev.eventId)) {
-			latestRevisionByEventId.set(rev.eventId, rev);
-		}
 	}
 
-	// Collect canonical revision IDs for latest revisions
-	const canonicalRevisionIds: string[] = [];
-	for (const event of events) {
-		const latestRev = latestRevisionByEventId.get(event.id);
-		if (!latestRev) continue;
-		const revStatus = latestRev.operation === "VOID" ? "VOID" : "POSTED";
-		if (validStatus && revStatus !== validStatus) continue;
-		canonicalRevisionIds.push(latestRev.canonicalRevisionId);
+	// 3. Query filtered, ordered, paginated rows
+	const rows = await tx
+		.select()
+		.from(latestRevsSq)
+		.where(outerConditions.length > 0 ? and(...outerConditions) : undefined)
+		.orderBy(
+			sql`${latestRevsSq.purchaseDate} DESC NULLS LAST`,
+			desc(latestRevsSq.occurredAt),
+			asc(latestRevsSq.eventId),
+		)
+		.limit(validLimit)
+		.offset(validOffset);
+
+	if (rows.length === 0) {
+		return [];
 	}
 
-	// 3. Bulk query ledger bindings
+	const canonicalRevisionIds = rows.map((r) => r.canonicalRevisionId);
+
+	// 4. Bulk query ledger bindings
 	const bindingsByRevisionId = new Map<string, string | null>();
-	if (canonicalRevisionIds.length > 0) {
-		const bindings = await tx
-			.select({
-				revisionId: transactionLedgerBindings.revisionId,
-				appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
-			})
-			.from(transactionLedgerBindings)
-			.where(
-				inArray(transactionLedgerBindings.revisionId, canonicalRevisionIds),
-			);
-		for (const b of bindings) {
-			bindingsByRevisionId.set(b.revisionId, b.appliedJournalEntryId);
-		}
+	const bindings = await tx
+		.select({
+			revisionId: transactionLedgerBindings.revisionId,
+			appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
+		})
+		.from(transactionLedgerBindings)
+		.where(inArray(transactionLedgerBindings.revisionId, canonicalRevisionIds));
+	for (const b of bindings) {
+		bindingsByRevisionId.set(b.revisionId, b.appliedJournalEntryId);
 	}
 
-	// 4. Bulk query canonical revision payloads
+	// 5. Bulk query canonical revision payloads
 	const payloadsByRevisionId = new Map<
 		string,
 		{ shortTermGoalId?: string | null } | undefined
 	>();
-	if (canonicalRevisionIds.length > 0) {
-		const canonicalRevs = await tx
-			.select({
-				id: transactionRevisions.id,
-				payload: transactionRevisions.payload,
-			})
-			.from(transactionRevisions)
-			.where(inArray(transactionRevisions.id, canonicalRevisionIds));
-		for (const cr of canonicalRevs) {
-			payloadsByRevisionId.set(
-				cr.id,
-				cr.payload as { shortTermGoalId?: string | null } | undefined,
-			);
-		}
+	const canonicalRevs = await tx
+		.select({
+			id: transactionRevisions.id,
+			payload: transactionRevisions.payload,
+		})
+		.from(transactionRevisions)
+		.where(inArray(transactionRevisions.id, canonicalRevisionIds));
+	for (const cr of canonicalRevs) {
+		payloadsByRevisionId.set(
+			cr.id,
+			cr.payload as { shortTermGoalId?: string | null } | undefined,
+		);
 	}
 
-	// 5. Assemble results in order
-	const results: CreditCardPurchaseRecord[] = [];
-	for (const ev of events) {
-		const latestRev = latestRevisionByEventId.get(ev.id);
-		if (!latestRev) continue;
-
-		const revStatus = latestRev.operation === "VOID" ? "VOID" : "POSTED";
-		if (validStatus && revStatus !== validStatus) continue;
-
+	// 6. Assemble results in order
+	return rows.map((row) => {
 		const appliedJournalEntryId =
-			bindingsByRevisionId.get(latestRev.canonicalRevisionId) ?? null;
-		const payload = payloadsByRevisionId.get(latestRev.canonicalRevisionId);
+			bindingsByRevisionId.get(row.canonicalRevisionId) ?? null;
+		const payload = payloadsByRevisionId.get(row.canonicalRevisionId);
 		const shortTermGoalId = payload?.shortTermGoalId ?? null;
+		const rowStatus: "POSTED" | "VOID" =
+			row.operation === "VOID" ? "VOID" : "POSTED";
 
-		results.push({
-			eventId: ev.id,
-			cardId: ev.creditCardId,
-			userId: ev.userId,
-			eventType: ev.eventType as CreditCardLiabilityEventType,
-			status: revStatus,
-			revisionNo: latestRev.revisionNo,
-			amount: latestRev.amount,
-			purchaseDate: latestRev.purchaseDate,
+		return {
+			eventId: row.eventId,
+			cardId: row.creditCardId,
+			userId: row.userId,
+			eventType: row.eventType as CreditCardLiabilityEventType,
+			status: rowStatus,
+			revisionNo: row.revisionNo,
+			amount: row.amount,
+			purchaseDate: row.purchaseDate,
 			purchaseCategory:
-				latestRev.budgetCategory as CreditCardPurchaseBudgetCategory | null,
+				row.budgetCategory as CreditCardPurchaseBudgetCategory | null,
 			shortTermGoalId,
-			merchant: latestRev.merchant,
-			description: latestRev.description,
-			installmentCount: latestRev.installmentCount ?? null,
-			canonicalTransactionId: ev.canonicalTransactionId,
-			canonicalRevisionId: latestRev.canonicalRevisionId,
+			merchant: row.merchant,
+			description: row.description,
+			installmentCount: row.installmentCount ?? null,
+			canonicalTransactionId: row.canonicalTransactionId,
+			canonicalRevisionId: row.canonicalRevisionId,
 			journalEntryId: appliedJournalEntryId,
-			createdAt: ev.createdAt,
-		});
-	}
-
-	return results;
+			createdAt: row.eventCreatedAt,
+		};
+	});
 }
 
 /**

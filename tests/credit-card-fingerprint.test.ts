@@ -6,7 +6,6 @@ import {
 	calculateStatementCreateFingerprint,
 	calculateStatementUpdateFingerprint,
 	calculateStatementVoidFingerprint,
-	generateCardReserveMidasKey,
 } from "../src/credit-cards/fingerprint";
 
 const BASE_DATE = new Date("2026-09-04T10:00:00.000Z");

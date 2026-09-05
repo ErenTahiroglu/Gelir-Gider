@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { CreditCardError } from "../src/credit-cards/errors";
 import { calculateStatementPayFingerprint } from "../src/credit-cards/fingerprint";
 import * as ledgerProvisioning from "../src/credit-cards/ledger-provisioning";
 import {
@@ -70,7 +69,22 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 											id: assetAccountId,
 											accountType: "ASSET",
 											normalBalance: "DEBIT",
+											currency: "TRY",
 											archivedAt: null,
+										},
+									]),
+								};
+							}
+							if (selectCallCount === 6) {
+								// midasAccounts check (not linked)
+								return { limit: vi.fn().mockResolvedValue([]) };
+							}
+							if (selectCallCount === 7) {
+								// users check
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											currency: "TRY",
 										},
 									]),
 								};
@@ -996,7 +1010,22 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 											id: assetAccountId,
 											accountType: "ASSET",
 											normalBalance: "DEBIT",
+											currency: "TRY",
 											archivedAt: null,
+										},
+									]),
+								};
+							}
+							if (selectCallCount === 6) {
+								// midasAccounts check (not linked)
+								return { limit: vi.fn().mockResolvedValue([]) };
+							}
+							if (selectCallCount === 7) {
+								// users check
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											currency: "TRY",
 										},
 									]),
 								};
@@ -1047,6 +1076,225 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 			).rejects.toThrow(
 				expect.objectContaining({
 					code: "CREDIT_CARD_LIABILITY_SHORTFALL",
+				}),
+			);
+		});
+
+		it("rejects contradictory paymentAssetAccountId and outsidePaymentAssetAccountId", async () => {
+			const mockDb = {
+				transaction: vi.fn(async (cb) =>
+					cb({} as unknown as DatabaseTransaction),
+				),
+			} as unknown as Database;
+
+			await expect(
+				payCreditCardStatement({
+					db: mockDb,
+					userId,
+					statementId,
+					expectedRevisionNo: 1,
+					paymentAmount: "100.00",
+					paymentMethod: "OUTSIDE_MIDAS",
+					paymentAssetAccountId: assetAccountId,
+					outsidePaymentAssetAccountId: "99999999-9999-9999-9999-999999999999",
+					occurredAt: new Date("2026-09-10T12:00:00Z"),
+					idempotencyKey: "k-pay-contradictory-1",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+		});
+
+		it("rejects MIDAS_FUND payment when supplied asset differs from Midas account", async () => {
+			let selectCallCount = 0;
+			const mockTx = {
+				select: vi.fn(() => ({
+					from: vi.fn(() => ({
+						where: vi.fn(() => {
+							selectCallCount++;
+							if (selectCallCount === 1) {
+								return { limit: vi.fn().mockResolvedValue([]) };
+							}
+							if (selectCallCount === 2) {
+								return {
+									for: vi
+										.fn()
+										.mockResolvedValue([
+											{ id: statementId, cardId, userId, midasAccountId },
+										]),
+								};
+							}
+							if (selectCallCount === 3) {
+								return { limit: vi.fn().mockResolvedValue([]) };
+							}
+							if (selectCallCount === 4) {
+								return {
+									orderBy: vi.fn().mockReturnValue({
+										limit: vi.fn().mockResolvedValue([
+											{
+												id: "rev-stmt-1",
+												statementId,
+												revisionNo: 1,
+												status: "OPEN",
+												statementAmount: "100.00",
+												statementDate: "2026-09-01",
+												dueDate: "2026-09-15",
+												reservePlacement: "MIDAS_FUND",
+												midasAccountId: midasAccountId,
+												note: null,
+											},
+										]),
+									}),
+								};
+							}
+							if (selectCallCount === 5) {
+								// midasAccounts query
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: midasAccountId,
+											ledgerAccountId: midasAccountId,
+										},
+									]),
+								};
+							}
+							return {
+								limit: vi.fn().mockResolvedValue([]),
+							};
+						}),
+					})),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			vi.spyOn(
+				ledgerProvisioning,
+				"ensureCreditCardLedgerLinkInTransaction",
+			).mockResolvedValue(liabilityAccountId);
+
+			await expect(
+				payCreditCardStatement({
+					db: mockDb,
+					userId,
+					statementId,
+					expectedRevisionNo: 1,
+					paymentAmount: "100.00",
+					paymentMethod: "MIDAS_FUND",
+					paymentAssetAccountId: "99999999-9999-9999-9999-999999999999", // Contradictory!
+					occurredAt: new Date("2026-09-10T12:00:00Z"),
+					idempotencyKey: "k-pay-midas-wrong-asset-1",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+		});
+
+		it("rejects OUTSIDE_MIDAS payment when asset account currency does not match user currency", async () => {
+			let selectCallCount = 0;
+			const mockTx = {
+				select: vi.fn(() => ({
+					from: vi.fn(() => ({
+						where: vi.fn(() => {
+							selectCallCount++;
+							if (selectCallCount === 1) {
+								return { limit: vi.fn().mockResolvedValue([]) };
+							}
+							if (selectCallCount === 2) {
+								return {
+									for: vi
+										.fn()
+										.mockResolvedValue([{ id: statementId, cardId, userId }]),
+								};
+							}
+							if (selectCallCount === 3) {
+								return { limit: vi.fn().mockResolvedValue([]) };
+							}
+							if (selectCallCount === 4) {
+								return {
+									orderBy: vi.fn().mockReturnValue({
+										limit: vi.fn().mockResolvedValue([
+											{
+												id: "rev-stmt-1",
+												statementId,
+												revisionNo: 1,
+												status: "OPEN",
+												statementAmount: "100.00",
+												statementDate: "2026-09-01",
+												dueDate: "2026-09-15",
+												reservePlacement: "OUTSIDE_MIDAS",
+												note: null,
+											},
+										]),
+									}),
+								};
+							}
+							if (selectCallCount === 5) {
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: assetAccountId,
+											accountType: "ASSET",
+											normalBalance: "DEBIT",
+											archivedAt: null,
+											currency: "USD", // Cross-currency!
+										},
+									]),
+								};
+							}
+							if (selectCallCount === 6) {
+								// midasAccounts check (not linked)
+								return { limit: vi.fn().mockResolvedValue([]) };
+							}
+							if (selectCallCount === 7) {
+								// users check
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: userId,
+											currency: "TRY",
+										},
+									]),
+								};
+							}
+							return {
+								limit: vi.fn().mockResolvedValue([]),
+							};
+						}),
+					})),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			vi.spyOn(
+				ledgerProvisioning,
+				"ensureCreditCardLedgerLinkInTransaction",
+			).mockResolvedValue(liabilityAccountId);
+
+			await expect(
+				payCreditCardStatement({
+					db: mockDb,
+					userId,
+					statementId,
+					expectedRevisionNo: 1,
+					paymentAmount: "100.00",
+					paymentMethod: "OUTSIDE_MIDAS",
+					paymentAssetAccountId: assetAccountId,
+					occurredAt: new Date("2026-09-10T12:00:00Z"),
+					idempotencyKey: "k-pay-outside-cross-curr-1",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_LEDGER_ACCOUNT_INVALID",
 				}),
 			);
 		});

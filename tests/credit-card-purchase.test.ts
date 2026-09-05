@@ -317,6 +317,17 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 
 			let selectCallCount = 0;
 			const mockTx = {
+				selectDistinctOn: vi.fn(() => ({
+					from: vi.fn(() => ({
+						innerJoin: vi.fn(() => ({
+							where: vi.fn(() => ({
+								orderBy: vi.fn(() => ({
+									as: vi.fn().mockReturnValue("latest_revs"),
+								})),
+							})),
+						})),
+					})),
+				})),
 				select: vi.fn(() => ({
 					from: vi.fn(() => {
 						selectCallCount++;
@@ -324,26 +335,48 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 						return {
 							where: vi.fn(() => {
 								if (currentCall === 1) {
-									// Event query
+									// Filtered, ordered, paginated rows
 									return {
 										orderBy: vi.fn().mockReturnValue({
 											limit: vi.fn().mockReturnValue({
 												offset: vi.fn().mockResolvedValue([
 													{
-														id: ev1Id,
-														creditCardId: cardId,
+														revisionId: "rev-1",
+														eventId: ev1Id,
 														userId,
+														revisionNo: 1,
+														canonicalRevisionId: canRev1Id,
+														operation: "CREATE",
+														amount: "100.00",
+														budgetCategory: "SHORT_TERM_PURCHASE",
+														merchant: "Migros",
+														description: "Groceries",
+														installmentCount: null,
+														purchaseDate: "2026-09-01",
+														occurredAt: new Date("2026-09-01T10:00:00Z"),
+														creditCardId: cardId,
 														eventType: "PURCHASE",
 														canonicalTransactionId: "can-tx-1",
-														createdAt: new Date("2026-09-01T10:00:00Z"),
+														eventCreatedAt: new Date("2026-09-01T10:00:00Z"),
 													},
 													{
-														id: ev2Id,
-														creditCardId: cardId,
+														revisionId: "rev-2",
+														eventId: ev2Id,
 														userId,
+														revisionNo: 1,
+														canonicalRevisionId: canRev2Id,
+														operation: "CREATE",
+														amount: "200.00",
+														budgetCategory: null,
+														merchant: null,
+														description: "Opening",
+														installmentCount: null,
+														purchaseDate: null,
+														occurredAt: new Date("2026-09-01T09:00:00Z"),
+														creditCardId: cardId,
 														eventType: "OPENING_BALANCE",
 														canonicalTransactionId: "can-tx-2",
-														createdAt: new Date("2026-09-01T09:00:00Z"),
+														eventCreatedAt: new Date("2026-09-01T09:00:00Z"),
 													},
 												]),
 											}),
@@ -351,39 +384,6 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 									};
 								}
 								if (currentCall === 2) {
-									// Event revisions in bulk
-									return {
-										orderBy: vi.fn().mockResolvedValue([
-											{
-												id: "rev-1",
-												eventId: ev1Id,
-												revisionNo: 1,
-												operation: "CREATE",
-												amount: "100.00",
-												purchaseDate: "2026-09-01",
-												budgetCategory: "SHORT_TERM_PURCHASE",
-												merchant: "Migros",
-												description: "Groceries",
-												installmentCount: null,
-												canonicalRevisionId: canRev1Id,
-											},
-											{
-												id: "rev-2",
-												eventId: ev2Id,
-												revisionNo: 1,
-												operation: "CREATE",
-												amount: "200.00",
-												purchaseDate: null,
-												budgetCategory: null,
-												merchant: null,
-												description: "Opening",
-												installmentCount: null,
-												canonicalRevisionId: canRev2Id,
-											},
-										]),
-									};
-								}
-								if (currentCall === 3) {
 									// Bindings in bulk
 									return [
 										{
@@ -396,7 +396,7 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 										},
 									];
 								}
-								if (currentCall === 4) {
+								if (currentCall === 3) {
 									// Canonical revisions in bulk
 									return [
 										{
@@ -424,6 +424,11 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 				db: mockDb,
 				userId,
 				cardId,
+				budgetCategory: "SHORT_TERM_PURCHASE",
+				purchaseDateFrom: "2026-09-01",
+				purchaseDateUntil: "2026-09-30",
+				limit: 20,
+				offset: 0,
 			});
 
 			expect(records).toHaveLength(2);
@@ -441,6 +446,17 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 
 		it("returns empty list if no events match", async () => {
 			const mockTx = {
+				selectDistinctOn: vi.fn(() => ({
+					from: vi.fn(() => ({
+						innerJoin: vi.fn(() => ({
+							where: vi.fn(() => ({
+								orderBy: vi.fn(() => ({
+									as: vi.fn().mockReturnValue("latest_revs"),
+								})),
+							})),
+						})),
+					})),
+				})),
 				select: vi.fn(() => ({
 					from: vi.fn(() => ({
 						where: vi.fn(() => ({
@@ -464,6 +480,47 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 			});
 
 			expect(records).toEqual([]);
+		});
+
+		it("rejects invalid date range where purchaseDateFrom is after purchaseDateUntil", async () => {
+			const mockDb = {
+				transaction: vi.fn(async (cb) =>
+					cb({} as unknown as DatabaseTransaction),
+				),
+			} as unknown as Database;
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					purchaseDateFrom: "2026-09-30",
+					purchaseDateUntil: "2026-09-01",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
+		});
+
+		it("rejects non-Gregorian leap date (e.g. 2026-02-29)", async () => {
+			const mockDb = {
+				transaction: vi.fn(async (cb) =>
+					cb({} as unknown as DatabaseTransaction),
+				),
+			} as unknown as Database;
+
+			await expect(
+				listCreditCardPurchases({
+					db: mockDb,
+					userId,
+					purchaseDateFrom: "2026-02-29",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_INPUT",
+				}),
+			);
 		});
 	});
 });

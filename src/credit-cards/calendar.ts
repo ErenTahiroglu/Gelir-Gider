@@ -465,3 +465,87 @@ export function validateInstallmentCount(value: unknown): number | null {
 	}
 	return value;
 }
+
+const GREGORIAN_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * Validates a Gregorian calendar date string in YYYY-MM-DD format.
+ */
+export function validateGregorianDateString(
+	value: unknown,
+	fieldName: string,
+): string {
+	if (typeof value !== "string" || !GREGORIAN_DATE_PATTERN.test(value)) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} must be a valid date in YYYY-MM-DD format`,
+		);
+	}
+	const match = GREGORIAN_DATE_PATTERN.exec(value);
+	if (!match) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} must be a valid date in YYYY-MM-DD format`,
+		);
+	}
+	const [_, yStr = "", mStr = "", dStr = ""] = match;
+	const year = Number.parseInt(yStr, 10);
+	const month = Number.parseInt(mStr, 10);
+	const day = Number.parseInt(dStr, 10);
+
+	if (month < 1 || month > 12) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} month must be between 01 and 12`,
+		);
+	}
+	const maxDays = getDaysInMonth(year, month);
+	if (day < 1 || day > maxDays) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} day must be between 01 and ${maxDays} for year ${year} and month ${month}`,
+		);
+	}
+	return value;
+}
+
+/**
+ * Validates an integer in a closed [min, max] range.
+ */
+export function validatePositiveIntegerRange(
+	value: unknown,
+	fieldName: string,
+	min: number,
+	max: number,
+): number {
+	if (
+		typeof value !== "number" ||
+		!Number.isInteger(value) ||
+		value < min ||
+		value > max
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} must be an integer between ${min} and ${max}`,
+		);
+	}
+	return value;
+}
+
+/**
+ * Validates a pagination offset (safe integer >= 0).
+ */
+export function validateCcOffset(value: unknown, fieldName = "offset"): number {
+	if (
+		typeof value !== "number" ||
+		!Number.isInteger(value) ||
+		value < 0 ||
+		!Number.isSafeInteger(value)
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`${fieldName} must be a non-negative safe integer`,
+		);
+	}
+	return value;
+}
