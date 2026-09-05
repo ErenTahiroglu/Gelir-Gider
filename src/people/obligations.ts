@@ -1609,7 +1609,6 @@ export interface VoidSplitObligationInTransactionParams {
 	obligationId: string;
 	expectedRevisionNo: number;
 	idempotencyKey: string;
-	occurredAt: Date;
 }
 
 export async function getObligationActiveSettledAmountCentsInTransaction(
@@ -1926,14 +1925,8 @@ export async function updateSplitObligationInTransaction(
 export async function voidSplitObligationInTransaction(
 	params: VoidSplitObligationInTransactionParams,
 ): Promise<{ obligationId: string; revisionId: string }> {
-	const {
-		tx,
-		userId,
-		obligationId,
-		expectedRevisionNo,
-		idempotencyKey,
-		occurredAt,
-	} = params;
+	const { tx, userId, obligationId, expectedRevisionNo, idempotencyKey } =
+		params;
 
 	const [obligation] = await tx
 		.select()
@@ -2001,6 +1994,11 @@ export async function voidSplitObligationInTransaction(
 		expectedRevisionNo,
 	});
 
+	// The canonical VOID revision always copies forward the previous
+	// canonical revision's occurred_at (it accepts no occurredAt override),
+	// so the projection row must copy forward latest.occurredAt to match --
+	// never a fresh caller-supplied value, which would violate the DB's
+	// projection/canonical occurred_at binding check.
 	const [insertedRev] = await tx
 		.insert(personObligationRevisions)
 		.values({
@@ -2014,7 +2012,7 @@ export async function voidSplitObligationInTransaction(
 			budgetCategory: null,
 			dueDate: latest.dueDate,
 			description: latest.description,
-			occurredAt,
+			occurredAt: latest.occurredAt,
 			canonicalRevisionId: boundRes.revisionId,
 			idempotencyKey,
 			revisionFingerprint: fingerprint,

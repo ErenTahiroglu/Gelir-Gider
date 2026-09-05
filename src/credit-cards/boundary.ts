@@ -484,6 +484,21 @@ export function mapPeopleError(
 				"CREDIT_CARD_SPLIT_NOT_ACTIVE",
 				"Split obligation is not active",
 			);
+		case "PEOPLE_OBLIGATION_OVERSETTLEMENT":
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_CONFLICT",
+				err.message || "Split obligation oversettlement conflict",
+			);
+		case "PEOPLE_LEDGER_ACCOUNT_INVALID":
+			throw new CreditCardError(
+				"CREDIT_CARD_LEDGER_ACCOUNT_INVALID",
+				err.message || "Invalid ledger account for split obligation",
+			);
+		case "PEOPLE_INVALID_STATE":
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_STATE",
+				err.message || "Invalid people domain state during split operation",
+			);
 		default:
 			throw new CreditCardError(
 				"CREDIT_CARD_SPLIT_CONFLICT",
@@ -511,6 +526,49 @@ export async function runCreditCardTransaction<T>(
 ): Promise<T> {
 	try {
 		return await db.transaction(work);
+	} catch (err: unknown) {
+		if (err instanceof CreditCardError) {
+			throw err;
+		}
+		if (err instanceof MidasError) {
+			mapMidasError(err);
+		}
+		if (err instanceof CanonicalTransactionError) {
+			mapCanonicalError(err);
+		}
+		if (err instanceof LedgerError) {
+			mapLedgerError(err);
+		}
+		if (
+			err &&
+			typeof err === "object" &&
+			"name" in err &&
+			(err as { name: string }).name === "PeopleError"
+		) {
+			mapPeopleError(err as import("../people/errors").PeopleError);
+		}
+		if (isDatabaseBoundaryError(err)) {
+			mapDbError(err);
+		}
+		throw err;
+	}
+}
+
+/**
+ * Executes a read-only unit of work under REPEATABLE READ isolation so a
+ * result combining multiple statements (e.g. a purchase's latest revision,
+ * an active split's latest revision, participant obligations, and settlement
+ * totals) is guaranteed to come from one coherent snapshot rather than
+ * possibly-different READ COMMITTED snapshots per statement. Uses the same
+ * sanitized error mapping as the write boundary. Does not affect write
+ * transaction isolation.
+ */
+export async function runCreditCardReadTransaction<T>(
+	db: Database,
+	work: (tx: DatabaseTransaction) => Promise<T>,
+): Promise<T> {
+	try {
+		return await db.transaction(work, { isolationLevel: "repeatable read" });
 	} catch (err: unknown) {
 		if (err instanceof CreditCardError) {
 			throw err;

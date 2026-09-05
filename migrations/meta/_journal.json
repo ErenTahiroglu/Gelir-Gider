@@ -253,6 +253,13 @@
       "when": 1788614208757,
       "tag": "0035_clever_rattler",
       "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1788616978892,
+      "tag": "0036_close_credit_card_shared_split_integrity_gaps",
+      "breakpoints": true
     }
   ]
 }

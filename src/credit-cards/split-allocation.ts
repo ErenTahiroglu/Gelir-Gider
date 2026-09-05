@@ -1,4 +1,5 @@
 import { CreditCardError } from "./errors";
+import { compareAscii } from "./fingerprint";
 
 export type SplitCalculationMethod = "EQUAL" | "MANUAL" | "RATIO";
 
@@ -81,7 +82,7 @@ export function calculateEqualSplit(params: {
 	// 2. Participants in personId lexical ASC order
 	// Sort participants by personId ASC for deterministic output
 	const sortedParticipants = [...participants].sort((a, b) =>
-		a.personId.localeCompare(b.personId),
+		compareAscii(a.personId, b.personId),
 	);
 
 	let userShare = baseShare;
@@ -160,7 +161,7 @@ export function calculateManualSplit(params: {
 
 	// Sort participants by personId ASC for deterministic output
 	const sortedParticipants = [...participants].sort((a, b) =>
-		a.personId.localeCompare(b.personId),
+		compareAscii(a.personId, b.personId),
 	);
 
 	for (const p of sortedParticipants) {
@@ -269,7 +270,7 @@ export function calculateRatioSplit(params: {
 	// Largest-remainder allocation
 	// Parties: USER (index -1), and sorted participants (index 0..N-1)
 	const sortedParticipants = [...participants].sort((a, b) =>
-		a.personId.localeCompare(b.personId),
+		compareAscii(a.personId, b.personId),
 	);
 
 	interface PartyAllocation {
@@ -321,7 +322,7 @@ export function calculateRatioSplit(params: {
 		}
 		if (a.isUser) return -1;
 		if (b.isUser) return 1;
-		return (a.personId ?? "").localeCompare(b.personId ?? "");
+		return compareAscii(a.personId ?? "", b.personId ?? "");
 	});
 
 	const extraCentsMap = new Map<string, bigint>();

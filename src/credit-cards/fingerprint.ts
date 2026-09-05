@@ -3,6 +3,18 @@
 // Deterministic SHA-256 fingerprinting for card and statement revisions.
 // ============================================================================
 
+/**
+ * Deterministic ASCII/code-point comparator for canonical UUID ordering.
+ * Person IDs are canonical lowercase UUIDs; locale-sensitive comparison
+ * (localeCompare) must never be used for accounting allocation or
+ * fingerprint canonicalization since its result can vary by runtime/locale.
+ */
+export function compareAscii(a: string, b: string): number {
+	if (a < b) return -1;
+	if (a > b) return 1;
+	return 0;
+}
+
 async function sha256Hex(data: unknown[]): Promise<string> {
 	const serialized = JSON.stringify(data, (_key, value) =>
 		typeof value === "bigint" ? value.toString() : value,
@@ -494,7 +506,7 @@ export async function calculateSplitCreateFingerprint(
 ): Promise<string> {
 	// Normalize items: sort by personId ASC
 	const sortedItems = [...params.items]
-		.sort((a, b) => a.personId.localeCompare(b.personId))
+		.sort((a, b) => compareAscii(a.personId, b.personId))
 		.map((item) => [
 			item.personId.trim().toLowerCase(),
 			item.shareAmount,
@@ -522,7 +534,7 @@ export async function calculateSplitUpdateFingerprint(
 	params: SplitUpdateFingerprintParams,
 ): Promise<string> {
 	const sortedItems = [...params.items]
-		.sort((a, b) => a.personId.localeCompare(b.personId))
+		.sort((a, b) => compareAscii(a.personId, b.personId))
 		.map((item) => [
 			item.personId.trim().toLowerCase(),
 			item.shareAmount,
@@ -558,4 +570,34 @@ export async function calculateSplitVoidFingerprint(
 		params.expectedRevisionNo,
 		params.occurredAt.toISOString(),
 	]);
+}
+
+export type SplitChildIdempotencyOperation =
+	| "PARTICIPANT_CREATE"
+	| "PARTICIPANT_UPDATE"
+	| "PARTICIPANT_VOID";
+
+/**
+ * Derives a deterministic, bounded (<=128 char) child idempotency key for a
+ * split participant's People obligation mutation. Raw concatenation of the
+ * caller-supplied parent key (which may itself be up to 128 characters) with
+ * a suffix would overflow the 128-character People/canonical key columns;
+ * SHA-256 hashing keeps the output bounded regardless of parent key length.
+ */
+export async function deriveCreditCardSplitChildIdempotencyKey(
+	parentKey: string,
+	splitId: string,
+	splitRevisionId: string,
+	personId: string,
+	operation: SplitChildIdempotencyOperation,
+): Promise<string> {
+	const hex = await sha256Hex([
+		"cc-split-child-idempotency-key",
+		parentKey.trim(),
+		splitId.trim().toLowerCase(),
+		splitRevisionId.trim().toLowerCase(),
+		personId.trim().toLowerCase(),
+		operation,
+	]);
+	return `CC_SPLIT_CHILD_${hex}`;
 }

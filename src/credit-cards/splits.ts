@@ -13,6 +13,7 @@ import {
 import {
 	creditCardPurchaseSplitParticipants,
 	creditCardPurchaseSplitRevisionItems,
+	creditCardPurchaseSplitRevisionSeals,
 	creditCardPurchaseSplitRevisions,
 	creditCardPurchaseSplits,
 	type SplitMethod,
@@ -32,17 +33,22 @@ import {
 	updateSplitObligationInTransaction,
 	voidSplitObligationInTransaction,
 } from "../people/obligations";
-import { runCreditCardTransaction } from "./boundary";
+import {
+	runCreditCardReadTransaction,
+	runCreditCardTransaction,
+} from "./boundary";
 import {
 	validateCcCanonicalUuid,
 	validateCcExpectedRevisionNo,
 	validateCcOccurredAt,
+	validateGregorianDateString,
 } from "./calendar";
 import { CreditCardError } from "./errors";
 import {
 	calculateSplitCreateFingerprint,
 	calculateSplitUpdateFingerprint,
 	calculateSplitVoidFingerprint,
+	deriveCreditCardSplitChildIdempotencyKey,
 	type SplitParticipantItemFingerprint,
 } from "./fingerprint";
 import {
@@ -187,6 +193,100 @@ function validateSplitMethod(value: string): SplitMethod {
 	return upper as SplitMethod;
 }
 
+/**
+ * Validates and normalizes an optional participant dueDate. undefined/null
+ * means omitted; a supplied value must be a strict YYYY-MM-DD Gregorian date
+ * string (rejects "", whitespace, non-zero-padded months/days, and invalid
+ * calendar dates like 2026-02-30 -- raw `new Date(string)` is never used).
+ */
+export function validateParticipantDueDate(
+	value: string | null | undefined,
+): string | null {
+	if (value === undefined || value === null) return null;
+	return validateGregorianDateString(value, "dueDate");
+}
+
+/**
+ * Validates and normalizes an optional participant description. null/
+ * undefined means omitted. A supplied value is trimmed; a whitespace-only
+ * or empty result normalizes to null (same rule used for storage and for
+ * fingerprint canonicalization so both agree); a non-empty trimmed value
+ * must be between 1 and 500 characters.
+ */
+export function validateParticipantDescription(
+	value: string | null | undefined,
+): string | null {
+	if (value === undefined || value === null) return null;
+	if (typeof value !== "string") {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"Participant description must be a string",
+		);
+	}
+	const trimmed = value.trim();
+	if (trimmed.length === 0) return null;
+	if (trimmed.length > 500) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"Participant description must be at most 500 characters",
+		);
+	}
+	return trimmed;
+}
+
+export interface NormalizedParticipantInput {
+	personId: string;
+	shareAmount?: string | undefined;
+	weight?: number | undefined;
+	dueDate: string | null;
+	description: string | null;
+}
+
+/**
+ * Validates the participants array shape and normalizes each participant's
+ * personId (canonical lowercase UUID), dueDate, and description BEFORE any
+ * DB query or allocation math, so the normalized values are used identically
+ * for duplicate detection, allocation ordering, fingerprints, DB queries, and
+ * payloads.
+ */
+export function validateParticipantsInput(
+	participants: unknown,
+): NormalizedParticipantInput[] {
+	if (!Array.isArray(participants)) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"participants must be an array",
+		);
+	}
+	if (participants.length < 1 || participants.length > 9) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`participants must contain between 1 and 9 entries (got ${participants.length})`,
+		);
+	}
+
+	return participants.map((raw, index) => {
+		if (typeof raw !== "object" || raw === null) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_INPUT",
+				`participants[${index}] must be an object`,
+			);
+		}
+		const p = raw as ParticipantAllocationInput;
+		const personId = validateCcCanonicalUuid(
+			p.personId,
+			`participants[${index}].personId`,
+		);
+		return {
+			personId,
+			shareAmount: p.shareAmount,
+			weight: p.weight,
+			dueDate: validateParticipantDueDate(p.dueDate),
+			description: validateParticipantDescription(p.description),
+		};
+	});
+}
+
 // ============================================================================
 // Internal Helpers
 // ============================================================================
@@ -314,15 +414,15 @@ function calculateAllocations(params: {
 	method: SplitMethod;
 	grossAmount: bigint;
 	userWeight?: number | undefined;
-	participants: ParticipantAllocationInput[];
+	participants: NormalizedParticipantInput[];
 }): SplitCalculationResult {
 	const { method, grossAmount, userWeight, participants } = params;
 
 	if (method === "EQUAL") {
 		const equalInputs: EqualParticipantInput[] = participants.map((p) => ({
 			personId: p.personId,
-			dueDate: p.dueDate ? new Date(p.dueDate) : null,
-			description: p.description ?? null,
+			dueDate: p.dueDate ? new Date(`${p.dueDate}T00:00:00.000Z`) : null,
+			description: p.description,
 		}));
 		return calculateEqualSplit({ grossAmount, participants: equalInputs });
 	}
@@ -339,8 +439,8 @@ function calculateAllocations(params: {
 			return {
 				personId: p.personId,
 				shareAmount: parsed.cents,
-				dueDate: p.dueDate ? new Date(p.dueDate) : null,
-				description: p.description ?? null,
+				dueDate: p.dueDate ? new Date(`${p.dueDate}T00:00:00.000Z`) : null,
+				description: p.description,
 			};
 		});
 		return calculateManualSplit({ grossAmount, participants: manualInputs });
@@ -384,6 +484,181 @@ function calculateAllocations(params: {
 // Read Model Construction
 // ============================================================================
 
+async function buildSplitReadModelFromRevisionInTransaction(
+	tx: DatabaseOrTransaction,
+	split: typeof creditCardPurchaseSplits.$inferSelect,
+	revision: typeof creditCardPurchaseSplitRevisions.$inferSelect,
+): Promise<CreditCardPurchaseSplitReadModel> {
+	const items = await tx
+		.select()
+		.from(creditCardPurchaseSplitRevisionItems)
+		.where(
+			eq(creditCardPurchaseSplitRevisionItems.splitRevisionId, revision.id),
+		)
+		.orderBy(asc(creditCardPurchaseSplitRevisionItems.personId));
+
+	if (items.length === 0) {
+		return {
+			splitId: split.id,
+			userId: split.userId,
+			purchaseEventId: split.purchaseEventId,
+			status: revision.operation === "VOID" ? "VOID" : "ACTIVE",
+			revisionNo: revision.revisionNo,
+			method: revision.method as SplitMethod,
+			grossAmount: revision.grossAmount,
+			userShareAmount: revision.userShareAmount,
+			externalShareAmount: revision.externalShareAmount,
+			userWeight: revision.userWeight,
+			occurredAt: revision.occurredAt,
+			createdAt: split.createdAt,
+			participants: [],
+		};
+	}
+
+	const participantIds = items.map((i) => i.participantId);
+	const personIds = [...new Set(items.map((i) => i.personId))];
+
+	const [participantRows, personRevRows] = await Promise.all([
+		tx
+			.select()
+			.from(creditCardPurchaseSplitParticipants)
+			.where(inArray(creditCardPurchaseSplitParticipants.id, participantIds)),
+		tx
+			.select()
+			.from(personRevisions)
+			.where(inArray(personRevisions.personId, personIds)),
+	]);
+
+	const participantById = new Map(participantRows.map((p) => [p.id, p]));
+
+	const latestPersonRevByPersonId = new Map<
+		string,
+		(typeof personRevRows)[number]
+	>();
+	for (const rev of personRevRows) {
+		const existing = latestPersonRevByPersonId.get(rev.personId);
+		if (!existing || rev.revisionNo > existing.revisionNo) {
+			latestPersonRevByPersonId.set(rev.personId, rev);
+		}
+	}
+
+	const obligationIds = participantRows.map((p) => p.personObligationId);
+	const settlementRows =
+		obligationIds.length > 0
+			? await tx
+					.select({
+						id: personSettlements.id,
+						obligationId: personSettlements.obligationId,
+					})
+					.from(personSettlements)
+					.where(inArray(personSettlements.obligationId, obligationIds))
+			: [];
+
+	const settlementIds = settlementRows.map((s) => s.id);
+	const settlementRevRows =
+		settlementIds.length > 0
+			? await tx
+					.select()
+					.from(personSettlementRevisions)
+					.where(inArray(personSettlementRevisions.settlementId, settlementIds))
+			: [];
+
+	const latestSettlementRevBySettlementId = new Map<
+		string,
+		(typeof settlementRevRows)[number]
+	>();
+	for (const rev of settlementRevRows) {
+		const existing = latestSettlementRevBySettlementId.get(rev.settlementId);
+		if (!existing || rev.revisionNo > existing.revisionNo) {
+			latestSettlementRevBySettlementId.set(rev.settlementId, rev);
+		}
+	}
+
+	const activeSettledCentsByObligationId = new Map<string, bigint>();
+	for (const s of settlementRows) {
+		const latestRev = latestSettlementRevBySettlementId.get(s.id);
+		if (latestRev && latestRev.operation !== "VOID") {
+			const prior = activeSettledCentsByObligationId.get(s.obligationId) ?? 0n;
+			activeSettledCentsByObligationId.set(
+				s.obligationId,
+				prior + parsePositiveMoneyString(latestRev.appliedAmount).cents,
+			);
+		}
+	}
+
+	const participants: CreditCardPurchaseSplitParticipantReadModel[] = [];
+
+	for (const item of items) {
+		const participant = participantById.get(item.participantId);
+		if (!participant) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_STATE",
+				`Split participant ${item.participantId} referenced by revision item is missing`,
+			);
+		}
+
+		const latestPersonRev = latestPersonRevByPersonId.get(item.personId);
+		if (!latestPersonRev) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_STATE",
+				`Person ${item.personId} has no revisions for split participant`,
+			);
+		}
+
+		const activeSettledCents =
+			activeSettledCentsByObligationId.get(participant.personObligationId) ??
+			0n;
+		const shareAmountCents = parsePositiveMoneyString(item.shareAmount).cents;
+		const remainingCents =
+			revision.operation === "VOID"
+				? 0n
+				: shareAmountCents - activeSettledCents;
+
+		if (remainingCents < 0n) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_STATE",
+				`Split participant ${participant.id} active settled amount ${formatCentsToMoney(activeSettledCents)} exceeds share ${item.shareAmount}`,
+			);
+		}
+
+		const dueDateStr = item.dueDate
+			? typeof item.dueDate === "string"
+				? item.dueDate
+				: (item.dueDate as Date).toISOString().slice(0, 10)
+			: null;
+
+		participants.push({
+			participantId: participant.id,
+			personId: item.personId,
+			displayName: latestPersonRev.displayName,
+			relationship: latestPersonRev.relationship,
+			shareAmount: item.shareAmount,
+			settledAmount: formatCentsToMoney(activeSettledCents),
+			remainingAmount: formatCentsToMoney(remainingCents),
+			weight: item.weight,
+			dueDate: dueDateStr,
+			description: item.description,
+			personObligationId: participant.personObligationId,
+		});
+	}
+
+	return {
+		splitId: split.id,
+		userId: split.userId,
+		purchaseEventId: split.purchaseEventId,
+		status: revision.operation === "VOID" ? "VOID" : "ACTIVE",
+		revisionNo: revision.revisionNo,
+		method: revision.method as SplitMethod,
+		grossAmount: revision.grossAmount,
+		userShareAmount: revision.userShareAmount,
+		externalShareAmount: revision.externalShareAmount,
+		userWeight: revision.userWeight,
+		occurredAt: revision.occurredAt,
+		createdAt: split.createdAt,
+		participants,
+	};
+}
+
 export async function buildSplitReadModelInTransaction(
 	tx: DatabaseOrTransaction,
 	splitId: string,
@@ -405,106 +680,48 @@ export async function buildSplitReadModelInTransaction(
 
 	if (!latestRev) return null;
 
-	const items = await tx
+	return buildSplitReadModelFromRevisionInTransaction(tx, split, latestRev);
+}
+
+/**
+ * Builds the read model as it looked immediately after a specific historical
+ * revision, for exact idempotent replay of a CREATE/UPDATE/VOID request whose
+ * fingerprint matches that revision -- even if the split has since moved
+ * forward (later UPDATEd/VOIDed) or the underlying purchase changed. Only the
+ * revision's own identity/economic snapshot is replayed exactly; settled and
+ * remaining amounts still reflect current settlement reality, since those
+ * change over time independent of which split revision is being replayed.
+ */
+async function buildSplitReadModelAtRevisionInTransaction(
+	tx: DatabaseOrTransaction,
+	splitId: string,
+	revisionId: string,
+): Promise<CreditCardPurchaseSplitReadModel> {
+	const [split] = await tx
 		.select()
-		.from(creditCardPurchaseSplitRevisionItems)
-		.where(
-			eq(creditCardPurchaseSplitRevisionItems.splitRevisionId, latestRev.id),
-		)
-		.orderBy(asc(creditCardPurchaseSplitRevisionItems.personId));
-
-	const participants: CreditCardPurchaseSplitParticipantReadModel[] = [];
-
-	for (const item of items) {
-		const [participant] = await tx
-			.select()
-			.from(creditCardPurchaseSplitParticipants)
-			.where(eq(creditCardPurchaseSplitParticipants.id, item.participantId))
-			.limit(1);
-
-		if (!participant) continue;
-
-		const [_person] = await tx
-			.select()
-			.from(people)
-			.where(eq(people.id, item.personId))
-			.limit(1);
-
-		const [latestPersonRev] = await tx
-			.select()
-			.from(personRevisions)
-			.where(eq(personRevisions.personId, item.personId))
-			.orderBy(desc(personRevisions.revisionNo))
-			.limit(1);
-
-		// Calculate active settled amount on this obligation
-		const settlements = await tx
-			.select({ id: personSettlements.id })
-			.from(personSettlements)
-			.where(
-				eq(personSettlements.obligationId, participant.personObligationId),
-			);
-
-		let activeSettledCents = 0n;
-		for (const s of settlements) {
-			const [latestSettlementRev] = await tx
-				.select()
-				.from(personSettlementRevisions)
-				.where(eq(personSettlementRevisions.settlementId, s.id))
-				.orderBy(desc(personSettlementRevisions.revisionNo))
-				.limit(1);
-
-			if (latestSettlementRev && latestSettlementRev.operation !== "VOID") {
-				activeSettledCents += parsePositiveMoneyString(
-					latestSettlementRev.appliedAmount,
-				).cents;
-			}
-		}
-
-		const shareAmountCents = parsePositiveMoneyString(item.shareAmount).cents;
-		const remainingCents =
-			latestRev.operation === "VOID"
-				? 0n
-				: shareAmountCents - activeSettledCents;
-
-		const dueDateStr = item.dueDate
-			? typeof item.dueDate === "string"
-				? item.dueDate
-				: (item.dueDate as Date).toISOString().slice(0, 10)
-			: null;
-
-		participants.push({
-			participantId: participant.id,
-			personId: item.personId,
-			displayName: latestPersonRev?.displayName ?? "Unknown",
-			relationship: latestPersonRev?.relationship ?? "OTHER",
-			shareAmount: item.shareAmount,
-			settledAmount: formatCentsToMoney(activeSettledCents),
-			remainingAmount: formatCentsToMoney(
-				remainingCents < 0n ? 0n : remainingCents,
-			),
-			weight: item.weight,
-			dueDate: dueDateStr,
-			description: item.description,
-			personObligationId: participant.personObligationId,
-		});
+		.from(creditCardPurchaseSplits)
+		.where(eq(creditCardPurchaseSplits.id, splitId))
+		.limit(1);
+	if (!split) {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_NOT_FOUND",
+			`Split "${splitId}" not found`,
+		);
 	}
 
-	return {
-		splitId: split.id,
-		userId: split.userId,
-		purchaseEventId: split.purchaseEventId,
-		status: latestRev.operation === "VOID" ? "VOID" : "ACTIVE",
-		revisionNo: latestRev.revisionNo,
-		method: latestRev.method as SplitMethod,
-		grossAmount: latestRev.grossAmount,
-		userShareAmount: latestRev.userShareAmount,
-		externalShareAmount: latestRev.externalShareAmount,
-		userWeight: latestRev.userWeight,
-		occurredAt: latestRev.occurredAt,
-		createdAt: split.createdAt,
-		participants,
-	};
+	const [revision] = await tx
+		.select()
+		.from(creditCardPurchaseSplitRevisions)
+		.where(eq(creditCardPurchaseSplitRevisions.id, revisionId))
+		.limit(1);
+	if (!revision) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_STATE",
+			`Split revision "${revisionId}" not found`,
+		);
+	}
+
+	return buildSplitReadModelFromRevisionInTransaction(tx, split, revision);
 }
 
 // ============================================================================
@@ -526,17 +743,14 @@ export async function createSplitInTransaction(
 	split: CreditCardPurchaseSplitReadModel;
 	idempotentReplay: boolean;
 }> {
-	const {
-		userId,
-		purchaseEventId,
-		method,
-		userWeight,
-		participants,
-		idempotencyKey,
-	} = params;
+	const { userId, purchaseEventId, method, userWeight, idempotencyKey } =
+		params;
+	const normalizedParticipants = validateParticipantsInput(params.participants);
 
-	// Lock purchase event FOR UPDATE
-	const [purchaseEvent] = await tx
+	// Global lock order: card -> purchase event -> split -> people -> obligations.
+	// Pre-read the immutable purchase event anchor WITHOUT a lock to resolve
+	// cardId, then lock card first, THEN lock the purchase event.
+	const [purchaseEventPeek] = await tx
 		.select()
 		.from(creditCardLiabilityEvents)
 		.where(
@@ -545,6 +759,28 @@ export async function createSplitInTransaction(
 				eq(creditCardLiabilityEvents.userId, userId),
 			),
 		)
+		.limit(1);
+
+	if (!purchaseEventPeek) {
+		throw new CreditCardError(
+			"CREDIT_CARD_PURCHASE_NOT_FOUND",
+			`Purchase event "${purchaseEventId}" not found`,
+		);
+	}
+
+	if (purchaseEventPeek.eventType !== "PURCHASE") {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"Cannot create a split on a non-PURCHASE liability event",
+		);
+	}
+
+	await lockCardAndVerifyActive(tx, userId, purchaseEventPeek.creditCardId);
+
+	const [purchaseEvent] = await tx
+		.select()
+		.from(creditCardLiabilityEvents)
+		.where(eq(creditCardLiabilityEvents.id, purchaseEventId))
 		.for("update");
 
 	if (!purchaseEvent) {
@@ -553,16 +789,6 @@ export async function createSplitInTransaction(
 			`Purchase event "${purchaseEventId}" not found`,
 		);
 	}
-
-	if (purchaseEvent.eventType !== "PURCHASE") {
-		throw new CreditCardError(
-			"CREDIT_CARD_INVALID_INPUT",
-			"Cannot create a split on a non-PURCHASE liability event",
-		);
-	}
-
-	// Lock card and verify ACTIVE
-	await lockCardAndVerifyActive(tx, userId, purchaseEvent.creditCardId);
 
 	// Check latest purchase revision
 	const latestPurchaseRev = await getLatestPurchaseRevisionInTransaction(
@@ -584,7 +810,6 @@ export async function createSplitInTransaction(
 		.for("update");
 
 	if (existingSplit) {
-		// Check if idempotent replay
 		const [firstRev] = await tx
 			.select()
 			.from(creditCardPurchaseSplitRevisions)
@@ -597,17 +822,66 @@ export async function createSplitInTransaction(
 			.limit(1);
 
 		if (firstRev && firstRev.idempotencyKey === idempotencyKey) {
-			const readModel = await buildSplitReadModelInTransaction(
-				tx,
-				existingSplit.id,
-			);
-			if (!readModel) {
+			// Exact-payload replay verification: recompute the candidate
+			// fingerprint against the HISTORICAL CREATE economic snapshot
+			// (the historical grossAmount, not any current purchase amount),
+			// so a replay is still recognized after the purchase or split has
+			// since been mutated further, but a changed payload under the same
+			// key is rejected rather than silently returning stale state.
+			const historicalGrossCents = parsePositiveMoneyString(
+				firstRev.grossAmount,
+			).cents;
+			const candidateAllocation = calculateAllocations({
+				method,
+				grossAmount: historicalGrossCents,
+				userWeight,
+				participants: normalizedParticipants,
+			});
+			const candidateOccurredAt = params.occurredAt ?? firstRev.occurredAt;
+			const candidateFingerprintItems: SplitParticipantItemFingerprint[] =
+				candidateAllocation.participants.map((p) => ({
+					personId: p.personId,
+					shareAmount: formatCentsToMoney(p.shareAmount),
+					weight: p.weight ?? null,
+					dueDate: p.dueDate ? p.dueDate.toISOString().slice(0, 10) : null,
+					description: p.description ?? null,
+				}));
+			const candidateFingerprint = await calculateSplitCreateFingerprint({
+				userId,
+				purchaseEventId,
+				method,
+				grossAmount: formatCentsToMoney(candidateAllocation.grossAmount),
+				userShareAmount: formatCentsToMoney(
+					candidateAllocation.userShareAmount,
+				),
+				externalShareAmount: formatCentsToMoney(
+					candidateAllocation.externalShareAmount,
+				),
+				userWeight: candidateAllocation.userWeight ?? null,
+				items: candidateFingerprintItems,
+				occurredAt: candidateOccurredAt,
+			});
+
+			if (candidateFingerprint !== firstRev.revisionFingerprint) {
 				throw new CreditCardError(
-					"CREDIT_CARD_INVALID_STATE",
-					"Failed to build split read model on replay",
+					"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+					"Idempotency key reused with a different split CREATE payload",
 				);
 			}
+
+			const readModel = await buildSplitReadModelAtRevisionInTransaction(
+				tx,
+				existingSplit.id,
+				firstRev.id,
+			);
 			return { split: readModel, idempotentReplay: true };
+		}
+
+		if (firstRev) {
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+				"A split already exists for this purchase under a different idempotency key",
+			);
 		}
 
 		throw new CreditCardError(
@@ -626,7 +900,7 @@ export async function createSplitInTransaction(
 		method,
 		grossAmount: purchaseGrossCents,
 		userWeight,
-		participants,
+		participants: normalizedParticipants,
 	});
 
 	// Lock people and verify active (ORDER BY id ASC)
@@ -694,7 +968,13 @@ export async function createSplitInTransaction(
 	// Create participant anchors, obligations, and revision items
 	for (const part of allocation.participants) {
 		const participantId = crypto.randomUUID();
-		const oblIdempotencyKey = `${idempotencyKey}_PART_${part.personId}`;
+		const oblIdempotencyKey = await deriveCreditCardSplitChildIdempotencyKey(
+			idempotencyKey,
+			splitId,
+			splitRevisionId,
+			part.personId,
+			"PARTICIPANT_CREATE",
+		);
 		const amountNormalized = formatCentsToMoney(part.shareAmount);
 		const dueDateStr = part.dueDate
 			? typeof part.dueDate === "string"
@@ -738,6 +1018,12 @@ export async function createSplitInTransaction(
 		});
 	}
 
+	// Seal LAST: once inserted, no further items may ever be appended to this
+	// revision, making the historical snapshot immutable beyond INSERT-only.
+	await tx.insert(creditCardPurchaseSplitRevisionSeals).values({
+		splitRevisionId,
+	});
+
 	const readModel = await buildSplitReadModelInTransaction(tx, splitId);
 	if (!readModel) {
 		throw new CreditCardError(
@@ -774,12 +1060,75 @@ export async function updateSplitInTransaction(
 		expectedRevisionNo,
 		method,
 		userWeight,
-		participants,
 		idempotencyKey,
 		overridePurchaseRevision,
 	} = params;
+	const normalizedParticipants = validateParticipantsInput(params.participants);
 
-	// Lock split anchor
+	// Pre-read the immutable split -> purchaseEventId, and purchase event ->
+	// cardId, WITHOUT locks, so the global lock order (card -> purchase event
+	// -> split) can be honored without a wrong-order deadlock-prone lock.
+	const [splitPeek] = await tx
+		.select()
+		.from(creditCardPurchaseSplits)
+		.where(
+			and(
+				eq(creditCardPurchaseSplits.id, splitId),
+				eq(creditCardPurchaseSplits.userId, userId),
+			),
+		)
+		.limit(1);
+
+	if (!splitPeek) {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_NOT_FOUND",
+			`Split "${splitId}" not found`,
+		);
+	}
+
+	// Early idempotency replay (unlocked read) before acquiring authoritative
+	// locks; a second replay check happens again below after locking.
+	const [earlyReplay] = await tx
+		.select()
+		.from(creditCardPurchaseSplitRevisions)
+		.where(
+			and(
+				eq(creditCardPurchaseSplitRevisions.splitId, splitId),
+				eq(creditCardPurchaseSplitRevisions.idempotencyKey, idempotencyKey),
+			),
+		)
+		.limit(1);
+
+	const [purchaseEventPeek] = await tx
+		.select()
+		.from(creditCardLiabilityEvents)
+		.where(eq(creditCardLiabilityEvents.id, splitPeek.purchaseEventId))
+		.limit(1);
+
+	if (!purchaseEventPeek) {
+		throw new CreditCardError(
+			"CREDIT_CARD_PURCHASE_NOT_FOUND",
+			"Underlying purchase event not found",
+		);
+	}
+
+	await lockCardAndVerifyActive(tx, userId, purchaseEventPeek.creditCardId);
+
+	// Lock purchase event FOR UPDATE
+	const [purchaseEvent] = await tx
+		.select()
+		.from(creditCardLiabilityEvents)
+		.where(eq(creditCardLiabilityEvents.id, splitPeek.purchaseEventId))
+		.for("update");
+
+	if (!purchaseEvent) {
+		throw new CreditCardError(
+			"CREDIT_CARD_PURCHASE_NOT_FOUND",
+			"Underlying purchase event not found",
+		);
+	}
+
+	// Lock split anchor last.
 	const [split] = await tx
 		.select()
 		.from(creditCardPurchaseSplits)
@@ -798,45 +1147,79 @@ export async function updateSplitInTransaction(
 		);
 	}
 
-	// Check idempotency early replay
-	const [existingRevWithKey] = await tx
-		.select()
-		.from(creditCardPurchaseSplitRevisions)
-		.where(
-			and(
-				eq(creditCardPurchaseSplitRevisions.splitId, splitId),
-				eq(creditCardPurchaseSplitRevisions.idempotencyKey, idempotencyKey),
-			),
-		)
-		.limit(1);
+	// Second replay check under lock (races must never double-post).
+	const [existingRevWithKey] =
+		earlyReplay !== undefined
+			? [earlyReplay]
+			: await tx
+					.select()
+					.from(creditCardPurchaseSplitRevisions)
+					.where(
+						and(
+							eq(creditCardPurchaseSplitRevisions.splitId, splitId),
+							eq(
+								creditCardPurchaseSplitRevisions.idempotencyKey,
+								idempotencyKey,
+							),
+						),
+					)
+					.limit(1);
 
 	if (existingRevWithKey) {
-		const readModel = await buildSplitReadModelInTransaction(tx, splitId);
-		if (!readModel) {
+		// Exact-payload replay verification against the HISTORICAL economic
+		// snapshot owned by this key (its own stored grossAmount/occurredAt),
+		// not any current mutable purchase/split state, so a genuine retry
+		// still replays after later lifecycle changes but a changed payload
+		// under the same key is rejected.
+		const historicalGrossCents = parsePositiveMoneyString(
+			existingRevWithKey.grossAmount,
+		).cents;
+		const historicalExpectedRevisionNo = existingRevWithKey.revisionNo - 1;
+		const candidateAllocation = calculateAllocations({
+			method,
+			grossAmount: historicalGrossCents,
+			userWeight,
+			participants: normalizedParticipants,
+		});
+		const candidateOccurredAt =
+			params.occurredAt ?? existingRevWithKey.occurredAt;
+		const candidateFingerprintItems: SplitParticipantItemFingerprint[] =
+			candidateAllocation.participants.map((p) => ({
+				personId: p.personId,
+				shareAmount: formatCentsToMoney(p.shareAmount),
+				weight: p.weight ?? null,
+				dueDate: p.dueDate ? p.dueDate.toISOString().slice(0, 10) : null,
+				description: p.description ?? null,
+			}));
+		const candidateFingerprint = await calculateSplitUpdateFingerprint({
+			userId,
+			splitId,
+			expectedRevisionNo: historicalExpectedRevisionNo,
+			method,
+			grossAmount: formatCentsToMoney(candidateAllocation.grossAmount),
+			userShareAmount: formatCentsToMoney(candidateAllocation.userShareAmount),
+			externalShareAmount: formatCentsToMoney(
+				candidateAllocation.externalShareAmount,
+			),
+			userWeight: candidateAllocation.userWeight ?? null,
+			items: candidateFingerprintItems,
+			occurredAt: candidateOccurredAt,
+		});
+
+		if (candidateFingerprint !== existingRevWithKey.revisionFingerprint) {
 			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_STATE",
-				"Failed to build split read model on replay",
+				"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+				"Idempotency key reused with a different split UPDATE payload",
 			);
 		}
+
+		const readModel = await buildSplitReadModelAtRevisionInTransaction(
+			tx,
+			splitId,
+			existingRevWithKey.id,
+		);
 		return { split: readModel, idempotentReplay: true };
 	}
-
-	// Lock purchase event FOR UPDATE
-	const [purchaseEvent] = await tx
-		.select()
-		.from(creditCardLiabilityEvents)
-		.where(eq(creditCardLiabilityEvents.id, split.purchaseEventId))
-		.for("update");
-
-	if (!purchaseEvent) {
-		throw new CreditCardError(
-			"CREDIT_CARD_PURCHASE_NOT_FOUND",
-			"Underlying purchase event not found",
-		);
-	}
-
-	// Lock card and verify ACTIVE
-	await lockCardAndVerifyActive(tx, userId, purchaseEvent.creditCardId);
 
 	// Get latest purchase revision
 	const latestPurchaseRev =
@@ -883,7 +1266,7 @@ export async function updateSplitInTransaction(
 		method,
 		grossAmount: purchaseGrossCents,
 		userWeight,
-		participants,
+		participants: normalizedParticipants,
 	});
 
 	// Lock people and verify active (ORDER BY id ASC)
@@ -922,6 +1305,8 @@ export async function updateSplitInTransaction(
 	}
 
 	const newPersonIdSet = new Set(newPersonIds);
+	const nextRevisionNo = latestSplitRev.revisionNo + 1;
+	const newSplitRevId = crypto.randomUUID();
 
 	// 1. For REMOVED people: void their linked obligation
 	for (const priorItem of priorItems) {
@@ -948,14 +1333,19 @@ export async function updateSplitInTransaction(
 					.limit(1);
 
 				if (latestOblRev && latestOblRev.operation !== "VOID") {
-					const oblVoidKey = `${idempotencyKey}_VOID_PART_${priorItem.personId}`;
+					const oblVoidKey = await deriveCreditCardSplitChildIdempotencyKey(
+						idempotencyKey,
+						splitId,
+						newSplitRevId,
+						priorItem.personId,
+						"PARTICIPANT_VOID",
+					);
 					await voidSplitObligationInTransaction({
 						tx,
 						userId,
 						obligationId: participant.personObligationId,
 						expectedRevisionNo: latestOblRev.revisionNo,
 						idempotencyKey: oblVoidKey,
-						occurredAt,
 					});
 				}
 			}
@@ -971,9 +1361,6 @@ export async function updateSplitInTransaction(
 			dueDate: p.dueDate ? p.dueDate.toISOString().slice(0, 10) : null,
 			description: p.description ?? null,
 		}));
-
-	const nextRevisionNo = latestSplitRev.revisionNo + 1;
-	const newSplitRevId = crypto.randomUUID();
 
 	const fingerprint = await calculateSplitUpdateFingerprint({
 		userId,
@@ -1052,7 +1439,13 @@ export async function updateSplitInTransaction(
 				);
 			}
 
-			const oblUpdateKey = `${idempotencyKey}_UPD_PART_${part.personId}`;
+			const oblUpdateKey = await deriveCreditCardSplitChildIdempotencyKey(
+				idempotencyKey,
+				splitId,
+				newSplitRevId,
+				part.personId,
+				"PARTICIPANT_UPDATE",
+			);
 			await updateSplitObligationInTransaction({
 				tx,
 				userId,
@@ -1073,7 +1466,13 @@ export async function updateSplitInTransaction(
 		} else {
 			// Newly added person -> create new participant anchor & new obligation
 			participantId = crypto.randomUUID();
-			const oblCreateKey = `${idempotencyKey}_ADD_PART_${part.personId}`;
+			const oblCreateKey = await deriveCreditCardSplitChildIdempotencyKey(
+				idempotencyKey,
+				splitId,
+				newSplitRevId,
+				part.personId,
+				"PARTICIPANT_CREATE",
+			);
 
 			const oblRes = await createSplitObligationInTransaction({
 				tx,
@@ -1113,6 +1512,10 @@ export async function updateSplitInTransaction(
 		});
 	}
 
+	await tx.insert(creditCardPurchaseSplitRevisionSeals).values({
+		splitRevisionId: newSplitRevId,
+	});
+
 	const readModel = await buildSplitReadModelInTransaction(tx, splitId);
 	if (!readModel) {
 		throw new CreditCardError(
@@ -1139,7 +1542,54 @@ export async function voidSplitInTransaction(
 }> {
 	const { userId, splitId, expectedRevisionNo, idempotencyKey } = params;
 
-	// Lock split anchor
+	// Pre-read split -> purchaseEventId and purchase event -> cardId WITHOUT
+	// locks, to honor the global lock order (card -> purchase event -> split).
+	const [splitPeek] = await tx
+		.select()
+		.from(creditCardPurchaseSplits)
+		.where(
+			and(
+				eq(creditCardPurchaseSplits.id, splitId),
+				eq(creditCardPurchaseSplits.userId, userId),
+			),
+		)
+		.limit(1);
+
+	if (!splitPeek) {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_NOT_FOUND",
+			`Split "${splitId}" not found`,
+		);
+	}
+
+	// Early idempotency replay (unlocked read).
+	const [earlyReplay] = await tx
+		.select()
+		.from(creditCardPurchaseSplitRevisions)
+		.where(
+			and(
+				eq(creditCardPurchaseSplitRevisions.splitId, splitId),
+				eq(creditCardPurchaseSplitRevisions.idempotencyKey, idempotencyKey),
+			),
+		)
+		.limit(1);
+
+	const [purchaseEventPeek] = await tx
+		.select()
+		.from(creditCardLiabilityEvents)
+		.where(eq(creditCardLiabilityEvents.id, splitPeek.purchaseEventId))
+		.limit(1);
+
+	if (purchaseEventPeek) {
+		await lockCardAndVerifyActive(tx, userId, purchaseEventPeek.creditCardId);
+		await tx
+			.select()
+			.from(creditCardLiabilityEvents)
+			.where(eq(creditCardLiabilityEvents.id, splitPeek.purchaseEventId))
+			.for("update");
+	}
+
+	// Lock split anchor last.
 	const [split] = await tx
 		.select()
 		.from(creditCardPurchaseSplits)
@@ -1158,26 +1608,47 @@ export async function voidSplitInTransaction(
 		);
 	}
 
-	// Check idempotency early replay
-	const [existingRevWithKey] = await tx
-		.select()
-		.from(creditCardPurchaseSplitRevisions)
-		.where(
-			and(
-				eq(creditCardPurchaseSplitRevisions.splitId, splitId),
-				eq(creditCardPurchaseSplitRevisions.idempotencyKey, idempotencyKey),
-			),
-		)
-		.limit(1);
+	// Second replay check under lock.
+	const [existingRevWithKey] =
+		earlyReplay !== undefined
+			? [earlyReplay]
+			: await tx
+					.select()
+					.from(creditCardPurchaseSplitRevisions)
+					.where(
+						and(
+							eq(creditCardPurchaseSplitRevisions.splitId, splitId),
+							eq(
+								creditCardPurchaseSplitRevisions.idempotencyKey,
+								idempotencyKey,
+							),
+						),
+					)
+					.limit(1);
 
 	if (existingRevWithKey) {
-		const readModel = await buildSplitReadModelInTransaction(tx, splitId);
-		if (!readModel) {
+		const historicalExpectedRevisionNo = existingRevWithKey.revisionNo - 1;
+		const candidateOccurredAt =
+			params.occurredAt ?? existingRevWithKey.occurredAt;
+		const candidateFingerprint = await calculateSplitVoidFingerprint({
+			userId,
+			splitId,
+			expectedRevisionNo: historicalExpectedRevisionNo,
+			occurredAt: candidateOccurredAt,
+		});
+
+		if (candidateFingerprint !== existingRevWithKey.revisionFingerprint) {
 			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_STATE",
-				"Failed to build split read model on replay",
+				"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+				"Idempotency key reused with a different split VOID payload",
 			);
 		}
+
+		const readModel = await buildSplitReadModelAtRevisionInTransaction(
+			tx,
+			splitId,
+			existingRevWithKey.id,
+		);
 		return { split: readModel, idempotentReplay: true };
 	}
 
@@ -1220,6 +1691,9 @@ export async function voidSplitInTransaction(
 	const personIds = currentItems.map((i) => i.personId);
 	await lockPeopleAndVerifyActive(tx, userId, personIds);
 
+	const nextRevisionNo = latestSplitRev.revisionNo + 1;
+	const newSplitRevId = crypto.randomUUID();
+
 	// Void all active participant obligations
 	for (const item of currentItems) {
 		const [participant] = await tx
@@ -1242,14 +1716,19 @@ export async function voidSplitInTransaction(
 				.limit(1);
 
 			if (latestOblRev && latestOblRev.operation !== "VOID") {
-				const oblVoidKey = `${idempotencyKey}_VOID_PART_${item.personId}`;
+				const oblVoidKey = await deriveCreditCardSplitChildIdempotencyKey(
+					idempotencyKey,
+					splitId,
+					newSplitRevId,
+					item.personId,
+					"PARTICIPANT_VOID",
+				);
 				await voidSplitObligationInTransaction({
 					tx,
 					userId,
 					obligationId: participant.personObligationId,
 					expectedRevisionNo: latestOblRev.revisionNo,
 					idempotencyKey: oblVoidKey,
-					occurredAt,
 				});
 			}
 		}
@@ -1261,9 +1740,6 @@ export async function voidSplitInTransaction(
 		expectedRevisionNo,
 		occurredAt,
 	});
-
-	const nextRevisionNo = latestSplitRev.revisionNo + 1;
-	const newSplitRevId = crypto.randomUUID();
 
 	// Insert VOID split revision (copy forward amounts)
 	await tx.insert(creditCardPurchaseSplitRevisions).values({
@@ -1281,6 +1757,10 @@ export async function voidSplitInTransaction(
 		occurredAt,
 		idempotencyKey,
 		revisionFingerprint: fingerprint,
+	});
+
+	await tx.insert(creditCardPurchaseSplitRevisionSeals).values({
+		splitRevisionId: newSplitRevId,
 	});
 
 	const readModel = await buildSplitReadModelInTransaction(tx, splitId);
@@ -1387,12 +1867,12 @@ export async function getCreditCardPurchaseSplit(
 	params: GetCreditCardPurchaseSplitParams,
 ): Promise<CreditCardPurchaseSplitReadModel | null> {
 	const validUserId = validateUserId(params.userId);
-	const validSplitId = params.splitId
-		? validateSplitId(params.splitId)
-		: undefined;
-	const validPurchaseEventId = params.purchaseEventId
-		? validatePurchaseEventId(params.purchaseEventId)
-		: undefined;
+	const validSplitId =
+		params.splitId === undefined ? undefined : validateSplitId(params.splitId);
+	const validPurchaseEventId =
+		params.purchaseEventId === undefined
+			? undefined
+			: validatePurchaseEventId(params.purchaseEventId);
 
 	if (!validSplitId && !validPurchaseEventId) {
 		throw new CreditCardError(
@@ -1401,9 +1881,34 @@ export async function getCreditCardPurchaseSplit(
 		);
 	}
 
-	return runCreditCardTransaction(params.db, async (tx) => {
-		let targetSplitId = validSplitId;
-		if (!targetSplitId && validPurchaseEventId) {
+	return runCreditCardReadTransaction(params.db, async (tx) => {
+		let ownedSplit: typeof creditCardPurchaseSplits.$inferSelect | undefined;
+
+		if (validSplitId) {
+			const [split] = await tx
+				.select()
+				.from(creditCardPurchaseSplits)
+				.where(
+					and(
+						eq(creditCardPurchaseSplits.id, validSplitId),
+						eq(creditCardPurchaseSplits.userId, validUserId),
+					),
+				)
+				.limit(1);
+			if (!split) return null;
+			ownedSplit = split;
+
+			// If purchaseEventId was also supplied, it must identify the same split.
+			if (
+				validPurchaseEventId &&
+				split.purchaseEventId !== validPurchaseEventId
+			) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_INPUT",
+					"splitId and purchaseEventId do not identify the same split",
+				);
+			}
+		} else if (validPurchaseEventId) {
 			const [split] = await tx
 				.select()
 				.from(creditCardPurchaseSplits)
@@ -1414,32 +1919,47 @@ export async function getCreditCardPurchaseSplit(
 					),
 				)
 				.limit(1);
-
 			if (!split) return null;
-			targetSplitId = split.id;
+			ownedSplit = split;
 		}
 
-		if (!targetSplitId) return null;
-		return buildSplitReadModelInTransaction(tx, targetSplitId);
+		if (!ownedSplit) return null;
+		return buildSplitReadModelInTransaction(tx, ownedSplit.id);
 	});
+}
+
+export function validateSplitStatusFilter(
+	value: unknown,
+): "ACTIVE" | "VOID" | undefined {
+	if (value === undefined) return undefined;
+	if (value !== "ACTIVE" && value !== "VOID") {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			`Invalid split status filter: "${String(value)}"`,
+		);
+	}
+	return value;
 }
 
 export async function listCreditCardPurchaseSplits(
 	params: ListCreditCardPurchaseSplitsParams,
 ): Promise<CreditCardPurchaseSplitReadModel[]> {
 	const validUserId = validateUserId(params.userId);
-	const validCardId = params.cardId
-		? validateCcCanonicalUuid(params.cardId, "cardId")
-		: undefined;
-	const validPurchaseEventId = params.purchaseEventId
-		? validatePurchaseEventId(params.purchaseEventId)
-		: undefined;
-	const validPersonId = params.personId
-		? validateCcCanonicalUuid(params.personId, "personId")
-		: undefined;
-	const validStatus = params.status;
+	const validCardId =
+		params.cardId === undefined
+			? undefined
+			: validateCcCanonicalUuid(params.cardId, "cardId");
+	const validPurchaseEventId =
+		params.purchaseEventId === undefined
+			? undefined
+			: validatePurchaseEventId(params.purchaseEventId);
+	const validPersonId =
+		params.personId === undefined
+			? undefined
+			: validateCcCanonicalUuid(params.personId, "personId");
+	const validStatus = validateSplitStatusFilter(params.status);
 
-	return runCreditCardTransaction(params.db, async (tx) => {
+	return runCreditCardReadTransaction(params.db, async (tx) => {
 		const conditions = [eq(creditCardPurchaseSplits.userId, validUserId)];
 
 		if (validPurchaseEventId) {
@@ -1492,7 +2012,10 @@ export async function listCreditCardPurchaseSplits(
 			.select()
 			.from(creditCardPurchaseSplits)
 			.where(and(...conditions))
-			.orderBy(desc(creditCardPurchaseSplits.createdAt));
+			.orderBy(
+				desc(creditCardPurchaseSplits.createdAt),
+				asc(creditCardPurchaseSplits.id),
+			);
 
 		const results: CreditCardPurchaseSplitReadModel[] = [];
 		for (const split of splits) {

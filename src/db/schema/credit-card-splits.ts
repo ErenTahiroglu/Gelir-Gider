@@ -244,3 +244,28 @@ export const creditCardPurchaseSplitRevisionItems = pgTable(
 		),
 	],
 );
+
+/**
+ * Credit Card Purchase Split Revision Seals Table (Append-Only, DB-authoritative).
+ * Exactly one row per split_revision_id, inserted LAST by the service after all
+ * revision items have been written. Once sealed, a BEFORE INSERT trigger on
+ * credit_card_purchase_split_revision_items rejects any further item referencing
+ * that revision, making the historical snapshot immutable beyond INSERT-only
+ * table semantics (which alone would still allow post-commit item appends).
+ */
+export const creditCardPurchaseSplitRevisionSeals = pgTable(
+	"credit_card_purchase_split_revision_seals",
+	{
+		splitRevisionId: uuid("split_revision_id")
+			.primaryKey()
+			.references(() => creditCardPurchaseSplitRevisions.id, {
+				onDelete: "restrict",
+			}),
+		createdAt: timestamp("created_at", {
+			withTimezone: true,
+			mode: "date",
+		})
+			.defaultNow()
+			.notNull(),
+	},
+);

@@ -1,5 +1,9 @@
 import { and, asc, desc, eq, gte, inArray, lte, ne, sql } from "drizzle-orm";
-import type { Database, DatabaseTransaction } from "../db/client";
+import type {
+	Database,
+	DatabaseOrTransaction,
+	DatabaseTransaction,
+} from "../db/client";
 import {
 	type CreditCardLiabilityEventOperation,
 	type CreditCardLiabilityEventType,
@@ -31,7 +35,10 @@ import {
 	reviseCanonicalTransactionWithLedgerInTransaction,
 	voidCanonicalTransactionWithLedgerInTransaction,
 } from "../transactions/ledger-lifecycle";
-import { runCreditCardTransaction } from "./boundary";
+import {
+	runCreditCardReadTransaction,
+	runCreditCardTransaction,
+} from "./boundary";
 import {
 	formatIstanbulPurchaseDate,
 	validateCcCanonicalUuid,
@@ -3015,6 +3022,16 @@ export async function getCreditCardPurchase({
 	const validUserId = validateCcCanonicalUuid(userId, "userId");
 	const validEventId = validateCcCanonicalUuid(eventId, "eventId");
 
+	return runCreditCardReadTransaction(db, (tx) =>
+		getCreditCardPurchaseInTransaction(tx, validUserId, validEventId),
+	);
+}
+
+async function getCreditCardPurchaseInTransaction(
+	db: DatabaseOrTransaction,
+	validUserId: string,
+	validEventId: string,
+): Promise<CreditCardPurchaseRecord> {
 	const [event] = await db
 		.select()
 		.from(creditCardLiabilityEvents)
@@ -3362,7 +3379,7 @@ export async function listCreditCardPurchasesInTransaction({
 export async function listCreditCardPurchases(
 	params: ListCreditCardPurchasesParams,
 ): Promise<CreditCardPurchaseRecord[]> {
-	return runCreditCardTransaction(params.db, async (tx) => {
+	return runCreditCardReadTransaction(params.db, async (tx) => {
 		return listCreditCardPurchasesInTransaction({ tx, ...params });
 	});
 }
