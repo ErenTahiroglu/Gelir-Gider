@@ -51,3 +51,20 @@ export function validateOptionalEnum<T extends string>(
 	}
 	return value;
 }
+
+/**
+ * Validates a caller-supplied expectedRevisionNo (OCC token) at the input
+ * boundary, before it can reach revision-conflict logic. A malformed value
+ * (0, negative, non-integer, NaN, Infinity, or beyond Number.isSafeInteger)
+ * must fail as PEOPLE_INVALID_INPUT, never be treated as a legitimate stale
+ * revision number that produces a PEOPLE_*_REVISION_CONFLICT.
+ */
+export function validateExpectedRevisionNo(value: number): number {
+	if (!Number.isSafeInteger(value) || value < 1) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_INPUT",
+			"expectedRevisionNo must be a safe integer >= 1",
+		);
+	}
+	return value;
+}

@@ -29,7 +29,7 @@ import {
 	createCanonicalTransactionWithLedgerInTransaction,
 	voidCanonicalTransactionWithLedgerInTransaction,
 } from "../transactions/ledger-lifecycle";
-import { runPeopleTransaction } from "./boundary";
+import { runPeopleReadTransaction, runPeopleTransaction } from "./boundary";
 import { validateOccurredAt } from "./calendar";
 import { PeopleError } from "./errors";
 import {
@@ -44,6 +44,7 @@ import {
 } from "./ledger-provisioning";
 import {
 	validateCanonicalUuid,
+	validateExpectedRevisionNo,
 	validateOptionalCanonicalUuid,
 	validateOptionalEnum,
 } from "./validation";
@@ -757,7 +758,9 @@ export async function voidPersonSettlement(
 	const settlementId = validateSettlementId(params.settlementId);
 	const reason = validateReason(params.reason);
 	const idempotencyKey = validateIdempotencyKey(params.idempotencyKey);
-	const { expectedRevisionNo } = params;
+	const expectedRevisionNo = validateExpectedRevisionNo(
+		params.expectedRevisionNo,
+	);
 
 	return runPeopleTransaction(params.db, async (tx) => {
 		const [earlyRev] = await tx
@@ -1118,7 +1121,7 @@ export async function getPersonSettlement({
 	const validUserId = validateUserId(userId);
 	const validSettlementId = validateSettlementId(settlementId);
 
-	return runPeopleTransaction(db, async (tx) => {
+	return runPeopleReadTransaction(db, async (tx) => {
 		const [settlement] = await tx
 			.select()
 			.from(personSettlements)
@@ -1190,7 +1193,7 @@ export async function listPersonSettlements({
 		"status",
 	);
 
-	return runPeopleTransaction(db, async (tx) => {
+	return runPeopleReadTransaction(db, async (tx) => {
 		const conditions = [eq(personSettlements.userId, validUserId)];
 		if (validObligationId !== undefined) {
 			conditions.push(eq(personSettlements.obligationId, validObligationId));

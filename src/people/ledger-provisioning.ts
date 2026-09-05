@@ -1,7 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import type { DatabaseTransaction } from "../db/client";
 import { incomeSources } from "../db/schema/income";
-import { ledgerAccounts } from "../db/schema/ledger";
 import {
 	people,
 	peopleSystemIncomeLinks,
@@ -9,8 +8,7 @@ import {
 } from "../db/schema/people";
 import { IncomeError } from "../income/errors";
 import { createIncomeSourceInTransaction } from "../income/sources";
-import { createLedgerAccountInTransaction } from "../ledger/accounts";
-import { LedgerError } from "../ledger/errors";
+import { ensureDeterministicLedgerAccountInTransaction } from "../ledger/accounts";
 import { PeopleError } from "./errors";
 
 export interface PersonLedgerLinkResult {
@@ -59,20 +57,22 @@ export async function ensurePersonLedgerLinkInTransaction(
 	const suffix = personId.replace(/-/g, "").toUpperCase();
 	const first8 = personId.replace(/-/g, "").slice(0, 8).toUpperCase();
 
-	const receivableAccount = await provisionAccountWithRetry(
+	const receivableAccount = await ensureDeterministicLedgerAccountInTransaction(
+		{
+			tx,
+			userId,
+			code: `PRCV_${suffix}`.slice(0, 64),
+			name: `Person receivable ${first8}`,
+			accountType: "ASSET",
+		},
+	);
+	const payableAccount = await ensureDeterministicLedgerAccountInTransaction({
 		tx,
 		userId,
-		`PRCV_${suffix}`.slice(0, 64),
-		`Person receivable ${first8}`,
-		"ASSET",
-	);
-	const payableAccount = await provisionAccountWithRetry(
-		tx,
-		userId,
-		`PPAY_${suffix}`.slice(0, 64),
-		`Person payable ${first8}`,
-		"LIABILITY",
-	);
+		code: `PPAY_${suffix}`.slice(0, 64),
+		name: `Person payable ${first8}`,
+		accountType: "LIABILITY",
+	});
 
 	const [createdLink] = await tx
 		.insert(personLedgerLinks)
@@ -112,49 +112,6 @@ export async function ensurePersonLedgerLinkInTransaction(
 	return raceExisting;
 }
 
-/**
- * Provisions a ledger account at a deterministic, singleton code. If a
- * concurrent transaction already created an account at that exact code, this
- * re-reads and reuses that row instead of retrying with a suffixed code --
- * a code collision on one of these identities always means "this exact
- * resource already exists", never "a different resource happened to collide",
- * so a suffix-retry would only create a permanent orphan duplicate.
- */
-async function provisionAccountWithRetry(
-	tx: DatabaseTransaction,
-	userId: string,
-	code: string,
-	name: string,
-	accountType: "ASSET" | "LIABILITY",
-): Promise<{ id: string }> {
-	try {
-		return await createLedgerAccountInTransaction({
-			tx,
-			userId,
-			code,
-			name,
-			accountType,
-		});
-	} catch (err: unknown) {
-		if (
-			err instanceof LedgerError &&
-			err.code === "LEDGER_ACCOUNT_CODE_CONFLICT"
-		) {
-			const [existing] = await tx
-				.select({ id: ledgerAccounts.id })
-				.from(ledgerAccounts)
-				.where(
-					and(eq(ledgerAccounts.userId, userId), eq(ledgerAccounts.code, code)),
-				)
-				.limit(1);
-			if (existing) {
-				return existing;
-			}
-		}
-		throw err;
-	}
-}
-
 const PEOPLE_OVERPAYMENT_SOURCE_CODE = "PEOPLE_OVERPAYMENT";
 const PEOPLE_OVERPAYMENT_SOURCE_NAME = "People settlement overpayment";
 const PEOPLE_OVERPAYMENT_ACTIVE_FROM = "1900-01-01";
@@ -162,6 +119,33 @@ const PEOPLE_OVERPAYMENT_ACTIVE_FROM = "1900-01-01";
 export interface PeopleOverpaymentIncomeSourceResult {
 	incomeSourceId: string;
 	incomeLedgerAccountId: string;
+}
+
+function validatePeopleOverpaymentSourceContract(source: {
+	id: string;
+	code: string;
+	nature: string;
+	referenceMethod: string;
+	archivedAt: Date | null;
+}): void {
+	if (source.code !== PEOPLE_OVERPAYMENT_SOURCE_CODE) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_STATE",
+			`People overpayment income source ${source.id} has unexpected code ${source.code}`,
+		);
+	}
+	if (source.nature !== "EXTRA" || source.referenceMethod !== "EXCLUDED") {
+		throw new PeopleError(
+			"PEOPLE_INVALID_STATE",
+			`People overpayment income source ${source.id} must be nature=EXTRA/referenceMethod=EXCLUDED`,
+		);
+	}
+	if (source.archivedAt !== null) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_STATE",
+			`People overpayment income source ${source.id} is archived`,
+		);
+	}
 }
 
 /**
@@ -188,6 +172,10 @@ export async function ensurePeopleOverpaymentIncomeSourceInTransaction(
 		const [source] = await tx
 			.select({
 				id: incomeSources.id,
+				code: incomeSources.code,
+				nature: incomeSources.nature,
+				referenceMethod: incomeSources.referenceMethod,
+				archivedAt: incomeSources.archivedAt,
 				incomeLedgerAccountId: incomeSources.incomeLedgerAccountId,
 			})
 			.from(incomeSources)
@@ -200,6 +188,7 @@ export async function ensurePeopleOverpaymentIncomeSourceInTransaction(
 				"People overpayment income link exists but source is missing",
 			);
 		}
+		validatePeopleOverpaymentSourceContract(source);
 
 		return {
 			incomeSourceId: source.id,
@@ -210,6 +199,10 @@ export async function ensurePeopleOverpaymentIncomeSourceInTransaction(
 	const [existingSourceByCode] = await tx
 		.select({
 			id: incomeSources.id,
+			code: incomeSources.code,
+			nature: incomeSources.nature,
+			referenceMethod: incomeSources.referenceMethod,
+			archivedAt: incomeSources.archivedAt,
 			incomeLedgerAccountId: incomeSources.incomeLedgerAccountId,
 		})
 		.from(incomeSources)
@@ -225,14 +218,17 @@ export async function ensurePeopleOverpaymentIncomeSourceInTransaction(
 	let incomeLedgerAccountId: string;
 
 	if (existingSourceByCode) {
+		validatePeopleOverpaymentSourceContract(existingSourceByCode);
 		sourceId = existingSourceByCode.id;
 		incomeLedgerAccountId = existingSourceByCode.incomeLedgerAccountId;
 	} else {
-		const account = await provisionIncomeAccountWithRetry(
+		const account = await ensureDeterministicLedgerAccountInTransaction({
 			tx,
 			userId,
-			"SYS_PEOPLE_OVERPAYMENT_INC",
-		);
+			code: "SYS_PEOPLE_OVERPAYMENT_INC",
+			name: "People Overpayment Income",
+			accountType: "INCOME",
+		});
 
 		try {
 			const source = await createIncomeSourceInTransaction({
@@ -258,6 +254,10 @@ export async function ensurePeopleOverpaymentIncomeSourceInTransaction(
 				const [raceSourceByCode] = await tx
 					.select({
 						id: incomeSources.id,
+						code: incomeSources.code,
+						nature: incomeSources.nature,
+						referenceMethod: incomeSources.referenceMethod,
+						archivedAt: incomeSources.archivedAt,
 						incomeLedgerAccountId: incomeSources.incomeLedgerAccountId,
 					})
 					.from(incomeSources)
@@ -269,6 +269,7 @@ export async function ensurePeopleOverpaymentIncomeSourceInTransaction(
 					)
 					.limit(1);
 				if (!raceSourceByCode) throw err;
+				validatePeopleOverpaymentSourceContract(raceSourceByCode);
 				sourceId = raceSourceByCode.id;
 				incomeLedgerAccountId = raceSourceByCode.incomeLedgerAccountId;
 			} else {
@@ -315,6 +316,10 @@ export async function ensurePeopleOverpaymentIncomeSourceInTransaction(
 	const [raceSource] = await tx
 		.select({
 			id: incomeSources.id,
+			code: incomeSources.code,
+			nature: incomeSources.nature,
+			referenceMethod: incomeSources.referenceMethod,
+			archivedAt: incomeSources.archivedAt,
 			incomeLedgerAccountId: incomeSources.incomeLedgerAccountId,
 		})
 		.from(incomeSources)
@@ -327,47 +332,10 @@ export async function ensurePeopleOverpaymentIncomeSourceInTransaction(
 			"Failed to resolve People overpayment income source after race",
 		);
 	}
+	validatePeopleOverpaymentSourceContract(raceSource);
 
 	return {
 		incomeSourceId: raceSource.id,
 		incomeLedgerAccountId: raceSource.incomeLedgerAccountId,
 	};
-}
-
-/**
- * Provisions the singleton per-user overpayment income ledger account. See
- * `provisionAccountWithRetry` for why a code conflict is resolved by re-read
- * rather than a suffix retry.
- */
-async function provisionIncomeAccountWithRetry(
-	tx: DatabaseTransaction,
-	userId: string,
-	code: string,
-): Promise<{ id: string }> {
-	try {
-		return await createLedgerAccountInTransaction({
-			tx,
-			userId,
-			code,
-			name: "People Overpayment Income",
-			accountType: "INCOME",
-		});
-	} catch (err: unknown) {
-		if (
-			err instanceof LedgerError &&
-			err.code === "LEDGER_ACCOUNT_CODE_CONFLICT"
-		) {
-			const [existing] = await tx
-				.select({ id: ledgerAccounts.id })
-				.from(ledgerAccounts)
-				.where(
-					and(eq(ledgerAccounts.userId, userId), eq(ledgerAccounts.code, code)),
-				)
-				.limit(1);
-			if (existing) {
-				return existing;
-			}
-		}
-		throw err;
-	}
 }

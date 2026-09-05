@@ -377,12 +377,9 @@ export function mapDbError(err: unknown, _context?: string): never {
  * - Recognized DB/Postgres/Drizzle error: mapped to sanitized PeopleError
  * - Programmer errors (e.g. TypeError, ReferenceError): rethrown unchanged
  */
-export async function runPeopleTransaction<T>(
-	db: Database,
-	work: (tx: DatabaseTransaction) => Promise<T>,
-): Promise<T> {
+async function withPeopleErrorBoundary<T>(exec: () => Promise<T>): Promise<T> {
 	try {
-		return await db.transaction(work);
+		return await exec();
 	} catch (err: unknown) {
 		if (err instanceof PeopleError) {
 			throw err;
@@ -401,4 +398,30 @@ export async function runPeopleTransaction<T>(
 		}
 		throw err;
 	}
+}
+
+export async function runPeopleTransaction<T>(
+	db: Database,
+	work: (tx: DatabaseTransaction) => Promise<T>,
+): Promise<T> {
+	return withPeopleErrorBoundary(() => db.transaction(work));
+}
+
+/**
+ * Executes a read-only unit of work inside a REPEATABLE READ transaction, so
+ * every statement inside `work` sees one coherent snapshot of the database
+ * rather than PostgreSQL's default READ COMMITTED behavior (which can observe
+ * a different committed state from one statement to the next within the same
+ * `db.transaction(...)` call). Used by every People read API that combines a
+ * revision with derived ledger balances or settlement totals, so those pieces
+ * are never assembled from different points in time. Shares the same
+ * sanitized error boundary as `runPeopleTransaction`.
+ */
+export async function runPeopleReadTransaction<T>(
+	db: Database,
+	work: (tx: DatabaseTransaction) => Promise<T>,
+): Promise<T> {
+	return withPeopleErrorBoundary(() =>
+		db.transaction(work, { isolationLevel: "repeatable read" }),
+	);
 }

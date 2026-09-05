@@ -5,9 +5,10 @@ import {
 	type CreditCardSystemAccountRole,
 	creditCardSystemAccounts,
 } from "../db/schema/credit-card-ledger";
-import { ledgerAccounts } from "../db/schema/ledger";
-import { type AccountType, createLedgerAccountInTransaction } from "./accounts";
-import { LedgerError } from "./errors";
+import {
+	type AccountType,
+	ensureDeterministicLedgerAccountInTransaction,
+} from "./accounts";
 
 /**
  * Neutral, domain-agnostic per-user system expense/equity ledger account roles.
@@ -79,42 +80,17 @@ export async function ensureUserExpenseSystemAccountsInTransaction(
 		const def = SYSTEM_ROLE_DEFINITIONS[role];
 		const code = `SYS_CC_${def.defaultCodeSuffix}`.slice(0, 64);
 
-		// This is a per-user singleton identity: a code conflict always means a
-		// concurrent transaction already created this exact account, never a
-		// different resource colliding by chance. Re-read and reuse it instead
-		// of retrying with a suffixed code, which would only create a permanent
-		// orphan duplicate.
-		let ledgerAccountId: string;
-		try {
-			const created = await createLedgerAccountInTransaction({
-				tx,
-				userId,
-				code,
-				name: def.name,
-				accountType: def.accountType,
-			});
-			ledgerAccountId = created.id;
-		} catch (err: unknown) {
-			if (
-				err instanceof LedgerError &&
-				err.code === "LEDGER_ACCOUNT_CODE_CONFLICT"
-			) {
-				const [existingAccount] = await tx
-					.select({ id: ledgerAccounts.id })
-					.from(ledgerAccounts)
-					.where(
-						and(
-							eq(ledgerAccounts.userId, userId),
-							eq(ledgerAccounts.code, code),
-						),
-					)
-					.limit(1);
-				if (!existingAccount) throw err;
-				ledgerAccountId = existingAccount.id;
-			} else {
-				throw err;
-			}
-		}
+		// This is a per-user singleton identity, provisioned via a safe
+		// ON CONFLICT DO NOTHING ensure (never a caught raw unique-violation
+		// exception, which would otherwise leave this transaction aborted).
+		const account = await ensureDeterministicLedgerAccountInTransaction({
+			tx,
+			userId,
+			code,
+			name: def.name,
+			accountType: def.accountType,
+		});
+		const ledgerAccountId = account.id;
 
 		const [insertedSystemAccount] = await tx
 			.insert(creditCardSystemAccounts)

@@ -10,7 +10,7 @@ import {
 	personRevisions,
 } from "../db/schema/people";
 import { getLedgerAccountBalanceInTransaction } from "../ledger/balances";
-import { runPeopleTransaction } from "./boundary";
+import { runPeopleReadTransaction, runPeopleTransaction } from "./boundary";
 import { validateOccurredAt } from "./calendar";
 import { PeopleError } from "./errors";
 import {
@@ -18,7 +18,11 @@ import {
 	calculatePersonCreateFingerprint,
 	calculatePersonUpdateFingerprint,
 } from "./fingerprint";
-import { validateCanonicalUuid, validateOptionalEnum } from "./validation";
+import {
+	validateCanonicalUuid,
+	validateExpectedRevisionNo,
+	validateOptionalEnum,
+} from "./validation";
 
 export interface PersonReadModel {
 	personId: string;
@@ -313,7 +317,9 @@ export async function updatePerson(
 	const note = validateNote(params.note);
 	const occurredAt = validateOccurredAt(params.occurredAt);
 	const idempotencyKey = validateIdempotencyKey(params.idempotencyKey);
-	const { expectedRevisionNo } = params;
+	const expectedRevisionNo = validateExpectedRevisionNo(
+		params.expectedRevisionNo,
+	);
 
 	return runPeopleTransaction(params.db, async (tx) => {
 		const [earlyRev] = await tx
@@ -488,7 +494,9 @@ export async function archivePerson(
 	const personId = validatePersonId(params.personId);
 	const occurredAt = validateOccurredAt(params.occurredAt);
 	const idempotencyKey = validateIdempotencyKey(params.idempotencyKey);
-	const { expectedRevisionNo } = params;
+	const expectedRevisionNo = validateExpectedRevisionNo(
+		params.expectedRevisionNo,
+	);
 
 	return runPeopleTransaction(params.db, async (tx) => {
 		const [earlyRev] = await tx
@@ -683,7 +691,7 @@ export async function getPerson({
 	const validUserId = validateUserId(userId);
 	const validPersonId = validatePersonId(personId);
 
-	return runPeopleTransaction(db, async (tx) => {
+	return runPeopleReadTransaction(db, async (tx) => {
 		const [person] = await tx
 			.select({ id: people.id })
 			.from(people)
@@ -758,7 +766,7 @@ export async function listPeople({
 		"relationship",
 	);
 
-	return runPeopleTransaction(db, async (tx) => {
+	return runPeopleReadTransaction(db, async (tx) => {
 		const rows = await tx
 			.select({ id: people.id })
 			.from(people)

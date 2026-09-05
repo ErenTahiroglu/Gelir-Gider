@@ -174,6 +174,165 @@ export async function createLedgerAccountInTransaction({
 	}
 }
 
+function mapLedgerAccountRow(row: {
+	id: string;
+	userId: string;
+	code: string;
+	name: string;
+	accountType: string;
+	normalBalance: string;
+	currency: string;
+	createdAt: Date;
+	archivedAt: Date | null;
+}): LedgerAccountRecord {
+	return {
+		id: row.id,
+		userId: row.userId,
+		code: row.code,
+		name: row.name,
+		accountType: row.accountType as AccountType,
+		normalBalance: row.normalBalance as NormalBalance,
+		currency: row.currency,
+		createdAt: row.createdAt,
+		archivedAt: row.archivedAt,
+	};
+}
+
+export interface EnsureDeterministicLedgerAccountParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	code: string;
+	name: string;
+	accountType: AccountType;
+}
+
+/**
+ * Ensures a per-user singleton ledger account exists at a deterministic code,
+ * without ever relying on catching a raw unique-constraint violation inside
+ * the current transaction. A code collision on one of these identities always
+ * means "this exact resource already exists" (never a different resource
+ * colliding by chance), so this uses `ON CONFLICT DO NOTHING` -- which never
+ * raises a Postgres error and therefore never aborts the surrounding
+ * transaction -- and re-reads the existing row when nothing was inserted,
+ * independently validating that it matches the expected type/balance/currency
+ * and is not archived before returning it.
+ *
+ * Contrast with `createLedgerAccountInTransaction`, which is a plain INSERT
+ * that raises `LEDGER_ACCOUNT_CODE_CONFLICT` on collision: catching that
+ * error and continuing to query in the same transaction is unsafe, because a
+ * real unique-constraint violation puts a PostgreSQL transaction into an
+ * aborted state until a ROLLBACK (or ROLLBACK TO SAVEPOINT) is issued -- any
+ * subsequent statement, including a "recovery" re-read, would itself fail
+ * with "current transaction is aborted". Callers provisioning a deterministic
+ * singleton account (as opposed to creating a fresh, caller-named one) should
+ * use this function instead.
+ */
+export async function ensureDeterministicLedgerAccountInTransaction({
+	tx,
+	userId,
+	code,
+	name,
+	accountType,
+}: EnsureDeterministicLedgerAccountParams): Promise<LedgerAccountRecord> {
+	if (!userId || userId.trim() === "") {
+		throw new LedgerError("LEDGER_USER_NOT_FOUND", "User ID is required");
+	}
+
+	const normalizedCode = code?.trim().toUpperCase();
+	if (!normalizedCode || !ACCOUNT_CODE_PATTERN.test(normalizedCode)) {
+		throw new LedgerError(
+			"LEDGER_INVALID_ENTRY",
+			`Invalid account code format: "${code}". Must match ^[A-Z][A-Z0-9_]{1,63}$`,
+		);
+	}
+
+	const trimmedName = name?.trim();
+	if (!trimmedName || trimmedName.length < 1 || trimmedName.length > 100) {
+		throw new LedgerError(
+			"LEDGER_INVALID_ENTRY",
+			"Account name must be between 1 and 100 characters",
+		);
+	}
+
+	if (!VALID_ACCOUNT_TYPES.has(accountType)) {
+		throw new LedgerError(
+			"LEDGER_INVALID_ENTRY",
+			`Invalid account type: "${accountType}"`,
+		);
+	}
+
+	const [user] = await tx
+		.select({ id: users.id, currency: users.currency })
+		.from(users)
+		.where(eq(users.id, userId))
+		.limit(1);
+
+	if (!user) {
+		throw new LedgerError("LEDGER_USER_NOT_FOUND", "User does not exist");
+	}
+
+	const normalBalance = deriveNormalBalance(accountType);
+
+	const [inserted] = await tx
+		.insert(ledgerAccounts)
+		.values({
+			userId: user.id,
+			code: normalizedCode,
+			name: trimmedName,
+			accountType,
+			normalBalance,
+			currency: user.currency,
+		})
+		.onConflictDoNothing({
+			target: [ledgerAccounts.userId, ledgerAccounts.code],
+		})
+		.returning();
+
+	if (inserted) {
+		return mapLedgerAccountRow(inserted);
+	}
+
+	// No exception was ever raised above, so the transaction is not aborted
+	// and this re-read is always safe.
+	const [existing] = await tx
+		.select()
+		.from(ledgerAccounts)
+		.where(
+			and(
+				eq(ledgerAccounts.userId, userId),
+				eq(ledgerAccounts.code, normalizedCode),
+			),
+		)
+		.limit(1);
+
+	if (!existing) {
+		throw new LedgerError(
+			"LEDGER_INVALID_ENTRY",
+			`Failed to provision or resolve deterministic ledger account "${normalizedCode}"`,
+		);
+	}
+
+	if (
+		existing.accountType !== accountType ||
+		existing.normalBalance !== normalBalance ||
+		existing.currency !== user.currency
+	) {
+		throw new LedgerError(
+			"LEDGER_INVALID_ENTRY",
+			`Existing ledger account "${normalizedCode}" does not match the expected type/balance/currency`,
+		);
+	}
+
+	if (existing.archivedAt !== null) {
+		throw new LedgerError(
+			"LEDGER_ACCOUNT_ARCHIVED",
+			`Deterministic ledger account "${normalizedCode}" is archived`,
+		);
+	}
+
+	return mapLedgerAccountRow(existing);
+}
+
 /**
  * Creates a new ledger account for the given user.
  * Derives normal balance from account type and currency from user's base currency.

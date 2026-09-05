@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { PeopleError } from "../src/people/errors";
 import {
 	validateCanonicalUuid,
+	validateExpectedRevisionNo,
 	validateOptionalCanonicalUuid,
 	validateOptionalEnum,
 } from "../src/people/validation";
@@ -77,5 +78,39 @@ describe("validateOptionalEnum", () => {
 			expect(e).toBeInstanceOf(PeopleError);
 			expect((e as PeopleError).code).toBe("PEOPLE_INVALID_INPUT");
 		}
+	});
+});
+
+describe("validateExpectedRevisionNo", () => {
+	it("accepts positive safe integers", () => {
+		expect(validateExpectedRevisionNo(1)).toBe(1);
+		expect(validateExpectedRevisionNo(42)).toBe(42);
+		expect(validateExpectedRevisionNo(Number.MAX_SAFE_INTEGER)).toBe(
+			Number.MAX_SAFE_INTEGER,
+		);
+	});
+
+	it("rejects 0 and negative numbers as PEOPLE_INVALID_INPUT, not an OCC conflict", () => {
+		for (const bad of [0, -1, -100]) {
+			try {
+				validateExpectedRevisionNo(bad);
+				expect.unreachable();
+			} catch (e) {
+				expect(e).toBeInstanceOf(PeopleError);
+				expect((e as PeopleError).code).toBe("PEOPLE_INVALID_INPUT");
+			}
+		}
+	});
+
+	it("rejects non-integers, NaN, and Infinity", () => {
+		for (const bad of [1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(() => validateExpectedRevisionNo(bad)).toThrow(PeopleError);
+		}
+	});
+
+	it("rejects values beyond Number.isSafeInteger", () => {
+		expect(() =>
+			validateExpectedRevisionNo(Number.MAX_SAFE_INTEGER + 1),
+		).toThrow(PeopleError);
 	});
 });

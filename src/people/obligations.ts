@@ -30,7 +30,7 @@ import {
 	reviseCanonicalTransactionWithLedgerInTransaction,
 	voidCanonicalTransactionWithLedgerInTransaction,
 } from "../transactions/ledger-lifecycle";
-import { runPeopleTransaction } from "./boundary";
+import { runPeopleReadTransaction, runPeopleTransaction } from "./boundary";
 import {
 	validateOccurredAt,
 	validateOptionalIsoCalendarDate,
@@ -44,6 +44,7 @@ import {
 import { ensurePersonLedgerLinkInTransaction } from "./ledger-provisioning";
 import {
 	validateCanonicalUuid,
+	validateExpectedRevisionNo,
 	validateOptionalCanonicalUuid,
 	validateOptionalEnum,
 } from "./validation";
@@ -1126,12 +1127,16 @@ export async function updatePersonReceivable(
 	const description = validateDescription(params.description);
 	const idempotencyKey = validateIdempotencyKey(params.idempotencyKey);
 
+	const expectedRevisionNo = validateExpectedRevisionNo(
+		params.expectedRevisionNo,
+	);
+
 	return updateObligationCore(params.db, {
 		direction: "RECEIVABLE",
 		canonicalKind: "PERSON_RECEIVABLE_ADVANCE",
 		userId,
 		obligationId,
-		expectedRevisionNo: params.expectedRevisionNo,
+		expectedRevisionNo,
 		amountNormalized: amount.normalized,
 		fundingAssetAccountId,
 		budgetCategory: null,
@@ -1157,12 +1162,16 @@ export async function updatePersonPayableExpense(
 	const description = validateDescription(params.description);
 	const idempotencyKey = validateIdempotencyKey(params.idempotencyKey);
 
+	const expectedRevisionNo = validateExpectedRevisionNo(
+		params.expectedRevisionNo,
+	);
+
 	return updateObligationCore(params.db, {
 		direction: "PAYABLE",
 		canonicalKind: "PERSON_PAYABLE_EXPENSE",
 		userId,
 		obligationId,
-		expectedRevisionNo: params.expectedRevisionNo,
+		expectedRevisionNo,
 		amountNormalized: amount.normalized,
 		fundingAssetAccountId: null,
 		budgetCategory,
@@ -1182,7 +1191,9 @@ export async function voidPersonObligation(
 	const userId = validateUserId(params.userId);
 	const obligationId = validateObligationId(params.obligationId);
 	const idempotencyKey = validateIdempotencyKey(params.idempotencyKey);
-	const { expectedRevisionNo } = params;
+	const expectedRevisionNo = validateExpectedRevisionNo(
+		params.expectedRevisionNo,
+	);
 
 	return runPeopleTransaction(params.db, async (tx) => {
 		const [earlyRev] = await tx
@@ -1433,7 +1444,7 @@ export async function getPersonObligation({
 	const validUserId = validateUserId(userId);
 	const validObligationId = validateObligationId(obligationId);
 
-	return runPeopleTransaction(db, async (tx) => {
+	return runPeopleReadTransaction(db, async (tx) => {
 		const [obligation] = await tx
 			.select()
 			.from(personObligations)
@@ -1502,7 +1513,18 @@ export async function listPersonObligations({
 			? (validateDueDate(dueDateUntil) ?? undefined)
 			: undefined;
 
-	return runPeopleTransaction(db, async (tx) => {
+	if (
+		validDueDateFrom !== undefined &&
+		validDueDateUntil !== undefined &&
+		validDueDateFrom > validDueDateUntil
+	) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_INPUT",
+			"dueDateFrom must be less than or equal to dueDateUntil",
+		);
+	}
+
+	return runPeopleReadTransaction(db, async (tx) => {
 		const conditions = [eq(personObligations.userId, validUserId)];
 		if (validPersonId !== undefined) {
 			conditions.push(eq(personObligations.personId, validPersonId));
