@@ -1566,3 +1566,470 @@ export async function listPersonObligations({
 		return results;
 	});
 }
+
+// ---- Credit Card Split Obligation Transaction Helpers ----
+
+export interface CreateSplitObligationInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	splitId: string;
+	splitRevisionId: string;
+	splitParticipantId: string;
+	purchaseEventId: string;
+	personId: string;
+	amountNormalized: string;
+	expenseAccountId: string;
+	dueDate?: string | null | undefined;
+	description?: string | null | undefined;
+	occurredAt: Date;
+	idempotencyKey: string;
+}
+
+export interface UpdateSplitObligationInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	splitId: string;
+	splitRevisionId: string;
+	splitParticipantId: string;
+	purchaseEventId: string;
+	personId: string;
+	obligationId: string;
+	expectedRevisionNo: number;
+	amountNormalized: string;
+	expenseAccountId: string;
+	dueDate?: string | null | undefined;
+	description?: string | null | undefined;
+	occurredAt: Date;
+	idempotencyKey: string;
+}
+
+export interface VoidSplitObligationInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	obligationId: string;
+	expectedRevisionNo: number;
+	idempotencyKey: string;
+	occurredAt: Date;
+}
+
+export async function getObligationActiveSettledAmountCentsInTransaction(
+	tx: DatabaseTransaction,
+	obligationId: string,
+): Promise<bigint> {
+	return getActiveSettledAmountCents(tx, obligationId);
+}
+
+export async function createSplitObligationInTransaction(
+	params: CreateSplitObligationInTransactionParams,
+): Promise<{
+	obligationId: string;
+	revisionId: string;
+	canonicalTransactionId: string;
+}> {
+	const {
+		tx,
+		userId,
+		splitId,
+		splitRevisionId,
+		splitParticipantId,
+		purchaseEventId,
+		personId,
+		amountNormalized,
+		expenseAccountId,
+		dueDate,
+		description,
+		occurredAt,
+		idempotencyKey,
+	} = params;
+
+	await lockPersonAndVerifyActive(tx, userId, personId);
+
+	const link = await ensurePersonLedgerLinkInTransaction(tx, userId, personId);
+
+	await lockLedgerAccountsInTransaction({
+		tx,
+		userId,
+		accountIds: [link.receivableAccountId, expenseAccountId],
+	});
+
+	const ledgerLines = [
+		{
+			accountId: link.receivableAccountId,
+			side: "DEBIT" as const,
+			amount: amountNormalized,
+		},
+		{
+			accountId: expenseAccountId,
+			side: "CREDIT" as const,
+			amount: amountNormalized,
+		},
+	];
+
+	const obligationId = crypto.randomUUID();
+
+	const canonicalPayload: Record<string, unknown> = {
+		obligationId,
+		splitId,
+		splitRevisionId,
+		splitParticipantId,
+		purchaseEventId,
+		personId,
+		direction: "RECEIVABLE",
+		amount: amountNormalized,
+		expenseAccountId,
+		dueDate: dueDate ?? null,
+		description: description ?? null,
+	};
+
+	const boundRes = await createCanonicalTransactionWithLedgerInTransaction({
+		tx,
+		userId,
+		kind: "CREDIT_CARD_PURCHASE_SPLIT",
+		idempotencyKey,
+		occurredAt,
+		payload: canonicalPayload,
+		source: { type: "CREDIT_CARD_PURCHASE_SPLIT", ref: idempotencyKey },
+		ledger: {
+			memo: "Credit card purchase split",
+			lines: ledgerLines,
+		},
+	});
+
+	await tx.insert(personObligations).values({
+		id: obligationId,
+		userId,
+		personId,
+		direction: "RECEIVABLE",
+		canonicalTransactionId: boundRes.transactionId,
+	});
+
+	const fingerprint = await calculateObligationCreateFingerprint({
+		userId,
+		personId,
+		direction: "RECEIVABLE",
+		amount: amountNormalized,
+		fundingAssetAccountId: null,
+		budgetCategory: null,
+		dueDate: dueDate ?? null,
+		description: description ?? null,
+		occurredAt,
+	});
+
+	const [insertedRev] = await tx
+		.insert(personObligationRevisions)
+		.values({
+			userId,
+			obligationId,
+			revisionNo: 1,
+			previousRevisionId: null,
+			operation: "CREATE",
+			principalAmount: amountNormalized,
+			fundingAssetAccountId: null,
+			budgetCategory: null,
+			dueDate: dueDate ?? null,
+			description: description ?? null,
+			occurredAt,
+			canonicalRevisionId: boundRes.revisionId,
+			idempotencyKey,
+			revisionFingerprint: fingerprint,
+		})
+		.returning();
+
+	if (!insertedRev) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_STATE",
+			"Failed to insert person obligation revision",
+		);
+	}
+
+	return {
+		obligationId,
+		revisionId: insertedRev.id,
+		canonicalTransactionId: boundRes.transactionId,
+	};
+}
+
+export async function updateSplitObligationInTransaction(
+	params: UpdateSplitObligationInTransactionParams,
+): Promise<{
+	obligationId: string;
+	revisionId: string;
+	canonicalTransactionId: string;
+}> {
+	const {
+		tx,
+		userId,
+		splitId,
+		splitRevisionId,
+		splitParticipantId,
+		purchaseEventId,
+		personId,
+		obligationId,
+		expectedRevisionNo,
+		amountNormalized,
+		expenseAccountId,
+		dueDate,
+		description,
+		occurredAt,
+		idempotencyKey,
+	} = params;
+
+	await lockPersonAndVerifyActive(tx, userId, personId);
+
+	const [obligation] = await tx
+		.select()
+		.from(personObligations)
+		.where(
+			and(
+				eq(personObligations.id, obligationId),
+				eq(personObligations.userId, userId),
+			),
+		)
+		.for("update");
+
+	if (!obligation) {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_NOT_FOUND",
+			`Obligation "${obligationId}" not found`,
+		);
+	}
+
+	const latest = await getLatestObligationRevision(tx, obligationId);
+	if (!latest) {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_NOT_FOUND",
+			"Obligation has no revisions",
+		);
+	}
+	if (latest.operation === "VOID") {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_NOT_ACTIVE",
+			`Obligation "${obligationId}" is VOID`,
+		);
+	}
+	if (latest.revisionNo !== expectedRevisionNo) {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_REVISION_CONFLICT",
+			`Expected revision ${expectedRevisionNo} but latest is ${latest.revisionNo}`,
+		);
+	}
+
+	const activeSettledCents = await getActiveSettledAmountCents(
+		tx,
+		obligationId,
+	);
+	if (parsePositiveMoneyString(amountNormalized).cents < activeSettledCents) {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT",
+			`Cannot revise principal below active settled amount ${formatCentsToMoney(activeSettledCents)}`,
+		);
+	}
+
+	const link = await ensurePersonLedgerLinkInTransaction(tx, userId, personId);
+
+	await lockLedgerAccountsInTransaction({
+		tx,
+		userId,
+		accountIds: [link.receivableAccountId, expenseAccountId],
+	});
+
+	const ledgerLines = [
+		{
+			accountId: link.receivableAccountId,
+			side: "DEBIT" as const,
+			amount: amountNormalized,
+		},
+		{
+			accountId: expenseAccountId,
+			side: "CREDIT" as const,
+			amount: amountNormalized,
+		},
+	];
+
+	const canonicalPayload: Record<string, unknown> = {
+		obligationId,
+		splitId,
+		splitRevisionId,
+		splitParticipantId,
+		purchaseEventId,
+		personId,
+		direction: "RECEIVABLE",
+		amount: amountNormalized,
+		expenseAccountId,
+		dueDate: dueDate ?? null,
+		description: description ?? null,
+	};
+
+	const boundRes = await reviseCanonicalTransactionWithLedgerInTransaction({
+		tx,
+		userId,
+		transactionId: obligation.canonicalTransactionId,
+		expectedRevisionNo,
+		idempotencyKey,
+		occurredAt,
+		payload: canonicalPayload,
+		reasonCode: "CREDIT_CARD_PURCHASE_SPLIT_UPDATE",
+		reasonNote: null,
+		source: { type: "CREDIT_CARD_PURCHASE_SPLIT", ref: idempotencyKey },
+		ledger: {
+			memo: "Credit card purchase split update",
+			lines: ledgerLines,
+		},
+	});
+
+	const fingerprint = await calculateObligationUpdateFingerprint({
+		userId,
+		obligationId,
+		expectedRevisionNo,
+		amount: amountNormalized,
+		fundingAssetAccountId: null,
+		budgetCategory: null,
+		dueDate: dueDate ?? null,
+		description: description ?? null,
+		occurredAt,
+	});
+
+	const [insertedRev] = await tx
+		.insert(personObligationRevisions)
+		.values({
+			userId,
+			obligationId,
+			revisionNo: latest.revisionNo + 1,
+			previousRevisionId: latest.id,
+			operation: "UPDATE",
+			principalAmount: amountNormalized,
+			fundingAssetAccountId: null,
+			budgetCategory: null,
+			dueDate: dueDate ?? null,
+			description: description ?? null,
+			occurredAt,
+			canonicalRevisionId: boundRes.revisionId,
+			idempotencyKey,
+			revisionFingerprint: fingerprint,
+		})
+		.returning();
+
+	if (!insertedRev) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_STATE",
+			"Failed to insert person obligation revision",
+		);
+	}
+
+	return {
+		obligationId,
+		revisionId: insertedRev.id,
+		canonicalTransactionId: boundRes.transactionId,
+	};
+}
+
+export async function voidSplitObligationInTransaction(
+	params: VoidSplitObligationInTransactionParams,
+): Promise<{ obligationId: string; revisionId: string }> {
+	const {
+		tx,
+		userId,
+		obligationId,
+		expectedRevisionNo,
+		idempotencyKey,
+		occurredAt,
+	} = params;
+
+	const [obligation] = await tx
+		.select()
+		.from(personObligations)
+		.where(
+			and(
+				eq(personObligations.id, obligationId),
+				eq(personObligations.userId, userId),
+			),
+		)
+		.for("update");
+
+	if (!obligation) {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_NOT_FOUND",
+			`Obligation "${obligationId}" not found`,
+		);
+	}
+
+	const latest = await getLatestObligationRevision(tx, obligationId);
+	if (!latest) {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_NOT_FOUND",
+			"Obligation has no revisions",
+		);
+	}
+	if (latest.operation === "VOID") {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_NOT_ACTIVE",
+			`Obligation "${obligationId}" is already VOID`,
+		);
+	}
+	if (latest.revisionNo !== expectedRevisionNo) {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_REVISION_CONFLICT",
+			`Expected revision ${expectedRevisionNo} but latest is ${latest.revisionNo}`,
+		);
+	}
+
+	const activeSettledCents = await getActiveSettledAmountCents(
+		tx,
+		obligationId,
+	);
+	if (activeSettledCents !== 0n) {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT",
+			`Cannot VOID obligation with active settled amount ${formatCentsToMoney(activeSettledCents)}. Void settlements first.`,
+		);
+	}
+
+	const boundRes = await voidCanonicalTransactionWithLedgerInTransaction({
+		tx,
+		userId,
+		transactionId: obligation.canonicalTransactionId,
+		expectedRevisionNo,
+		idempotencyKey,
+		reasonCode: "CREDIT_CARD_PURCHASE_SPLIT_VOID",
+		reasonNote: null,
+		source: { type: "CREDIT_CARD_PURCHASE_SPLIT", ref: idempotencyKey },
+	});
+
+	const fingerprint = await calculateObligationVoidFingerprint({
+		userId,
+		obligationId,
+		expectedRevisionNo,
+	});
+
+	const [insertedRev] = await tx
+		.insert(personObligationRevisions)
+		.values({
+			userId,
+			obligationId,
+			revisionNo: latest.revisionNo + 1,
+			previousRevisionId: latest.id,
+			operation: "VOID",
+			principalAmount: latest.principalAmount,
+			fundingAssetAccountId: null,
+			budgetCategory: null,
+			dueDate: latest.dueDate,
+			description: latest.description,
+			occurredAt,
+			canonicalRevisionId: boundRes.revisionId,
+			idempotencyKey,
+			revisionFingerprint: fingerprint,
+		})
+		.returning();
+
+	if (!insertedRev) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_STATE",
+			"Failed to insert person obligation revision",
+		);
+	}
+
+	return {
+		obligationId,
+		revisionId: insertedRev.id,
+	};
+}

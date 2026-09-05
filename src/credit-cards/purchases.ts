@@ -8,6 +8,11 @@ import {
 	creditCardLiabilityEvents,
 	mapPurchaseCategoryToSystemRole,
 } from "../db/schema/credit-card-ledger";
+import {
+	creditCardPurchaseSplitRevisions,
+	creditCardPurchaseSplits,
+	type SplitMethod,
+} from "../db/schema/credit-card-splits";
 import { creditCardRevisions, creditCards } from "../db/schema/credit-cards";
 import {
 	shortTermGoalRevisions,
@@ -55,6 +60,14 @@ import {
 	ensureCreditCardLedgerLinkInTransaction,
 	ensureCreditCardSystemAccountsInTransaction,
 } from "./ledger-provisioning";
+import {
+	buildSplitReadModelInTransaction,
+	type CreditCardPurchaseSplitReadModel,
+	createSplitInTransaction,
+	type ParticipantAllocationInput,
+	updateSplitInTransaction,
+	voidSplitInTransaction,
+} from "./splits";
 
 // ============================================================================
 // Record & Snapshot Types
@@ -68,6 +81,9 @@ export interface CreditCardPurchaseRecord {
 	status: "POSTED" | "VOID";
 	revisionNo: number;
 	amount: string;
+	personalExpenseAmount: string;
+	externalReceivableAmount: string;
+	split: CreditCardPurchaseSplitReadModel | null;
 	purchaseDate: string | null;
 	purchaseCategory: CreditCardPurchaseBudgetCategory | null;
 	shortTermGoalId: string | null;
@@ -133,6 +149,25 @@ export interface RecordCreditCardPurchaseParams {
 	idempotencyKey: string;
 }
 
+export interface RecordSharedCreditCardPurchaseParams {
+	db: Database;
+	userId: string;
+	cardId: string;
+	amount: string;
+	purchaseCategory: string;
+	shortTermGoalId?: string | null | undefined;
+	merchant?: string | null | undefined;
+	description?: string | null | undefined;
+	installmentCount?: number | null | undefined;
+	occurredAt: Date;
+	purchaseIdempotencyKey: string;
+
+	splitMethod: SplitMethod;
+	userWeight?: number | undefined;
+	participants: ParticipantAllocationInput[];
+	splitIdempotencyKey: string;
+}
+
 export interface UpdateCreditCardPurchaseInTransactionParams {
 	tx: DatabaseTransaction;
 	userId: string;
@@ -147,6 +182,7 @@ export interface UpdateCreditCardPurchaseInTransactionParams {
 	reasonNote?: string | null | undefined;
 	occurredAt: Date;
 	idempotencyKey: string;
+	isCoordinatedWithSplit?: boolean | undefined;
 }
 
 export interface UpdateCreditCardPurchaseParams {
@@ -165,6 +201,28 @@ export interface UpdateCreditCardPurchaseParams {
 	idempotencyKey: string;
 }
 
+export interface UpdateCreditCardPurchaseWithSplitParams {
+	db: Database;
+	userId: string;
+	purchaseEventId: string;
+	purchaseExpectedRevisionNo: number;
+	amount: string;
+	purchaseCategory: string;
+	shortTermGoalId?: string | null | undefined;
+	merchant?: string | null | undefined;
+	description?: string | null | undefined;
+	installmentCount?: number | null | undefined;
+	reasonNote?: string | null | undefined;
+	occurredAt: Date;
+	purchaseIdempotencyKey: string;
+
+	splitExpectedRevisionNo: number;
+	splitMethod: SplitMethod;
+	userWeight?: number | undefined;
+	participants: ParticipantAllocationInput[];
+	splitIdempotencyKey: string;
+}
+
 export interface VoidCreditCardPurchaseInTransactionParams {
 	tx: DatabaseTransaction;
 	userId: string;
@@ -173,6 +231,7 @@ export interface VoidCreditCardPurchaseInTransactionParams {
 	reasonNote?: string | null | undefined;
 	occurredAt: Date;
 	idempotencyKey: string;
+	isCoordinatedWithSplit?: boolean | undefined;
 }
 
 export interface VoidCreditCardPurchaseParams {
@@ -183,6 +242,18 @@ export interface VoidCreditCardPurchaseParams {
 	reasonNote?: string | null | undefined;
 	occurredAt: Date;
 	idempotencyKey: string;
+}
+
+export interface VoidCreditCardPurchaseWithSplitParams {
+	db: Database;
+	userId: string;
+	purchaseEventId: string;
+	purchaseExpectedRevisionNo: number;
+	splitExpectedRevisionNo: number;
+	purchaseIdempotencyKey: string;
+	splitIdempotencyKey: string;
+	reasonNote?: string | null | undefined;
+	occurredAt?: Date | undefined;
 }
 
 export interface RecordCreditCardOpeningBalanceInTransactionParams {
@@ -732,6 +803,7 @@ export async function updateCreditCardPurchaseInTransaction({
 	reasonNote,
 	occurredAt,
 	idempotencyKey,
+	isCoordinatedWithSplit,
 }: UpdateCreditCardPurchaseInTransactionParams): Promise<CreditCardLiabilityEventLifecycleResult> {
 	const validUserId = validateCcCanonicalUuid(userId, "userId");
 	const validEventId = validateCcCanonicalUuid(eventId, "eventId");
@@ -932,6 +1004,36 @@ export async function updateCreditCardPurchaseInTransaction({
 			"CREDIT_CARD_REVISION_CONFLICT",
 			`Expected revision ${validExpectedRev} does not match current revision ${latestRev.revisionNo}`,
 		);
+	}
+
+	// Protection against uncoordinated economic updates to purchases with active splits
+	if (!isCoordinatedWithSplit) {
+		const [existingSplit] = await tx
+			.select()
+			.from(creditCardPurchaseSplits)
+			.where(eq(creditCardPurchaseSplits.purchaseEventId, validEventId))
+			.limit(1);
+
+		if (existingSplit) {
+			const [latestSplitRev] = await tx
+				.select()
+				.from(creditCardPurchaseSplitRevisions)
+				.where(eq(creditCardPurchaseSplitRevisions.splitId, existingSplit.id))
+				.orderBy(desc(creditCardPurchaseSplitRevisions.revisionNo))
+				.limit(1);
+
+			if (latestSplitRev && latestSplitRev.operation !== "VOID") {
+				if (
+					latestRev.amount !== validAmount ||
+					latestRev.budgetCategory !== validCategory
+				) {
+					throw new CreditCardError(
+						"CREDIT_CARD_SPLIT_CONFLICT",
+						"Cannot modify purchase amount or category while an active split exists. Use updateCreditCardPurchaseWithSplit.",
+					);
+				}
+			}
+		}
 	}
 
 	// Verify short-term goal if applicable
@@ -1242,6 +1344,7 @@ export async function voidCreditCardPurchaseInTransaction({
 	reasonNote,
 	occurredAt,
 	idempotencyKey,
+	isCoordinatedWithSplit,
 }: VoidCreditCardPurchaseInTransactionParams): Promise<CreditCardLiabilityEventLifecycleResult> {
 	const validUserId = validateCcCanonicalUuid(userId, "userId");
 	const validEventId = validateCcCanonicalUuid(eventId, "eventId");
@@ -1405,6 +1508,30 @@ export async function voidCreditCardPurchaseInTransaction({
 		);
 	}
 
+	if (!isCoordinatedWithSplit) {
+		const [existingSplit] = await tx
+			.select()
+			.from(creditCardPurchaseSplits)
+			.where(eq(creditCardPurchaseSplits.purchaseEventId, validEventId))
+			.limit(1);
+
+		if (existingSplit) {
+			const [latestSplitRev] = await tx
+				.select()
+				.from(creditCardPurchaseSplitRevisions)
+				.where(eq(creditCardPurchaseSplitRevisions.splitId, existingSplit.id))
+				.orderBy(desc(creditCardPurchaseSplitRevisions.revisionNo))
+				.limit(1);
+
+			if (latestSplitRev && latestSplitRev.operation !== "VOID") {
+				throw new CreditCardError(
+					"CREDIT_CARD_SPLIT_CONFLICT",
+					"Cannot void purchase while an active split exists. Use voidCreditCardPurchaseWithSplit.",
+				);
+			}
+		}
+	}
+
 	// 6. Resolve Ledger Accounts
 	const liabilityAccountId = await ensureCreditCardLedgerLinkInTransaction(
 		tx,
@@ -1462,9 +1589,9 @@ export async function voidCreditCardPurchaseInTransaction({
 		tx,
 		userId: validUserId,
 		transactionId: event.canonicalTransactionId,
-		expectedRevisionNo: canonicalRev.revisionNo,
+		expectedRevisionNo: latestRev.revisionNo,
 		idempotencyKey: validKey,
-		reasonCode: "PURCHASE_VOID",
+		reasonCode: "CREDIT_CARD_PURCHASE_VOID",
 		reasonNote: validReason,
 		source: {
 			type: "CREDIT_CARD_PURCHASE",
@@ -1531,6 +1658,17 @@ async function checkPurchaseVoidReplay(
 	reasonNote: string | null,
 	occurredAt: Date,
 ): Promise<CreditCardLiabilityEventLifecycleResult> {
+	if (
+		existingRev.userId !== userId ||
+		existingRev.eventId !== eventId ||
+		existingRev.operation !== "VOID"
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used for a different liability event or operation",
+		);
+	}
+
 	const fpV2 = await calculateLiabilityEventVoidFingerprint({
 		userId,
 		eventId,
@@ -1552,7 +1690,7 @@ async function checkPurchaseVoidReplay(
 	) {
 		throw new CreditCardError(
 			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
-			"Idempotency key already used with different void payload",
+			"Idempotency key already used with different VOID payload parameters",
 		);
 	}
 
@@ -1585,6 +1723,180 @@ export async function voidCreditCardPurchase(
 ): Promise<CreditCardLiabilityEventLifecycleResult> {
 	return runCreditCardTransaction(params.db, async (tx) => {
 		return voidCreditCardPurchaseInTransaction({ tx, ...params });
+	});
+}
+
+/**
+ * Convenience API to record a purchase and its split in one atomic transaction.
+ */
+export async function recordSharedCreditCardPurchase(
+	params: RecordSharedCreditCardPurchaseParams,
+): Promise<{
+	purchase: CreditCardLiabilityEventLifecycleResult;
+	split: CreditCardPurchaseSplitReadModel;
+	idempotentReplay: boolean;
+}> {
+	return runCreditCardTransaction(params.db, async (tx) => {
+		const purchaseRes = await recordCreditCardPurchaseInTransaction({
+			tx,
+			userId: params.userId,
+			cardId: params.cardId,
+			amount: params.amount,
+			purchaseCategory: params.purchaseCategory,
+			shortTermGoalId: params.shortTermGoalId,
+			merchant: params.merchant,
+			description: params.description,
+			installmentCount: params.installmentCount,
+			occurredAt: params.occurredAt,
+			idempotencyKey: params.purchaseIdempotencyKey,
+		});
+
+		const splitRes = await createSplitInTransaction(tx, {
+			userId: params.userId,
+			purchaseEventId: purchaseRes.eventId,
+			method: params.splitMethod,
+			userWeight: params.userWeight,
+			participants: params.participants,
+			idempotencyKey: params.splitIdempotencyKey,
+			occurredAt: params.occurredAt,
+		});
+
+		return {
+			purchase: purchaseRes,
+			split: splitRes.split,
+			idempotentReplay:
+				purchaseRes.idempotentReplay && splitRes.idempotentReplay,
+		};
+	});
+}
+
+/**
+ * Coordinated API to update a purchase and its linked split in one atomic transaction.
+ */
+export async function updateCreditCardPurchaseWithSplit(
+	params: UpdateCreditCardPurchaseWithSplitParams,
+): Promise<{
+	purchase: CreditCardLiabilityEventLifecycleResult;
+	split: CreditCardPurchaseSplitReadModel;
+	idempotentReplay: boolean;
+}> {
+	return runCreditCardTransaction(params.db, async (tx) => {
+		const purchaseRes = await updateCreditCardPurchaseInTransaction({
+			tx,
+			userId: params.userId,
+			eventId: params.purchaseEventId,
+			expectedRevisionNo: params.purchaseExpectedRevisionNo,
+			amount: params.amount,
+			purchaseCategory: params.purchaseCategory,
+			shortTermGoalId: params.shortTermGoalId,
+			merchant: params.merchant,
+			description: params.description,
+			installmentCount: params.installmentCount,
+			reasonNote: params.reasonNote,
+			occurredAt: params.occurredAt,
+			idempotencyKey: params.purchaseIdempotencyKey,
+			isCoordinatedWithSplit: true,
+		});
+
+		const [newPurchaseRev] = await tx
+			.select()
+			.from(creditCardLiabilityEventRevisions)
+			.where(eq(creditCardLiabilityEventRevisions.id, purchaseRes.revisionId))
+			.limit(1);
+
+		const [split] = await tx
+			.select()
+			.from(creditCardPurchaseSplits)
+			.where(
+				and(
+					eq(creditCardPurchaseSplits.purchaseEventId, params.purchaseEventId),
+					eq(creditCardPurchaseSplits.userId, params.userId),
+				),
+			)
+			.limit(1);
+
+		if (!split) {
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_NOT_FOUND",
+				`No split found for purchase "${params.purchaseEventId}"`,
+			);
+		}
+
+		const splitRes = await updateSplitInTransaction(tx, {
+			userId: params.userId,
+			splitId: split.id,
+			expectedRevisionNo: params.splitExpectedRevisionNo,
+			method: params.splitMethod,
+			userWeight: params.userWeight,
+			participants: params.participants,
+			idempotencyKey: params.splitIdempotencyKey,
+			occurredAt: params.occurredAt,
+			overridePurchaseRevision: newPurchaseRev,
+		});
+
+		return {
+			purchase: purchaseRes,
+			split: splitRes.split,
+			idempotentReplay:
+				purchaseRes.idempotentReplay && splitRes.idempotentReplay,
+		};
+	});
+}
+
+/**
+ * Coordinated API to void a split and its underlying purchase in one atomic transaction.
+ */
+export async function voidCreditCardPurchaseWithSplit(
+	params: VoidCreditCardPurchaseWithSplitParams,
+): Promise<{
+	purchase: CreditCardLiabilityEventLifecycleResult;
+	split: CreditCardPurchaseSplitReadModel;
+	idempotentReplay: boolean;
+}> {
+	return runCreditCardTransaction(params.db, async (tx) => {
+		const [split] = await tx
+			.select()
+			.from(creditCardPurchaseSplits)
+			.where(
+				and(
+					eq(creditCardPurchaseSplits.purchaseEventId, params.purchaseEventId),
+					eq(creditCardPurchaseSplits.userId, params.userId),
+				),
+			)
+			.limit(1);
+
+		if (!split) {
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_NOT_FOUND",
+				`No split found for purchase "${params.purchaseEventId}"`,
+			);
+		}
+
+		const splitRes = await voidSplitInTransaction(tx, {
+			userId: params.userId,
+			splitId: split.id,
+			expectedRevisionNo: params.splitExpectedRevisionNo,
+			idempotencyKey: params.splitIdempotencyKey,
+			occurredAt: params.occurredAt,
+		});
+
+		const purchaseRes = await voidCreditCardPurchaseInTransaction({
+			tx,
+			userId: params.userId,
+			eventId: params.purchaseEventId,
+			expectedRevisionNo: params.purchaseExpectedRevisionNo,
+			reasonNote: params.reasonNote ?? null,
+			occurredAt: params.occurredAt ?? new Date(),
+			idempotencyKey: params.purchaseIdempotencyKey,
+			isCoordinatedWithSplit: true,
+		});
+
+		return {
+			purchase: purchaseRes,
+			split: splitRes.split,
+			idempotentReplay:
+				purchaseRes.idempotentReplay && splitRes.idempotentReplay,
+		};
 	});
 }
 
@@ -2758,6 +3070,27 @@ export async function getCreditCardPurchase({
 		| undefined;
 	const shortTermGoalId = payload?.shortTermGoalId ?? null;
 
+	// Fetch split read model if split exists
+	const [split] = await db
+		.select({ id: creditCardPurchaseSplits.id })
+		.from(creditCardPurchaseSplits)
+		.where(eq(creditCardPurchaseSplits.purchaseEventId, validEventId))
+		.limit(1);
+
+	let splitModel: CreditCardPurchaseSplitReadModel | null = null;
+	if (split) {
+		splitModel = await buildSplitReadModelInTransaction(db, split.id);
+	}
+
+	const personalExpenseAmount =
+		splitModel !== null && splitModel.status === "ACTIVE"
+			? splitModel.userShareAmount
+			: latestRev.amount;
+	const externalReceivableAmount =
+		splitModel !== null && splitModel.status === "ACTIVE"
+			? splitModel.externalShareAmount
+			: "0.00";
+
 	return {
 		eventId: event.id,
 		cardId: event.creditCardId,
@@ -2766,6 +3099,9 @@ export async function getCreditCardPurchase({
 		status: latestRev.operation === "VOID" ? "VOID" : "POSTED",
 		revisionNo: latestRev.revisionNo,
 		amount: latestRev.amount,
+		personalExpenseAmount,
+		externalReceivableAmount,
+		split: splitModel,
 		purchaseDate: latestRev.purchaseDate,
 		purchaseCategory:
 			latestRev.budgetCategory as CreditCardPurchaseBudgetCategory | null,
@@ -2880,23 +3216,25 @@ export async function listCreditCardPurchasesInTransaction({
 			creditCardLiabilityEventRevisions.eventId,
 			desc(creditCardLiabilityEventRevisions.revisionNo),
 		)
-		.as("latest_revs");
+		.as("latest_liability_revs");
 
-	// 2. Build outer filter conditions on the latest revision attributes
+	// 2. Build outer filter conditions
 	const outerConditions = [];
-	if (validStatus) {
-		if (validStatus === "VOID") {
-			outerConditions.push(eq(latestRevsSq.operation, "VOID"));
-		} else {
-			outerConditions.push(ne(latestRevsSq.operation, "VOID"));
-		}
+
+	if (validStatus === "POSTED") {
+		outerConditions.push(ne(latestRevsSq.operation, "VOID"));
+	} else if (validStatus === "VOID") {
+		outerConditions.push(eq(latestRevsSq.operation, "VOID"));
 	}
+
 	if (validBudgetCategory) {
 		outerConditions.push(eq(latestRevsSq.budgetCategory, validBudgetCategory));
 	}
+
 	if (validPurchaseDateFrom) {
 		outerConditions.push(gte(latestRevsSq.purchaseDate, validPurchaseDateFrom));
 	}
+
 	if (validPurchaseDateUntil) {
 		outerConditions.push(
 			lte(latestRevsSq.purchaseDate, validPurchaseDateUntil),
@@ -2921,6 +3259,7 @@ export async function listCreditCardPurchasesInTransaction({
 	}
 
 	const canonicalRevisionIds = rows.map((r) => r.canonicalRevisionId);
+	const eventIds = rows.map((r) => r.eventId);
 
 	// 4. Bulk query ledger bindings
 	const bindingsByRevisionId = new Map<string, string | null>();
@@ -2954,7 +3293,26 @@ export async function listCreditCardPurchasesInTransaction({
 		);
 	}
 
-	// 6. Assemble results in order
+	// 6. Bulk query splits
+	const splitMap = new Map<string, CreditCardPurchaseSplitReadModel>();
+	if (eventIds.length > 0) {
+		const splits = await tx
+			.select({
+				id: creditCardPurchaseSplits.id,
+				purchaseEventId: creditCardPurchaseSplits.purchaseEventId,
+			})
+			.from(creditCardPurchaseSplits)
+			.where(inArray(creditCardPurchaseSplits.purchaseEventId, eventIds));
+
+		for (const s of splits) {
+			const model = await buildSplitReadModelInTransaction(tx, s.id);
+			if (model) {
+				splitMap.set(s.purchaseEventId, model);
+			}
+		}
+	}
+
+	// 7. Assemble results in order
 	return rows.map((row) => {
 		const appliedJournalEntryId =
 			bindingsByRevisionId.get(row.canonicalRevisionId) ?? null;
@@ -2962,6 +3320,15 @@ export async function listCreditCardPurchasesInTransaction({
 		const shortTermGoalId = payload?.shortTermGoalId ?? null;
 		const rowStatus: "POSTED" | "VOID" =
 			row.operation === "VOID" ? "VOID" : "POSTED";
+
+		const split = splitMap.get(row.eventId) ?? null;
+		const isSplitActive = split && split.status === "ACTIVE";
+		const personalExpenseAmount = isSplitActive
+			? split.userShareAmount
+			: row.amount;
+		const externalReceivableAmount = isSplitActive
+			? split.externalShareAmount
+			: "0.00";
 
 		return {
 			eventId: row.eventId,
@@ -2971,6 +3338,9 @@ export async function listCreditCardPurchasesInTransaction({
 			status: rowStatus,
 			revisionNo: row.revisionNo,
 			amount: row.amount,
+			personalExpenseAmount,
+			externalReceivableAmount,
+			split,
 			purchaseDate: row.purchaseDate,
 			purchaseCategory:
 				row.budgetCategory as CreditCardPurchaseBudgetCategory | null,

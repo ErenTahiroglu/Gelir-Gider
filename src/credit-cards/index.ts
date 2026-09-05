@@ -5,3 +5,5 @@ export * from "./ledger-provisioning";
 export * from "./payments";
 export * from "./purchases";
 export * from "./service";
+export * from "./split-allocation";
+export * from "./splits";

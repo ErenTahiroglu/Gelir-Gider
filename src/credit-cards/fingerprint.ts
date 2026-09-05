@@ -446,3 +446,116 @@ export async function generateCreditCardPaymentReopenJournalKey(
 	]);
 	return `CC_REOPEN_${hex}`;
 }
+
+// ---- Credit Card Purchase Split Fingerprints ----
+
+export interface SplitParticipantItemFingerprint {
+	personId: string;
+	shareAmount: string; // normalized money string
+	weight?: number | null;
+	dueDate?: string | null;
+	description?: string | null;
+}
+
+export interface SplitCreateFingerprintParams {
+	userId: string;
+	purchaseEventId: string;
+	method: "EQUAL" | "MANUAL" | "RATIO";
+	grossAmount: string;
+	userShareAmount: string;
+	externalShareAmount: string;
+	userWeight: number | null;
+	items: SplitParticipantItemFingerprint[]; // sorted by personId ASC
+	occurredAt: Date;
+}
+
+export interface SplitUpdateFingerprintParams {
+	userId: string;
+	splitId: string;
+	expectedRevisionNo: number;
+	method: "EQUAL" | "MANUAL" | "RATIO";
+	grossAmount: string;
+	userShareAmount: string;
+	externalShareAmount: string;
+	userWeight: number | null;
+	items: SplitParticipantItemFingerprint[]; // sorted by personId ASC
+	occurredAt: Date;
+}
+
+export interface SplitVoidFingerprintParams {
+	userId: string;
+	splitId: string;
+	expectedRevisionNo: number;
+	occurredAt: Date;
+}
+
+export async function calculateSplitCreateFingerprint(
+	params: SplitCreateFingerprintParams,
+): Promise<string> {
+	// Normalize items: sort by personId ASC
+	const sortedItems = [...params.items]
+		.sort((a, b) => a.personId.localeCompare(b.personId))
+		.map((item) => [
+			item.personId.trim().toLowerCase(),
+			item.shareAmount,
+			item.weight ?? null,
+			item.dueDate ?? null,
+			item.description ?? null,
+		]);
+
+	return sha256Hex([
+		"credit-card-split-revision-v1",
+		params.userId.trim().toLowerCase(),
+		params.purchaseEventId.trim().toLowerCase(),
+		"CREATE",
+		params.method,
+		params.grossAmount,
+		params.userShareAmount,
+		params.externalShareAmount,
+		params.userWeight ?? null,
+		sortedItems,
+		params.occurredAt.toISOString(),
+	]);
+}
+
+export async function calculateSplitUpdateFingerprint(
+	params: SplitUpdateFingerprintParams,
+): Promise<string> {
+	const sortedItems = [...params.items]
+		.sort((a, b) => a.personId.localeCompare(b.personId))
+		.map((item) => [
+			item.personId.trim().toLowerCase(),
+			item.shareAmount,
+			item.weight ?? null,
+			item.dueDate ?? null,
+			item.description ?? null,
+		]);
+
+	return sha256Hex([
+		"credit-card-split-revision-v1",
+		params.userId.trim().toLowerCase(),
+		params.splitId.trim().toLowerCase(),
+		"UPDATE",
+		params.expectedRevisionNo,
+		params.method,
+		params.grossAmount,
+		params.userShareAmount,
+		params.externalShareAmount,
+		params.userWeight ?? null,
+		sortedItems,
+		params.occurredAt.toISOString(),
+	]);
+}
+
+export async function calculateSplitVoidFingerprint(
+	params: SplitVoidFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"credit-card-split-revision-v1",
+		params.userId.trim().toLowerCase(),
+		params.splitId.trim().toLowerCase(),
+		"VOID",
+		params.expectedRevisionNo,
+		params.occurredAt.toISOString(),
+	]);
+}

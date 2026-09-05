@@ -389,10 +389,107 @@ export function mapDbError(err: unknown, _context?: string): never {
 		);
 	}
 
+	if (
+		matchesDbConstraint(err, "credit_card_purchase_splits_purchase_event_id_uq")
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_CONFLICT",
+			"A split already exists for this purchase",
+		);
+	}
+	if (
+		matchesDbConstraint(
+			err,
+			"credit_card_purchase_split_revisions_split_revision_no_uq",
+			"trg_fn_guard_cc_split_revision_insert",
+		) ||
+		causeChain.includes("split revision branching")
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_REVISION_CONFLICT",
+			"Credit card split revision conflict",
+		);
+	}
+	if (
+		matchesDbConstraint(
+			err,
+			"credit_card_purchase_split_revisions_split_idempotency_key_uq",
+		)
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+			"Credit card split idempotency key conflict",
+		);
+	}
+	if (
+		matchesDbConstraint(
+			err,
+			"credit_card_purchase_split_revision_items_rev_person_uq",
+		)
+	) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"Duplicate person in split revision",
+		);
+	}
+
 	throw new CreditCardError(
 		"CREDIT_CARD_INVALID_STATE",
 		"Credit card state transition failed",
 	);
+}
+
+/**
+ * Maps People domain errors into sanitized CreditCardError instances.
+ */
+export function mapPeopleError(
+	err: import("../people/errors").PeopleError,
+	_context?: string,
+): never {
+	switch (err.code) {
+		case "PEOPLE_NOT_FOUND":
+		case "PEOPLE_INVALID_INPUT":
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_INPUT",
+				err.message || "Invalid people parameter",
+			);
+		case "PEOPLE_NOT_ACTIVE":
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_CONFLICT",
+				"Selected person is not active",
+			);
+		case "PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT":
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_CONFLICT",
+				err.message ||
+					"Cannot modify or void obligation with active settlements",
+			);
+		case "PEOPLE_OBLIGATION_REVISION_CONFLICT":
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_REVISION_CONFLICT",
+				"Split obligation revision conflict",
+			);
+		case "PEOPLE_IDEMPOTENCY_CONFLICT":
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT",
+				"Split obligation idempotency conflict",
+			);
+		case "PEOPLE_OBLIGATION_NOT_FOUND":
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_NOT_FOUND",
+				"Split obligation not found",
+			);
+		case "PEOPLE_OBLIGATION_NOT_ACTIVE":
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_NOT_ACTIVE",
+				"Split obligation is not active",
+			);
+		default:
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_CONFLICT",
+				"People domain conflict during credit card operation",
+			);
+	}
 }
 
 /**
@@ -404,6 +501,7 @@ export function mapDbError(err: unknown, _context?: string): never {
  * - MidasError: mapped to sanitized CreditCardError
  * - CanonicalTransactionError: mapped to sanitized CreditCardError
  * - LedgerError: mapped to sanitized CreditCardError
+ * - PeopleError: mapped to sanitized CreditCardError
  * - Recognized DB/Postgres/Drizzle error: mapped to sanitized CreditCardError
  * - Programmer errors (e.g. TypeError, ReferenceError): rethrown unchanged
  */
@@ -425,6 +523,14 @@ export async function runCreditCardTransaction<T>(
 		}
 		if (err instanceof LedgerError) {
 			mapLedgerError(err);
+		}
+		if (
+			err &&
+			typeof err === "object" &&
+			"name" in err &&
+			(err as { name: string }).name === "PeopleError"
+		) {
+			mapPeopleError(err as import("../people/errors").PeopleError);
 		}
 		if (isDatabaseBoundaryError(err)) {
 			mapDbError(err);
