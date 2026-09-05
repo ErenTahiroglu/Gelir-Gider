@@ -215,9 +215,6 @@ export const rewardEvents = pgTable(
 		uniqueIndex("reward_events_canonical_tx_idx")
 			.on(table.canonicalTransactionId)
 			.where(sql`${table.canonicalTransactionId} IS NOT NULL`),
-		uniqueIndex("reward_events_account_opening_idx")
-			.on(table.rewardAccountId)
-			.where(sql`${table.eventType} = 'OPENING_BALANCE'`),
 		index("reward_events_account_idx").on(table.rewardAccountId),
 		index("reward_events_user_idx").on(table.userId),
 		check(

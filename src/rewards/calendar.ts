@@ -292,3 +292,27 @@ export function validateRewardSourceType(
 	}
 	return value as "MANUAL" | "CAMPAIGN" | "IMPORT";
 }
+
+/**
+ * Validates a reward event provenance sourceRef. Accepts `unknown`.
+ * `undefined` or `null` mean omitted (returns null).
+ * If supplied, must be a string and trimmed length must be between 1 and 128
+ * characters (empty or whitespace-only strings are rejected).
+ */
+export function validateRewardSourceRef(value: unknown): string | null {
+	if (value === undefined || value === null) return null;
+	if (typeof value !== "string") {
+		throw new RewardError(
+			"REWARD_INVALID_INPUT",
+			"sourceRef must be a string if supplied",
+		);
+	}
+	const trimmed = value.trim();
+	if (trimmed.length < 1 || trimmed.length > 128) {
+		throw new RewardError(
+			"REWARD_INVALID_INPUT",
+			"sourceRef must be between 1 and 128 characters when supplied",
+		);
+	}
+	return trimmed;
+}

@@ -32,6 +32,7 @@ import {
 	validateRewardOccurredAt,
 	validateRewardOptionalText,
 	validateRewardPurchaseCategory,
+	validateRewardSourceRef,
 	validateRewardSourceType,
 } from "./calendar";
 import {
@@ -368,7 +369,7 @@ async function createSimpleRewardEventInTransaction(
 	}
 
 	if (args.eventType === "OPENING_BALANCE") {
-		const [existingOpening] = await tx
+		const openingEvents = await tx
 			.select({ id: rewardEvents.id })
 			.from(rewardEvents)
 			.where(
@@ -376,13 +377,40 @@ async function createSimpleRewardEventInTransaction(
 					eq(rewardEvents.rewardAccountId, args.rewardAccountId),
 					eq(rewardEvents.eventType, "OPENING_BALANCE"),
 				),
-			)
-			.limit(1);
-		if (existingOpening) {
-			throw new RewardError(
-				"REWARD_EVENT_CONFLICT",
-				"An opening balance event already exists for this reward account",
 			);
+		if (openingEvents.length > 0) {
+			const openingIds = openingEvents.map((e) => e.id);
+			const revisions = await tx
+				.select({
+					rewardEventId: rewardEventRevisions.rewardEventId,
+					revisionNo: rewardEventRevisions.revisionNo,
+					operation: rewardEventRevisions.operation,
+				})
+				.from(rewardEventRevisions)
+				.where(inArray(rewardEventRevisions.rewardEventId, openingIds));
+
+			const latestByEvent = new Map<
+				string,
+				{ revisionNo: number; operation: string }
+			>();
+			for (const r of revisions) {
+				const prev = latestByEvent.get(r.rewardEventId);
+				if (!prev || r.revisionNo > prev.revisionNo) {
+					latestByEvent.set(r.rewardEventId, {
+						revisionNo: r.revisionNo,
+						operation: r.operation,
+					});
+				}
+			}
+
+			for (const [, latest] of latestByEvent) {
+				if (latest.operation !== "VOID") {
+					throw new RewardError(
+						"REWARD_EVENT_CONFLICT",
+						"An active opening balance event already exists for this reward account",
+					);
+				}
+			}
 		}
 	}
 
@@ -474,12 +502,11 @@ export async function recordRewardEarnInTransaction(
 		sourceRef?: string | null | undefined;
 	},
 ): Promise<{ event: RewardEventReadModel; idempotentReplay: boolean }> {
-	const sourceType = validateRewardSourceType(args.sourceType ?? "MANUAL");
-	const sourceRef = validateRewardOptionalText(
-		args.sourceRef ?? null,
-		"sourceRef",
-		128,
-	);
+	const sourceType =
+		args.sourceType === undefined
+			? "MANUAL"
+			: validateRewardSourceType(args.sourceType);
+	const sourceRef = validateRewardSourceRef(args.sourceRef);
 	return createSimpleRewardEventInTransaction(tx, {
 		userId: args.userId,
 		rewardAccountId: args.rewardAccountId,

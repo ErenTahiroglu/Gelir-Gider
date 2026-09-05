@@ -281,6 +281,13 @@
       "when": 1788629292011,
       "tag": "0039_harden_rewards_domain_integrity",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1788631341441,
+      "tag": "0040_giant_power_pack",
+      "breakpoints": true
     }
   ]
 }
