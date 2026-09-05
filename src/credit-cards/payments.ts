@@ -52,8 +52,6 @@ import {
 	calculateStatementPayFingerprint,
 	calculateStatementReopenFingerprint,
 	generateCardReserveMidasKey,
-	generateCreditCardPaymentJournalKey,
-	generateCreditCardPaymentReopenJournalKey,
 } from "./fingerprint";
 import { ensureCreditCardLedgerLinkInTransaction } from "./ledger-provisioning";
 import type { CreditCardStatementLifecycleResult } from "./service";
@@ -163,6 +161,9 @@ export async function payCreditCardStatementInTransaction({
 	);
 
 	// 1. EARLY IDEMPOTENCY REPLAY CHECK
+	const candidateAssetId =
+		outsidePaymentAssetAccountId ?? paymentAssetAccountId;
+
 	const [earlyRev] = await tx
 		.select()
 		.from(creditCardStatementRevisions)
@@ -175,7 +176,17 @@ export async function payCreditCardStatementInTransaction({
 		.limit(1);
 
 	if (earlyRev) {
-		return checkStatementPayReplay(tx, earlyRev, validUserId, validStatementId);
+		return checkStatementPayReplay(
+			tx,
+			earlyRev,
+			validUserId,
+			validStatementId,
+			validExpectedRev,
+			validOccurredAt,
+			paymentAmount,
+			paymentMethod,
+			candidateAssetId,
+		);
 	}
 
 	// 2. Lock Statement Anchor FOR UPDATE
@@ -221,6 +232,11 @@ export async function payCreditCardStatementInTransaction({
 			secondRev,
 			validUserId,
 			validStatementId,
+			validExpectedRev,
+			validOccurredAt,
+			paymentAmount,
+			paymentMethod,
+			candidateAssetId,
 		);
 	}
 
@@ -578,11 +594,104 @@ async function checkStatementPayReplay(
 	existingRev: typeof creditCardStatementRevisions.$inferSelect,
 	userId: string,
 	statementId: string,
+	expectedRevisionNo: number,
+	occurredAt: Date,
+	paymentAmount?: string | undefined,
+	paymentMethod?: "MIDAS_FUND" | "OUTSIDE_MIDAS" | undefined,
+	candidateAssetAccountId?: string | undefined,
 ): Promise<CreditCardStatementLifecycleResult> {
 	if (existingRev.operation !== "PAY" || existingRev.status !== "PAID") {
 		throw new CreditCardError(
 			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
 			"Idempotency key already used with different statement operation",
+		);
+	}
+
+	if (!existingRev.paymentEventId) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_STATE",
+			`Historical PAY revision ${existingRev.id} is missing paymentEventId`,
+		);
+	}
+
+	// Load historical payment event to obtain historical paymentAssetAccountId
+	const [paymentEvent] = await tx
+		.select({
+			id: creditCardStatementPaymentEvents.id,
+			paymentAssetAccountId:
+				creditCardStatementPaymentEvents.paymentAssetAccountId,
+		})
+		.from(creditCardStatementPaymentEvents)
+		.where(
+			and(
+				eq(creditCardStatementPaymentEvents.id, existingRev.paymentEventId),
+				eq(creditCardStatementPaymentEvents.userId, userId),
+			),
+		)
+		.limit(1);
+
+	if (!paymentEvent) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_STATE",
+			`Historical payment event "${existingRev.paymentEventId}" not found`,
+		);
+	}
+
+	// Validate caller optional assertions if provided
+	if (paymentAmount !== undefined && paymentAmount !== null) {
+		const validPassedAmount = validateCcPositiveMoneyString(
+			paymentAmount,
+			"paymentAmount",
+		).normalized;
+		if (validPassedAmount !== existingRev.statementAmount) {
+			throw new CreditCardError(
+				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+				`Idempotency key used with different paymentAmount: passed "${validPassedAmount}" vs historical "${existingRev.statementAmount}"`,
+			);
+		}
+	}
+
+	if (paymentMethod !== undefined && paymentMethod !== null) {
+		const validPassedMethod = validatePaymentMethod(paymentMethod);
+		if (validPassedMethod !== existingRev.reservePlacement) {
+			throw new CreditCardError(
+				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+				`Idempotency key used with different paymentMethod: passed "${validPassedMethod}" vs historical "${existingRev.reservePlacement}"`,
+			);
+		}
+	}
+
+	if (
+		candidateAssetAccountId !== undefined &&
+		candidateAssetAccountId !== null
+	) {
+		const validPassedAssetId = validateCcCanonicalUuid(
+			candidateAssetAccountId,
+			"paymentAssetAccountId",
+		);
+		if (validPassedAssetId !== paymentEvent.paymentAssetAccountId) {
+			throw new CreditCardError(
+				"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+				`Idempotency key used with different paymentAssetAccountId: passed "${validPassedAssetId}" vs historical "${paymentEvent.paymentAssetAccountId}"`,
+			);
+		}
+	}
+
+	// Calculate fingerprint using caller's expectedRevisionNo & occurredAt + historical authoritative values
+	const expectedFingerprint = await calculateStatementPayFingerprint({
+		userId,
+		statementId,
+		expectedRevisionNo,
+		paymentAmount: existingRev.statementAmount,
+		paymentMethod: existingRev.reservePlacement as CreditCardReservePlacement,
+		assetAccountId: paymentEvent.paymentAssetAccountId,
+		occurredAt,
+	});
+
+	if (existingRev.revisionFingerprint !== expectedFingerprint) {
+		throw new CreditCardError(
+			"CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used with different pay payload or intent",
 		);
 	}
 
@@ -623,13 +732,19 @@ export async function payCreditCardStatement(
 /**
  * Reopens a PAID credit card statement inside a transaction.
  *
- * EXECUTION ORDER (MIDAS_FUND):
- * 1. Lock card & statement anchors FOR UPDATE.
- * 2. Lock required ledger accounts FOR UPDATE.
- * 3. Lock parent Midas account FOR UPDATE.
- * 4. VOID/reverse canonical payment FIRST (restoring physical Midas ledger asset).
- * 5. Allocate full statement amount back into CREDIT_CARD_RESERVE virtual bucket.
- * 6. Insert REOPEN statement revision.
+ * EXECUTION ORDER:
+ * 1. Early idempotency replay check.
+ * 2. Preliminary statement lookup -> creditCardId.
+ * 3. Lock credit_cards row FOR UPDATE.
+ * 4. Re-read current card revision, require status === 'ACTIVE'.
+ * 5. Lock credit_card_statements row FOR UPDATE.
+ * 6. Second idempotency replay check under lock.
+ * 7. Validate PAID status & expectedRevisionNo.
+ * 8. Lock required ledger accounts FOR UPDATE (sorted by ID).
+ * 9. Lock parent Midas account FOR UPDATE (if MIDAS_FUND).
+ * 10. VOID/reverse canonical payment FIRST (restoring physical Midas ledger asset).
+ * 11. Allocate full statement amount back into CREDIT_CARD_RESERVE virtual bucket.
+ * 12. Insert REOPEN statement revision.
  */
 export async function reopenCreditCardStatementPaymentInTransaction({
 	tx,
@@ -674,7 +789,67 @@ export async function reopenCreditCardStatementPaymentInTransaction({
 		);
 	}
 
-	// 2. Lock Statement Anchor FOR UPDATE
+	// 2. Preliminary statement lookup without lock to obtain creditCardId
+	const [stmtLookup] = await tx
+		.select({
+			creditCardId: creditCardStatements.creditCardId,
+		})
+		.from(creditCardStatements)
+		.where(
+			and(
+				eq(creditCardStatements.id, validStatementId),
+				eq(creditCardStatements.userId, validUserId),
+			),
+		)
+		.limit(1);
+
+	if (!stmtLookup) {
+		throw new CreditCardError(
+			"CREDIT_CARD_STATEMENT_NOT_FOUND",
+			`Statement "${validStatementId}" not found`,
+		);
+	}
+
+	// 3. Lock credit_cards row FOR UPDATE
+	const [card] = await tx
+		.select({
+			id: creditCards.id,
+			userId: creditCards.userId,
+		})
+		.from(creditCards)
+		.where(
+			and(
+				eq(creditCards.id, stmtLookup.creditCardId),
+				eq(creditCards.userId, validUserId),
+			),
+		)
+		.for("update");
+
+	if (!card) {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_FOUND",
+			`Credit card "${stmtLookup.creditCardId}" not found`,
+		);
+	}
+
+	// 4. Re-read latest card revision and require ACTIVE
+	const [cardRev] = await tx
+		.select({
+			status: creditCardRevisions.status,
+		})
+		.from(creditCardRevisions)
+		.where(eq(creditCardRevisions.creditCardId, card.id))
+		.orderBy(desc(creditCardRevisions.revisionNo))
+		.limit(1);
+
+	if (cardRev?.status !== "ACTIVE") {
+		throw new CreditCardError(
+			"CREDIT_CARD_NOT_ACTIVE",
+			`Credit card "${card.id}" is not active (status: "${cardRev?.status}")`,
+		);
+	}
+
+	// 5. Lock Statement Anchor FOR UPDATE
 	const [statement] = await tx
 		.select({
 			id: creditCardStatements.id,
@@ -699,7 +874,7 @@ export async function reopenCreditCardStatementPaymentInTransaction({
 		);
 	}
 
-	// 4.1 SECOND IDEMPOTENCY REPLAY CHECK (under lock)
+	// 6. SECOND IDEMPOTENCY REPLAY CHECK (under lock)
 	const [secondRev] = await tx
 		.select()
 		.from(creditCardStatementRevisions)
@@ -722,7 +897,7 @@ export async function reopenCreditCardStatementPaymentInTransaction({
 		);
 	}
 
-	// 5. Fetch latest revision
+	// 7. Fetch latest revision
 	const [latestRev] = await tx
 		.select()
 		.from(creditCardStatementRevisions)
@@ -765,7 +940,7 @@ export async function reopenCreditCardStatementPaymentInTransaction({
 		);
 	}
 
-	// 6. Fetch Payment Event
+	// Fetch Payment Event
 	const [paymentEvent] = await tx
 		.select()
 		.from(creditCardStatementPaymentEvents)
@@ -784,14 +959,14 @@ export async function reopenCreditCardStatementPaymentInTransaction({
 		);
 	}
 
-	// 7. Resolve Liability Ledger Account
+	// 8. Resolve Liability Ledger Account
 	const liabilityAccountId = await ensureCreditCardLedgerLinkInTransaction(
 		tx,
 		validUserId,
 		statement.creditCardId,
 	);
 
-	// 8. Lock Ledger Accounts FOR UPDATE
+	// Lock Ledger Accounts FOR UPDATE (sorted)
 	await lockLedgerAccountsInTransaction({
 		tx,
 		userId: validUserId,
@@ -1000,7 +1175,7 @@ export async function reopenCreditCardStatementPayment(
 
 /**
  * Reconciles a credit card statement against current card liability and reserve readiness.
- * Returns coherent status: READY (coverage >= statement) or SHORTFALL.
+ * Returns coherent status: READY (coverage >= statement) or SHORTFALL from a single serialized snapshot.
  */
 export async function reconcileCreditCardStatementInTransaction({
 	tx,
@@ -1010,7 +1185,7 @@ export async function reconcileCreditCardStatementInTransaction({
 	const validUserId = validateCcCanonicalUuid(userId, "userId");
 	const validStatementId = validateCcCanonicalUuid(statementId, "statementId");
 
-	// 1. Fetch statement anchor & latest revision
+	// 1. Lock Statement Anchor FOR UPDATE
 	const [statement] = await tx
 		.select({
 			id: creditCardStatements.id,
@@ -1026,7 +1201,7 @@ export async function reconcileCreditCardStatementInTransaction({
 				eq(creditCardStatements.userId, validUserId),
 			),
 		)
-		.limit(1);
+		.for("update");
 
 	if (!statement) {
 		throw new CreditCardError(
@@ -1035,6 +1210,53 @@ export async function reconcileCreditCardStatementInTransaction({
 		);
 	}
 
+	// 2. Resolve liability ledger account
+	const liabilityAccountId = await ensureCreditCardLedgerLinkInTransaction(
+		tx,
+		validUserId,
+		statement.creditCardId,
+	);
+
+	// Resolve Midas physical ledger account if linked
+	let midasPhysicalAccountId: string | null = null;
+	if (statement.midasAccountId) {
+		const [midasAcc] = await tx
+			.select({ ledgerAccountId: midasAccounts.ledgerAccountId })
+			.from(midasAccounts)
+			.where(
+				and(
+					eq(midasAccounts.id, statement.midasAccountId),
+					eq(midasAccounts.userId, validUserId),
+				),
+			)
+			.limit(1);
+
+		if (midasAcc) {
+			midasPhysicalAccountId = midasAcc.ledgerAccountId;
+		}
+	}
+
+	// 3. Lock all required ledger accounts together (sorted by ID)
+	const ledgerAccountIds = [liabilityAccountId];
+	if (midasPhysicalAccountId) {
+		ledgerAccountIds.push(midasPhysicalAccountId);
+	}
+	await lockLedgerAccountsInTransaction({
+		tx,
+		userId: validUserId,
+		accountIds: ledgerAccountIds,
+	});
+
+	// 4. Lock Midas account (global order: ledger_accounts -> midas_accounts)
+	if (statement.midasAccountId) {
+		await lockMidasAllocationStateInTransaction({
+			tx,
+			userId: validUserId,
+			midasAccountId: statement.midasAccountId,
+		});
+	}
+
+	// 5. Re-read latest statement revision
 	const [latestRev] = await tx
 		.select()
 		.from(creditCardStatementRevisions)
@@ -1049,13 +1271,7 @@ export async function reconcileCreditCardStatementInTransaction({
 		);
 	}
 
-	// 2. Fetch current live card liability balance
-	const liabilityAccountId = await ensureCreditCardLedgerLinkInTransaction(
-		tx,
-		validUserId,
-		statement.creditCardId,
-	);
-
+	// 6. Read exact current card liability balance
 	const cardBal = await getLedgerAccountBalanceInTransaction({
 		tx,
 		userId: validUserId,
@@ -1069,12 +1285,9 @@ export async function reconcileCreditCardStatementInTransaction({
 	const ledgerCents =
 		parseSignedAggregateMoneyString(cardLiabilityBalance).cents;
 
-	// 3. Fetch reserve amount if MIDAS_FUND
+	// 7. Read exact current reserve state
 	let reserveAmount = "0.00";
-	if (
-		latestRev.reservePlacement === "MIDAS_FUND" &&
-		statement.midasReserveBucketId
-	) {
+	if (statement.midasReserveBucketId && statement.midasAccountId) {
 		const midasState = await getMidasLiquidityStateInTransaction({
 			tx,
 			userId: validUserId,
@@ -1087,7 +1300,33 @@ export async function reconcileCreditCardStatementInTransaction({
 		}
 	}
 
-	// 4. Compute liability coverage and expected post-payment liability
+	// 8. Validate reserve invariant
+	if (latestRev.status === "OPEN") {
+		if (latestRev.reservePlacement === "MIDAS_FUND") {
+			if (reserveAmount !== latestRev.statementAmount) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					`OPEN MIDAS_FUND statement ${validStatementId} reserve amount (${reserveAmount}) does not match statement amount (${latestRev.statementAmount})`,
+				);
+			}
+		} else if (latestRev.reservePlacement === "OUTSIDE_MIDAS") {
+			if (reserveAmount !== "0.00") {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					`OPEN OUTSIDE_MIDAS statement ${validStatementId} must have reserve amount 0.00, found ${reserveAmount}`,
+				);
+			}
+		}
+	} else if (latestRev.status === "PAID" || latestRev.status === "VOID") {
+		if (reserveAmount !== "0.00") {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_STATE",
+				`${latestRev.status} statement ${validStatementId} must have reserve amount 0.00, found ${reserveAmount}`,
+			);
+		}
+	}
+
+	// 9. Derive coverage and expected post-payment liability
 	const isReady = ledgerCents >= stmtCents;
 	const liabilityCoverage = isReady ? "READY" : "SHORTFALL";
 	const diffCents = ledgerCents - stmtCents;

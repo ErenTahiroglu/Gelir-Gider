@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { CreditCardError } from "../src/credit-cards/errors";
 import * as ledgerProvisioning from "../src/credit-cards/ledger-provisioning";
 import {
+	listCreditCardPurchases,
 	normalizePurchaseBudgetCategory,
 	recordCreditCardOpeningBalance,
 	recordCreditCardPurchase,
@@ -304,6 +305,165 @@ describe("Credit Card Purchase & Opening Balance Domain Unit Tests", () => {
 					}),
 				}),
 			);
+		});
+	});
+
+	describe("listCreditCardPurchases", () => {
+		it("retrieves purchases and opening balances in bulk with goalId and bindings", async () => {
+			const ev1Id = "ev-11111111-1111-1111-1111-111111111111";
+			const ev2Id = "ev-22222222-2222-2222-2222-222222222222";
+			const canRev1Id = "can-rev-1";
+			const canRev2Id = "can-rev-2";
+
+			let selectCallCount = 0;
+			const mockTx = {
+				select: vi.fn(() => ({
+					from: vi.fn(() => {
+						selectCallCount++;
+						const currentCall = selectCallCount;
+						return {
+							where: vi.fn(() => {
+								if (currentCall === 1) {
+									// Event query
+									return {
+										orderBy: vi.fn().mockReturnValue({
+											limit: vi.fn().mockReturnValue({
+												offset: vi.fn().mockResolvedValue([
+													{
+														id: ev1Id,
+														creditCardId: cardId,
+														userId,
+														eventType: "PURCHASE",
+														canonicalTransactionId: "can-tx-1",
+														createdAt: new Date("2026-09-01T10:00:00Z"),
+													},
+													{
+														id: ev2Id,
+														creditCardId: cardId,
+														userId,
+														eventType: "OPENING_BALANCE",
+														canonicalTransactionId: "can-tx-2",
+														createdAt: new Date("2026-09-01T09:00:00Z"),
+													},
+												]),
+											}),
+										}),
+									};
+								}
+								if (currentCall === 2) {
+									// Event revisions in bulk
+									return {
+										orderBy: vi.fn().mockResolvedValue([
+											{
+												id: "rev-1",
+												eventId: ev1Id,
+												revisionNo: 1,
+												operation: "CREATE",
+												amount: "100.00",
+												purchaseDate: "2026-09-01",
+												budgetCategory: "SHORT_TERM_PURCHASE",
+												merchant: "Migros",
+												description: "Groceries",
+												installmentCount: null,
+												canonicalRevisionId: canRev1Id,
+											},
+											{
+												id: "rev-2",
+												eventId: ev2Id,
+												revisionNo: 1,
+												operation: "CREATE",
+												amount: "200.00",
+												purchaseDate: null,
+												budgetCategory: null,
+												merchant: null,
+												description: "Opening",
+												installmentCount: null,
+												canonicalRevisionId: canRev2Id,
+											},
+										]),
+									};
+								}
+								if (currentCall === 3) {
+									// Bindings in bulk
+									return [
+										{
+											revisionId: canRev1Id,
+											appliedJournalEntryId: "journal-entry-1",
+										},
+										{
+											revisionId: canRev2Id,
+											appliedJournalEntryId: "journal-entry-2",
+										},
+									];
+								}
+								if (currentCall === 4) {
+									// Canonical revisions in bulk
+									return [
+										{
+											id: canRev1Id,
+											payload: { shortTermGoalId: goalId },
+										},
+										{
+											id: canRev2Id,
+											payload: {},
+										},
+									];
+								}
+								return [];
+							}),
+						};
+					}),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			const records = await listCreditCardPurchases({
+				db: mockDb,
+				userId,
+				cardId,
+			});
+
+			expect(records).toHaveLength(2);
+			expect(records[0]?.eventId).toBe(ev1Id);
+			expect(records[0]?.amount).toBe("100.00");
+			expect(records[0]?.shortTermGoalId).toBe(goalId);
+			expect(records[0]?.journalEntryId).toBe("journal-entry-1");
+			expect(records[0]?.status).toBe("POSTED");
+
+			expect(records[1]?.eventId).toBe(ev2Id);
+			expect(records[1]?.amount).toBe("200.00");
+			expect(records[1]?.shortTermGoalId).toBeNull();
+			expect(records[1]?.journalEntryId).toBe("journal-entry-2");
+		});
+
+		it("returns empty list if no events match", async () => {
+			const mockTx = {
+				select: vi.fn(() => ({
+					from: vi.fn(() => ({
+						where: vi.fn(() => ({
+							orderBy: vi.fn().mockReturnValue({
+								limit: vi.fn().mockReturnValue({
+									offset: vi.fn().mockResolvedValue([]),
+								}),
+							}),
+						})),
+					})),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			const records = await listCreditCardPurchases({
+				db: mockDb,
+				userId,
+			});
+
+			expect(records).toEqual([]);
 		});
 	});
 });

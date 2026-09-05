@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { CreditCardError } from "../src/credit-cards/errors";
+import { calculateStatementPayFingerprint } from "../src/credit-cards/fingerprint";
 import * as ledgerProvisioning from "../src/credit-cards/ledger-provisioning";
 import {
 	payCreditCardStatement,
@@ -151,7 +153,11 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 								side: "DEBIT",
 								amount: "2500.00",
 							},
-							{ accountId: assetAccountId, side: "CREDIT", amount: "2500.00" },
+							{
+								accountId: assetAccountId,
+								side: "CREDIT",
+								amount: "2500.00",
+							},
 						],
 					}),
 				}),
@@ -165,14 +171,14 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 					from: vi.fn(() => ({
 						where: vi.fn(() => {
 							selectCallCount++;
-							if (selectCallCount === 1)
+							if (selectCallCount === 1) {
 								return { limit: vi.fn().mockResolvedValue([]) };
+							}
 							if (selectCallCount === 2) {
 								return {
 									for: vi.fn().mockResolvedValue([
 										{
 											id: statementId,
-											creditCardId: cardId,
 											cardId,
 											userId,
 											midasAccountId,
@@ -181,8 +187,9 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 									]),
 								};
 							}
-							if (selectCallCount === 3)
+							if (selectCallCount === 3) {
 								return { limit: vi.fn().mockResolvedValue([]) };
+							}
 							if (selectCallCount === 4) {
 								return {
 									orderBy: vi.fn().mockReturnValue({
@@ -203,25 +210,17 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 								};
 							}
 							if (selectCallCount === 5) {
-								// Midas account lookup
 								return {
 									limit: vi.fn().mockResolvedValue([
 										{
+											id: midasAccountId,
 											ledgerAccountId: assetAccountId,
 										},
 									]),
 								};
 							}
-							// Payment asset account
 							return {
-								limit: vi.fn().mockResolvedValue([
-									{
-										id: assetAccountId,
-										accountType: "ASSET",
-										normalBalance: "DEBIT",
-										archivedAt: null,
-									},
-								]),
+								limit: vi.fn().mockResolvedValue([]),
 							};
 						}),
 					})),
@@ -304,6 +303,168 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 				}),
 			);
 		});
+
+		it("replays exact historical PAY revision when idempotency key is re-sent with exact payload", async () => {
+			const occurredAt = new Date("2026-09-10T12:00:00Z");
+			const storedFp = await calculateStatementPayFingerprint({
+				userId,
+				statementId,
+				expectedRevisionNo: 1,
+				paymentAmount: "2500.00",
+				paymentMethod: "OUTSIDE_MIDAS",
+				assetAccountId,
+				occurredAt,
+			});
+
+			let selectCallCount = 0;
+			const mockTx = {
+				select: vi.fn(() => ({
+					from: vi.fn(() => ({
+						where: vi.fn(() => {
+							selectCallCount++;
+							if (selectCallCount === 1) {
+								// Early replay find
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: "rev-stmt-pay-1",
+											userId,
+											statementId,
+											revisionNo: 2,
+											previousRevisionId: "rev-stmt-1",
+											operation: "PAY",
+											status: "PAID",
+											statementAmount: "2500.00",
+											statementDate: "2026-09-01",
+											dueDate: "2026-09-15",
+											reservePlacement: "OUTSIDE_MIDAS",
+											paymentEventId,
+											note: null,
+											reasonNote: null,
+											revisionFingerprint: storedFp,
+										},
+									]),
+								};
+							}
+							if (selectCallCount === 2) {
+								// Payment event query in checkStatementPayReplay
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: paymentEventId,
+											paymentAssetAccountId: assetAccountId,
+										},
+									]),
+								};
+							}
+							return { limit: vi.fn().mockResolvedValue([]) };
+						}),
+					})),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			const res = await payCreditCardStatement({
+				db: mockDb,
+				userId,
+				statementId,
+				expectedRevisionNo: 1,
+				paymentAmount: "2500.00",
+				paymentMethod: "OUTSIDE_MIDAS",
+				paymentAssetAccountId: assetAccountId,
+				occurredAt,
+				idempotencyKey: "k-pay-replay-1",
+			});
+
+			expect(res.idempotentReplay).toBe(true);
+			expect(res.operation).toBe("PAY");
+			expect(res.status).toBe("PAID");
+			expect(res.revisionId).toBe("rev-stmt-pay-1");
+		});
+
+		it("throws CREDIT_CARD_IDEMPOTENCY_CONFLICT when replaying PAY with changed payload", async () => {
+			const occurredAt = new Date("2026-09-10T12:00:00Z");
+			const storedFp = await calculateStatementPayFingerprint({
+				userId,
+				statementId,
+				expectedRevisionNo: 1,
+				paymentAmount: "2500.00",
+				paymentMethod: "OUTSIDE_MIDAS",
+				assetAccountId,
+				occurredAt,
+			});
+
+			let selectCallCount = 0;
+			const mockTx = {
+				select: vi.fn(() => ({
+					from: vi.fn(() => ({
+						where: vi.fn(() => {
+							selectCallCount++;
+							if (selectCallCount === 1) {
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: "rev-stmt-pay-1",
+											userId,
+											statementId,
+											revisionNo: 2,
+											previousRevisionId: "rev-stmt-1",
+											operation: "PAY",
+											status: "PAID",
+											statementAmount: "2500.00",
+											statementDate: "2026-09-01",
+											dueDate: "2026-09-15",
+											reservePlacement: "OUTSIDE_MIDAS",
+											paymentEventId,
+											note: null,
+											reasonNote: null,
+											revisionFingerprint: storedFp,
+										},
+									]),
+								};
+							}
+							if (selectCallCount === 2) {
+								return {
+									limit: vi.fn().mockResolvedValue([
+										{
+											id: paymentEventId,
+											paymentAssetAccountId: assetAccountId,
+										},
+									]),
+								};
+							}
+							return { limit: vi.fn().mockResolvedValue([]) };
+						}),
+					})),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			// Pass wrong expectedRevisionNo (2 instead of 1)
+			await expect(
+				payCreditCardStatement({
+					db: mockDb,
+					userId,
+					statementId,
+					expectedRevisionNo: 2,
+					paymentAmount: "2500.00",
+					paymentMethod: "OUTSIDE_MIDAS",
+					paymentAssetAccountId: assetAccountId,
+					occurredAt,
+					idempotencyKey: "k-pay-replay-1",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_IDEMPOTENCY_CONFLICT",
+				}),
+			);
+		});
 	});
 
 	describe("reopenCreditCardStatementPayment", () => {
@@ -315,23 +476,37 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 						where: vi.fn(() => {
 							selectCallCount++;
 							if (selectCallCount === 1)
-								return { limit: vi.fn().mockResolvedValue([]) };
-							if (selectCallCount === 2) {
+								return { limit: vi.fn().mockResolvedValue([]) }; // early replay
+							if (selectCallCount === 2)
+								return {
+									limit: vi.fn().mockResolvedValue([{ creditCardId: cardId }]),
+								}; // preliminary stmt lookup
+							if (selectCallCount === 3)
+								return {
+									for: vi.fn().mockResolvedValue([{ id: cardId, userId }]),
+								}; // card lock
+							if (selectCallCount === 4)
+								return {
+									orderBy: vi.fn().mockReturnValue({
+										limit: vi.fn().mockResolvedValue([{ status: "ACTIVE" }]), // card rev
+									}),
+								};
+							if (selectCallCount === 5) {
 								return {
 									for: vi.fn().mockResolvedValue([
 										{
 											id: statementId,
 											creditCardId: cardId,
-											cardId,
 											userId,
+											midasAccountId,
 											midasReserveBucketId: reserveBucketId,
 										},
 									]),
-								};
+								}; // statement lock
 							}
-							if (selectCallCount === 3)
-								return { limit: vi.fn().mockResolvedValue([]) };
-							if (selectCallCount === 4) {
+							if (selectCallCount === 6)
+								return { limit: vi.fn().mockResolvedValue([]) }; // 2nd replay
+							if (selectCallCount === 7) {
 								return {
 									orderBy: vi.fn().mockReturnValue({
 										limit: vi.fn().mockResolvedValue([
@@ -352,7 +527,7 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 									}),
 								};
 							}
-							if (selectCallCount === 5) {
+							if (selectCallCount === 8) {
 								// Payment event
 								return {
 									limit: vi.fn().mockResolvedValue([
@@ -365,7 +540,7 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 									]),
 								};
 							}
-							if (selectCallCount === 6) {
+							if (selectCallCount === 9) {
 								// Midas account lookup
 								return {
 									limit: vi.fn().mockResolvedValue([{ id: midasAccountId }]),
@@ -446,6 +621,56 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 				}),
 			);
 		});
+
+		it("throws CREDIT_CARD_NOT_ACTIVE if card is ARCHIVED when fresh REOPEN is attempted", async () => {
+			let selectCallCount = 0;
+			const mockTx = {
+				select: vi.fn(() => ({
+					from: vi.fn(() => ({
+						where: vi.fn(() => {
+							selectCallCount++;
+							if (selectCallCount === 1)
+								return { limit: vi.fn().mockResolvedValue([]) }; // early replay
+							if (selectCallCount === 2)
+								return {
+									limit: vi.fn().mockResolvedValue([{ creditCardId: cardId }]),
+								}; // preliminary stmt lookup
+							if (selectCallCount === 3)
+								return {
+									for: vi.fn().mockResolvedValue([{ id: cardId, userId }]),
+								}; // card lock
+							if (selectCallCount === 4)
+								return {
+									orderBy: vi.fn().mockReturnValue({
+										limit: vi.fn().mockResolvedValue([{ status: "ARCHIVED" }]), // card rev is ARCHIVED
+									}),
+								};
+							return { limit: vi.fn().mockResolvedValue([]) };
+						}),
+					})),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			await expect(
+				reopenCreditCardStatementPayment({
+					db: mockDb,
+					userId,
+					statementId,
+					expectedRevisionNo: 2,
+					reasonNote: "Reopen after archive attempt",
+					occurredAt: new Date("2026-09-11T12:00:00Z"),
+					idempotencyKey: "k-reopen-archived-1",
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_NOT_ACTIVE",
+				}),
+			);
+		});
 	});
 
 	describe("reconcileCreditCardStatement", () => {
@@ -458,11 +683,15 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 							selectCallCount++;
 							if (selectCallCount === 1) {
 								return {
-									limit: vi
-										.fn()
-										.mockResolvedValue([
-											{ id: statementId, creditCardId: cardId, userId },
-										]),
+									for: vi.fn().mockResolvedValue([
+										{
+											id: statementId,
+											creditCardId: cardId,
+											userId,
+											midasAccountId: null,
+											midasReserveBucketId: null,
+										},
+									]),
 								};
 							}
 							if (selectCallCount === 2) {
@@ -473,6 +702,7 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 												id: "rev-stmt-1",
 												statementId,
 												revisionNo: 1,
+												status: "OPEN",
 												statementAmount: "4500.00",
 												statementDate: "2026-09-01",
 												reservePlacement: "OUTSIDE_MIDAS",
@@ -493,6 +723,14 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 				transaction: vi.fn(async (cb) => cb(mockTx)),
 			} as unknown as Database;
 
+			vi.spyOn(
+				ledgerProvisioning,
+				"ensureCreditCardLedgerLinkInTransaction",
+			).mockResolvedValue(liabilityAccountId);
+			vi.spyOn(
+				ledgerPosting,
+				"lockLedgerAccountsInTransaction",
+			).mockResolvedValue([]);
 			vi.spyOn(
 				ledgerBalances,
 				"getLedgerAccountBalanceInTransaction",
@@ -525,11 +763,15 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 							selectCallCount++;
 							if (selectCallCount === 1) {
 								return {
-									limit: vi
-										.fn()
-										.mockResolvedValue([
-											{ id: statementId, creditCardId: cardId, userId },
-										]),
+									for: vi.fn().mockResolvedValue([
+										{
+											id: statementId,
+											creditCardId: cardId,
+											userId,
+											midasAccountId: null,
+											midasReserveBucketId: null,
+										},
+									]),
 								};
 							}
 							if (selectCallCount === 2) {
@@ -540,6 +782,7 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 												id: "rev-stmt-1",
 												statementId,
 												revisionNo: 1,
+												status: "OPEN",
 												statementAmount: "8000.00",
 												statementDate: "2026-09-01",
 												reservePlacement: "OUTSIDE_MIDAS",
@@ -560,6 +803,14 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 				transaction: vi.fn(async (cb) => cb(mockTx)),
 			} as unknown as Database;
 
+			vi.spyOn(
+				ledgerProvisioning,
+				"ensureCreditCardLedgerLinkInTransaction",
+			).mockResolvedValue(liabilityAccountId);
+			vi.spyOn(
+				ledgerPosting,
+				"lockLedgerAccountsInTransaction",
+			).mockResolvedValue([]);
 			vi.spyOn(
 				ledgerBalances,
 				"getLedgerAccountBalanceInTransaction",
@@ -582,12 +833,124 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 			expect(rec.cardLiabilityBalance).toBe("7000.00");
 			expect(rec.liabilityAfterPayment).toBe("-1000.00");
 		});
+
+		it("throws CREDIT_CARD_INVALID_STATE if OPEN MIDAS_FUND reserve amount does not match statement amount", async () => {
+			let selectCallCount = 0;
+			const mockTx = {
+				select: vi.fn(() => ({
+					from: vi.fn(() => ({
+						where: vi.fn(() => {
+							selectCallCount++;
+							if (selectCallCount === 1) {
+								return {
+									for: vi.fn().mockResolvedValue([
+										{
+											id: statementId,
+											creditCardId: cardId,
+											userId,
+											midasAccountId,
+											midasReserveBucketId: reserveBucketId,
+										},
+									]),
+								};
+							}
+							if (selectCallCount === 2) {
+								return {
+									limit: vi
+										.fn()
+										.mockResolvedValue([{ ledgerAccountId: assetAccountId }]),
+								};
+							}
+							if (selectCallCount === 3) {
+								return {
+									orderBy: vi.fn().mockReturnValue({
+										limit: vi.fn().mockResolvedValue([
+											{
+												id: "rev-stmt-1",
+												statementId,
+												revisionNo: 1,
+												status: "OPEN",
+												statementAmount: "8000.00",
+												statementDate: "2026-09-01",
+												reservePlacement: "MIDAS_FUND",
+											},
+										]),
+									}),
+								};
+							}
+							return {
+								limit: vi.fn().mockResolvedValue([]),
+							};
+						}),
+					})),
+				})),
+			} as unknown as DatabaseTransaction;
+
+			const mockDb = {
+				transaction: vi.fn(async (cb) => cb(mockTx)),
+			} as unknown as Database;
+
+			vi.spyOn(
+				ledgerProvisioning,
+				"ensureCreditCardLedgerLinkInTransaction",
+			).mockResolvedValue(liabilityAccountId);
+			vi.spyOn(
+				ledgerPosting,
+				"lockLedgerAccountsInTransaction",
+			).mockResolvedValue([]);
+			vi.spyOn(
+				midasService,
+				"lockMidasAllocationStateInTransaction",
+			).mockResolvedValue(
+				{} as unknown as midasService.LockedMidasAllocationIdentity,
+			);
+			vi.spyOn(
+				ledgerBalances,
+				"getLedgerAccountBalanceInTransaction",
+			).mockResolvedValue({
+				accountId: liabilityAccountId,
+				currency: "TRY",
+				normalBalance: "CREDIT",
+				balance: "8000.00",
+				asOf: "2026-09-01T23:59:59.999Z",
+			});
+			vi.spyOn(
+				midasService,
+				"getMidasLiquidityStateInTransaction",
+			).mockResolvedValue({
+				midasAccountId,
+				ledgerAccountId: "midas-ledger-account",
+				currency: "TRY",
+				physicalBalance: "8000.00",
+				totalEarmarked: "5000.00",
+				unallocatedBalance: "3000.00",
+				buckets: [
+					{
+						bucketId: reserveBucketId,
+						code: "CC_RESERVE",
+						name: "CREDIT_CARD_RESERVE",
+						bucketType: "CREDIT_CARD_RESERVE",
+						balance: "5000.00", // Mismatched reserve! (5000 vs 8000)
+					},
+				],
+			});
+
+			await expect(
+				reconcileCreditCardStatement({
+					db: mockDb,
+					userId,
+					statementId,
+				}),
+			).rejects.toThrow(
+				expect.objectContaining({
+					code: "CREDIT_CARD_INVALID_STATE",
+				}),
+			);
+		});
 	});
 
 	describe("payCreditCardStatement shortfall enforcement", () => {
 		it("throws CREDIT_CARD_LIABILITY_SHORTFALL when liability is less than statement amount", async () => {
-			const { CreditCardError } = await import("../src/credit-cards/errors");
-
 			let selectCallCount = 0;
 			const mockTx = {
 				select: vi.fn(() => ({

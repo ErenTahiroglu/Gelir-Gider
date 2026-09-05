@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	type CreditCardLiabilityEventOperation,
@@ -17,7 +17,6 @@ import { transactionLedgerBindings } from "../db/schema/transaction-ledger";
 import { transactionRevisions } from "../db/schema/transactions";
 import { getLedgerAccountBalanceInTransaction } from "../ledger/balances";
 import {
-	formatSignedCentsToMoney,
 	parsePositiveMoneyString,
 	parseSignedAggregateMoneyString,
 } from "../ledger/money";
@@ -254,6 +253,15 @@ export interface GetCreditCardPurchaseParams {
 	eventId: string;
 }
 
+export interface ListCreditCardPurchasesInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	cardId?: string | undefined;
+	status?: "POSTED" | "VOID" | undefined;
+	limit?: number | undefined;
+	offset?: number | undefined;
+}
+
 export interface ListCreditCardPurchasesParams {
 	db: Database;
 	userId: string;
@@ -406,7 +414,7 @@ export async function recordCreditCardPurchaseInTransaction({
 		.orderBy(desc(creditCardRevisions.revisionNo))
 		.limit(1);
 
-	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+	if (latestCardRev?.status !== "ACTIVE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_NOT_ACTIVE",
 			`Credit card "${validCardId}" is not active`,
@@ -498,11 +506,6 @@ export async function recordCreditCardPurchaseInTransaction({
 	// Pre-generate event ID before canonical transaction creation
 	const eventId = crypto.randomUUID();
 	const canonicalPurchaseDate = formatIstanbulPurchaseDate(validOccurredAt);
-	const journalKey = await generateCreditCardLiabilityJournalKey(
-		validKey,
-		eventId,
-		1,
-	);
 
 	// 6. Post Canonical Transaction with Ledger Lines
 	const canonicalRes = await createCanonicalTransactionWithLedgerInTransaction({
@@ -607,7 +610,7 @@ export async function recordCreditCardPurchaseInTransaction({
 }
 
 async function checkPurchaseCreateReplay(
-	tx: DatabaseTransaction,
+	_tx: DatabaseTransaction,
 	existingRev: typeof creditCardLiabilityEventRevisions.$inferSelect,
 	userId: string,
 	cardId: string,
@@ -839,7 +842,7 @@ export async function updateCreditCardPurchaseInTransaction({
 		.orderBy(desc(creditCardRevisions.revisionNo))
 		.limit(1);
 
-	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+	if (latestCardRev?.status !== "ACTIVE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_NOT_ACTIVE",
 			`Credit card "${event.creditCardId}" is not active`,
@@ -1317,7 +1320,7 @@ export async function voidCreditCardPurchaseInTransaction({
 		.orderBy(desc(creditCardRevisions.revisionNo))
 		.limit(1);
 
-	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+	if (latestCardRev?.status !== "ACTIVE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_NOT_ACTIVE",
 			`Credit card "${event.creditCardId}" is not active`,
@@ -1657,7 +1660,7 @@ export async function recordCreditCardOpeningBalanceInTransaction({
 		.orderBy(desc(creditCardRevisions.revisionNo))
 		.limit(1);
 
-	if (!latestCardRev || latestCardRev.status !== "ACTIVE") {
+	if (latestCardRev?.status !== "ACTIVE") {
 		throw new CreditCardError(
 			"CREDIT_CARD_NOT_ACTIVE",
 			`Credit card "${validCardId}" is not active`,
@@ -2764,16 +2767,18 @@ export async function getCreditCardPurchase({
 }
 
 /**
- * Lists credit card purchases and opening balances.
+ * Lists credit card purchases and opening balances inside a transaction using bulk queries.
  */
-export async function listCreditCardPurchases({
-	db,
+export async function listCreditCardPurchasesInTransaction({
+	tx,
 	userId,
 	cardId,
 	status,
 	limit = 50,
 	offset = 0,
-}: ListCreditCardPurchasesParams): Promise<CreditCardPurchaseRecord[]> {
+}: ListCreditCardPurchasesInTransactionParams): Promise<
+	CreditCardPurchaseRecord[]
+> {
 	const validUserId = validateCcCanonicalUuid(userId, "userId");
 	const validStatus = validateLiabilityEventStatusFilter(status);
 	const validCardId = cardId
@@ -2785,7 +2790,8 @@ export async function listCreditCardPurchases({
 		conditions.push(eq(creditCardLiabilityEvents.creditCardId, validCardId));
 	}
 
-	const events = await db
+	// 1. Query event anchors
+	const events = await tx
 		.select()
 		.from(creditCardLiabilityEvents)
 		.where(and(...conditions))
@@ -2793,39 +2799,93 @@ export async function listCreditCardPurchases({
 		.limit(limit)
 		.offset(offset);
 
+	if (events.length === 0) {
+		return [];
+	}
+
+	const eventIds = events.map((e) => e.id);
+
+	// 2. Query revisions for all events in bulk
+	const allRevisions = await tx
+		.select()
+		.from(creditCardLiabilityEventRevisions)
+		.where(inArray(creditCardLiabilityEventRevisions.eventId, eventIds))
+		.orderBy(
+			creditCardLiabilityEventRevisions.eventId,
+			desc(creditCardLiabilityEventRevisions.revisionNo),
+		);
+
+	// Derive latest revision per event
+	const latestRevisionByEventId = new Map<
+		string,
+		typeof creditCardLiabilityEventRevisions.$inferSelect
+	>();
+	for (const rev of allRevisions) {
+		if (!latestRevisionByEventId.has(rev.eventId)) {
+			latestRevisionByEventId.set(rev.eventId, rev);
+		}
+	}
+
+	// Collect canonical revision IDs for latest revisions
+	const canonicalRevisionIds: string[] = [];
+	for (const event of events) {
+		const latestRev = latestRevisionByEventId.get(event.id);
+		if (!latestRev) continue;
+		const revStatus = latestRev.operation === "VOID" ? "VOID" : "POSTED";
+		if (validStatus && revStatus !== validStatus) continue;
+		canonicalRevisionIds.push(latestRev.canonicalRevisionId);
+	}
+
+	// 3. Bulk query ledger bindings
+	const bindingsByRevisionId = new Map<string, string | null>();
+	if (canonicalRevisionIds.length > 0) {
+		const bindings = await tx
+			.select({
+				revisionId: transactionLedgerBindings.revisionId,
+				appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
+			})
+			.from(transactionLedgerBindings)
+			.where(
+				inArray(transactionLedgerBindings.revisionId, canonicalRevisionIds),
+			);
+		for (const b of bindings) {
+			bindingsByRevisionId.set(b.revisionId, b.appliedJournalEntryId);
+		}
+	}
+
+	// 4. Bulk query canonical revision payloads
+	const payloadsByRevisionId = new Map<
+		string,
+		{ shortTermGoalId?: string | null } | undefined
+	>();
+	if (canonicalRevisionIds.length > 0) {
+		const canonicalRevs = await tx
+			.select({
+				id: transactionRevisions.id,
+				payload: transactionRevisions.payload,
+			})
+			.from(transactionRevisions)
+			.where(inArray(transactionRevisions.id, canonicalRevisionIds));
+		for (const cr of canonicalRevs) {
+			payloadsByRevisionId.set(
+				cr.id,
+				cr.payload as { shortTermGoalId?: string | null } | undefined,
+			);
+		}
+	}
+
+	// 5. Assemble results in order
 	const results: CreditCardPurchaseRecord[] = [];
 	for (const ev of events) {
-		const [latestRev] = await db
-			.select()
-			.from(creditCardLiabilityEventRevisions)
-			.where(eq(creditCardLiabilityEventRevisions.eventId, ev.id))
-			.orderBy(desc(creditCardLiabilityEventRevisions.revisionNo))
-			.limit(1);
-
+		const latestRev = latestRevisionByEventId.get(ev.id);
 		if (!latestRev) continue;
 
 		const revStatus = latestRev.operation === "VOID" ? "VOID" : "POSTED";
 		if (validStatus && revStatus !== validStatus) continue;
 
-		const [binding] = await db
-			.select({
-				appliedJournalEntryId: transactionLedgerBindings.appliedJournalEntryId,
-			})
-			.from(transactionLedgerBindings)
-			.where(
-				eq(transactionLedgerBindings.revisionId, latestRev.canonicalRevisionId),
-			)
-			.limit(1);
-
-		const [canonicalRev] = await db
-			.select({ payload: transactionRevisions.payload })
-			.from(transactionRevisions)
-			.where(eq(transactionRevisions.id, latestRev.canonicalRevisionId))
-			.limit(1);
-
-		const payload = canonicalRev?.payload as
-			| { shortTermGoalId?: string | null }
-			| undefined;
+		const appliedJournalEntryId =
+			bindingsByRevisionId.get(latestRev.canonicalRevisionId) ?? null;
+		const payload = payloadsByRevisionId.get(latestRev.canonicalRevisionId);
 		const shortTermGoalId = payload?.shortTermGoalId ?? null;
 
 		results.push({
@@ -2845,10 +2905,21 @@ export async function listCreditCardPurchases({
 			installmentCount: latestRev.installmentCount ?? null,
 			canonicalTransactionId: ev.canonicalTransactionId,
 			canonicalRevisionId: latestRev.canonicalRevisionId,
-			journalEntryId: binding?.appliedJournalEntryId ?? null,
+			journalEntryId: appliedJournalEntryId,
 			createdAt: ev.createdAt,
 		});
 	}
 
 	return results;
+}
+
+/**
+ * Lists credit card purchases and opening balances.
+ */
+export async function listCreditCardPurchases(
+	params: ListCreditCardPurchasesParams,
+): Promise<CreditCardPurchaseRecord[]> {
+	return runCreditCardTransaction(params.db, async (tx) => {
+		return listCreditCardPurchasesInTransaction({ tx, ...params });
+	});
 }
