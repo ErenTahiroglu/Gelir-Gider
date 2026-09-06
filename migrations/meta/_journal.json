@@ -323,6 +323,13 @@
       "when": 1788691331840,
       "tag": "0045_add_scheduled_credit_card_due_notifications",
       "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "7",
+      "when": 1788694730915,
+      "tag": "0046_harden_scheduled_notification_delivery_integrity",
+      "breakpoints": true
     }
   ]
 }

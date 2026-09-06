@@ -1,9 +1,4 @@
-import { and, eq } from "drizzle-orm";
 import type { Database } from "../db/client";
-import {
-	notificationDeliveries,
-	notificationDeliveryAttempts,
-} from "../db/schema/notifications";
 import {
 	runNotificationReadTransaction,
 	runNotificationTransaction,
@@ -13,12 +8,16 @@ import {
 	isAtOrAfterNotificationDeliveryHour,
 } from "./calendar";
 import {
-	type DeliveryAttemptHistory,
 	ensureDeliveryInTransaction,
 	insertDeliveryAttemptInTransaction,
-	lockDeliveryAttemptHistoryInTransaction,
+	lockDeliveryHistoryInTransaction,
 	planDeliveryAttempt,
+	reserveDispatchInTransaction,
+	resolveStaleDispatchReservationsInTransaction,
+	toAttemptHistory,
+	truncateToSchedulerHourSlot,
 } from "./delivery";
+import { NotificationError } from "./errors";
 import type { NotificationEventReadModel } from "./events";
 import {
 	getLatestStatementRevisionInTransaction,
@@ -27,11 +26,12 @@ import {
 } from "./events";
 import { deriveNotificationChildIdempotencyKey } from "./fingerprint";
 import {
-	disablePushSubscriptionForEndpointGoneInTransaction,
+	disablePushSubscriptionForEndpointGoneIfStillLatestInTransaction,
+	getActiveSubscriptionRevisionInTransaction,
 	listActivePushSubscriptionsInTransaction,
 	type PushSubscriptionReadModel,
 } from "./subscriptions";
-import type { PushTransport } from "./web-push";
+import type { PushSendResult, PushTransport } from "./web-push";
 
 const NOTIFICATION_PUSH_TTL_SECONDS = 12 * 60 * 60;
 
@@ -50,110 +50,50 @@ export interface NotificationSchedulerSummary {
 	suppressed: number;
 }
 
-async function readUnlockedHistory(
-	db: Database,
-	eventId: string,
-	subscriptionId: string,
-): Promise<{ deliveryExists: boolean; history: DeliveryAttemptHistory }> {
-	return runNotificationReadTransaction(db, async (tx) => {
-		const [delivery] = await tx
-			.select({ id: notificationDeliveries.id })
-			.from(notificationDeliveries)
-			.where(
-				and(
-					eq(notificationDeliveries.notificationEventId, eventId),
-					eq(notificationDeliveries.pushSubscriptionId, subscriptionId),
-				),
-			)
-			.limit(1);
-		if (!delivery) {
-			return {
-				deliveryExists: false,
-				history: {
-					attemptCount: 0,
-					lastAttemptStatus: null,
-					hasSuccess: false,
-				},
-			};
-		}
-		const attempts = await tx
-			.select()
-			.from(notificationDeliveryAttempts)
-			.where(eq(notificationDeliveryAttempts.deliveryId, delivery.id));
-		return {
-			deliveryExists: true,
-			history: {
-				attemptCount: attempts.length,
-				lastAttemptStatus:
-					attempts.length > 0
-						? (attempts[attempts.length - 1]
-								?.status as DeliveryAttemptHistory["lastAttemptStatus"])
-						: null,
-				hasSuccess: attempts.some((a) => a.status === "SUCCESS"),
-			},
-		};
-	});
+function zeroSummary(): NotificationSchedulerSummary {
+	return {
+		eventsCreated: 0,
+		deliveriesCreated: 0,
+		successes: 0,
+		retryableFailures: 0,
+		terminalFailures: 0,
+		suppressed: 0,
+	};
 }
 
+type ReservationOutcome =
+	| {
+			kind: "RESERVED";
+			deliveryId: string;
+			dispatchId: string;
+			pushSubscriptionRevisionId: string;
+			endpoint: string;
+			p256dh: string;
+			auth: string;
+	  }
+	| { kind: "NONE" };
+
 /**
- * Processes exactly one (event, active subscription) pair for this
- * scheduler run. The push-service network call (if any) always happens
- * OUTSIDE any open database transaction; the delivery anchor and its
- * resulting attempt are always created together, atomically, in the single
- * transaction that follows -- a naked delivery-with-zero-attempts is never
- * left behind (Section 13/35-37).
+ * Phase 15-R1 Section A -- Transaction A ("reserve"). Runs entirely inside
+ * one DB transaction and performs NO network I/O. Ensures/locks the
+ * delivery, resolves any stale (crash-window) dispatch reservations, re-
+ * checks the statement status and the subscription's exact ACTIVE revision,
+ * decides whether a send is still warranted, and -- only if so -- commits a
+ * durable pre-send dispatch reservation bound to that exact revision. If a
+ * concurrent scheduler invocation already reserved this exact
+ * (delivery, hourly slot) pair, the reservation INSERT is a no-op
+ * (`ON CONFLICT DO NOTHING`) and this returns `{ kind: "NONE" }` -- zero
+ * network calls follow.
  */
-async function processEventSubscription(
+async function reserveInTransaction(
 	db: Database,
-	transport: PushTransport,
 	event: NotificationEventReadModel,
 	subscription: PushSubscriptionReadModel,
 	scheduledAt: Date,
+	currentHourSlot: Date,
 	summary: NotificationSchedulerSummary,
-): Promise<void> {
-	const precheck = await readUnlockedHistory(
-		db,
-		event.id,
-		subscription.subscriptionId,
-	);
-
-	const precheckStatement = await runNotificationReadTransaction(db, (tx) =>
-		getLatestStatementRevisionInTransaction(tx, event.subjectId),
-	);
-	const precheckStatus =
-		(precheckStatement?.status as "OPEN" | "PAID" | "VOID" | undefined) ??
-		"VOID";
-	const precheckPlan = planDeliveryAttempt({
-		history: precheck.history,
-		currentStatementStatus: precheckStatus,
-		isSameDueDay: true,
-	});
-
-	if (
-		precheckPlan === "SKIP_DONE" ||
-		precheckPlan === "SKIP_MAX_ATTEMPTS" ||
-		precheckPlan === "SKIP_NOT_SAME_DAY"
-	) {
-		return;
-	}
-
-	// Only call the transport when a send is genuinely still warranted right
-	// now -- never for an already-obsolete/exhausted/completed delivery
-	// (Section 17, Section 41).
-	const sendResult =
-		precheckPlan === "SEND"
-			? await transport.send(
-					{
-						endpoint: subscription.endpoint,
-						p256dh: subscription.p256dh,
-						auth: subscription.auth,
-					},
-					event.payload as object,
-					{ ttlSeconds: NOTIFICATION_PUSH_TTL_SECONDS },
-				)
-			: null;
-
-	await runNotificationTransaction(db, async (tx) => {
+): Promise<ReservationOutcome> {
+	return runNotificationTransaction(db, async (tx) => {
 		const { deliveryId, created } = await ensureDeliveryInTransaction(tx, {
 			userId: event.userId,
 			eventId: event.id,
@@ -161,61 +101,131 @@ async function processEventSubscription(
 		});
 		if (created) summary.deliveriesCreated++;
 
-		const freshHistory = await lockDeliveryAttemptHistoryInTransaction(
-			tx,
+		let history = await lockDeliveryHistoryInTransaction(tx, deliveryId);
+		history = await resolveStaleDispatchReservationsInTransaction(tx, {
+			userId: event.userId,
 			deliveryId,
-		);
-		const freshStatement = await getLatestStatementRevisionInTransaction(
+			currentHourSlot,
+			history,
+			resolvedAt: scheduledAt,
+		});
+
+		const statement = await getLatestStatementRevisionInTransaction(
 			tx,
 			event.subjectId,
 		);
-		const freshStatus =
-			(freshStatement?.status as "OPEN" | "PAID" | "VOID" | undefined) ??
-			"VOID";
-		const freshPlan = planDeliveryAttempt({
-			history: freshHistory,
-			currentStatementStatus: freshStatus,
+		const currentStatementStatus =
+			(statement?.status as "OPEN" | "PAID" | "VOID" | undefined) ?? "VOID";
+
+		const plan = planDeliveryAttempt({
+			history: toAttemptHistory(history),
+			currentStatementStatus,
+			// `listEventsForLocalDateInTransaction` only ever returns events
+			// whose scheduled_local_date equals today's Istanbul local date,
+			// so a delivery reached through this path is always same-due-day
+			// by construction (Section 19/21 additionally gate the whole run
+			// before this point is ever reached).
 			isSameDueDay: true,
 		});
 
 		if (
-			freshPlan === "SKIP_DONE" ||
-			freshPlan === "SKIP_MAX_ATTEMPTS" ||
-			freshPlan === "SKIP_NOT_SAME_DAY"
+			plan === "SKIP_DONE" ||
+			plan === "SKIP_MAX_ATTEMPTS" ||
+			plan === "SKIP_NOT_SAME_DAY"
 		) {
-			// Resolved concurrently since the precheck; a pre-existing delivery
-			// already carries its own attempts, so nothing is left naked.
-			return;
+			return { kind: "NONE" };
 		}
 
-		if (freshPlan === "SUPPRESS_OBSOLETE") {
+		if (plan === "SUPPRESS_OBSOLETE") {
 			await insertDeliveryAttemptInTransaction(tx, {
 				userId: event.userId,
 				deliveryId,
-				nextAttemptNo: freshHistory.attemptCount + 1,
+				nextAttemptNo: history.attemptCount + 1,
 				status: "SUPPRESSED_OBSOLETE",
 				httpStatus: null,
 				errorCode: null,
 				attemptedAt: scheduledAt,
+				dispatchId: null,
 			});
 			summary.suppressed++;
-			return;
+			return { kind: "NONE" };
 		}
 
-		// freshPlan === "SEND". sendResult must be non-null here: the precheck
-		// already established the statement was OPEN and the delivery was
-		// eligible, and freshPlan re-confirmed the same; the only way to reach
-		// "SEND" is via the precheck-also-"SEND" branch above.
-		if (!sendResult) return;
+		// plan === "SEND": re-resolve the EXACT current ACTIVE subscription
+		// revision (Section B) -- never trust the revision snapshot the
+		// outer loop's listing took moments earlier.
+		const revision = await getActiveSubscriptionRevisionInTransaction(
+			tx,
+			subscription.subscriptionId,
+		);
+		if (!revision) {
+			// Subscription was disabled concurrently since the outer active-
+			// subscription listing. Nothing to reserve; the delivery anchor
+			// is guaranteed non-naked because reaching "SEND" with a
+			// brand-new delivery is only possible when the DB's own
+			// cross-user/active-subscription INSERT guard already accepted
+			// the delivery row moments earlier in this same transaction.
+			return { kind: "NONE" };
+		}
 
-		const attempt = await insertDeliveryAttemptInTransaction(tx, {
+		const { reserved, dispatch } = await reserveDispatchInTransaction(tx, {
 			userId: event.userId,
 			deliveryId,
-			nextAttemptNo: freshHistory.attemptCount + 1,
+			nextDispatchNo: history.dispatchCount + 1,
+			pushSubscriptionRevisionId: revision.id,
+			schedulerHourSlot: currentHourSlot,
+			reservedAt: scheduledAt,
+		});
+		if (!reserved || !dispatch) {
+			// Another concurrent scheduler invocation already reserved this
+			// exact hourly slot for this delivery -- zero network calls.
+			return { kind: "NONE" };
+		}
+
+		return {
+			kind: "RESERVED",
+			deliveryId,
+			dispatchId: dispatch.id,
+			pushSubscriptionRevisionId: revision.id,
+			endpoint: revision.endpoint,
+			p256dh: revision.p256dh,
+			auth: revision.auth,
+		};
+	});
+}
+
+/**
+ * Phase 15-R1 Section A -- Transaction B ("finalize"). Runs after the
+ * network call (if any) completes, entirely outside that network I/O. Locks
+ * the delivery, appends the attempt result bound to the EXACT dispatch
+ * reservation created in Transaction A, and -- only for a 404/410
+ * ENDPOINT_GONE result -- conditionally auto-disables the subscription, but
+ * ONLY if the dispatch's exact revision is still the subscription's current
+ * latest revision (Section B/10/11 race fix).
+ */
+async function finalizeInTransaction(
+	db: Database,
+	event: NotificationEventReadModel,
+	subscription: PushSubscriptionReadModel,
+	reservation: Extract<ReservationOutcome, { kind: "RESERVED" }>,
+	sendResult: PushSendResult,
+	scheduledAt: Date,
+	summary: NotificationSchedulerSummary,
+): Promise<void> {
+	await runNotificationTransaction(db, async (tx) => {
+		const history = await lockDeliveryHistoryInTransaction(
+			tx,
+			reservation.deliveryId,
+		);
+		const attempt = await insertDeliveryAttemptInTransaction(tx, {
+			userId: event.userId,
+			deliveryId: reservation.deliveryId,
+			nextAttemptNo: history.attemptCount + 1,
 			status: sendResult.outcome,
 			httpStatus: sendResult.httpStatus ?? null,
 			errorCode: sendResult.errorCode ?? null,
 			attemptedAt: scheduledAt,
+			dispatchId: reservation.dispatchId,
 		});
 
 		if (sendResult.outcome === "SUCCESS") summary.successes++;
@@ -229,21 +239,119 @@ async function processEventSubscription(
 		) {
 			const idempotencyKey = await deriveNotificationChildIdempotencyKey(
 				"scheduler-endpoint-gone",
-				[subscription.subscriptionId, deliveryId, String(attempt.attemptNo)],
+				[
+					subscription.subscriptionId,
+					reservation.deliveryId,
+					String(attempt.attemptNo),
+				],
 			);
-			await disablePushSubscriptionForEndpointGoneInTransaction(tx, {
-				userId: event.userId,
-				subscriptionId: subscription.subscriptionId,
-				occurredAt: scheduledAt,
-				idempotencyKey,
-			});
+			await disablePushSubscriptionForEndpointGoneIfStillLatestInTransaction(
+				tx,
+				{
+					userId: event.userId,
+					subscriptionId: subscription.subscriptionId,
+					expectedRevisionId: reservation.pushSubscriptionRevisionId,
+					occurredAt: scheduledAt,
+					idempotencyKey,
+				},
+			);
 		}
 	});
 }
 
 /**
+ * Processes exactly one (event, active subscription) pair for this
+ * scheduler run using the reserve-then-send-then-finalize architecture
+ * (Phase 15-R1 Section A): the push-service network call always happens
+ * OUTSIDE any open database transaction, sandwiched between the durable
+ * pre-send reservation (Transaction A) and the result finalization
+ * (Transaction B). A global Web Push configuration failure
+ * (`NOTIFICATION_PUSH_CONFIG_INVALID`) is rethrown to abort the whole
+ * scheduler run rather than being misclassified as this one subscription's
+ * problem (Section C/15); any other transport/crypto failure (e.g. a
+ * subscription-specific encryption error from corrupted stored key
+ * material) is isolated to this one subscription as a sanitized
+ * `TERMINAL_FAILURE`/`INVALID_SUBSCRIPTION` result so it never aborts
+ * processing of other subscriptions in the same run.
+ */
+async function processEventSubscription(
+	db: Database,
+	transport: PushTransport,
+	event: NotificationEventReadModel,
+	subscription: PushSubscriptionReadModel,
+	scheduledAt: Date,
+	currentHourSlot: Date,
+	summary: NotificationSchedulerSummary,
+): Promise<void> {
+	const reservation = await reserveInTransaction(
+		db,
+		event,
+		subscription,
+		scheduledAt,
+		currentHourSlot,
+		summary,
+	);
+	if (reservation.kind !== "RESERVED") return;
+
+	let sendResult: PushSendResult;
+	try {
+		sendResult = await transport.send(
+			{
+				endpoint: reservation.endpoint,
+				p256dh: reservation.p256dh,
+				auth: reservation.auth,
+			},
+			event.payload as object,
+			{ ttlSeconds: NOTIFICATION_PUSH_TTL_SECONDS },
+		);
+	} catch (err) {
+		if (
+			err instanceof NotificationError &&
+			err.code === "NOTIFICATION_PUSH_CONFIG_INVALID"
+		) {
+			// Global VAPID/config failure -- must NOT be silently converted
+			// into "every subscription's attempt is terminal" (that would
+			// burn through each delivery's 5-attempt budget instantly).
+			// Still finalize this one reservation as an unresolved/unknown
+			// outcome so it isn't left dangling, then abort the whole run.
+			await finalizeInTransaction(
+				db,
+				event,
+				subscription,
+				reservation,
+				{ outcome: "RETRYABLE_FAILURE", errorCode: "PUSH_CONFIG_INVALID" },
+				scheduledAt,
+				summary,
+			);
+			throw err;
+		}
+		// Subscription-specific crypto/transport failure (e.g. corrupted
+		// stored key material throwing a raw DOMException out of the
+		// encryption step) -- sanitize and isolate, never let it escape
+		// uncaught or abort other subscriptions in this run.
+		sendResult = {
+			outcome: "TERMINAL_FAILURE",
+			errorCode: "INVALID_SUBSCRIPTION",
+		};
+	}
+
+	await finalizeInTransaction(
+		db,
+		event,
+		subscription,
+		reservation,
+		sendResult,
+		scheduledAt,
+		summary,
+	);
+}
+
+/**
  * The hourly cron entrypoint's core algorithm (Section 25). Never returns
- * PII -- counts only.
+ * PII -- counts only. Phase 15-R1 Section 19: before 12:00 Europe/Istanbul
+ * local time, this returns a fully-zero summary IMMEDIATELY -- no
+ * materialization, no event listing, no delivery/retry work of any kind,
+ * even for an event that already exists from an earlier run today.
  */
 export async function runNotificationScheduler(
 	params: RunNotificationSchedulerParams,
@@ -251,21 +359,17 @@ export async function runNotificationScheduler(
 	const { db, scheduledAt, transport } = params;
 	const { localDate, localHour } = getIstanbulLocalDateAndHour(scheduledAt);
 
-	const summary: NotificationSchedulerSummary = {
-		eventsCreated: 0,
-		deliveriesCreated: 0,
-		successes: 0,
-		retryableFailures: 0,
-		terminalFailures: 0,
-		suppressed: 0,
-	};
-
-	if (isAtOrAfterNotificationDeliveryHour(localHour)) {
-		const result = await runNotificationTransaction(db, (tx) =>
-			materializeCreditCardDueEventsInTransaction(tx, localDate),
-		);
-		summary.eventsCreated = result.eventsCreated;
+	if (!isAtOrAfterNotificationDeliveryHour(localHour)) {
+		return zeroSummary();
 	}
+
+	const summary = zeroSummary();
+	const currentHourSlot = truncateToSchedulerHourSlot(scheduledAt);
+
+	const result = await runNotificationTransaction(db, (tx) =>
+		materializeCreditCardDueEventsInTransaction(tx, localDate),
+	);
+	summary.eventsCreated = result.eventsCreated;
 
 	const events = await runNotificationReadTransaction(db, (tx) =>
 		listEventsForLocalDateInTransaction(tx, localDate),
@@ -298,6 +402,7 @@ export async function runNotificationScheduler(
 				event,
 				subscription,
 				scheduledAt,
+				currentHourSlot,
 				summary,
 			);
 		}

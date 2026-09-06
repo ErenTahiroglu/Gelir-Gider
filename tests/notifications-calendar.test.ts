@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	assertP256dhOnCurve,
 	decodeBase64Url,
 	encodeBase64Url,
 	getIstanbulLocalDateAndHour,
@@ -10,6 +11,7 @@ import {
 	validateNotificationIdempotencyKey,
 	validateNotificationLocalDate,
 	validateNotificationOccurredAt,
+	validateNotificationOptionalSubscriptionStatus,
 	validateNotificationP256dh,
 	validateNotificationPushEndpoint,
 } from "../src/notifications/calendar";
@@ -83,6 +85,72 @@ describe("validateNotificationLocalDate", () => {
 	});
 	it("rejects a malformed date", () => {
 		expect(() => validateNotificationLocalDate("01-05-2026", "d")).toThrow();
+	});
+
+	// ------------------------------------------------------------------
+	// Phase 15-R1 Section 28: strict Gregorian calendar validity, not just
+	// regex shape.
+	// ------------------------------------------------------------------
+	it("accepts a genuine leap day", () => {
+		expect(validateNotificationLocalDate("2028-02-29", "d")).toBe("2028-02-29");
+	});
+	it("rejects a non-existent leap day in a non-leap year", () => {
+		expect(() => validateNotificationLocalDate("2026-02-29", "d")).toThrow();
+	});
+	it("rejects February 30th", () => {
+		expect(() => validateNotificationLocalDate("2026-02-30", "d")).toThrow();
+	});
+	it("rejects April 31st", () => {
+		expect(() => validateNotificationLocalDate("2026-04-31", "d")).toThrow();
+	});
+	it("rejects month 13", () => {
+		expect(() => validateNotificationLocalDate("2026-13-01", "d")).toThrow();
+	});
+	it("rejects day 00 and month 00", () => {
+		expect(() => validateNotificationLocalDate("2026-00-10", "d")).toThrow();
+		expect(() => validateNotificationLocalDate("2026-01-00", "d")).toThrow();
+	});
+});
+
+describe("validateNotificationOptionalSubscriptionStatus (Section 27)", () => {
+	it("returns undefined only for undefined", () => {
+		expect(validateNotificationOptionalSubscriptionStatus(undefined)).toBe(
+			undefined,
+		);
+	});
+	it("accepts exactly ACTIVE and DISABLED", () => {
+		expect(validateNotificationOptionalSubscriptionStatus("ACTIVE")).toBe(
+			"ACTIVE",
+		);
+		expect(validateNotificationOptionalSubscriptionStatus("DISABLED")).toBe(
+			"DISABLED",
+		);
+	});
+	it("rejects null (not omission)", () => {
+		expect(() =>
+			validateNotificationOptionalSubscriptionStatus(null),
+		).toThrow();
+	});
+	it("rejects an empty string (not omission -- no truthiness check)", () => {
+		expect(() => validateNotificationOptionalSubscriptionStatus("")).toThrow();
+	});
+	it("rejects whitespace-only", () => {
+		expect(() =>
+			validateNotificationOptionalSubscriptionStatus("   "),
+		).toThrow();
+	});
+	it("rejects an unknown status string", () => {
+		expect(() =>
+			validateNotificationOptionalSubscriptionStatus("BOGUS"),
+		).toThrow();
+	});
+	it("rejects a number", () => {
+		expect(() => validateNotificationOptionalSubscriptionStatus(1)).toThrow();
+	});
+	it("rejects an object", () => {
+		expect(() =>
+			validateNotificationOptionalSubscriptionStatus({ status: "ACTIVE" }),
+		).toThrow();
 	});
 });
 
@@ -177,6 +245,40 @@ describe("validateNotificationP256dh / validateNotificationAuth (Section 7)", ()
 	it("rejects an auth secret with the wrong byte length", () => {
 		const bytes = new Uint8Array(15);
 		expect(() => validateNotificationAuth(encodeBase64Url(bytes))).toThrow();
+	});
+});
+
+describe("assertP256dhOnCurve (Phase 15-R1 Section C)", () => {
+	it("accepts a genuine on-curve P-256 public key with zero DB calls", async () => {
+		const keyPair = (await crypto.subtle.generateKey(
+			{ name: "ECDH", namedCurve: "P-256" },
+			true,
+			["deriveBits"],
+		)) as CryptoKeyPair;
+		const raw = new Uint8Array(
+			(await crypto.subtle.exportKey("raw", keyPair.publicKey)) as ArrayBuffer,
+		);
+		const p256dh = encodeBase64Url(raw);
+		await expect(assertP256dhOnCurve(p256dh)).resolves.toBeUndefined();
+	});
+
+	it("rejects a structurally-valid but off-curve point as a sanitized NotificationError (never a raw DOMException)", async () => {
+		// Correct shape (65 bytes, leading 0x04) but the x/y coordinates do
+		// not satisfy the P-256 curve equation -- WebCrypto's raw ECDH
+		// import throws a raw DOMException for this, which must never
+		// escape uncaught.
+		const p256dh = synthP256dh();
+		let caught: unknown;
+		try {
+			await assertP256dhOnCurve(p256dh);
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as Error).name).toBe("NotificationError");
+		expect((caught as { code?: string }).code).toBe(
+			"NOTIFICATION_INVALID_INPUT",
+		);
 	});
 });
 

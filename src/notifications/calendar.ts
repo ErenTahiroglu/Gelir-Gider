@@ -36,7 +36,10 @@ const LOCAL_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 /**
  * Validates a "YYYY-MM-DD" local-date string used for scheduled_local_date /
- * dueDate comparisons.
+ * dueDate comparisons. Enforces genuine Gregorian calendar validity (Section
+ * 28) via a `Date.UTC` round-trip -- not merely regex shape -- so
+ * "2026-02-30", "2026-04-31", and "2026-13-01" are all rejected, mirroring
+ * `short-term-goals/calendar.ts::validateGregorianDate`.
  */
 export function validateNotificationLocalDate(
 	value: unknown,
@@ -54,6 +57,20 @@ export function validateNotificationLocalDate(
 		throw new NotificationError(
 			"NOTIFICATION_INVALID_INPUT",
 			`${fieldName} must match YYYY-MM-DD format: "${value}"`,
+		);
+	}
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	const roundTrip = new Date(Date.UTC(year, month - 1, day));
+	if (
+		roundTrip.getUTCFullYear() !== year ||
+		roundTrip.getUTCMonth() !== month - 1 ||
+		roundTrip.getUTCDate() !== day
+	) {
+		throw new NotificationError(
+			"NOTIFICATION_INVALID_INPUT",
+			`${fieldName} is not a valid Gregorian calendar date: "${trimmed}"`,
 		);
 	}
 	return trimmed;
@@ -265,7 +282,9 @@ export function encodeBase64Url(bytes: Uint8Array): string {
 /**
  * Validates `p256dh`: strict base64url decoding to exactly 65 bytes with a
  * leading 0x04 byte (the uncompressed P-256 public key shape). Structural
- * validation only -- does not verify the point is actually on-curve.
+ * validation only -- does not verify the point is actually on-curve. Callers
+ * that need cryptographic proof (Section C) must additionally call
+ * `assertP256dhOnCurve` before any DB call.
  */
 export function validateNotificationP256dh(value: unknown): string {
 	if (typeof value !== "string") {
@@ -283,6 +302,34 @@ export function validateNotificationP256dh(value: unknown): string {
 		);
 	}
 	return trimmed;
+}
+
+/**
+ * Phase 15-R1 Section C: proves the structurally-valid p256dh bytes are
+ * actually an on-curve P-256 point, by attempting a real WebCrypto ECDH
+ * import. `crypto.subtle.importKey` throws a raw `DOMException` for an
+ * off-curve point (or any other cryptographically invalid encoding); that
+ * raw exception is caught here and converted to a sanitized
+ * `NotificationError` so it never escapes uncaught. Pure crypto -- zero DB
+ * calls -- so it can run before any transaction opens, alongside every other
+ * "validate `unknown` before `db.transaction()`" check in this domain.
+ */
+export async function assertP256dhOnCurve(p256dh: string): Promise<void> {
+	const bytes = decodeBase64Url(p256dh, "p256dh");
+	try {
+		await crypto.subtle.importKey(
+			"raw",
+			bytes,
+			{ name: "ECDH", namedCurve: "P-256" },
+			false,
+			[],
+		);
+	} catch {
+		throw new NotificationError(
+			"NOTIFICATION_INVALID_INPUT",
+			"p256dh is not a valid P-256 public key",
+		);
+	}
 }
 
 /**
@@ -344,4 +391,23 @@ export function validateNotificationOptionalType(
 		);
 	}
 	return value as "CREDIT_CARD_DUE";
+}
+
+/**
+ * Phase 15-R1 Section H/27: strict runtime validation for the push
+ * subscription `status` read filter. ONLY `undefined` means "omitted" --
+ * `null`, `""`, whitespace, a number, an object, or any string other than
+ * exactly "ACTIVE"/"DISABLED" is rejected with NOTIFICATION_INVALID_INPUT.
+ * Never uses a truthiness check (`if (status)`), which would incorrectly
+ * treat `""` as "omitted" rather than invalid.
+ */
+export function validateNotificationOptionalSubscriptionStatus(
+	value: unknown,
+): "ACTIVE" | "DISABLED" | undefined {
+	if (value === undefined) return undefined;
+	if (value === "ACTIVE" || value === "DISABLED") return value;
+	throw new NotificationError(
+		"NOTIFICATION_INVALID_INPUT",
+		'status must be exactly "ACTIVE" or "DISABLED" when provided',
+	);
 }

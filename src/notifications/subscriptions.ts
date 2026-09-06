@@ -9,12 +9,14 @@ import {
 	runNotificationTransaction,
 } from "./boundary";
 import {
+	assertP256dhOnCurve,
 	computeEndpointHash,
 	validateNotificationAuth,
 	validateNotificationCanonicalUuid,
 	validateNotificationIdempotencyKey,
 	validateNotificationOccurredAt,
 	validateNotificationOptionalExpirationTime,
+	validateNotificationOptionalSubscriptionStatus,
 	validateNotificationOptionalText,
 	validateNotificationP256dh,
 	validateNotificationPushEndpoint,
@@ -403,6 +405,9 @@ export async function registerPushSubscription(
 	const userId = validateNotificationCanonicalUuid(params.userId, "userId");
 	const endpoint = validateNotificationPushEndpoint(params.endpoint);
 	const p256dh = validateNotificationP256dh(params.p256dh);
+	// Phase 15-R1 Section C: structural validation alone does not prove the
+	// point is on-curve. Pure crypto, zero DB calls, before any transaction.
+	await assertP256dhOnCurve(p256dh);
 	const auth = validateNotificationAuth(params.auth);
 	const expirationTime = validateNotificationOptionalExpirationTime(
 		params.expirationTime,
@@ -629,6 +634,16 @@ export async function disablePushSubscription(
  * `PUSH_ENDPOINT_GONE:<subscriptionId>:...` derived idempotency key (Section
  * 9). Never hard-deletes the subscription row. Safe to call from the
  * delivery/scheduler layer when the push transport reports 404/410.
+ *
+ * @deprecated Phase 15-R1 Section B: this unconditionally disables whatever
+ * revision is LATEST at call time, which is racy if a REFRESH/REACTIVATE was
+ * appended between when the 404/410 dispatch was sent and when its result is
+ * finalized. Callers driven by the scheduler's dispatch-reservation
+ * architecture must use
+ * `disablePushSubscriptionForEndpointGoneIfStillLatestInTransaction` instead,
+ * which only disables when the EXACT revision the dispatch was sent against
+ * is still the latest. Kept for any caller that has no dispatch-bound
+ * revision id to compare against.
  */
 export async function disablePushSubscriptionForEndpointGoneInTransaction(
 	tx: DatabaseTransaction,
@@ -646,6 +661,59 @@ export async function disablePushSubscriptionForEndpointGoneInTransaction(
 		occurredAt: args.occurredAt,
 		idempotencyKey: args.idempotencyKey,
 	});
+}
+
+/**
+ * Phase 15-R1 Section B/10/11: race-safe endpoint-gone auto-disable. Only
+ * appends a DISABLE revision when `expectedRevisionId` -- the EXACT
+ * `push_subscription_revision_id` that was bound to the dispatch reservation
+ * whose network call actually returned 404/410 -- is STILL the subscription's
+ * current latest revision at finalization time. If a REFRESH/REACTIVATE was
+ * appended in between (a real race under this architecture), the newer
+ * revision is left untouched and this is a no-op: the old dispatch's result
+ * simply remains recorded as TERMINAL_FAILURE, and the subscription stays
+ * ACTIVE on its newer revision. Comparing by exact revision id is strictly
+ * stronger than comparing individual fields (endpoint/p256dh/auth) since a
+ * revision id uniquely determines every one of its fields.
+ */
+export async function disablePushSubscriptionForEndpointGoneIfStillLatestInTransaction(
+	tx: DatabaseTransaction,
+	args: {
+		userId: string;
+		subscriptionId: string;
+		expectedRevisionId: string;
+		occurredAt: Date;
+		idempotencyKey: string;
+	},
+): Promise<{ disabled: boolean }> {
+	const latest = await findLatestRevisionInTransaction(tx, args.subscriptionId);
+	if (!latest || latest.id !== args.expectedRevisionId) {
+		return { disabled: false };
+	}
+	await disablePushSubscriptionInTransaction(tx, {
+		userId: args.userId,
+		subscriptionId: args.subscriptionId,
+		disableReason: "PUSH_ENDPOINT_GONE",
+		occurredAt: args.occurredAt,
+		idempotencyKey: args.idempotencyKey,
+	});
+	return { disabled: true };
+}
+
+/**
+ * Resolves the subscription's current ACTIVE revision inside an already-open
+ * transaction (used by the scheduler's dispatch-reservation Transaction A --
+ * Phase 15-R1 Section A/B). Returns null if the subscription is no longer
+ * ACTIVE (e.g. disabled concurrently since the outer active-subscription
+ * listing was taken).
+ */
+export async function getActiveSubscriptionRevisionInTransaction(
+	tx: DatabaseTransaction,
+	subscriptionId: string,
+): Promise<typeof pushSubscriptionRevisions.$inferSelect | null> {
+	const latest = await findLatestRevisionInTransaction(tx, subscriptionId);
+	if (latest?.status !== "ACTIVE") return null;
+	return latest;
 }
 
 // ============================================================================
@@ -682,13 +750,17 @@ export async function getPushSubscription(
 export interface ListPushSubscriptionsParams {
 	db: Database;
 	userId: unknown;
-	status?: "ACTIVE" | "DISABLED" | undefined;
+	status?: unknown;
 }
 
 export async function listPushSubscriptions(
 	params: ListPushSubscriptionsParams,
 ): Promise<PushSubscriptionReadModel[]> {
 	const userId = validateNotificationCanonicalUuid(params.userId, "userId");
+	// Phase 15-R1 Section H/27: strict runtime validation BEFORE any DB call
+	// -- only `undefined` means "omitted"; never a truthiness check (which
+	// would incorrectly treat "" as omitted rather than invalid).
+	const status = validateNotificationOptionalSubscriptionStatus(params.status);
 	return runNotificationReadTransaction(params.db, async (tx) => {
 		const anchors = await tx
 			.select()
@@ -698,7 +770,7 @@ export async function listPushSubscriptions(
 		for (const anchor of anchors) {
 			const latest = await findLatestRevisionInTransaction(tx, anchor.id);
 			if (!latest) continue;
-			if (params.status && latest.status !== params.status) continue;
+			if (status !== undefined && latest.status !== status) continue;
 			results.push(
 				toReadModel(anchor.id, anchor.userId, latest, anchor.createdAt),
 			);

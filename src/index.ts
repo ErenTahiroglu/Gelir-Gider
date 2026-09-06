@@ -60,7 +60,13 @@ export default {
 					// handler -- the sanitized notification error boundary already
 					// stripped anything sensitive before this point, and anything
 					// that escapes it (e.g. a missing DATABASE_URL) must not be
-					// surfaced with its raw message either.
+					// surfaced with its raw message either. But the failure must
+					// still be visible to Cloudflare: rethrow a sanitized generic
+					// error so the promise passed to `ctx.waitUntil` actually
+					// rejects and the invocation is recorded as failed, rather
+					// than silently resolving as if nothing went wrong (Phase
+					// 15-R1 Section G).
+					throw new Error("Scheduled notification run failed");
 				}
 			})(),
 		);

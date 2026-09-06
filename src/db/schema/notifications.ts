@@ -253,9 +253,75 @@ export const notificationDeliveries = pgTable(
 );
 
 /**
+ * Notification Delivery Dispatches Table (Append-Only Pre-Send Reservation)
+ * Phase 15-R1 Section A. A durable reservation, committed BEFORE any network
+ * call, that binds one (delivery, hourly cron slot) pair to the EXACT push
+ * subscription revision that will be used. `dispatch_no` is a
+ * strictly-increasing unbranched sequence per delivery_id, starting at 1
+ * (independent of `notification_delivery_attempts.attempt_no`, which also
+ * counts no-network SUPPRESSED_OBSOLETE outcomes). The
+ * `(delivery_id, scheduler_hour_slot)` UNIQUE constraint is what makes "two
+ * overlapping/concurrent scheduler invocations for the same hourly slot
+ * perform zero duplicate network calls" DB-provable: a second reservation
+ * attempt for the same slot conflicts and is treated as a no-op by the
+ * caller (see `reserveDispatchInTransaction`).
+ */
+export const notificationDeliveryDispatches = pgTable(
+	"notification_delivery_dispatches",
+	{
+		id: uuid("id").defaultRandom().primaryKey().notNull(),
+		userId: uuid("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "restrict" }),
+		deliveryId: uuid("delivery_id")
+			.notNull()
+			.references(() => notificationDeliveries.id, { onDelete: "restrict" }),
+		dispatchNo: integer("dispatch_no").notNull(),
+		pushSubscriptionRevisionId: uuid("push_subscription_revision_id")
+			.notNull()
+			.references(() => pushSubscriptionRevisions.id, {
+				onDelete: "restrict",
+			}),
+		schedulerHourSlot: timestamp("scheduler_hour_slot", {
+			withTimezone: true,
+			mode: "date",
+		}).notNull(),
+		reservedAt: timestamp("reserved_at", {
+			withTimezone: true,
+			mode: "date",
+		}).notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+			.defaultNow()
+			.notNull(),
+	},
+	(table) => [
+		uniqueIndex("notification_delivery_dispatches_delivery_no_idx").on(
+			table.deliveryId,
+			table.dispatchNo,
+		),
+		uniqueIndex("notification_delivery_dispatches_delivery_hour_idx").on(
+			table.deliveryId,
+			table.schedulerHourSlot,
+		),
+		index("notification_delivery_dispatches_delivery_idx").on(table.deliveryId),
+		index("notification_delivery_dispatches_user_idx").on(table.userId),
+		index("notification_delivery_dispatches_revision_idx").on(
+			table.pushSubscriptionRevisionId,
+		),
+		check(
+			"notification_delivery_dispatches_no_check",
+			sql`${table.dispatchNo} > 0 AND ${table.dispatchNo} <= 5`,
+		),
+	],
+);
+
+/**
  * Notification Delivery Attempts Table (Append-Only Attempt Chain)
  * attempt_no is a strictly-increasing unbranched sequence per delivery_id,
  * starting at 1. Raw push response bodies are NEVER persisted here.
+ * `dispatch_id` (Phase 15-R1 Section A/K) binds a completed network attempt
+ * result to the exact pre-send dispatch reservation it resolves -- NULL only
+ * for the no-network SUPPRESSED_OBSOLETE path (Section J/31).
  */
 export const notificationDeliveryAttempts = pgTable(
 	"notification_delivery_attempts",
@@ -267,6 +333,10 @@ export const notificationDeliveryAttempts = pgTable(
 		deliveryId: uuid("delivery_id")
 			.notNull()
 			.references(() => notificationDeliveries.id, { onDelete: "restrict" }),
+		dispatchId: uuid("dispatch_id").references(
+			() => notificationDeliveryDispatches.id,
+			{ onDelete: "restrict" },
+		),
 		attemptNo: integer("attempt_no").notNull(),
 		status: varchar("status", { length: 30 }).notNull(),
 		httpStatus: integer("http_status"),
@@ -288,6 +358,9 @@ export const notificationDeliveryAttempts = pgTable(
 			table.deliveryId,
 			table.attemptNo,
 		),
+		uniqueIndex("notification_delivery_attempts_dispatch_idx")
+			.on(table.dispatchId)
+			.where(sql`${table.dispatchId} IS NOT NULL`),
 		index("notification_delivery_attempts_delivery_idx").on(table.deliveryId),
 		index("notification_delivery_attempts_user_idx").on(table.userId),
 		check(
