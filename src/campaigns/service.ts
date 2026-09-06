@@ -43,6 +43,7 @@ import {
 } from "./decimal";
 import { CampaignError } from "./errors";
 import {
+	type CampaignPeriodAmendFingerprintParams,
 	calculateCampaignOverrideFingerprint,
 	calculateCampaignPeriodAmendFingerprint,
 	calculateCampaignPeriodCreateRequestFingerprint,
@@ -116,7 +117,7 @@ export interface CampaignPeriodRevisionReadModel {
  * `tryReplayCampaignPeriodRevisionByKey` (historical-replay builder) both
  * delegate here so the row-shaping logic exists exactly once.
  */
-async function buildCampaignPeriodReadModelForRevisionInTransaction(
+export async function buildCampaignPeriodReadModelForRevisionInTransaction(
 	tx: DatabaseTransaction,
 	campaignPeriodId: string,
 	revisionId: string,
@@ -940,6 +941,145 @@ export interface AmendCampaignPeriodInput
 	expectedRevisionNo: number;
 }
 
+/**
+ * Section A (Phase 16-R2): transaction-scoped AMEND primitive extracted from
+ * the former body of the public `amendCampaignPeriod` (mirroring the exact
+ * extraction shape already applied once in this codebase for
+ * `voidRewardEventInTransaction` in src/rewards/events.ts). Does NOT call
+ * db.transaction()/runCampaignsTransaction() itself -- callers must already
+ * be inside an open transaction. This lets `applyCampaignReviewCandidate`
+ * drive the campaign AMEND on its OWN already-open transaction so the
+ * candidate APPLY and the campaign AMEND commit or roll back together as one
+ * atomic unit, instead of the AMEND opening a second, independent,
+ * unrelated transaction/connection entirely disconnected from the outer
+ * candidate-APPLY transaction. Pure refactor of `amendCampaignPeriod`'s
+ * former inline body: zero behavior change.
+ */
+export interface AmendCampaignPeriodInTransactionFields
+	extends CampaignPeriodAmendFingerprintParams {
+	idempotencyKey: string;
+}
+
+export async function amendCampaignPeriodInTransaction(
+	tx: DatabaseTransaction,
+	fields: AmendCampaignPeriodInTransactionFields,
+): Promise<CampaignPeriodRevisionReadModel> {
+	const { userId, campaignPeriodId, expectedRevisionNo } = fields;
+
+	// Section C (Phase 16-R1): the AMEND fingerprint binds
+	// expectedRevisionNo (true OCC) and parser provenance -- neither of
+	// which the legacy generic fingerprint bound.
+	const fingerprint = await calculateCampaignPeriodAmendFingerprint(fields);
+
+	const replay = await tryReplayCampaignPeriodRevisionByKey(
+		tx,
+		userId,
+		fields.idempotencyKey,
+		fingerprint,
+	);
+	if (replay) return replay;
+
+	const latest = await getLatestRevisionInTransaction(
+		tx,
+		userId,
+		campaignPeriodId,
+	);
+	if (!latest) {
+		throw new CampaignError(
+			"CAMPAIGN_NOT_FOUND",
+			`Campaign period "${campaignPeriodId}" not found`,
+		);
+	}
+	if (latest.row.revisionNo !== expectedRevisionNo) {
+		throw new CampaignError(
+			"CAMPAIGN_REVISION_CONFLICT",
+			`Expected campaign period revision ${expectedRevisionNo} but found ${latest.row.revisionNo}`,
+		);
+	}
+	if (latest.row.lifecycleStatus !== "ACTIVE") {
+		throw new CampaignError(
+			"CAMPAIGN_NOT_ACTIVE",
+			`Campaign period "${campaignPeriodId}" must be ACTIVE to AMEND`,
+		);
+	}
+
+	const [revision] = await tx
+		.insert(campaignPeriodRevisions)
+		.values({
+			userId,
+			campaignPeriodId,
+			revisionNo: latest.row.revisionNo + 1,
+			previousRevisionId: latest.row.id,
+			operation: "AMEND",
+			lifecycleStatus: "ACTIVE",
+			visibility: latest.row.visibility,
+			title: fields.title,
+			startsOn: fields.startsOn,
+			endsOn: fields.endsOn,
+			ruleMode: fields.ruleMode,
+			targetSpendAmount: fields.targetSpendAmount,
+			requiredTransactionCount: fields.requiredTransactionCount,
+			minimumTransactionAmount: fields.minimumTransactionAmount,
+			stepSpendAmount: fields.stepSpendAmount,
+			rewardPointsPerStep: fields.rewardPointsPerStep,
+			maxSteps: fields.maxSteps,
+			rewardKind: fields.rewardKind,
+			rewardAccountId: fields.rewardAccountId,
+			expectedRewardPoints: fields.expectedRewardPoints,
+			merchantScopeMode: fields.merchantScopeMode,
+			requiredCanonicalMerchantNames: fields.requiredCanonicalMerchantNames,
+			allowedMccCodes: fields.allowedMccCodes,
+			rewardExpiryDate: fields.rewardExpiryDate,
+			sourceSnapshotId: fields.sourceSnapshotId,
+			parserType: fields.parserType,
+			parserVersion: fields.parserVersion,
+			parserConfidence:
+				fields.parserConfidence === null
+					? null
+					: fields.parserConfidence.toString(),
+			note: fields.note,
+			occurredAt: fields.occurredAt,
+			idempotencyKey: fields.idempotencyKey,
+			revisionFingerprint: fingerprint,
+		})
+		.returning();
+
+	if (!revision) {
+		throw new CampaignError(
+			"CAMPAIGN_INVALID_STATE",
+			"Failed to create campaign period AMEND revision",
+		);
+	}
+
+	if (fields.cardIds.length > 0) {
+		await tx.insert(campaignPeriodRevisionCards).values(
+			fields.cardIds.map((creditCardId) => ({
+				revisionId: revision.id,
+				creditCardId,
+			})),
+		);
+	}
+
+	const readModel = await buildCampaignPeriodReadModelForRevisionInTransaction(
+		tx,
+		campaignPeriodId,
+		revision.id,
+	);
+	if (!readModel) {
+		throw new CampaignError(
+			"CAMPAIGN_INVALID_STATE",
+			"Failed to build campaign period read model",
+		);
+	}
+	return readModel;
+}
+
+/**
+ * Public AMEND API: validates/normalizes inputs (unchanged), then delegates
+ * to `amendCampaignPeriodInTransaction` inside a managed transaction. Thin
+ * wrapper only -- zero behavior change from the pre-extraction
+ * implementation (Section A, Phase 16-R2).
+ */
 export async function amendCampaignPeriod(
 	params: AmendCampaignPeriodInput,
 ): Promise<CampaignPeriodRevisionReadModel> {
@@ -958,11 +1098,8 @@ export async function amendCampaignPeriod(
 		periodKey: "AMEND",
 	});
 
-	return runCampaignsTransaction(params.db, async (tx) => {
-		// Section C (Phase 16-R1): the AMEND fingerprint binds
-		// expectedRevisionNo (true OCC) and parser provenance -- neither of
-		// which the legacy generic fingerprint bound.
-		const fingerprint = await calculateCampaignPeriodAmendFingerprint({
+	return runCampaignsTransaction(params.db, (tx) =>
+		amendCampaignPeriodInTransaction(tx, {
 			userId,
 			campaignPeriodId,
 			expectedRevisionNo,
@@ -990,109 +1127,9 @@ export async function amendCampaignPeriod(
 			parserConfidence: fields.parserConfidence,
 			note: fields.note,
 			occurredAt: fields.occurredAt,
-		});
-
-		const replay = await tryReplayCampaignPeriodRevisionByKey(
-			tx,
-			userId,
-			fields.idempotencyKey,
-			fingerprint,
-		);
-		if (replay) return replay;
-
-		const latest = await getLatestRevisionInTransaction(
-			tx,
-			userId,
-			campaignPeriodId,
-		);
-		if (!latest) {
-			throw new CampaignError(
-				"CAMPAIGN_NOT_FOUND",
-				`Campaign period "${campaignPeriodId}" not found`,
-			);
-		}
-		if (latest.row.revisionNo !== expectedRevisionNo) {
-			throw new CampaignError(
-				"CAMPAIGN_REVISION_CONFLICT",
-				`Expected campaign period revision ${expectedRevisionNo} but found ${latest.row.revisionNo}`,
-			);
-		}
-		if (latest.row.lifecycleStatus !== "ACTIVE") {
-			throw new CampaignError(
-				"CAMPAIGN_NOT_ACTIVE",
-				`Campaign period "${campaignPeriodId}" must be ACTIVE to AMEND`,
-			);
-		}
-
-		const [revision] = await tx
-			.insert(campaignPeriodRevisions)
-			.values({
-				userId,
-				campaignPeriodId,
-				revisionNo: latest.row.revisionNo + 1,
-				previousRevisionId: latest.row.id,
-				operation: "AMEND",
-				lifecycleStatus: "ACTIVE",
-				visibility: latest.row.visibility,
-				title: fields.title,
-				startsOn: fields.startsOn,
-				endsOn: fields.endsOn,
-				ruleMode: fields.ruleMode,
-				targetSpendAmount: fields.targetSpendAmount,
-				requiredTransactionCount: fields.requiredTransactionCount,
-				minimumTransactionAmount: fields.minimumTransactionAmount,
-				stepSpendAmount: fields.stepSpendAmount,
-				rewardPointsPerStep: fields.rewardPointsPerStep,
-				maxSteps: fields.maxSteps,
-				rewardKind: fields.rewardKind,
-				rewardAccountId: fields.rewardAccountId,
-				expectedRewardPoints: fields.expectedRewardPoints,
-				merchantScopeMode: fields.merchantScopeMode,
-				requiredCanonicalMerchantNames: fields.requiredCanonicalMerchantNames,
-				allowedMccCodes: fields.allowedMccCodes,
-				rewardExpiryDate: fields.rewardExpiryDate,
-				sourceSnapshotId: fields.sourceSnapshotId,
-				parserType: fields.parserType,
-				parserVersion: fields.parserVersion,
-				parserConfidence:
-					fields.parserConfidence === null
-						? null
-						: fields.parserConfidence.toString(),
-				note: fields.note,
-				occurredAt: fields.occurredAt,
-				idempotencyKey: fields.idempotencyKey,
-				revisionFingerprint: fingerprint,
-			})
-			.returning();
-
-		if (!revision) {
-			throw new CampaignError(
-				"CAMPAIGN_INVALID_STATE",
-				"Failed to create campaign period AMEND revision",
-			);
-		}
-
-		if (fields.cardIds.length > 0) {
-			await tx.insert(campaignPeriodRevisionCards).values(
-				fields.cardIds.map((creditCardId) => ({
-					revisionId: revision.id,
-					creditCardId,
-				})),
-			);
-		}
-
-		const readModel = await buildCampaignPeriodReadModelInTransaction(
-			tx,
-			campaignPeriodId,
-		);
-		if (!readModel) {
-			throw new CampaignError(
-				"CAMPAIGN_INVALID_STATE",
-				"Failed to build campaign period read model",
-			);
-		}
-		return readModel;
-	});
+			idempotencyKey: fields.idempotencyKey,
+		}),
+	);
 }
 
 // ============================================================================

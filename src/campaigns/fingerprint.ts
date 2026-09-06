@@ -226,6 +226,114 @@ export async function calculateCampaignPeriodAmendFingerprint(
 }
 
 /**
+ * Section B (Phase 16-R2): bounded, deterministic, collision-resistant
+ * child-idempotency-key derivation for a review-candidate-driven child
+ * mutation (e.g. the campaign AMEND that `applyCampaignReviewCandidate`
+ * drives). `campaign_period_revisions.idempotency_key` is `varchar(128)` and
+ * the parent (candidate) idempotency key can itself be up to 128 chars, so
+ * raw string concatenation (e.g. `${parentKey}:campaign-amend`) can overflow
+ * the column. Mirrors the existing
+ * `deriveNotificationChildIdempotencyKey` pattern (src/notifications/
+ * fingerprint.ts): output is always exactly 64 lowercase hex chars
+ * regardless of parentKey length.
+ */
+export interface CampaignReviewChildIdempotencyKeyParams {
+	parentKey: string;
+	candidateId: string;
+	operation: "APPLY";
+	child: "CAMPAIGN_AMEND";
+}
+
+export async function deriveCampaignReviewChildIdempotencyKey(
+	params: CampaignReviewChildIdempotencyKeyParams,
+): Promise<string> {
+	return sha256Hex([
+		"campaign-review-child-idempotency-v1",
+		params.parentKey,
+		params.candidateId,
+		params.operation,
+		params.child,
+	]);
+}
+
+/**
+ * Section C (Phase 16-R2): the CREATE-specific exact-replay request
+ * fingerprint for a review candidate. Unlike `candidateHash` (a
+ * content-addressed semantic identity deliberately excluding occurredAt,
+ * used only for cross-request PENDING dedup -- see
+ * `calculateCampaignReviewCandidateHash` below), this fingerprint binds
+ * every field that determines exact request intent so that a byte-identical
+ * retry of the same idempotency key replays cleanly, while any change (to
+ * occurredAt, sourceSnapshotId, campaignPeriodId, or any term/card/parser
+ * field, all of which are subsumed by candidateHash) produces
+ * CAMPAIGN_IDEMPOTENCY_CONFLICT.
+ */
+export interface CampaignReviewCandidateCreateRequestFingerprintParams {
+	userId: string;
+	campaignPeriodId: string;
+	sourceSnapshotId: string;
+	candidateHash: string;
+	title: string;
+	startsOn: string;
+	endsOn: string;
+	ruleMode: string;
+	targetSpendAmount: string | null;
+	requiredTransactionCount: number | null;
+	minimumTransactionAmount: string | null;
+	stepSpendAmount: string | null;
+	rewardPointsPerStep: string | null;
+	maxSteps: number | null;
+	rewardKind: string;
+	rewardAccountId: string | null;
+	expectedRewardPoints: string | null;
+	merchantScopeMode: string;
+	requiredCanonicalMerchantNames: string[] | null;
+	allowedMccCodes: string[] | null;
+	rewardExpiryDate: string | null;
+	parserType: string | null;
+	parserVersion: string | null;
+	parserConfidence: number | null;
+	proposedCardIds: string[];
+	occurredAt: Date;
+}
+
+export async function calculateCampaignReviewCandidateCreateRequestFingerprint(
+	params: CampaignReviewCandidateCreateRequestFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"campaign-review-candidate-create-request-v1",
+		params.userId.trim().toLowerCase(),
+		params.campaignPeriodId.trim().toLowerCase(),
+		params.sourceSnapshotId.trim().toLowerCase(),
+		params.candidateHash,
+		params.title,
+		params.startsOn,
+		params.endsOn,
+		params.ruleMode,
+		params.targetSpendAmount,
+		params.requiredTransactionCount,
+		params.minimumTransactionAmount,
+		params.stepSpendAmount,
+		params.rewardPointsPerStep,
+		params.maxSteps,
+		params.rewardKind,
+		params.rewardAccountId?.trim().toLowerCase() ?? null,
+		params.expectedRewardPoints,
+		params.merchantScopeMode,
+		params.requiredCanonicalMerchantNames
+			? [...params.requiredCanonicalMerchantNames].sort()
+			: null,
+		params.allowedMccCodes ? [...params.allowedMccCodes].sort() : null,
+		params.rewardExpiryDate,
+		params.parserType,
+		params.parserVersion,
+		params.parserConfidence,
+		[...params.proposedCardIds].map((id) => id.trim().toLowerCase()).sort(),
+		params.occurredAt.toISOString(),
+	]);
+}
+
+/**
  * Section K (Phase 16-R1): the semantic hash used to dedup review candidates.
  * Computed over the SAME normalized-term fields as the CREATE request
  * fingerprint (minus identity fields that are not part of the "proposed

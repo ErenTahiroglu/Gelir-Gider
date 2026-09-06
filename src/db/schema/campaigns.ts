@@ -797,6 +797,16 @@ export const campaignReviewCandidateRevisions = pgTable(
 		parserVersion: varchar("parser_version", { length: 40 }),
 		parserConfidence: numeric("parser_confidence", { precision: 5, scale: 4 }),
 		proposedCardIds: jsonb("proposed_card_ids").notNull(),
+		// Section D/J (Phase 16-R2): the exact campaign_period_revisions.id
+		// the AMEND driven by this row's APPLY produced. NULL for CREATE and
+		// DISMISS; NOT NULL for APPLY (enforced by
+		// campaign_review_candidate_revisions_applied_revision_shape_check
+		// below). The partial unique index ensures one AMEND revision can be
+		// the "product" of at most one candidate APPLY.
+		appliedCampaignRevisionId: uuid("applied_campaign_revision_id").references(
+			() => campaignPeriodRevisions.id,
+			{ onDelete: "restrict" },
+		),
 		occurredAt: timestamp("occurred_at", {
 			withTimezone: true,
 			mode: "date",
@@ -824,6 +834,9 @@ export const campaignReviewCandidateRevisions = pgTable(
 		index("campaign_review_candidate_revisions_candidate_idx").on(
 			table.candidateId,
 		),
+		uniqueIndex("campaign_review_candidate_revisions_applied_revision_idx")
+			.on(table.appliedCampaignRevisionId)
+			.where(sql`${table.appliedCampaignRevisionId} IS NOT NULL`),
 		check(
 			"campaign_review_candidate_revisions_rev_no_check",
 			sql`${table.revisionNo} > 0`,
@@ -849,12 +862,57 @@ export const campaignReviewCandidateRevisions = pgTable(
 			sql`${table.ruleMode} IN ('TOTAL_SPEND', 'TRANSACTION_COUNT', 'REPEATABLE_SPEND')`,
 		),
 		check(
+			"campaign_review_candidate_revisions_rule_shape_check",
+			sql`(
+				${table.ruleMode} = 'TOTAL_SPEND' AND ${table.targetSpendAmount} IS NOT NULL AND ${table.targetSpendAmount} > 0
+					AND ${table.requiredTransactionCount} IS NULL AND ${table.minimumTransactionAmount} IS NULL
+					AND ${table.stepSpendAmount} IS NULL AND ${table.rewardPointsPerStep} IS NULL AND ${table.maxSteps} IS NULL
+			) OR (
+				${table.ruleMode} = 'TRANSACTION_COUNT' AND ${table.requiredTransactionCount} IS NOT NULL AND ${table.requiredTransactionCount} >= 1
+					AND (${table.minimumTransactionAmount} IS NULL OR ${table.minimumTransactionAmount} > 0)
+					AND ${table.targetSpendAmount} IS NULL AND ${table.stepSpendAmount} IS NULL
+					AND ${table.rewardPointsPerStep} IS NULL AND ${table.maxSteps} IS NULL
+			) OR (
+				${table.ruleMode} = 'REPEATABLE_SPEND' AND ${table.stepSpendAmount} IS NOT NULL AND ${table.stepSpendAmount} > 0
+					AND ${table.rewardPointsPerStep} IS NOT NULL AND ${table.rewardPointsPerStep} > 0
+					AND ${table.maxSteps} IS NOT NULL AND ${table.maxSteps} >= 1
+					AND (${table.minimumTransactionAmount} IS NULL OR ${table.minimumTransactionAmount} > 0)
+					AND ${table.targetSpendAmount} IS NULL AND ${table.requiredTransactionCount} IS NULL
+			)`,
+		),
+		check(
 			"campaign_review_candidate_revisions_reward_kind_check",
 			sql`${table.rewardKind} IN ('REWARD_POINTS', 'STATEMENT_CREDIT', 'INFORMATIONAL')`,
 		),
 		check(
+			"campaign_review_candidate_revisions_reward_shape_check",
+			sql`(
+				${table.rewardKind} = 'REWARD_POINTS' AND ${table.rewardAccountId} IS NOT NULL
+					AND (
+						(${table.ruleMode} = 'REPEATABLE_SPEND' AND ${table.expectedRewardPoints} IS NULL)
+						OR (${table.ruleMode} != 'REPEATABLE_SPEND' AND ${table.expectedRewardPoints} IS NOT NULL AND ${table.expectedRewardPoints} > 0)
+					)
+			) OR (
+				${table.rewardKind} IN ('STATEMENT_CREDIT', 'INFORMATIONAL')
+					AND ${table.rewardAccountId} IS NULL AND ${table.expectedRewardPoints} IS NULL
+			)`,
+		),
+		check(
 			"campaign_review_candidate_revisions_merchant_scope_check",
 			sql`${table.merchantScopeMode} IN ('ALL_MERCHANTS', 'MERCHANT_ALIASES', 'MANUAL_REVIEW_REQUIRED')`,
+		),
+		check(
+			"campaign_review_candidate_revisions_merchant_scope_shape_check",
+			sql`(
+				${table.merchantScopeMode} = 'MERCHANT_ALIASES' AND ${table.requiredCanonicalMerchantNames} IS NOT NULL
+					AND jsonb_typeof(${table.requiredCanonicalMerchantNames}) = 'array' AND jsonb_array_length(${table.requiredCanonicalMerchantNames}) >= 1
+			) OR (
+				${table.merchantScopeMode} != 'MERCHANT_ALIASES' AND ${table.requiredCanonicalMerchantNames} IS NULL
+			)`,
+		),
+		check(
+			"campaign_review_candidate_revisions_applied_revision_shape_check",
+			sql`(${table.operation} = 'APPLY') = (${table.appliedCampaignRevisionId} IS NOT NULL)`,
 		),
 		check(
 			"campaign_review_candidate_revisions_mcc_shape_check",

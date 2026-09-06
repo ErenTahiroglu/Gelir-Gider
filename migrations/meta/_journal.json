@@ -351,6 +351,13 @@
       "when": 1788714548735,
       "tag": "0049_harden_campaign_qualification_and_reward_integrity",
       "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1788718098748,
+      "tag": "0050_close_final_campaign_review_workflow_gaps",
+      "breakpoints": true
     }
   ]
 }

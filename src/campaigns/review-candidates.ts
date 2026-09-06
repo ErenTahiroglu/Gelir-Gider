@@ -32,16 +32,19 @@ import {
 } from "./decimal";
 import { CampaignError } from "./errors";
 import {
+	calculateCampaignReviewCandidateCreateRequestFingerprint,
 	calculateCampaignReviewCandidateHash,
 	calculateCampaignReviewCandidateLifecycleFingerprint,
+	deriveCampaignReviewChildIdempotencyKey,
 } from "./fingerprint";
 import {
 	validateCampaignRewardShape,
 	validateCampaignRuleShape,
 } from "./rules";
 import {
-	amendCampaignPeriod,
-	buildCampaignPeriodReadModelInTransaction,
+	amendCampaignPeriodInTransaction,
+	buildCampaignPeriodReadModelForRevisionInTransaction,
+	type CampaignPeriodRevisionReadModel,
 	getLatestRevisionInTransaction,
 } from "./service";
 import { computeCampaignSemanticDiff } from "./sources";
@@ -83,6 +86,14 @@ export interface CampaignReviewCandidateReadModel {
 	parserVersion: string | null;
 	parserConfidence: string | null;
 	proposedCardIds: string[];
+	/**
+	 * Section D/J (Phase 16-R2): the exact campaign_period_revisions.id the
+	 * AMEND driven by this candidate's APPLY revision produced. NULL for
+	 * CREATE and DISMISS; always set for APPLY. Used to replay an APPLY
+	 * idempotency key against the EXACT historical AMEND snapshot rather than
+	 * the campaign's current latest state.
+	 */
+	appliedCampaignRevisionId: string | null;
 	occurredAt: Date;
 	createdAt: Date;
 }
@@ -132,14 +143,25 @@ function buildReadModel(
 		parserVersion: revision.parserVersion,
 		parserConfidence: revision.parserConfidence,
 		proposedCardIds: revision.proposedCardIds as string[],
+		appliedCampaignRevisionId: revision.appliedCampaignRevisionId,
 		occurredAt: revision.occurredAt,
 		createdAt: revision.createdAt,
 	};
 }
 
-async function buildLatestReadModelInTransaction(
+/**
+ * Section D (Phase 16-R2): reads the EXACT historical
+ * campaign_review_candidate_revisions row identified by `revisionId` (not
+ * necessarily the latest one for `candidateId`), mirroring the exact pattern
+ * used for campaigns themselves
+ * (`buildCampaignPeriodReadModelForRevisionInTransaction` in service.ts).
+ * `buildLatestReadModelInTransaction` delegates here so the row-shaping
+ * logic exists exactly once.
+ */
+export async function buildCampaignReviewCandidateReadModelForRevisionInTransaction(
 	tx: DatabaseTransaction,
 	candidateId: string,
+	revisionId: string,
 ): Promise<CampaignReviewCandidateReadModel | null> {
 	const [candidate] = await tx
 		.select()
@@ -151,12 +173,39 @@ async function buildLatestReadModelInTransaction(
 	const [revision] = await tx
 		.select()
 		.from(campaignReviewCandidateRevisions)
-		.where(eq(campaignReviewCandidateRevisions.candidateId, candidateId))
-		.orderBy(desc(campaignReviewCandidateRevisions.revisionNo))
+		.where(
+			and(
+				eq(campaignReviewCandidateRevisions.candidateId, candidateId),
+				eq(campaignReviewCandidateRevisions.id, revisionId),
+			),
+		)
 		.limit(1);
 	if (!revision) return null;
 
 	return buildReadModel(candidate, revision);
+}
+
+/**
+ * Latest-state read model builder: resolves the latest revision id for
+ * `candidateId` then delegates to the revision-scoped builder above -- no
+ * duplicated row-shaping logic (Section D).
+ */
+async function buildLatestReadModelInTransaction(
+	tx: DatabaseTransaction,
+	candidateId: string,
+): Promise<CampaignReviewCandidateReadModel | null> {
+	const [latest] = await tx
+		.select({ id: campaignReviewCandidateRevisions.id })
+		.from(campaignReviewCandidateRevisions)
+		.where(eq(campaignReviewCandidateRevisions.candidateId, candidateId))
+		.orderBy(desc(campaignReviewCandidateRevisions.revisionNo))
+		.limit(1);
+	if (!latest) return null;
+	return buildCampaignReviewCandidateReadModelForRevisionInTransaction(
+		tx,
+		candidateId,
+		latest.id,
+	);
 }
 
 // ============================================================================
@@ -319,13 +368,17 @@ function normalizeProposedTerms(input: ProposedCampaignTermsInput) {
 			"proposedCardIds must be an array",
 		);
 	}
+	// Section I (Phase 16-R2): stored in a canonical (sorted) order so a
+	// straightforward `IS NOT DISTINCT FROM` JSONB array comparison in the
+	// terminal copy-forward trigger works without needing order-insensitive
+	// SQL on every insert.
 	const proposedCardIds = Array.from(
 		new Set(
 			input.proposedCardIds.map((id, i) =>
 				validateCampaignCanonicalUuid(id, `proposedCardIds[${i}]`),
 			),
 		),
-	);
+	).sort();
 
 	const parserType = validateCampaignOptionalText(
 		input.parserType,
@@ -425,27 +478,62 @@ export async function createCampaignReviewCandidate(
 	const terms = normalizeProposedTerms(params);
 
 	return runCampaignsTransaction(params.db, async (tx) => {
+		// Section E/G (Phase 16-R2): lock the owning campaign_periods row
+		// FOR UPDATE as the VERY FIRST statement. This is BOTH the ACTIVE
+		// lifecycle gate's read point AND the serialization point for the
+		// concurrent-PENDING-dedup fix below -- two concurrent identical
+		// candidate-creation calls both acquire this SAME row lock before
+		// doing anything else, so they serialize correctly (the loser sees
+		// the winner's already-created PENDING candidate).
 		const [period] = await tx
-			.select({
-				id: campaignPeriods.id,
-				provider: campaignFamilies.provider,
-			})
+			.select()
 			.from(campaignPeriods)
-			.innerJoin(
-				campaignFamilies,
-				eq(campaignFamilies.id, campaignPeriods.campaignFamilyId),
-			)
 			.where(
 				and(
 					eq(campaignPeriods.id, campaignPeriodId),
 					eq(campaignPeriods.userId, userId),
 				),
 			)
-			.limit(1);
+			.for("update");
 		if (!period) {
 			throw new CampaignError(
 				"CAMPAIGN_NOT_FOUND",
 				`Campaign period "${campaignPeriodId}" not found`,
+			);
+		}
+
+		const [family] = await tx
+			.select({ provider: campaignFamilies.provider })
+			.from(campaignFamilies)
+			.where(eq(campaignFamilies.id, period.campaignFamilyId))
+			.limit(1);
+		if (!family) {
+			throw new CampaignError(
+				"CAMPAIGN_INVALID_STATE",
+				"Campaign family for this period could not be resolved",
+			);
+		}
+
+		// Section E: a candidate can only be created against an ACTIVE
+		// campaign lifecycle. HIDDEN visibility with ACTIVE lifecycle is
+		// explicitly allowed (visibility is orthogonal); REVIEW_REQUIRED,
+		// ENDED, and CANCELLED lifecycle are all rejected -- there is
+		// nothing to amend/re-review for those states.
+		const latestPeriodRev = await getLatestRevisionInTransaction(
+			tx,
+			userId,
+			campaignPeriodId,
+		);
+		if (!latestPeriodRev) {
+			throw new CampaignError(
+				"CAMPAIGN_NOT_FOUND",
+				`Campaign period "${campaignPeriodId}" not found`,
+			);
+		}
+		if (latestPeriodRev.row.lifecycleStatus !== "ACTIVE") {
+			throw new CampaignError(
+				"CAMPAIGN_NOT_ACTIVE",
+				`Campaign period "${campaignPeriodId}" must be ACTIVE to create a review candidate (found ${latestPeriodRev.row.lifecycleStatus})`,
 			);
 		}
 
@@ -467,14 +555,18 @@ export async function createCampaignReviewCandidate(
 		}
 		if (
 			snapshot.sourceType !== "MANUAL" &&
-			snapshot.provider !== period.provider
+			snapshot.provider !== family.provider
 		) {
 			throw new CampaignError(
 				"CAMPAIGN_INVALID_INPUT",
-				`Source snapshot provider "${snapshot.provider}" does not match campaign family provider "${period.provider}"`,
+				`Source snapshot provider "${snapshot.provider}" does not match campaign family provider "${family.provider}"`,
 			);
 		}
 
+		// Section K (Phase 16-R1): content-addressed semantic identity used
+		// ONLY for cross-request PENDING dedup (Section G) and the anchor's
+		// candidate_hash column -- deliberately excludes occurredAt and
+		// other request-specific fields.
 		const candidateHash = await calculateCampaignReviewCandidateHash({
 			campaignPeriodId,
 			sourceSnapshotId,
@@ -501,8 +593,46 @@ export async function createCampaignReviewCandidate(
 			proposedCardIds: terms.proposedCardIds,
 		});
 
+		// Section C (Phase 16-R2): the EXACT-replay request fingerprint --
+		// unlike candidateHash, this binds occurredAt/userId/campaignPeriodId/
+		// sourceSnapshotId (plus candidateHash itself, so any term/card/
+		// parser change also changes this). Stored as this CREATE revision's
+		// revisionFingerprint and used for the early idempotency-key replay
+		// check below.
+		const createRequestFingerprint =
+			await calculateCampaignReviewCandidateCreateRequestFingerprint({
+				userId,
+				campaignPeriodId,
+				sourceSnapshotId,
+				candidateHash,
+				title: terms.title,
+				startsOn: terms.startsOn,
+				endsOn: terms.endsOn,
+				ruleMode: terms.ruleMode,
+				targetSpendAmount: terms.targetSpendAmount,
+				requiredTransactionCount: terms.requiredTransactionCount,
+				minimumTransactionAmount: terms.minimumTransactionAmount,
+				stepSpendAmount: terms.stepSpendAmount,
+				rewardPointsPerStep: terms.rewardPointsPerStep,
+				maxSteps: terms.maxSteps,
+				rewardKind: terms.rewardKind,
+				rewardAccountId: terms.rewardAccountId,
+				expectedRewardPoints: terms.expectedRewardPoints,
+				merchantScopeMode: terms.merchantScopeMode,
+				requiredCanonicalMerchantNames: terms.requiredCanonicalMerchantNames,
+				allowedMccCodes: terms.allowedMccCodes,
+				rewardExpiryDate: terms.rewardExpiryDate,
+				parserType: terms.parserType,
+				parserVersion: terms.parserVersion,
+				parserConfidence: terms.parserConfidence,
+				proposedCardIds: terms.proposedCardIds,
+				occurredAt,
+			});
+
 		// Early idempotency replay (by userId + idempotencyKey), scoped
-		// globally across every candidate revision.
+		// globally across every candidate revision. Section D: replays the
+		// EXACT historical revision that owns this key (not whatever is
+		// currently latest for the candidate).
 		const [existingRevByKey] = await tx
 			.select()
 			.from(campaignReviewCandidateRevisions)
@@ -514,16 +644,18 @@ export async function createCampaignReviewCandidate(
 			)
 			.limit(1);
 		if (existingRevByKey) {
-			if (existingRevByKey.revisionFingerprint !== candidateHash) {
+			if (existingRevByKey.revisionFingerprint !== createRequestFingerprint) {
 				throw new CampaignError(
 					"CAMPAIGN_IDEMPOTENCY_CONFLICT",
 					"Idempotency key reused with a different review candidate payload",
 				);
 			}
-			const readModel = await buildLatestReadModelInTransaction(
-				tx,
-				existingRevByKey.candidateId,
-			);
+			const readModel =
+				await buildCampaignReviewCandidateReadModelForRevisionInTransaction(
+					tx,
+					existingRevByKey.candidateId,
+					existingRevByKey.id,
+				);
 			if (!readModel) {
 				throw new CampaignError(
 					"CAMPAIGN_INVALID_STATE",
@@ -534,7 +666,10 @@ export async function createCampaignReviewCandidate(
 		}
 
 		// Get-or-create by semantic hash: an existing PENDING candidate for
-		// this period with an identical hash is returned as-is.
+		// this period with an identical hash is returned as-is. Section G:
+		// safe from concurrent duplication because the campaign_periods row
+		// lock acquired above is held for the duration of this check AND the
+		// insert below.
 		const existingCandidates = await tx
 			.select()
 			.from(campaignReviewCandidates)
@@ -598,9 +733,10 @@ export async function createCampaignReviewCandidate(
 						? null
 						: terms.parserConfidence.toString(),
 				proposedCardIds: terms.proposedCardIds,
+				appliedCampaignRevisionId: null,
 				occurredAt,
 				idempotencyKey,
-				revisionFingerprint: candidateHash,
+				revisionFingerprint: createRequestFingerprint,
 			})
 			.returning();
 		if (!revision) {
@@ -821,17 +957,23 @@ export interface ApplyCampaignReviewCandidateParams {
 }
 
 /**
- * Section K: applies a PENDING review candidate as a normal AMEND revision
- * on the campaign (reusing amendCampaignPeriod internally -- no duplicated
- * lifecycle logic), and marks the candidate APPLIED in the SAME transaction.
- * Revalidates the candidate's stored term snapshot through the same
- * validators again as defense against a stale candidate.
+ * Section A/D/J (Phase 16-R2): applies a PENDING review candidate as a
+ * normal AMEND revision on the campaign, driven on the SAME already-open
+ * transaction as the candidate APPLY revision insert (reuses
+ * `amendCampaignPeriodInTransaction` -- no duplicated lifecycle logic, and
+ * no second independent transaction/connection). The single atomic unit is:
+ * candidate lock -> campaign-period lock/OCC (now on the same tx) -> AMEND
+ * revision insert -> AMEND card companions insert -> candidate APPLY
+ * revision insert (storing the exact AMEND revision id it produced). If any
+ * step fails, everything rolls back together. Revalidates the candidate's
+ * stored term snapshot through the same validators again as defense against
+ * a stale candidate.
  */
 export async function applyCampaignReviewCandidate(
 	params: ApplyCampaignReviewCandidateParams,
 ): Promise<{
 	candidate: CampaignReviewCandidateReadModel;
-	campaign: Awaited<ReturnType<typeof amendCampaignPeriod>>;
+	campaign: CampaignPeriodRevisionReadModel;
 }> {
 	const userId = validateCampaignCanonicalUuid(params.userId, "userId");
 	const candidateId = validateCampaignCanonicalUuid(
@@ -901,14 +1043,28 @@ export async function applyCampaignReviewCandidate(
 					"Idempotency key reused with a different APPLY payload",
 				);
 			}
-			const readModel = await buildLatestReadModelInTransaction(
-				tx,
-				candidateId,
-			);
-			const campaign = await buildCampaignPeriodReadModelInTransaction(
-				tx,
-				candidate.campaignPeriodId,
-			);
+			// Section D: replay the EXACT historical candidate APPLY
+			// revision AND the exact historical campaign AMEND revision it
+			// produced -- NOT the campaign's current latest state, which may
+			// have since been amended again, hidden, or ended.
+			if (!existingRevByKey.appliedCampaignRevisionId) {
+				throw new CampaignError(
+					"CAMPAIGN_INVALID_STATE",
+					"Historical APPLY revision is missing its applied campaign revision binding",
+				);
+			}
+			const readModel =
+				await buildCampaignReviewCandidateReadModelForRevisionInTransaction(
+					tx,
+					candidateId,
+					existingRevByKey.id,
+				);
+			const campaign =
+				await buildCampaignPeriodReadModelForRevisionInTransaction(
+					tx,
+					candidate.campaignPeriodId,
+					existingRevByKey.appliedCampaignRevisionId,
+				);
 			if (!readModel || !campaign) {
 				throw new CampaignError(
 					"CAMPAIGN_INVALID_STATE",
@@ -958,10 +1114,22 @@ export async function applyCampaignReviewCandidate(
 					: Number(latestCandidateRev.parserConfidence),
 		});
 
-		// Create a normal AMEND revision on the campaign (reuses
-		// amendCampaignPeriod internally -- no duplicated lifecycle logic).
-		const campaignReadModel = await amendCampaignPeriod({
-			db: params.db,
+		// Section B: bounded, deterministic, collision-resistant child
+		// idempotency key -- NOT raw string concatenation, which could
+		// overflow campaign_period_revisions.idempotency_key (varchar(128))
+		// when the parent key is itself near the 128-char limit.
+		const childIdempotencyKey = await deriveCampaignReviewChildIdempotencyKey({
+			parentKey: idempotencyKey,
+			candidateId,
+			operation: "APPLY",
+			child: "CAMPAIGN_AMEND",
+		});
+
+		// Section A: drives the campaign AMEND on this SAME already-open
+		// transaction (`tx`) -- NOT a fresh runCampaignsTransaction(params.db,
+		// ...) call, which would open a second, independent transaction
+		// disconnected from this one.
+		const campaignReadModel = await amendCampaignPeriodInTransaction(tx, {
 			userId,
 			campaignPeriodId: candidate.campaignPeriodId,
 			expectedRevisionNo: expectedCampaignRevisionNo,
@@ -969,22 +1137,20 @@ export async function applyCampaignReviewCandidate(
 			startsOn: revalidated.startsOn,
 			endsOn: revalidated.endsOn,
 			ruleMode: revalidated.ruleMode,
-			targetSpendAmount: revalidated.targetSpendAmount ?? undefined,
-			requiredTransactionCount:
-				revalidated.requiredTransactionCount ?? undefined,
-			minimumTransactionAmount:
-				revalidated.minimumTransactionAmount ?? undefined,
-			stepSpendAmount: revalidated.stepSpendAmount ?? undefined,
-			rewardPointsPerStep: revalidated.rewardPointsPerStep ?? undefined,
-			maxSteps: revalidated.maxSteps ?? undefined,
+			targetSpendAmount: revalidated.targetSpendAmount,
+			requiredTransactionCount: revalidated.requiredTransactionCount,
+			minimumTransactionAmount: revalidated.minimumTransactionAmount,
+			stepSpendAmount: revalidated.stepSpendAmount,
+			rewardPointsPerStep: revalidated.rewardPointsPerStep,
+			maxSteps: revalidated.maxSteps,
 			rewardKind: revalidated.rewardKind,
-			rewardAccountId: revalidated.rewardAccountId ?? undefined,
-			expectedRewardPoints: revalidated.expectedRewardPoints ?? undefined,
+			rewardAccountId: revalidated.rewardAccountId,
+			expectedRewardPoints: revalidated.expectedRewardPoints,
 			merchantScopeMode: revalidated.merchantScopeMode,
 			requiredCanonicalMerchantNames:
-				revalidated.requiredCanonicalMerchantNames ?? undefined,
-			allowedMccCodes: revalidated.allowedMccCodes ?? undefined,
-			rewardExpiryDate: revalidated.rewardExpiryDate ?? undefined,
+				revalidated.requiredCanonicalMerchantNames,
+			allowedMccCodes: revalidated.allowedMccCodes,
+			rewardExpiryDate: revalidated.rewardExpiryDate,
 			cardIds: revalidated.proposedCardIds,
 			sourceSnapshotId: candidate.sourceSnapshotId,
 			parserType: revalidated.parserType,
@@ -992,9 +1158,13 @@ export async function applyCampaignReviewCandidate(
 			parserConfidence: revalidated.parserConfidence,
 			note,
 			occurredAt,
-			idempotencyKey: `${idempotencyKey}:campaign-amend`,
+			idempotencyKey: childIdempotencyKey,
 		});
 
+		// Section D/J: store the EXACT AMEND revision id this APPLY produced
+		// so a future idempotency-key replay (or the sealing trigger) can
+		// resolve the exact historical campaign snapshot rather than the
+		// campaign's current latest state.
 		const [revision] = await tx
 			.insert(campaignReviewCandidateRevisions)
 			.values({
@@ -1026,6 +1196,7 @@ export async function applyCampaignReviewCandidate(
 				parserVersion: latestCandidateRev.parserVersion,
 				parserConfidence: latestCandidateRev.parserConfidence,
 				proposedCardIds: latestCandidateRev.proposedCardIds,
+				appliedCampaignRevisionId: campaignReadModel.revisionId,
 				occurredAt,
 				idempotencyKey,
 				revisionFingerprint: fingerprint,
@@ -1125,10 +1296,14 @@ export async function dismissCampaignReviewCandidate(
 					"Idempotency key reused with a different DISMISS payload",
 				);
 			}
-			const readModel = await buildLatestReadModelInTransaction(
-				tx,
-				candidateId,
-			);
+			// Section D: replay the EXACT historical DISMISS revision that
+			// owns this key, not whatever is currently latest.
+			const readModel =
+				await buildCampaignReviewCandidateReadModelForRevisionInTransaction(
+					tx,
+					candidateId,
+					existingRevByKey.id,
+				);
 			if (!readModel) {
 				throw new CampaignError(
 					"CAMPAIGN_INVALID_STATE",
@@ -1176,6 +1351,7 @@ export async function dismissCampaignReviewCandidate(
 				parserVersion: latestCandidateRev.parserVersion,
 				parserConfidence: latestCandidateRev.parserConfidence,
 				proposedCardIds: latestCandidateRev.proposedCardIds,
+				appliedCampaignRevisionId: null,
 				occurredAt,
 				idempotencyKey,
 				revisionFingerprint: fingerprint,
