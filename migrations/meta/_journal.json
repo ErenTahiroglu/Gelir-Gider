@@ -337,6 +337,13 @@
       "when": 1788704896248,
       "tag": "0047_harden_notification_dispatch_race_integrity",
       "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1788708189742,
+      "tag": "0048_add_credit_card_campaign_tracking",
+      "breakpoints": true
     }
   ]
 }

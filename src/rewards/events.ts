@@ -983,6 +983,255 @@ export interface VoidRewardEventParams {
 	idempotencyKey: string;
 }
 
+/**
+ * Internal transaction-scoped primitive for VOIDing any reward event (any
+ * event type). Extracted from the former body of the public `voidRewardEvent`
+ * so Phase 16 campaigns can VOID a linked reward EARN event atomically inside
+ * their own campaign-credit-void transaction. Does NOT call db.transaction()
+ * itself -- callers must already be inside a transaction. Pure refactor: this
+ * contains every line of logic `voidRewardEvent` used to run inline, with
+ * zero behavior change.
+ */
+export async function voidRewardEventInTransaction(
+	tx: DatabaseTransaction,
+	args: {
+		userId: string;
+		rewardEventId: string;
+		expectedRevisionNo: number;
+		reasonNote: string | null;
+		idempotencyKey: string;
+	},
+): Promise<{ event: RewardEventReadModel; idempotentReplay: boolean }> {
+	const {
+		userId,
+		rewardEventId,
+		expectedRevisionNo,
+		reasonNote,
+		idempotencyKey,
+	} = args;
+
+	const [eventPeek] = await tx
+		.select()
+		.from(rewardEvents)
+		.where(
+			and(eq(rewardEvents.id, rewardEventId), eq(rewardEvents.userId, userId)),
+		)
+		.limit(1);
+	if (!eventPeek) {
+		throw new RewardError(
+			"REWARD_EVENT_NOT_FOUND",
+			`Reward event "${rewardEventId}" not found`,
+		);
+	}
+
+	// A reward event has at most two revisions (#1 CREATE, then a single
+	// terminal VOID). The VOID always copies forward revision #1's
+	// occurred_at -- exactly mirroring how the canonical VOID layer itself
+	// never accepts a fresh occurredAt for a REDEEM_PURCHASE's canonical
+	// transaction, it always copies the previous canonical revision's
+	// occurred_at forward. Deriving it uniformly here (for every event
+	// type, not just REDEEM_PURCHASE) keeps the projection's occurred_at
+	// always in lockstep with the canonical layer's own behavior.
+	const [createRev] = await tx
+		.select({ occurredAt: rewardEventRevisions.occurredAt })
+		.from(rewardEventRevisions)
+		.where(
+			and(
+				eq(rewardEventRevisions.rewardEventId, rewardEventId),
+				eq(rewardEventRevisions.revisionNo, 1),
+			),
+		)
+		.limit(1);
+	if (!createRev) {
+		throw new RewardError(
+			"REWARD_INVALID_STATE",
+			"Reward event has no CREATE revision",
+		);
+	}
+	const occurredAt = createRev.occurredAt;
+
+	const tryReplay = async (
+		existingRev: typeof rewardEventRevisions.$inferSelect,
+	) => {
+		if (existingRev.operation !== "VOID") {
+			throw new RewardError(
+				"REWARD_IDEMPOTENCY_CONFLICT",
+				"Idempotency key was already used for a different reward event operation",
+			);
+		}
+		const candidateFingerprint = await calculateRewardEventVoidFingerprint({
+			userId,
+			rewardEventId,
+			expectedRevisionNo,
+			occurredAt,
+			reasonNote,
+		});
+		if (candidateFingerprint !== existingRev.revisionFingerprint) {
+			throw new RewardError(
+				"REWARD_IDEMPOTENCY_CONFLICT",
+				"Idempotency key reused with a different reward event VOID payload",
+			);
+		}
+		const readModel = await buildRewardEventReadModelByIdInTransaction(
+			tx,
+			rewardEventId,
+		);
+		if (!readModel) {
+			throw new RewardError(
+				"REWARD_INVALID_STATE",
+				"Failed to build replayed reward event read model",
+			);
+		}
+		return { event: readModel, idempotentReplay: true as const };
+	};
+
+	const [earlyRev] = await tx
+		.select()
+		.from(rewardEventRevisions)
+		.where(
+			and(
+				eq(rewardEventRevisions.rewardEventId, rewardEventId),
+				eq(rewardEventRevisions.idempotencyKey, idempotencyKey),
+			),
+		)
+		.limit(1);
+	if (earlyRev) return tryReplay(earlyRev);
+
+	// Global lock order: reward account -> reward event -> ledger accounts.
+	await lockActiveRewardAccountInTransaction(
+		tx,
+		userId,
+		eventPeek.rewardAccountId,
+	);
+
+	const secondRev = earlyRev
+		? earlyRev
+		: (
+				await tx
+					.select()
+					.from(rewardEventRevisions)
+					.where(
+						and(
+							eq(rewardEventRevisions.rewardEventId, rewardEventId),
+							eq(rewardEventRevisions.idempotencyKey, idempotencyKey),
+						),
+					)
+					.limit(1)
+			)[0];
+	if (secondRev) return tryReplay(secondRev);
+
+	const [latestRev] = await tx
+		.select()
+		.from(rewardEventRevisions)
+		.where(eq(rewardEventRevisions.rewardEventId, rewardEventId))
+		.orderBy(desc(rewardEventRevisions.revisionNo))
+		.limit(1);
+	if (!latestRev) {
+		throw new RewardError(
+			"REWARD_INVALID_STATE",
+			"Reward event has no revisions",
+		);
+	}
+	if (latestRev.operation === "VOID") {
+		throw new RewardError(
+			"REWARD_EVENT_NOT_ACTIVE",
+			`Reward event "${rewardEventId}" is already VOID`,
+		);
+	}
+	if (latestRev.revisionNo !== expectedRevisionNo) {
+		throw new RewardError(
+			"REWARD_EVENT_REVISION_CONFLICT",
+			`Expected reward event revision ${expectedRevisionNo} but found ${latestRev.revisionNo}`,
+		);
+	}
+
+	// Pre-check: voiding a positive-contribution event may derive a
+	// negative balance if later negative events already consumed those
+	// points -- reject early with a clear error rather than relying only
+	// on the deferred DB trigger.
+	if (POSITIVE_EVENT_TYPES.has(eventPeek.eventType as RewardEventType)) {
+		const currentBalance = await deriveRewardPointBalanceInTransaction(
+			tx,
+			eventPeek.rewardAccountId,
+		);
+		const thisEventUnits = parsePointQuantity(latestRev.pointAmount).units;
+		if (currentBalance - thisEventUnits < 0n) {
+			throw new RewardError(
+				"REWARD_INSUFFICIENT_POINTS",
+				`Cannot VOID reward event "${rewardEventId}": later activity has already consumed these points`,
+			);
+		}
+	}
+
+	let canonicalRevisionId: string | null = null;
+	if (eventPeek.eventType === "REDEEM_PURCHASE") {
+		if (!eventPeek.canonicalTransactionId || !latestRev.canonicalRevisionId) {
+			throw new RewardError(
+				"REWARD_INVALID_STATE",
+				"Reward purchase event is missing its canonical transaction binding",
+			);
+		}
+		const boundRes = await voidCanonicalTransactionWithLedgerInTransaction({
+			tx,
+			userId,
+			transactionId: eventPeek.canonicalTransactionId,
+			expectedRevisionNo: 1,
+			idempotencyKey,
+			reasonCode: "REWARD_FUNDED_PURCHASE_VOID",
+			reasonNote: reasonNote ?? null,
+			source: { type: "REWARD_FUNDED_PURCHASE", ref: idempotencyKey },
+		});
+		canonicalRevisionId = boundRes.revisionId;
+	}
+
+	const fingerprint = await calculateRewardEventVoidFingerprint({
+		userId,
+		rewardEventId,
+		expectedRevisionNo,
+		occurredAt,
+		reasonNote,
+	});
+
+	await tx.insert(rewardEventRevisions).values({
+		userId,
+		rewardEventId,
+		revisionNo: latestRev.revisionNo + 1,
+		previousRevisionId: latestRev.id,
+		operation: "VOID",
+		pointAmount: latestRev.pointAmount,
+		conversionRate: latestRev.conversionRate,
+		economicAmount: latestRev.economicAmount,
+		purchaseCategory: latestRev.purchaseCategory,
+		shortTermGoalId: latestRev.shortTermGoalId,
+		merchant: latestRev.merchant,
+		description: latestRev.description,
+		reasonNote,
+		occurredAt,
+		canonicalRevisionId,
+		sourceType: latestRev.sourceType,
+		sourceRef: latestRev.sourceRef,
+		idempotencyKey,
+		revisionFingerprint: fingerprint,
+	});
+
+	const readModel = await buildRewardEventReadModelByIdInTransaction(
+		tx,
+		rewardEventId,
+	);
+	if (!readModel) {
+		throw new RewardError(
+			"REWARD_INVALID_STATE",
+			"Failed to build voided reward event read model",
+		);
+	}
+	return { event: readModel, idempotentReplay: false };
+}
+
+/**
+ * Public VOID API: validates inputs, then delegates to
+ * `voidRewardEventInTransaction` inside a managed transaction. Thin wrapper
+ * only -- zero behavior change from the pre-extraction implementation.
+ */
 export async function voidRewardEvent(
 	params: VoidRewardEventParams,
 ): Promise<{ event: RewardEventReadModel; idempotentReplay: boolean }> {
@@ -1001,226 +1250,15 @@ export async function voidRewardEvent(
 	);
 	const idempotencyKey = validateRewardIdempotencyKey(params.idempotencyKey);
 
-	return runRewardsTransaction(params.db, async (tx) => {
-		const [eventPeek] = await tx
-			.select()
-			.from(rewardEvents)
-			.where(
-				and(
-					eq(rewardEvents.id, rewardEventId),
-					eq(rewardEvents.userId, userId),
-				),
-			)
-			.limit(1);
-		if (!eventPeek) {
-			throw new RewardError(
-				"REWARD_EVENT_NOT_FOUND",
-				`Reward event "${rewardEventId}" not found`,
-			);
-		}
-
-		// A reward event has at most two revisions (#1 CREATE, then a single
-		// terminal VOID). The VOID always copies forward revision #1's
-		// occurred_at -- exactly mirroring how the canonical VOID layer itself
-		// never accepts a fresh occurredAt for a REDEEM_PURCHASE's canonical
-		// transaction, it always copies the previous canonical revision's
-		// occurred_at forward. Deriving it uniformly here (for every event
-		// type, not just REDEEM_PURCHASE) keeps the projection's occurred_at
-		// always in lockstep with the canonical layer's own behavior.
-		const [createRev] = await tx
-			.select({ occurredAt: rewardEventRevisions.occurredAt })
-			.from(rewardEventRevisions)
-			.where(
-				and(
-					eq(rewardEventRevisions.rewardEventId, rewardEventId),
-					eq(rewardEventRevisions.revisionNo, 1),
-				),
-			)
-			.limit(1);
-		if (!createRev) {
-			throw new RewardError(
-				"REWARD_INVALID_STATE",
-				"Reward event has no CREATE revision",
-			);
-		}
-		const occurredAt = createRev.occurredAt;
-
-		const tryReplay = async (
-			existingRev: typeof rewardEventRevisions.$inferSelect,
-		) => {
-			if (existingRev.operation !== "VOID") {
-				throw new RewardError(
-					"REWARD_IDEMPOTENCY_CONFLICT",
-					"Idempotency key was already used for a different reward event operation",
-				);
-			}
-			const candidateFingerprint = await calculateRewardEventVoidFingerprint({
-				userId,
-				rewardEventId,
-				expectedRevisionNo,
-				occurredAt,
-				reasonNote,
-			});
-			if (candidateFingerprint !== existingRev.revisionFingerprint) {
-				throw new RewardError(
-					"REWARD_IDEMPOTENCY_CONFLICT",
-					"Idempotency key reused with a different reward event VOID payload",
-				);
-			}
-			const readModel = await buildRewardEventReadModelByIdInTransaction(
-				tx,
-				rewardEventId,
-			);
-			if (!readModel) {
-				throw new RewardError(
-					"REWARD_INVALID_STATE",
-					"Failed to build replayed reward event read model",
-				);
-			}
-			return { event: readModel, idempotentReplay: true as const };
-		};
-
-		const [earlyRev] = await tx
-			.select()
-			.from(rewardEventRevisions)
-			.where(
-				and(
-					eq(rewardEventRevisions.rewardEventId, rewardEventId),
-					eq(rewardEventRevisions.idempotencyKey, idempotencyKey),
-				),
-			)
-			.limit(1);
-		if (earlyRev) return tryReplay(earlyRev);
-
-		// Global lock order: reward account -> reward event -> ledger accounts.
-		await lockActiveRewardAccountInTransaction(
-			tx,
-			userId,
-			eventPeek.rewardAccountId,
-		);
-
-		const secondRev = earlyRev
-			? earlyRev
-			: (
-					await tx
-						.select()
-						.from(rewardEventRevisions)
-						.where(
-							and(
-								eq(rewardEventRevisions.rewardEventId, rewardEventId),
-								eq(rewardEventRevisions.idempotencyKey, idempotencyKey),
-							),
-						)
-						.limit(1)
-				)[0];
-		if (secondRev) return tryReplay(secondRev);
-
-		const [latestRev] = await tx
-			.select()
-			.from(rewardEventRevisions)
-			.where(eq(rewardEventRevisions.rewardEventId, rewardEventId))
-			.orderBy(desc(rewardEventRevisions.revisionNo))
-			.limit(1);
-		if (!latestRev) {
-			throw new RewardError(
-				"REWARD_INVALID_STATE",
-				"Reward event has no revisions",
-			);
-		}
-		if (latestRev.operation === "VOID") {
-			throw new RewardError(
-				"REWARD_EVENT_NOT_ACTIVE",
-				`Reward event "${rewardEventId}" is already VOID`,
-			);
-		}
-		if (latestRev.revisionNo !== expectedRevisionNo) {
-			throw new RewardError(
-				"REWARD_EVENT_REVISION_CONFLICT",
-				`Expected reward event revision ${expectedRevisionNo} but found ${latestRev.revisionNo}`,
-			);
-		}
-
-		// Pre-check: voiding a positive-contribution event may derive a
-		// negative balance if later negative events already consumed those
-		// points -- reject early with a clear error rather than relying only
-		// on the deferred DB trigger.
-		if (POSITIVE_EVENT_TYPES.has(eventPeek.eventType as RewardEventType)) {
-			const currentBalance = await deriveRewardPointBalanceInTransaction(
-				tx,
-				eventPeek.rewardAccountId,
-			);
-			const thisEventUnits = parsePointQuantity(latestRev.pointAmount).units;
-			if (currentBalance - thisEventUnits < 0n) {
-				throw new RewardError(
-					"REWARD_INSUFFICIENT_POINTS",
-					`Cannot VOID reward event "${rewardEventId}": later activity has already consumed these points`,
-				);
-			}
-		}
-
-		let canonicalRevisionId: string | null = null;
-		if (eventPeek.eventType === "REDEEM_PURCHASE") {
-			if (!eventPeek.canonicalTransactionId || !latestRev.canonicalRevisionId) {
-				throw new RewardError(
-					"REWARD_INVALID_STATE",
-					"Reward purchase event is missing its canonical transaction binding",
-				);
-			}
-			const boundRes = await voidCanonicalTransactionWithLedgerInTransaction({
-				tx,
-				userId,
-				transactionId: eventPeek.canonicalTransactionId,
-				expectedRevisionNo: 1,
-				idempotencyKey,
-				reasonCode: "REWARD_FUNDED_PURCHASE_VOID",
-				reasonNote: reasonNote ?? null,
-				source: { type: "REWARD_FUNDED_PURCHASE", ref: idempotencyKey },
-			});
-			canonicalRevisionId = boundRes.revisionId;
-		}
-
-		const fingerprint = await calculateRewardEventVoidFingerprint({
+	return runRewardsTransaction(params.db, (tx) =>
+		voidRewardEventInTransaction(tx, {
 			userId,
 			rewardEventId,
 			expectedRevisionNo,
-			occurredAt,
 			reasonNote,
-		});
-
-		await tx.insert(rewardEventRevisions).values({
-			userId,
-			rewardEventId,
-			revisionNo: latestRev.revisionNo + 1,
-			previousRevisionId: latestRev.id,
-			operation: "VOID",
-			pointAmount: latestRev.pointAmount,
-			conversionRate: latestRev.conversionRate,
-			economicAmount: latestRev.economicAmount,
-			purchaseCategory: latestRev.purchaseCategory,
-			shortTermGoalId: latestRev.shortTermGoalId,
-			merchant: latestRev.merchant,
-			description: latestRev.description,
-			reasonNote,
-			occurredAt,
-			canonicalRevisionId,
-			sourceType: latestRev.sourceType,
-			sourceRef: latestRev.sourceRef,
 			idempotencyKey,
-			revisionFingerprint: fingerprint,
-		});
-
-		const readModel = await buildRewardEventReadModelByIdInTransaction(
-			tx,
-			rewardEventId,
-		);
-		if (!readModel) {
-			throw new RewardError(
-				"REWARD_INVALID_STATE",
-				"Failed to build voided reward event read model",
-			);
-		}
-		return { event: readModel, idempotentReplay: false };
-	});
+		}),
+	);
 }
 
 // ============================================================================

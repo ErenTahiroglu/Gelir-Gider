@@ -1,5 +1,6 @@
 export * from "./auth";
 export * from "./budget";
+export * from "./campaigns";
 export * from "./credit-card-ledger";
 export * from "./credit-card-splits";
 export * from "./credit-cards";
