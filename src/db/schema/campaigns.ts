@@ -940,3 +940,76 @@ export const campaignReviewCandidateRevisions = pgTable(
 		),
 	],
 );
+
+// ============================================================================
+// Campaign Review Candidate Idempotency Receipts (Immutable, Phase 16-R3)
+// Section 3: the single authoritative idempotency-key namespace across all
+// three review-candidate mutations (CREATE/APPLY/DISMISS). Replaces/
+// supplements the ad-hoc per-operation lookup that used to be done directly
+// against campaign_review_candidate_revisions.idempotency_key.
+// ============================================================================
+
+export const CAMPAIGN_REVIEW_CANDIDATE_RECEIPT_OPERATIONS = [
+	"CREATE",
+	"APPLY",
+	"DISMISS",
+] as const;
+export type CampaignReviewCandidateReceiptOperation =
+	(typeof CAMPAIGN_REVIEW_CANDIDATE_RECEIPT_OPERATIONS)[number];
+
+export const campaignReviewCandidateIdempotencyReceipts = pgTable(
+	"campaign_review_candidate_idempotency_receipts",
+	{
+		id: uuid("id").defaultRandom().primaryKey().notNull(),
+		userId: uuid("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "restrict" }),
+		idempotencyKey: varchar("idempotency_key", { length: 128 }).notNull(),
+		operation: varchar("operation", { length: 10 }).notNull(),
+		requestFingerprint: varchar("request_fingerprint", {
+			length: 64,
+		}).notNull(),
+		candidateId: uuid("candidate_id")
+			.notNull()
+			.references(() => campaignReviewCandidates.id, { onDelete: "restrict" }),
+		candidateRevisionId: uuid("candidate_revision_id")
+			.notNull()
+			.references(() => campaignReviewCandidateRevisions.id, {
+				onDelete: "restrict",
+			}),
+		campaignRevisionId: uuid("campaign_revision_id").references(
+			() => campaignPeriodRevisions.id,
+			{ onDelete: "restrict" },
+		),
+		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+			.defaultNow()
+			.notNull(),
+	},
+	(table) => [
+		uniqueIndex(
+			"campaign_review_candidate_idempotency_receipts_user_key_idx",
+		).on(table.userId, table.idempotencyKey),
+		index("campaign_review_candidate_idempotency_receipts_candidate_idx").on(
+			table.candidateId,
+		),
+		index("campaign_review_candidate_idempotency_receipts_campaign_rev_idx").on(
+			table.campaignRevisionId,
+		),
+		check(
+			"campaign_review_candidate_idempotency_receipts_op_check",
+			sql`${table.operation} IN ('CREATE', 'APPLY', 'DISMISS')`,
+		),
+		check(
+			"campaign_review_candidate_idempotency_receipts_apply_shape_check",
+			sql`(${table.operation} = 'APPLY') = (${table.campaignRevisionId} IS NOT NULL)`,
+		),
+		check(
+			"campaign_review_candidate_idempotency_receipts_fingerprint_check",
+			sql`${table.requestFingerprint} ~ '^[0-9a-f]{64}$'`,
+		),
+		check(
+			"campaign_review_candidate_idempotency_receipts_idempotency_check",
+			sql`${table.idempotencyKey} = btrim(${table.idempotencyKey}) AND length(${table.idempotencyKey}) >= 1 AND length(${table.idempotencyKey}) <= 128`,
+		),
+	],
+);

@@ -212,6 +212,7 @@ function createQueueTx(responses: unknown[][]): {
 				insertedValues.push(v);
 				return obj;
 			},
+			onConflictDoNothing: () => obj,
 			returning: () => obj,
 			// biome-ignore lint/suspicious/noThenProperty: intentional thenable mock query builder (mirrors real drizzle chain, which is also thenable)
 			then: (
@@ -311,6 +312,33 @@ function makeCandidateRevisionRow(
 	return { ...defaults, ...overrides };
 }
 
+const RECEIPT_ID = "88888888-aaaa-aaaa-aaaa-888888888888";
+const APPLY_REVISION_ID = "99999999-9999-9999-9999-999999999999";
+const DISMISS_REVISION_ID = "aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa";
+const APPLIED_CAMPAIGN_REVISION_ID = "bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb";
+
+/**
+ * Phase 16-R3: a row shaped like
+ * campaign_review_candidate_idempotency_receipts.$inferSelect, as returned
+ * by a `.select()` against that table.
+ */
+function makeReceiptRow(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	const defaults = {
+		id: RECEIPT_ID,
+		userId: USER_ID,
+		idempotencyKey: "stored-key",
+		operation: "CREATE",
+		requestFingerprint: "b".repeat(64),
+		candidateId: CANDIDATE_ID,
+		candidateRevisionId: CANDIDATE_REVISION_ID,
+		campaignRevisionId: null,
+		createdAt: new Date("2024-09-01T00:00:00Z"),
+	};
+	return { ...defaults, ...overrides };
+}
+
 // ============================================================================
 // Section A: applyCampaignReviewCandidate must invoke db.transaction exactly
 // once per call -- proving the campaign AMEND no longer opens a second,
@@ -368,11 +396,14 @@ describe("applyCampaignReviewCandidate transaction atomicity (Section A)", () =>
 });
 
 // ============================================================================
-// Section D: CREATE/APPLY/DISMISS idempotency replay must resolve the EXACT
-// historical revision that owns the key, not whatever is currently latest.
+// Phase 16-R3, Section 13: the idempotency receipt is now THE authoritative
+// lookup for all three mutations. Every scenario below traces the EXACT
+// query sequence the current source issues (receipt-table lookup(s) first,
+// legacy per-operation revision-table fallback second, mutable-state checks
+// LAST), proving the ordering the spec requires -- not merely the outcome.
 // ============================================================================
 
-describe("createCampaignReviewCandidate historical replay (Section C/D)", () => {
+describe("createCampaignReviewCandidate historical replay (Phase 16-R3)", () => {
 	const createParams = {
 		userId: USER_ID,
 		campaignPeriodId: CAMPAIGN_PERIOD_ID,
@@ -470,31 +501,29 @@ describe("createCampaignReviewCandidate historical replay (Section C/D)", () => 
 		});
 	}
 
-	function queueThroughEarlyReplayCheck() {
-		return [
-			[periodRow], // 1. period select ... .for("update")
-			[{ provider: "TEST_BANK" }], // 2. family provider select
-			[periodRow], // 3a. getLatestRevisionInTransaction: period select
-			[latestPeriodRevRow], // 3b. latest period revision select
-			[], // 3c. cards select
-			[snapshotRow], // 4. source snapshot select
-		];
-	}
-
-	it("exact retry (same key, byte-identical request) returns the historical PENDING CREATE revision", async () => {
+	// Scenario A: exact retry while the campaign is still ACTIVE. The receipt
+	// is found on the FIRST lookup -- proving the replay short-circuits
+	// before ever touching campaign_periods.
+	it("A: exact retry (receipt found immediately) returns the historical PENDING CREATE revision without ever locking campaign_periods", async () => {
 		const occurredAt = new Date("2024-09-01T00:00:00Z");
 		const fingerprint = await expectedCreateFingerprint(occurredAt);
 		const candidateRow = makeCandidateRow();
-		const revisionRow = makeCandidateRevisionRow({
+		const createRevisionRow = makeCandidateRevisionRow({
 			idempotencyKey: "create-key-1",
 			revisionFingerprint: fingerprint,
 		});
+		const receiptRow = makeReceiptRow({
+			operation: "CREATE",
+			requestFingerprint: fingerprint,
+			candidateId: CANDIDATE_ID,
+			candidateRevisionId: CANDIDATE_REVISION_ID,
+			campaignRevisionId: null,
+		});
 
 		const responses: unknown[][] = [
-			...queueThroughEarlyReplayCheck(),
-			[revisionRow], // 5. existingRevByKey select -> found
-			[candidateRow], // 6. revision-scoped candidate select
-			[revisionRow], // 7. revision-scoped revision select
+			[receiptRow], // 1. receipt select -> found immediately
+			[candidateRow], // 2. buildReplayResultFromReceipt: candidate select
+			[createRevisionRow], // 3. buildReplayResultFromReceipt: revision select
 		];
 		const { db } = createQueueDb(responses);
 		const { createCampaignReviewCandidate } = await import(
@@ -512,19 +541,73 @@ describe("createCampaignReviewCandidate historical replay (Section C/D)", () => 
 		expect(result.status).toBe("PENDING");
 	});
 
-	it("same key + changed occurredAt is rejected as CAMPAIGN_IDEMPOTENCY_CONFLICT", async () => {
-		const storedFingerprint = await expectedCreateFingerprint(
-			new Date("2024-09-01T00:00:00Z"),
-		);
-		const revisionRow = makeCandidateRevisionRow({
+	// Scenario B (Defect 1 regression -- the core fix of this phase):
+	// CREATE while ACTIVE -> APPLY -> END the campaign -> retry the ORIGINAL
+	// CREATE key. No receipt exists yet for this key in this scenario (it
+	// predates migration 0051), so the legacy fallback resolves it and
+	// lazily backfills a receipt. Crucially, the queued response sequence
+	// contains NO campaign_periods lock, NO lifecycle-status read, and NO
+	// snapshot/provider read at all -- if the implementation regressed to
+	// checking ACTIVE status before this replay, it would issue additional
+	// queries the queue does not have, and the call would reject instead of
+	// resolving.
+	it("B: CREATE retry after APPLY+END the campaign still returns the historical CREATE/PENDING snapshot, never touching campaign lifecycle (Defect 1)", async () => {
+		const occurredAt = new Date("2024-09-01T00:00:00Z");
+		const fingerprint = await expectedCreateFingerprint(occurredAt);
+		const candidateRow = makeCandidateRow();
+		const createRevisionRow = makeCandidateRevisionRow({
 			idempotencyKey: "create-key-1",
-			revisionFingerprint: storedFingerprint,
+			revisionFingerprint: fingerprint,
+			revisionNo: 1,
+			operation: "CREATE",
+			status: "PENDING",
+		});
+		const backfilledReceiptRow = makeReceiptRow({
+			operation: "CREATE",
+			requestFingerprint: fingerprint,
+			candidateId: CANDIDATE_ID,
+			candidateRevisionId: CANDIDATE_REVISION_ID,
+			campaignRevisionId: null,
 		});
 
 		const responses: unknown[][] = [
-			...queueThroughEarlyReplayCheck(),
-			[revisionRow], // existingRevByKey select -> found, but fingerprint
-			// was computed for a DIFFERENT occurredAt than this call uses.
+			[], // 1. receipt select -> not found
+			[createRevisionRow], // 2. legacy revision select -> found (pre-0051 CREATE)
+			[], // 3. INSERT ... ON CONFLICT DO NOTHING (backfill)
+			[backfilledReceiptRow], // 4. re-read confirms the backfilled receipt
+			[candidateRow], // 5. buildReplayResultFromReceipt: candidate select
+			[createRevisionRow], // 6. buildReplayResultFromReceipt: revision select
+		];
+		const { db } = createQueueDb(responses);
+		const { createCampaignReviewCandidate } = await import(
+			"../src/campaigns/review-candidates"
+		);
+
+		const result = await createCampaignReviewCandidate({
+			...createParams,
+			db,
+			occurredAt,
+		});
+
+		expect(result.revisionNo).toBe(1);
+		expect(result.operation).toBe("CREATE");
+		expect(result.status).toBe("PENDING");
+	});
+
+	// Scenario D: same key, changed occurredAt -> the fingerprint no longer
+	// matches the receipt's stored fingerprint -> CONFLICT, thrown at the
+	// very first lookup (before any further query).
+	it("D: same key + changed occurredAt is rejected as CAMPAIGN_IDEMPOTENCY_CONFLICT at the very first receipt lookup", async () => {
+		const storedFingerprint = await expectedCreateFingerprint(
+			new Date("2024-09-01T00:00:00Z"),
+		);
+		const receiptRow = makeReceiptRow({
+			operation: "CREATE",
+			requestFingerprint: storedFingerprint,
+		});
+
+		const responses: unknown[][] = [
+			[receiptRow], // 1. receipt select -> found, but for a DIFFERENT occurredAt
 		];
 		const { db } = createQueueDb(responses);
 		const { createCampaignReviewCandidate } = await import(
@@ -542,71 +625,49 @@ describe("createCampaignReviewCandidate historical replay (Section C/D)", () => 
 		} satisfies Partial<CampaignError>);
 	});
 
-	it("same key + changed sourceSnapshotId is rejected as CAMPAIGN_IDEMPOTENCY_CONFLICT", async () => {
-		const occurredAt = new Date("2024-09-01T00:00:00Z");
-		const storedFingerprint = await expectedCreateFingerprint(occurredAt);
-		const revisionRow = makeCandidateRevisionRow({
-			idempotencyKey: "create-key-1",
-			revisionFingerprint: storedFingerprint,
-		});
-		const otherSnapshotId = "99999999-9999-9999-9999-999999999999";
-		const otherSnapshotRow = {
-			id: otherSnapshotId,
-			userId: USER_ID,
-			provider: "TEST_BANK",
-			sourceType: "MANUAL",
-		};
-
-		const responses: unknown[][] = [
-			[periodRow],
-			[{ provider: "TEST_BANK" }],
-			[periodRow],
-			[latestPeriodRevRow],
-			[],
-			[otherSnapshotRow],
-			[revisionRow], // stored fingerprint bound to the ORIGINAL sourceSnapshotId
-		];
-		const { db } = createQueueDb(responses);
-		const { createCampaignReviewCandidate } = await import(
-			"../src/campaigns/review-candidates"
-		);
-
-		await expect(
-			createCampaignReviewCandidate({
-				...createParams,
-				db,
-				occurredAt,
-				sourceSnapshotId: otherSnapshotId, // changed
-			}),
-		).rejects.toMatchObject({
-			code: "CAMPAIGN_IDEMPOTENCY_CONFLICT",
-		} satisfies Partial<CampaignError>);
-	});
-
-	it("CREATE after a later APPLY still returns the historical PENDING CREATE revision via the original key (Section D)", async () => {
-		// Even though buildCampaignReviewCandidateReadModelForRevisionInTransaction
-		// is now used (resolving the EXACT revision id the key owns) instead of
-		// buildLatestReadModelInTransaction (which would resolve whatever is
-		// CURRENTLY latest -- e.g. an APPLY row from a later operation), the
-		// mock only models the revision-scoped query directly. This proves the
-		// code path taken (revision-scoped, not latest-scoped) returns the
-		// CREATE snapshot when fed the CREATE row for that exact revision id.
+	// Scenario C (Section 9, dedup-alias durability): request A creates
+	// candidate C; request B (same semantic proposal, different key) hits
+	// the get-or-create dedup path and must durably bind its OWN key to C's
+	// CREATE revision, not merely return it.
+	it("C part 1: a dedup-alias request (no receipt/legacy match, hits the semantic-hash PENDING match) durably binds its own key to the resolved candidate", async () => {
 		const occurredAt = new Date("2024-09-01T00:00:00Z");
 		const fingerprint = await expectedCreateFingerprint(occurredAt);
 		const candidateRow = makeCandidateRow();
 		const createRevisionRow = makeCandidateRevisionRow({
-			idempotencyKey: "create-key-1",
-			revisionFingerprint: fingerprint,
+			idempotencyKey: "create-key-A", // owned by the ORIGINAL request, not this one
+			revisionFingerprint: "c".repeat(64),
 			revisionNo: 1,
 			operation: "CREATE",
 			status: "PENDING",
 		});
+		const boundReceiptRow = makeReceiptRow({
+			idempotencyKey: "create-key-B",
+			operation: "CREATE",
+			requestFingerprint: fingerprint,
+			candidateId: CANDIDATE_ID,
+			candidateRevisionId: CANDIDATE_REVISION_ID,
+			campaignRevisionId: null,
+		});
 
 		const responses: unknown[][] = [
-			...queueThroughEarlyReplayCheck(),
-			[createRevisionRow], // existingRevByKey resolves to the CREATE row itself
-			[candidateRow],
-			[createRevisionRow],
+			[], // 1. receipt select (early) -> not found
+			[], // 2. legacy select (early) -> not found
+			[periodRow], // 3. lock campaign_periods FOR UPDATE
+			[], // 4. receipt select (locked) -> not found
+			[], // 5. legacy select (locked) -> not found
+			[{ provider: "TEST_BANK" }], // 6. family provider select
+			[periodRow], // 7. getLatestRevisionInTransaction: period select
+			[latestPeriodRevRow], // 8. latest period revision select (ACTIVE)
+			[], // 9. cards select
+			[snapshotRow], // 10. source snapshot select
+			[candidateRow], // 11. existingCandidates select (same candidateHash)
+			[{ id: CANDIDATE_REVISION_ID }], // 12. buildLatestReadModelInTransaction: latest id
+			[candidateRow], // 13. revision-scoped candidate select
+			[createRevisionRow], // 14. revision-scoped revision select -> PENDING
+			[], // 15. bindCandidateReceipt: INSERT ... ON CONFLICT DO NOTHING
+			[boundReceiptRow], // 16. bindCandidateReceipt: re-read confirms
+			[candidateRow], // 17. buildReplayResultFromReceipt: candidate select
+			[createRevisionRow], // 18. buildReplayResultFromReceipt: revision select
 		];
 		const { db } = createQueueDb(responses);
 		const { createCampaignReviewCandidate } = await import(
@@ -617,6 +678,54 @@ describe("createCampaignReviewCandidate historical replay (Section C/D)", () => 
 			...createParams,
 			db,
 			occurredAt,
+			idempotencyKey: "create-key-B",
+		});
+
+		expect(result.candidateId).toBe(CANDIDATE_ID);
+		expect(result.status).toBe("PENDING");
+	});
+
+	it("C part 2: retrying the dedup-alias key later (after the candidate has since moved on) still replays the durably-bound historical CREATE/PENDING snapshot via the receipt found immediately", async () => {
+		// This models the state AFTER part 1's bind: key "create-key-B" now
+		// has its OWN receipt row pointing at candidate C's original CREATE
+		// revision. A later retry finds that receipt on the very FIRST
+		// lookup -- no campaign_periods/lifecycle query at all -- regardless
+		// of what has since happened to candidate C (APPLIED, campaign
+		// HIDDEN/ENDED, etc).
+		const occurredAt = new Date("2024-09-01T00:00:00Z");
+		const fingerprint = await expectedCreateFingerprint(occurredAt);
+		const candidateRow = makeCandidateRow();
+		const originalCreateRevisionRow = makeCandidateRevisionRow({
+			idempotencyKey: "create-key-A",
+			revisionFingerprint: "c".repeat(64),
+			revisionNo: 1,
+			operation: "CREATE",
+			status: "PENDING",
+		});
+		const boundReceiptRow = makeReceiptRow({
+			idempotencyKey: "create-key-B",
+			operation: "CREATE",
+			requestFingerprint: fingerprint,
+			candidateId: CANDIDATE_ID,
+			candidateRevisionId: CANDIDATE_REVISION_ID,
+			campaignRevisionId: null,
+		});
+
+		const responses: unknown[][] = [
+			[boundReceiptRow], // 1. receipt select -> found immediately
+			[candidateRow], // 2. candidate select
+			[originalCreateRevisionRow], // 3. revision select -> STILL the original CREATE/PENDING snapshot
+		];
+		const { db } = createQueueDb(responses);
+		const { createCampaignReviewCandidate } = await import(
+			"../src/campaigns/review-candidates"
+		);
+
+		const result = await createCampaignReviewCandidate({
+			...createParams,
+			db,
+			occurredAt,
+			idempotencyKey: "create-key-B",
 		});
 
 		expect(result.revisionNo).toBe(1);
@@ -624,17 +733,21 @@ describe("createCampaignReviewCandidate historical replay (Section C/D)", () => 
 		expect(result.status).toBe("PENDING");
 	});
 
-	it("rejects candidate creation against a non-ACTIVE campaign (Section E, app-level check)", async () => {
+	it("rejects candidate creation against a non-ACTIVE campaign once past both replay checks (Section E, app-level check)", async () => {
 		const nonActiveLatestRev = {
 			...latestPeriodRevRow,
 			lifecycleStatus: "REVIEW_REQUIRED",
 		};
 		const responses: unknown[][] = [
-			[periodRow],
-			[{ provider: "TEST_BANK" }],
-			[periodRow],
-			[nonActiveLatestRev],
-			[],
+			[], // 1. receipt select (early) -> not found
+			[], // 2. legacy select (early) -> not found
+			[periodRow], // 3. lock
+			[], // 4. receipt select (locked) -> not found
+			[], // 5. legacy select (locked) -> not found
+			[{ provider: "TEST_BANK" }], // 6. family select
+			[periodRow], // 7. getLatestRevisionInTransaction: period select
+			[nonActiveLatestRev], // 8. latest revision select -> non-ACTIVE
+			[], // 9. cards select
 		];
 		const { db } = createQueueDb(responses);
 		const { createCampaignReviewCandidate } = await import(
@@ -656,12 +769,16 @@ describe("createCampaignReviewCandidate historical replay (Section C/D)", () => 
 			sourceType: "OFFICIAL_PUBLIC_PAGE",
 		};
 		const responses: unknown[][] = [
-			[periodRow],
-			[{ provider: "TEST_BANK" }],
-			[periodRow],
-			[latestPeriodRevRow],
-			[],
-			[mismatchedSnapshot],
+			[], // 1. receipt select (early) -> not found
+			[], // 2. legacy select (early) -> not found
+			[periodRow], // 3. lock
+			[], // 4. receipt select (locked) -> not found
+			[], // 5. legacy select (locked) -> not found
+			[{ provider: "TEST_BANK" }], // 6. family select
+			[periodRow], // 7. getLatestRevisionInTransaction: period select
+			[latestPeriodRevRow], // 8. latest revision select -> ACTIVE
+			[], // 9. cards select
+			[mismatchedSnapshot], // 10. source snapshot select
 		];
 		const { db } = createQueueDb(responses);
 		const { createCampaignReviewCandidate } = await import(
@@ -676,10 +793,175 @@ describe("createCampaignReviewCandidate historical replay (Section C/D)", () => 
 	});
 });
 
-describe("dismissCampaignReviewCandidate historical replay (Section D)", () => {
-	it("exact replay returns the historical DISMISS revision via the revision-scoped builder", async () => {
+describe("applyCampaignReviewCandidate / dismissCampaignReviewCandidate historical replay (Phase 16-R3)", () => {
+	const periodRow = {
+		id: CAMPAIGN_PERIOD_ID,
+		userId: USER_ID,
+		campaignFamilyId: CAMPAIGN_FAMILY_ID,
+		periodKey: "2024-09",
+		createdAt: new Date("2024-01-01T00:00:00Z"),
+	};
+	const familyRow = {
+		id: CAMPAIGN_FAMILY_ID,
+		userId: USER_ID,
+		provider: "TEST_BANK",
+		familyKey: "test-family",
+		createdAt: new Date("2024-01-01T00:00:00Z"),
+	};
+
+	function makeAmendJoinRow(
+		overrides: Record<string, unknown> = {},
+	): Record<string, unknown> {
+		const revisionDefaults = {
+			id: APPLIED_CAMPAIGN_REVISION_ID,
+			campaignPeriodId: CAMPAIGN_PERIOD_ID,
+			revisionNo: 3,
+			operation: "AMEND",
+			lifecycleStatus: "ACTIVE",
+			visibility: "VISIBLE",
+			title: "Back to School",
+			startsOn: "2024-09-01",
+			endsOn: "2024-09-30",
+			ruleMode: "TOTAL_SPEND",
+			targetSpendAmount: "100.00",
+			requiredTransactionCount: null,
+			minimumTransactionAmount: null,
+			stepSpendAmount: null,
+			rewardPointsPerStep: null,
+			maxSteps: null,
+			rewardKind: "STATEMENT_CREDIT",
+			rewardAccountId: null,
+			expectedRewardPoints: null,
+			merchantScopeMode: "ALL_MERCHANTS",
+			requiredCanonicalMerchantNames: null,
+			allowedMccCodes: null,
+			rewardExpiryDate: null,
+			sourceSnapshotId: SOURCE_SNAPSHOT_ID,
+			parserType: null,
+			parserVersion: null,
+			parserConfidence: null,
+			note: null,
+			occurredAt: new Date("2024-09-05T00:00:00Z"),
+			createdAt: new Date("2024-09-05T00:00:00Z"),
+		};
+		return {
+			period: periodRow,
+			family: familyRow,
+			revision: { ...revisionDefaults, ...overrides },
+		};
+	}
+
+	// Scenario E (Section 4, cross-operation namespace guarantee): a CREATE
+	// idempotency key reused for an APPLY call must CONFLICT (operation
+	// mismatch), even though the candidate itself is genuinely PENDING.
+	it("E: a CREATE idempotency key reused for an APPLY call is rejected as CAMPAIGN_IDEMPOTENCY_CONFLICT", async () => {
 		const candidateRow = makeCandidateRow();
-		const pendingRevisionRow = makeCandidateRevisionRow();
+		const pendingRevisionRow = makeCandidateRevisionRow({ status: "PENDING" });
+		const receiptRowFromEarlierCreate = makeReceiptRow({
+			operation: "CREATE", // this key was originally used for a CREATE
+		});
+
+		const responses: unknown[][] = [
+			[candidateRow], // 1. candidate select ... .for("update")
+			[{ id: pendingRevisionRow.id }], // 2. buildLatestReadModelInTransaction: latest id
+			[candidateRow], // 3. revision-scoped candidate select
+			[pendingRevisionRow], // 4. revision-scoped revision select
+			[receiptRowFromEarlierCreate], // 5. receipt select -> found, but operation is CREATE not APPLY
+		];
+		const { db } = createQueueDb(responses);
+		const { applyCampaignReviewCandidate } = await import(
+			"../src/campaigns/review-candidates"
+		);
+
+		await expect(
+			applyCampaignReviewCandidate({
+				db,
+				userId: USER_ID,
+				candidateId: CANDIDATE_ID,
+				expectedCampaignRevisionNo: 3,
+				occurredAt: new Date("2024-09-10T00:00:00Z"),
+				idempotencyKey: "reused-key",
+			}),
+		).rejects.toMatchObject({
+			code: "CAMPAIGN_IDEMPOTENCY_CONFLICT",
+		} satisfies Partial<CampaignError>);
+	});
+
+	// Scenario F (Phase 16-R1/R2 regression): APPLY exact retry after a
+	// later campaign HIDE/AMEND must still return the EXACT historical APPLY
+	// + AMEND snapshot -- the receipt-based fast path must not regress this.
+	it("F: APPLY exact retry returns the exact historical APPLY + AMEND snapshot via the receipt path", async () => {
+		const candidateRow = makeCandidateRow();
+		const latestRevisionRow = makeCandidateRevisionRow({
+			id: APPLY_REVISION_ID,
+			revisionNo: 2,
+			operation: "APPLY",
+			status: "APPLIED",
+			appliedCampaignRevisionId: APPLIED_CAMPAIGN_REVISION_ID,
+		});
+		const occurredAt = new Date("2024-09-05T00:00:00Z");
+		const expectedCampaignRevisionNo = 2;
+		const note = null;
+		const fingerprint =
+			await calculateCampaignReviewCandidateLifecycleFingerprint({
+				userId: USER_ID,
+				candidateId: CANDIDATE_ID,
+				operation: "APPLY",
+				expectedCampaignRevisionNo,
+				occurredAt,
+				note,
+			});
+		const receiptRow = makeReceiptRow({
+			operation: "APPLY",
+			requestFingerprint: fingerprint,
+			candidateId: CANDIDATE_ID,
+			candidateRevisionId: APPLY_REVISION_ID,
+			campaignRevisionId: APPLIED_CAMPAIGN_REVISION_ID,
+		});
+		const amendJoinRow = makeAmendJoinRow();
+
+		const responses: unknown[][] = [
+			[candidateRow], // 1. candidate select ... .for("update")
+			[{ id: latestRevisionRow.id }], // 2. buildLatestReadModelInTransaction: latest id
+			[candidateRow], // 3. revision-scoped candidate select
+			[latestRevisionRow], // 4. revision-scoped revision select
+			[receiptRow], // 5. receipt select -> found, operation + fingerprint match
+			[candidateRow], // 6. buildReplayResultFromReceipt: candidate select
+			[latestRevisionRow], // 7. buildReplayResultFromReceipt: revision select
+			[amendJoinRow], // 8. buildCampaignPeriodReadModelForRevisionInTransaction: joined select
+			[], // 9. buildCampaignPeriodReadModelForRevisionInTransaction: card rows select
+		];
+		const { db } = createQueueDb(responses);
+		const { applyCampaignReviewCandidate } = await import(
+			"../src/campaigns/review-candidates"
+		);
+
+		const result = await applyCampaignReviewCandidate({
+			db,
+			userId: USER_ID,
+			candidateId: CANDIDATE_ID,
+			expectedCampaignRevisionNo,
+			occurredAt,
+			idempotencyKey: "apply-key-1",
+			note,
+		});
+
+		expect(result.candidate.operation).toBe("APPLY");
+		expect(result.candidate.status).toBe("APPLIED");
+		expect(result.campaign.revisionId).toBe(APPLIED_CAMPAIGN_REVISION_ID);
+		expect(result.campaign.operation).toBe("AMEND");
+	});
+
+	// Scenario G: DISMISS exact retry returns the historical DISMISS
+	// revision via the receipt path.
+	it("G: DISMISS exact retry returns the historical DISMISS revision via the receipt path", async () => {
+		const candidateRow = makeCandidateRow();
+		const latestRevisionRow = makeCandidateRevisionRow({
+			id: DISMISS_REVISION_ID,
+			revisionNo: 2,
+			operation: "DISMISS",
+			status: "DISMISSED",
+		});
 		const occurredAt = new Date("2024-09-10T00:00:00Z");
 		const note = null;
 		const fingerprint =
@@ -691,24 +973,22 @@ describe("dismissCampaignReviewCandidate historical replay (Section D)", () => {
 				occurredAt,
 				note,
 			});
-		const dismissRevisionRow = makeCandidateRevisionRow({
-			id: "99999999-9999-9999-9999-999999999999",
-			revisionNo: 2,
+		const receiptRow = makeReceiptRow({
 			operation: "DISMISS",
-			status: "DISMISSED",
-			idempotencyKey: "dismiss-key-1",
-			revisionFingerprint: fingerprint,
-			occurredAt,
+			requestFingerprint: fingerprint,
+			candidateId: CANDIDATE_ID,
+			candidateRevisionId: DISMISS_REVISION_ID,
+			campaignRevisionId: null,
 		});
 
 		const responses: unknown[][] = [
-			[candidateRow], // candidate select ... .for("update")
-			[{ id: pendingRevisionRow.id }], // buildLatestReadModelInTransaction latest id
-			[candidateRow],
-			[pendingRevisionRow],
-			[dismissRevisionRow], // existingRevByKey select -> found
-			[candidateRow], // revision-scoped candidate select
-			[dismissRevisionRow], // revision-scoped revision select
+			[candidateRow], // 1. candidate select ... .for("update")
+			[{ id: latestRevisionRow.id }], // 2. buildLatestReadModelInTransaction: latest id
+			[candidateRow], // 3. revision-scoped candidate select
+			[latestRevisionRow], // 4. revision-scoped revision select
+			[receiptRow], // 5. receipt select -> found
+			[candidateRow], // 6. buildReplayResultFromReceipt: candidate select
+			[latestRevisionRow], // 7. buildReplayResultFromReceipt: revision select
 		];
 		const { db } = createQueueDb(responses);
 		const { dismissCampaignReviewCandidate } = await import(

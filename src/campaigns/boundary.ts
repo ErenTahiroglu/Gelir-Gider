@@ -311,6 +311,17 @@ export function mapDbError(err: unknown): never {
 		);
 	}
 	if (
+		matchesDbConstraint(
+			err,
+			"campaign_review_candidate_idempotency_receipts_user_key_idx",
+		)
+	) {
+		throw new CampaignError(
+			"CAMPAIGN_IDEMPOTENCY_CONFLICT",
+			"Campaign review candidate idempotency receipt conflict",
+		);
+	}
+	if (
 		matchesDbConstraint(err, "campaign_families_user_provider_key_idx") ||
 		matchesDbConstraint(err, "campaign_periods_family_period_key_idx")
 	) {

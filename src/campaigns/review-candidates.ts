@@ -3,6 +3,7 @@ import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	campaignFamilies,
 	campaignPeriods,
+	campaignReviewCandidateIdempotencyReceipts,
 	campaignReviewCandidateRevisions,
 	campaignReviewCandidates,
 	campaignSourceSnapshots,
@@ -206,6 +207,266 @@ async function buildLatestReadModelInTransaction(
 		candidateId,
 		latest.id,
 	);
+}
+
+// ============================================================================
+// Idempotency receipt helpers (Phase 16-R3, Sections 3/4/7/9/10/11): the ONE
+// authoritative idempotency namespace shared by CREATE/APPLY/DISMISS. See
+// campaign_review_candidate_idempotency_receipts (src/db/schema/campaigns.ts,
+// migration 0051).
+// ============================================================================
+
+interface CandidateReceipt {
+	id: string;
+	userId: string;
+	idempotencyKey: string;
+	operation: "CREATE" | "APPLY" | "DISMISS";
+	requestFingerprint: string;
+	candidateId: string;
+	candidateRevisionId: string;
+	campaignRevisionId: string | null;
+}
+
+function toCandidateReceipt(
+	row: typeof campaignReviewCandidateIdempotencyReceipts.$inferSelect,
+): CandidateReceipt {
+	return {
+		id: row.id,
+		userId: row.userId,
+		idempotencyKey: row.idempotencyKey,
+		operation: row.operation as "CREATE" | "APPLY" | "DISMISS",
+		requestFingerprint: row.requestFingerprint,
+		candidateId: row.candidateId,
+		candidateRevisionId: row.candidateRevisionId,
+		campaignRevisionId: row.campaignRevisionId,
+	};
+}
+
+async function findCandidateReceiptInTransaction(
+	tx: DatabaseTransaction,
+	userId: string,
+	idempotencyKey: string,
+): Promise<CandidateReceipt | null> {
+	const [row] = await tx
+		.select()
+		.from(campaignReviewCandidateIdempotencyReceipts)
+		.where(
+			and(
+				eq(campaignReviewCandidateIdempotencyReceipts.userId, userId),
+				eq(
+					campaignReviewCandidateIdempotencyReceipts.idempotencyKey,
+					idempotencyKey,
+				),
+			),
+		)
+		.limit(1);
+	return row ? toCandidateReceipt(row) : null;
+}
+
+/**
+ * Section 10 (Phase 16-R3): conflict-safe insert-or-fetch for a candidate
+ * idempotency receipt -- never assumes this call is the only writer for
+ * `idempotencyKey`. Uses INSERT ... ON CONFLICT DO NOTHING followed by a
+ * re-read (mirroring the established `push_subscriptions` /
+ * `campaign_periods` anchor get-or-create idiom elsewhere in this
+ * codebase), then compares the confirmed row's operation/fingerprint
+ * against what this request expects. A match (whether this call's own
+ * insert won the race, or a concurrent writer's did) is treated as a
+ * confirmed bind: the preceding computation, performed under the SAME
+ * campaign_periods lock (CREATE) or against the SAME locked candidate
+ * anchor (APPLY/DISMISS), is what determined the candidate/revision this
+ * call resolved to. A mismatch means a genuine concurrent conflicting use
+ * of the same key for a different request/intent.
+ */
+async function bindCandidateReceiptInTransaction(
+	tx: DatabaseTransaction,
+	args: {
+		userId: string;
+		idempotencyKey: string;
+		operation: "CREATE" | "APPLY" | "DISMISS";
+		requestFingerprint: string;
+		candidateId: string;
+		candidateRevisionId: string;
+		campaignRevisionId: string | null;
+	},
+): Promise<CandidateReceipt> {
+	await tx
+		.insert(campaignReviewCandidateIdempotencyReceipts)
+		.values({
+			userId: args.userId,
+			idempotencyKey: args.idempotencyKey,
+			operation: args.operation,
+			requestFingerprint: args.requestFingerprint,
+			candidateId: args.candidateId,
+			candidateRevisionId: args.candidateRevisionId,
+			campaignRevisionId: args.campaignRevisionId,
+		})
+		.onConflictDoNothing({
+			target: [
+				campaignReviewCandidateIdempotencyReceipts.userId,
+				campaignReviewCandidateIdempotencyReceipts.idempotencyKey,
+			],
+		});
+
+	const confirmed = await findCandidateReceiptInTransaction(
+		tx,
+		args.userId,
+		args.idempotencyKey,
+	);
+	if (!confirmed) {
+		throw new CampaignError(
+			"CAMPAIGN_INVALID_STATE",
+			"Failed to bind campaign review candidate idempotency receipt",
+		);
+	}
+	if (
+		confirmed.operation !== args.operation ||
+		confirmed.requestFingerprint !== args.requestFingerprint
+	) {
+		throw new CampaignError(
+			"CAMPAIGN_IDEMPOTENCY_CONFLICT",
+			"Idempotency key reused with a different review candidate payload",
+		);
+	}
+	return confirmed;
+}
+
+/**
+ * Section 4/7 (Phase 16-R3): the ONE idempotency lookup used by all three
+ * review-candidate mutations. Checks the authoritative receipt table
+ * first; if no receipt exists yet, falls back to the legacy direct
+ * campaign_review_candidate_revisions lookup (Section 7 Option A) for
+ * exact-retry compatibility with revisions created before migration 0051,
+ * and -- since this is a safe idempotent bootstrap -- lazily backfills a
+ * receipt for it via `bindCandidateReceiptInTransaction` (INSERT ...
+ * ON CONFLICT DO NOTHING + re-read, Section 10) so a future retry of the
+ * same key takes the fast/authoritative receipt path. Throws
+ * CAMPAIGN_IDEMPOTENCY_CONFLICT if a match is found under either mechanism
+ * but its operation or fingerprint disagrees with this request's.
+ */
+async function replayCandidateReceiptInTransaction(
+	tx: DatabaseTransaction,
+	args: {
+		userId: string;
+		idempotencyKey: string;
+		operation: "CREATE" | "APPLY" | "DISMISS";
+		expectedFingerprint: string;
+	},
+): Promise<CandidateReceipt | null> {
+	const receipt = await findCandidateReceiptInTransaction(
+		tx,
+		args.userId,
+		args.idempotencyKey,
+	);
+	if (receipt) {
+		if (
+			receipt.operation !== args.operation ||
+			receipt.requestFingerprint !== args.expectedFingerprint
+		) {
+			throw new CampaignError(
+				"CAMPAIGN_IDEMPOTENCY_CONFLICT",
+				"Idempotency key reused with a different review candidate payload",
+			);
+		}
+		return receipt;
+	}
+
+	// Section 7 Option A: legacy fallback against the pre-migration-0051
+	// per-operation revision-table lookup (the mechanism every CREATE/APPLY/
+	// DISMISS revision already recorded its idempotencyKey against).
+	const [legacyRev] = await tx
+		.select()
+		.from(campaignReviewCandidateRevisions)
+		.where(
+			and(
+				eq(campaignReviewCandidateRevisions.userId, args.userId),
+				eq(
+					campaignReviewCandidateRevisions.idempotencyKey,
+					args.idempotencyKey,
+				),
+			),
+		)
+		.limit(1);
+	if (!legacyRev) return null;
+
+	if (
+		legacyRev.operation !== args.operation ||
+		legacyRev.revisionFingerprint !== args.expectedFingerprint
+	) {
+		throw new CampaignError(
+			"CAMPAIGN_IDEMPOTENCY_CONFLICT",
+			"Idempotency key reused with a different review candidate payload",
+		);
+	}
+	if (legacyRev.operation === "APPLY" && !legacyRev.appliedCampaignRevisionId) {
+		throw new CampaignError(
+			"CAMPAIGN_INVALID_STATE",
+			"Historical APPLY revision is missing its applied campaign revision binding",
+		);
+	}
+
+	return bindCandidateReceiptInTransaction(tx, {
+		userId: args.userId,
+		idempotencyKey: args.idempotencyKey,
+		operation: legacyRev.operation as "CREATE" | "APPLY" | "DISMISS",
+		requestFingerprint: legacyRev.revisionFingerprint,
+		candidateId: legacyRev.candidateId,
+		candidateRevisionId: legacyRev.id,
+		campaignRevisionId:
+			legacyRev.operation === "APPLY"
+				? (legacyRev.appliedCampaignRevisionId as string)
+				: null,
+	});
+}
+
+async function buildReplayResultFromReceiptInTransaction(
+	tx: DatabaseTransaction,
+	receipt: CandidateReceipt,
+): Promise<CampaignReviewCandidateReadModel> {
+	const readModel =
+		await buildCampaignReviewCandidateReadModelForRevisionInTransaction(
+			tx,
+			receipt.candidateId,
+			receipt.candidateRevisionId,
+		);
+	if (!readModel) {
+		throw new CampaignError(
+			"CAMPAIGN_INVALID_STATE",
+			"Idempotency replay resolved to a missing review candidate",
+		);
+	}
+	return readModel;
+}
+
+async function buildApplyReplayResultFromReceiptInTransaction(
+	tx: DatabaseTransaction,
+	receipt: CandidateReceipt,
+): Promise<{
+	candidate: CampaignReviewCandidateReadModel;
+	campaign: CampaignPeriodRevisionReadModel;
+}> {
+	const candidate = await buildReplayResultFromReceiptInTransaction(
+		tx,
+		receipt,
+	);
+	if (!receipt.campaignRevisionId) {
+		throw new CampaignError(
+			"CAMPAIGN_INVALID_STATE",
+			"APPLY idempotency receipt is missing its applied campaign revision binding",
+		);
+	}
+	const campaign = await buildCampaignPeriodReadModelForRevisionInTransaction(
+		tx,
+		candidate.campaignPeriodId,
+		receipt.campaignRevisionId,
+	);
+	if (!campaign) {
+		throw new CampaignError(
+			"CAMPAIGN_INVALID_STATE",
+			"Idempotency replay resolved to missing campaign state",
+		);
+	}
+	return { candidate, campaign };
 }
 
 // ============================================================================
@@ -477,14 +738,100 @@ export async function createCampaignReviewCandidate(
 	const idempotencyKey = validateCampaignIdempotencyKey(params.idempotencyKey);
 	const terms = normalizeProposedTerms(params);
 
+	// Section 5 (Phase 16-R3): candidateHash and createRequestFingerprint are
+	// pure over the normalized input plus identity fields -- neither needs
+	// any DB read -- so both are computed BEFORE the transaction opens,
+	// ahead of ANY mutable-state-dependent logic (the ACTIVE lifecycle gate
+	// included).
+	const candidateHash = await calculateCampaignReviewCandidateHash({
+		campaignPeriodId,
+		sourceSnapshotId,
+		title: terms.title,
+		startsOn: terms.startsOn,
+		endsOn: terms.endsOn,
+		ruleMode: terms.ruleMode,
+		targetSpendAmount: terms.targetSpendAmount,
+		requiredTransactionCount: terms.requiredTransactionCount,
+		minimumTransactionAmount: terms.minimumTransactionAmount,
+		stepSpendAmount: terms.stepSpendAmount,
+		rewardPointsPerStep: terms.rewardPointsPerStep,
+		maxSteps: terms.maxSteps,
+		rewardKind: terms.rewardKind,
+		rewardAccountId: terms.rewardAccountId,
+		expectedRewardPoints: terms.expectedRewardPoints,
+		merchantScopeMode: terms.merchantScopeMode,
+		requiredCanonicalMerchantNames: terms.requiredCanonicalMerchantNames,
+		allowedMccCodes: terms.allowedMccCodes,
+		rewardExpiryDate: terms.rewardExpiryDate,
+		parserType: terms.parserType,
+		parserVersion: terms.parserVersion,
+		parserConfidence: terms.parserConfidence,
+		proposedCardIds: terms.proposedCardIds,
+	});
+
+	// Section C (Phase 16-R2): the EXACT-replay request fingerprint --
+	// unlike candidateHash, this binds occurredAt/userId/campaignPeriodId/
+	// sourceSnapshotId (plus candidateHash itself, so any term/card/
+	// parser change also changes this). Stored as this CREATE revision's
+	// revisionFingerprint and used for the early idempotency-key replay
+	// check below.
+	const createRequestFingerprint =
+		await calculateCampaignReviewCandidateCreateRequestFingerprint({
+			userId,
+			campaignPeriodId,
+			sourceSnapshotId,
+			candidateHash,
+			title: terms.title,
+			startsOn: terms.startsOn,
+			endsOn: terms.endsOn,
+			ruleMode: terms.ruleMode,
+			targetSpendAmount: terms.targetSpendAmount,
+			requiredTransactionCount: terms.requiredTransactionCount,
+			minimumTransactionAmount: terms.minimumTransactionAmount,
+			stepSpendAmount: terms.stepSpendAmount,
+			rewardPointsPerStep: terms.rewardPointsPerStep,
+			maxSteps: terms.maxSteps,
+			rewardKind: terms.rewardKind,
+			rewardAccountId: terms.rewardAccountId,
+			expectedRewardPoints: terms.expectedRewardPoints,
+			merchantScopeMode: terms.merchantScopeMode,
+			requiredCanonicalMerchantNames: terms.requiredCanonicalMerchantNames,
+			allowedMccCodes: terms.allowedMccCodes,
+			rewardExpiryDate: terms.rewardExpiryDate,
+			parserType: terms.parserType,
+			parserVersion: terms.parserVersion,
+			parserConfidence: terms.parserConfidence,
+			proposedCardIds: terms.proposedCardIds,
+			occurredAt,
+		});
+
 	return runCampaignsTransaction(params.db, async (tx) => {
-		// Section E/G (Phase 16-R2): lock the owning campaign_periods row
-		// FOR UPDATE as the VERY FIRST statement. This is BOTH the ACTIVE
-		// lifecycle gate's read point AND the serialization point for the
-		// concurrent-PENDING-dedup fix below -- two concurrent identical
-		// candidate-creation calls both acquire this SAME row lock before
-		// doing anything else, so they serialize correctly (the loser sees
-		// the winner's already-created PENDING candidate).
+		// Section 6 step 2 / Section 8 step 1 (Phase 16-R3, Defect 1 fix): the
+		// FIRST logical action inside the transaction is the idempotency-key
+		// replay lookup -- BEFORE locking campaign_periods, BEFORE the ACTIVE
+		// lifecycle gate, BEFORE validating the source snapshot/provider. An
+		// exact retry of a request that already succeeded historically must
+		// always return that historical result regardless of what has
+		// happened to the campaign lifecycle since (e.g. CREATE while ACTIVE
+		// -> APPLY -> END the campaign -> retry the ORIGINAL CREATE key must
+		// still return the historical CREATE/PENDING snapshot).
+		const earlyReceipt = await replayCandidateReceiptInTransaction(tx, {
+			userId,
+			idempotencyKey,
+			operation: "CREATE",
+			expectedFingerprint: createRequestFingerprint,
+		});
+		if (earlyReceipt) {
+			return buildReplayResultFromReceiptInTransaction(tx, earlyReceipt);
+		}
+
+		// Section 8 step 2: lock the owning campaign_periods row FOR UPDATE.
+		// This is BOTH the ACTIVE lifecycle gate's read point AND the
+		// serialization point for the concurrent-PENDING-dedup fix below --
+		// two concurrent identical candidate-creation calls both acquire this
+		// SAME row lock before doing anything else, so they serialize
+		// correctly (the loser sees the winner's already-created PENDING
+		// candidate, or the winner's already-bound receipt).
 		const [period] = await tx
 			.select()
 			.from(campaignPeriods)
@@ -502,6 +849,20 @@ export async function createCampaignReviewCandidate(
 			);
 		}
 
+		// Section 8 step 3: SECOND idempotency-key replay check, now under the
+		// lock -- closes the race where a concurrent identical request
+		// committed its receipt between step 1 (above) and this call winning
+		// the lock.
+		const lockedReceipt = await replayCandidateReceiptInTransaction(tx, {
+			userId,
+			idempotencyKey,
+			operation: "CREATE",
+			expectedFingerprint: createRequestFingerprint,
+		});
+		if (lockedReceipt) {
+			return buildReplayResultFromReceiptInTransaction(tx, lockedReceipt);
+		}
+
 		const [family] = await tx
 			.select({ provider: campaignFamilies.provider })
 			.from(campaignFamilies)
@@ -514,11 +875,12 @@ export async function createCampaignReviewCandidate(
 			);
 		}
 
-		// Section E: a candidate can only be created against an ACTIVE
-		// campaign lifecycle. HIDDEN visibility with ACTIVE lifecycle is
-		// explicitly allowed (visibility is orthogonal); REVIEW_REQUIRED,
-		// ENDED, and CANCELLED lifecycle are all rejected -- there is
-		// nothing to amend/re-review for those states.
+		// Section E (Phase 16-R2): a FRESH candidate can only be created
+		// against an ACTIVE campaign lifecycle. HIDDEN visibility with ACTIVE
+		// lifecycle is explicitly allowed (visibility is orthogonal);
+		// REVIEW_REQUIRED, ENDED, and CANCELLED lifecycle are all rejected --
+		// there is nothing to amend/re-review for those states. This check
+		// only applies past both replay checks above (Section 6/8).
 		const latestPeriodRev = await getLatestRevisionInTransaction(
 			tx,
 			userId,
@@ -563,113 +925,15 @@ export async function createCampaignReviewCandidate(
 			);
 		}
 
-		// Section K (Phase 16-R1): content-addressed semantic identity used
-		// ONLY for cross-request PENDING dedup (Section G) and the anchor's
-		// candidate_hash column -- deliberately excludes occurredAt and
-		// other request-specific fields.
-		const candidateHash = await calculateCampaignReviewCandidateHash({
-			campaignPeriodId,
-			sourceSnapshotId,
-			title: terms.title,
-			startsOn: terms.startsOn,
-			endsOn: terms.endsOn,
-			ruleMode: terms.ruleMode,
-			targetSpendAmount: terms.targetSpendAmount,
-			requiredTransactionCount: terms.requiredTransactionCount,
-			minimumTransactionAmount: terms.minimumTransactionAmount,
-			stepSpendAmount: terms.stepSpendAmount,
-			rewardPointsPerStep: terms.rewardPointsPerStep,
-			maxSteps: terms.maxSteps,
-			rewardKind: terms.rewardKind,
-			rewardAccountId: terms.rewardAccountId,
-			expectedRewardPoints: terms.expectedRewardPoints,
-			merchantScopeMode: terms.merchantScopeMode,
-			requiredCanonicalMerchantNames: terms.requiredCanonicalMerchantNames,
-			allowedMccCodes: terms.allowedMccCodes,
-			rewardExpiryDate: terms.rewardExpiryDate,
-			parserType: terms.parserType,
-			parserVersion: terms.parserVersion,
-			parserConfidence: terms.parserConfidence,
-			proposedCardIds: terms.proposedCardIds,
-		});
-
-		// Section C (Phase 16-R2): the EXACT-replay request fingerprint --
-		// unlike candidateHash, this binds occurredAt/userId/campaignPeriodId/
-		// sourceSnapshotId (plus candidateHash itself, so any term/card/
-		// parser change also changes this). Stored as this CREATE revision's
-		// revisionFingerprint and used for the early idempotency-key replay
-		// check below.
-		const createRequestFingerprint =
-			await calculateCampaignReviewCandidateCreateRequestFingerprint({
-				userId,
-				campaignPeriodId,
-				sourceSnapshotId,
-				candidateHash,
-				title: terms.title,
-				startsOn: terms.startsOn,
-				endsOn: terms.endsOn,
-				ruleMode: terms.ruleMode,
-				targetSpendAmount: terms.targetSpendAmount,
-				requiredTransactionCount: terms.requiredTransactionCount,
-				minimumTransactionAmount: terms.minimumTransactionAmount,
-				stepSpendAmount: terms.stepSpendAmount,
-				rewardPointsPerStep: terms.rewardPointsPerStep,
-				maxSteps: terms.maxSteps,
-				rewardKind: terms.rewardKind,
-				rewardAccountId: terms.rewardAccountId,
-				expectedRewardPoints: terms.expectedRewardPoints,
-				merchantScopeMode: terms.merchantScopeMode,
-				requiredCanonicalMerchantNames: terms.requiredCanonicalMerchantNames,
-				allowedMccCodes: terms.allowedMccCodes,
-				rewardExpiryDate: terms.rewardExpiryDate,
-				parserType: terms.parserType,
-				parserVersion: terms.parserVersion,
-				parserConfidence: terms.parserConfidence,
-				proposedCardIds: terms.proposedCardIds,
-				occurredAt,
-			});
-
-		// Early idempotency replay (by userId + idempotencyKey), scoped
-		// globally across every candidate revision. Section D: replays the
-		// EXACT historical revision that owns this key (not whatever is
-		// currently latest for the candidate).
-		const [existingRevByKey] = await tx
-			.select()
-			.from(campaignReviewCandidateRevisions)
-			.where(
-				and(
-					eq(campaignReviewCandidateRevisions.userId, userId),
-					eq(campaignReviewCandidateRevisions.idempotencyKey, idempotencyKey),
-				),
-			)
-			.limit(1);
-		if (existingRevByKey) {
-			if (existingRevByKey.revisionFingerprint !== createRequestFingerprint) {
-				throw new CampaignError(
-					"CAMPAIGN_IDEMPOTENCY_CONFLICT",
-					"Idempotency key reused with a different review candidate payload",
-				);
-			}
-			const readModel =
-				await buildCampaignReviewCandidateReadModelForRevisionInTransaction(
-					tx,
-					existingRevByKey.candidateId,
-					existingRevByKey.id,
-				);
-			if (!readModel) {
-				throw new CampaignError(
-					"CAMPAIGN_INVALID_STATE",
-					"Idempotency replay resolved to a missing review candidate",
-				);
-			}
-			return readModel;
-		}
-
 		// Get-or-create by semantic hash: an existing PENDING candidate for
 		// this period with an identical hash is returned as-is. Section G:
 		// safe from concurrent duplication because the campaign_periods row
 		// lock acquired above is held for the duration of this check AND the
-		// insert below.
+		// insert below. Section 9 (Phase 16-R3, Defect 2 fix): this dedup-
+		// alias path must ALSO durably bind idempotencyKey to the exact
+		// resolved candidate/revision, not merely return it -- otherwise a
+		// LATER retry of this same key would have no receipt to replay
+		// against and would fall through to the full creation logic again.
 		const existingCandidates = await tx
 			.select()
 			.from(campaignReviewCandidates)
@@ -685,7 +949,16 @@ export async function createCampaignReviewCandidate(
 				existing.id,
 			);
 			if (readModel && readModel.status === "PENDING") {
-				return readModel;
+				const receipt = await bindCandidateReceiptInTransaction(tx, {
+					userId,
+					idempotencyKey,
+					operation: "CREATE",
+					requestFingerprint: createRequestFingerprint,
+					candidateId: readModel.candidateId,
+					candidateRevisionId: readModel.revisionId,
+					campaignRevisionId: null,
+				});
+				return buildReplayResultFromReceiptInTransaction(tx, receipt);
 			}
 		}
 
@@ -746,7 +1019,16 @@ export async function createCampaignReviewCandidate(
 			);
 		}
 
-		return buildReadModel(candidate, revision);
+		const receipt = await bindCandidateReceiptInTransaction(tx, {
+			userId,
+			idempotencyKey,
+			operation: "CREATE",
+			requestFingerprint: createRequestFingerprint,
+			candidateId: candidate.id,
+			candidateRevisionId: revision.id,
+			campaignRevisionId: null,
+		});
+		return buildReplayResultFromReceiptInTransaction(tx, receipt);
 	});
 }
 
@@ -1026,52 +1308,24 @@ export async function applyCampaignReviewCandidate(
 				note,
 			});
 
-		const [existingRevByKey] = await tx
-			.select()
-			.from(campaignReviewCandidateRevisions)
-			.where(
-				and(
-					eq(campaignReviewCandidateRevisions.userId, userId),
-					eq(campaignReviewCandidateRevisions.idempotencyKey, idempotencyKey),
-				),
-			)
-			.limit(1);
-		if (existingRevByKey) {
-			if (existingRevByKey.revisionFingerprint !== fingerprint) {
-				throw new CampaignError(
-					"CAMPAIGN_IDEMPOTENCY_CONFLICT",
-					"Idempotency key reused with a different APPLY payload",
-				);
-			}
-			// Section D: replay the EXACT historical candidate APPLY
-			// revision AND the exact historical campaign AMEND revision it
-			// produced -- NOT the campaign's current latest state, which may
-			// have since been amended again, hidden, or ended.
-			if (!existingRevByKey.appliedCampaignRevisionId) {
-				throw new CampaignError(
-					"CAMPAIGN_INVALID_STATE",
-					"Historical APPLY revision is missing its applied campaign revision binding",
-				);
-			}
-			const readModel =
-				await buildCampaignReviewCandidateReadModelForRevisionInTransaction(
-					tx,
-					candidateId,
-					existingRevByKey.id,
-				);
-			const campaign =
-				await buildCampaignPeriodReadModelForRevisionInTransaction(
-					tx,
-					candidate.campaignPeriodId,
-					existingRevByKey.appliedCampaignRevisionId,
-				);
-			if (!readModel || !campaign) {
-				throw new CampaignError(
-					"CAMPAIGN_INVALID_STATE",
-					"Idempotency replay resolved to missing state",
-				);
-			}
-			return { candidate: readModel, campaign };
+		// Section 4/11 (Phase 16-R3): receipt-based early replay FIRST --
+		// before the "candidate must be PENDING" mutable-state check below.
+		// Falls back to the legacy direct revision-table lookup (Section 7
+		// Option A) for exact-retry compatibility with APPLY revisions
+		// recorded before migration 0051, lazily backfilling a receipt for
+		// it. Section D (Phase 16-R1/R2, preserved): replays the EXACT
+		// historical candidate APPLY revision AND the exact historical
+		// campaign AMEND revision it produced -- NOT the campaign's current
+		// latest state, which may have since been amended again, hidden, or
+		// ended.
+		const earlyReceipt = await replayCandidateReceiptInTransaction(tx, {
+			userId,
+			idempotencyKey,
+			operation: "APPLY",
+			expectedFingerprint: fingerprint,
+		});
+		if (earlyReceipt) {
+			return buildApplyReplayResultFromReceiptInTransaction(tx, earlyReceipt);
 		}
 
 		if (latestCandidateRev.status !== "PENDING") {
@@ -1209,10 +1463,21 @@ export async function applyCampaignReviewCandidate(
 			);
 		}
 
-		return {
-			candidate: buildReadModel(candidate, revision),
-			campaign: campaignReadModel,
-		};
+		// Section 11 (Phase 16-R3): bind idempotencyKey to this exact fresh
+		// APPLY outcome (Section 10's conflict-safe insert-or-fetch), so a
+		// future retry of this key replays via the authoritative receipt
+		// path regardless of what happens to the candidate or campaign
+		// afterward.
+		const receipt = await bindCandidateReceiptInTransaction(tx, {
+			userId,
+			idempotencyKey,
+			operation: "APPLY",
+			requestFingerprint: fingerprint,
+			candidateId: candidate.id,
+			candidateRevisionId: revision.id,
+			campaignRevisionId: campaignReadModel.revisionId,
+		});
+		return buildApplyReplayResultFromReceiptInTransaction(tx, receipt);
 	});
 }
 
@@ -1279,38 +1544,21 @@ export async function dismissCampaignReviewCandidate(
 				note,
 			});
 
-		const [existingRevByKey] = await tx
-			.select()
-			.from(campaignReviewCandidateRevisions)
-			.where(
-				and(
-					eq(campaignReviewCandidateRevisions.userId, userId),
-					eq(campaignReviewCandidateRevisions.idempotencyKey, idempotencyKey),
-				),
-			)
-			.limit(1);
-		if (existingRevByKey) {
-			if (existingRevByKey.revisionFingerprint !== fingerprint) {
-				throw new CampaignError(
-					"CAMPAIGN_IDEMPOTENCY_CONFLICT",
-					"Idempotency key reused with a different DISMISS payload",
-				);
-			}
-			// Section D: replay the EXACT historical DISMISS revision that
-			// owns this key, not whatever is currently latest.
-			const readModel =
-				await buildCampaignReviewCandidateReadModelForRevisionInTransaction(
-					tx,
-					candidateId,
-					existingRevByKey.id,
-				);
-			if (!readModel) {
-				throw new CampaignError(
-					"CAMPAIGN_INVALID_STATE",
-					"Idempotency replay resolved to missing state",
-				);
-			}
-			return readModel;
+		// Section 4/11 (Phase 16-R3): receipt-based early replay FIRST --
+		// before the "candidate must be PENDING" mutable-state check below.
+		// Falls back to the legacy direct revision-table lookup (Section 7
+		// Option A) for exact-retry compatibility with DISMISS revisions
+		// recorded before migration 0051, lazily backfilling a receipt for
+		// it. Section D (preserved): replays the EXACT historical DISMISS
+		// revision that owns this key, not whatever is currently latest.
+		const earlyReceipt = await replayCandidateReceiptInTransaction(tx, {
+			userId,
+			idempotencyKey,
+			operation: "DISMISS",
+			expectedFingerprint: fingerprint,
+		});
+		if (earlyReceipt) {
+			return buildReplayResultFromReceiptInTransaction(tx, earlyReceipt);
 		}
 
 		if (latestCandidateRev.status !== "PENDING") {
@@ -1364,6 +1612,17 @@ export async function dismissCampaignReviewCandidate(
 			);
 		}
 
-		return buildReadModel(candidate, revision);
+		// Section 11 (Phase 16-R3): bind idempotencyKey to this exact fresh
+		// DISMISS outcome (Section 10's conflict-safe insert-or-fetch).
+		const receipt = await bindCandidateReceiptInTransaction(tx, {
+			userId,
+			idempotencyKey,
+			operation: "DISMISS",
+			requestFingerprint: fingerprint,
+			candidateId: candidate.id,
+			candidateRevisionId: revision.id,
+			campaignRevisionId: null,
+		});
+		return buildReplayResultFromReceiptInTransaction(tx, receipt);
 	});
 }
