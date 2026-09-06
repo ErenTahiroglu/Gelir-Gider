@@ -38,6 +38,16 @@ export interface PushTransport {
 		payload: object,
 		options: PushSendOptions,
 	): Promise<PushSendResult>;
+	/**
+	 * Optional global preparation step. Must validate everything required for
+	 * a push send WITHOUT any DB access, network call, or knowledge of a
+	 * specific subscription's endpoint -- e.g. VAPID key coherence. Called at
+	 * most once per scheduler invocation, before the first dispatch
+	 * reservation that might need a network send. Throws
+	 * `NotificationError("NOTIFICATION_PUSH_CONFIG_INVALID", ...)` on
+	 * failure.
+	 */
+	prepare?(): Promise<void>;
 }
 
 /**
@@ -68,10 +78,16 @@ export function classifyPushResponseStatus(
 		};
 	}
 	if (httpStatus === 401 || httpStatus === 403) {
+		// Phase 15-R2 Section D: a 401/403 is a global VAPID/auth rejection,
+		// not evidence this specific subscription is dead -- it must never
+		// disable the subscription and must never permanently terminate the
+		// delivery. Classified as retryable/dispatch-bound here; the
+		// scheduler separately aborts the whole run when it sees this code
+		// (Section D), after durably persisting this one result.
 		return {
-			outcome: "TERMINAL_FAILURE",
+			outcome: "RETRYABLE_FAILURE",
 			httpStatus,
-			errorCode: "NOTIFICATION_PUSH_CONFIG_INVALID",
+			errorCode: "PUSH_AUTH_REJECTED",
 		};
 	}
 	if (httpStatus >= 500) {
@@ -371,6 +387,31 @@ export class WebPushTransport implements PushTransport {
 
 	constructor(env: AppEnv) {
 		this.env = env;
+	}
+
+	/**
+	 * Phase 15-R2 Section C: global VAPID/config preflight, performed with
+	 * ZERO DB access and ZERO network calls -- validates the VAPID env is
+	 * present/well-formed and that the public/private key pair is coherent
+	 * and importable as a P-256 signing key. Called at most once per
+	 * scheduler run, before the first dispatch reservation that might need a
+	 * network send (see `runNotificationScheduler`).
+	 */
+	async prepare(): Promise<void> {
+		let vapid: ReturnType<typeof getWebPushVapidConfig>;
+		try {
+			vapid = getWebPushVapidConfig(this.env);
+		} catch {
+			throw new NotificationError(
+				"NOTIFICATION_PUSH_CONFIG_INVALID",
+				"Web Push VAPID configuration is missing or invalid",
+			);
+		}
+		// Proves the public/private key pair is coherent and importable as a
+		// P-256 signing key -- pure crypto, no DB/network calls. Already
+		// throws a sanitized NotificationError("NOTIFICATION_PUSH_CONFIG_INVALID", ...)
+		// on failure (see its own catch blocks), so just let it propagate.
+		await importVapidPrivateKey(vapid.privateKey, vapid.publicKey);
 	}
 
 	async send(

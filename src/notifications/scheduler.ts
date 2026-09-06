@@ -50,6 +50,31 @@ export interface NotificationSchedulerSummary {
 	suppressed: number;
 }
 
+/**
+ * Phase 15-R2 Section C: per-run preflight cache. `runNotificationScheduler`
+ * creates one `{ prepared: boolean }` object per invocation and threads it
+ * through every `processEventSubscription` call, so `transport.prepare()` is
+ * invoked at most once per run -- lazily, only once there is at least one
+ * (event, active subscription) pair to process -- never on an empty run or
+ * the pre-12:00 early return.
+ */
+export async function ensurePushTransportPrepared(
+	transport: PushTransport,
+	state: { prepared: boolean },
+): Promise<void> {
+	if (state.prepared) return;
+	try {
+		await transport.prepare?.();
+	} catch (err) {
+		if (err instanceof NotificationError) throw err;
+		throw new NotificationError(
+			"NOTIFICATION_PUSH_CONFIG_INVALID",
+			"Web Push transport preflight failed",
+		);
+	}
+	state.prepared = true;
+}
+
 function zeroSummary(): NotificationSchedulerSummary {
 	return {
 		eventsCreated: 0,
@@ -282,7 +307,16 @@ async function processEventSubscription(
 	scheduledAt: Date,
 	currentHourSlot: Date,
 	summary: NotificationSchedulerSummary,
+	transportPreparedState: { prepared: boolean },
 ): Promise<void> {
+	// Phase 15-R2 Section C: global VAPID/config preflight -- performed
+	// BEFORE the first dispatch reservation of this run. If it throws, zero
+	// dispatch reservations, zero attempts, and zero network calls happen for
+	// this run (this propagates uncaught out of the `for` loop in
+	// `runNotificationScheduler`, same as the existing global-config-failure
+	// rethrow path below).
+	await ensurePushTransportPrepared(transport, transportPreparedState);
+
 	const reservation = await reserveInTransaction(
 		db,
 		event,
@@ -344,6 +378,24 @@ async function processEventSubscription(
 		scheduledAt,
 		summary,
 	);
+
+	// Phase 15-R2 Section D: a 401/403 (PUSH_AUTH_REJECTED) is a global
+	// VAPID/auth rejection, not evidence this specific subscription is dead.
+	// This must run AFTER `finalizeInTransaction` -- the one real network
+	// attempt that occurred must be durably persisted first (as
+	// RETRYABLE_FAILURE/PUSH_AUTH_REJECTED, dispatch-bound, subscription
+	// untouched/still ACTIVE) -- but BEFORE returning to the caller, so the
+	// exception propagates up through the `for` loop over
+	// subscriptions/events in `runNotificationScheduler`, aborting the rest
+	// of that run (zero further network calls for any other subscription in
+	// this run). Never marks the subscription TERMINAL_FAILURE or disables it
+	// for 401/403.
+	if (sendResult.errorCode === "PUSH_AUTH_REJECTED") {
+		throw new NotificationError(
+			"NOTIFICATION_PUSH_CONFIG_INVALID",
+			"Push service rejected VAPID credentials (401/403); aborting scheduler run",
+		);
+	}
 }
 
 /**
@@ -378,6 +430,13 @@ export async function runNotificationScheduler(
 		return summary;
 	}
 
+	// Phase 15-R2 Section C: created once per run, threaded through every
+	// `processEventSubscription` call so `transport.prepare()` is invoked at
+	// most once -- lazily, only once this point is reached (i.e. there is at
+	// least one event for today), never on an empty run or the pre-12:00
+	// early return above.
+	const transportPreparedState = { prepared: false };
+
 	for (const rawEvent of events) {
 		const event: NotificationEventReadModel = {
 			id: rawEvent.id,
@@ -404,6 +463,7 @@ export async function runNotificationScheduler(
 				scheduledAt,
 				currentHourSlot,
 				summary,
+				transportPreparedState,
 			);
 		}
 	}

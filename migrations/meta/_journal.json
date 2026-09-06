@@ -330,6 +330,13 @@
       "when": 1788694730915,
       "tag": "0046_harden_scheduled_notification_delivery_integrity",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1788704896248,
+      "tag": "0047_harden_notification_dispatch_race_integrity",
+      "breakpoints": true
     }
   ]
 }

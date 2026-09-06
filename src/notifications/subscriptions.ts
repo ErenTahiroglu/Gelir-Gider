@@ -664,17 +664,27 @@ export async function disablePushSubscriptionForEndpointGoneInTransaction(
 }
 
 /**
- * Phase 15-R1 Section B/10/11: race-safe endpoint-gone auto-disable. Only
- * appends a DISABLE revision when `expectedRevisionId` -- the EXACT
- * `push_subscription_revision_id` that was bound to the dispatch reservation
- * whose network call actually returned 404/410 -- is STILL the subscription's
- * current latest revision at finalization time. If a REFRESH/REACTIVATE was
- * appended in between (a real race under this architecture), the newer
- * revision is left untouched and this is a no-op: the old dispatch's result
- * simply remains recorded as TERMINAL_FAILURE, and the subscription stays
- * ACTIVE on its newer revision. Comparing by exact revision id is strictly
- * stronger than comparing individual fields (endpoint/p256dh/auth) since a
- * revision id uniquely determines every one of its fields.
+ * Phase 15-R1 Section B/10/11, hardened by Phase 15-R2 Section B: race-safe
+ * endpoint-gone auto-disable. Only appends a DISABLE revision when
+ * `expectedRevisionId` -- the EXACT `push_subscription_revision_id` that was
+ * bound to the dispatch reservation whose network call actually returned
+ * 404/410 -- is STILL the subscription's current latest revision at
+ * finalization time. If a REFRESH/REACTIVATE was appended in between (a real
+ * race under this architecture), the newer revision is left untouched and
+ * this is a no-op: the old dispatch's result simply remains recorded as
+ * TERMINAL_FAILURE, and the subscription stays ACTIVE on its newer revision.
+ * Comparing by exact revision id is strictly stronger than comparing
+ * individual fields (endpoint/p256dh/auth) since a revision id uniquely
+ * determines every one of its fields.
+ *
+ * The `push_subscriptions` anchor is locked FOR UPDATE and held for the
+ * remainder of this transaction BEFORE resolving latest, so the whole
+ * decision (lock -> validate user -> resolve latest -> compare -> append
+ * DISABLE) is made under one uninterrupted hold: no concurrent REFRESH can
+ * even start its own revision insert (which re-locks this same row) until
+ * this transaction commits or rolls back, closing the check-then-act race
+ * window that existed when latest was resolved without first taking this
+ * lock.
  */
 export async function disablePushSubscriptionForEndpointGoneIfStillLatestInTransaction(
 	tx: DatabaseTransaction,
@@ -686,6 +696,14 @@ export async function disablePushSubscriptionForEndpointGoneIfStillLatestInTrans
 		idempotencyKey: string;
 	},
 ): Promise<{ disabled: boolean }> {
+	const [anchor] = await tx
+		.select()
+		.from(pushSubscriptions)
+		.where(eq(pushSubscriptions.id, args.subscriptionId))
+		.for("update");
+	if (!anchor || anchor.userId !== args.userId) {
+		return { disabled: false };
+	}
 	const latest = await findLatestRevisionInTransaction(tx, args.subscriptionId);
 	if (!latest || latest.id !== args.expectedRevisionId) {
 		return { disabled: false };
@@ -706,11 +724,31 @@ export async function disablePushSubscriptionForEndpointGoneIfStillLatestInTrans
  * Phase 15-R1 Section A/B). Returns null if the subscription is no longer
  * ACTIVE (e.g. disabled concurrently since the outer active-subscription
  * listing was taken).
+ *
+ * Phase 15-R2 Section A: locks the `push_subscriptions` anchor row FOR UPDATE
+ * BEFORE resolving latest -- the same row the DB's
+ * `trg_fn_guard_push_subscription_revision_insert` trigger locks for a
+ * REFRESH/REACTIVATE/DISABLE revision insert. Taking this lock here means
+ * that by the time the caller reserves a dispatch, a concurrent subscription
+ * lifecycle mutation has either already committed (and this resolves the
+ * newer revision) or cannot proceed until this transaction commits/rolls
+ * back -- making the resolve-then-reserve two-step race-free in the normal
+ * path. The DB trigger's own re-lock/re-check on the dispatch insert remains
+ * as defense-in-depth for any other caller. Lock ordering is always
+ * delivery -> subscription here (the scheduler already locks the delivery
+ * row via `lockDeliveryHistoryInTransaction` earlier in the same
+ * transaction); subscription lifecycle mutations never lock
+ * `notification_deliveries`, so no lock-order cycle is possible.
  */
 export async function getActiveSubscriptionRevisionInTransaction(
 	tx: DatabaseTransaction,
 	subscriptionId: string,
 ): Promise<typeof pushSubscriptionRevisions.$inferSelect | null> {
+	await tx
+		.select({ id: pushSubscriptions.id })
+		.from(pushSubscriptions)
+		.where(eq(pushSubscriptions.id, subscriptionId))
+		.for("update");
 	const latest = await findLatestRevisionInTransaction(tx, subscriptionId);
 	if (latest?.status !== "ACTIVE") return null;
 	return latest;

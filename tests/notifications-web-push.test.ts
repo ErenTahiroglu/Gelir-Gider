@@ -347,10 +347,16 @@ describe("classifyPushResponseStatus (Section 23)", () => {
 		expect(classifyPushResponseStatus(410).errorCode).toBe("ENDPOINT_GONE");
 	});
 
-	it("classifies 401/403 as a config-invalid terminal failure", () => {
+	it("classifies 401/403 as a retryable, dispatch-bound PUSH_AUTH_REJECTED (Phase 15-R2 Section D)", () => {
 		expect(classifyPushResponseStatus(401)).toMatchObject({
-			outcome: "TERMINAL_FAILURE",
-			errorCode: "NOTIFICATION_PUSH_CONFIG_INVALID",
+			outcome: "RETRYABLE_FAILURE",
+			httpStatus: 401,
+			errorCode: "PUSH_AUTH_REJECTED",
+		});
+		expect(classifyPushResponseStatus(403)).toMatchObject({
+			outcome: "RETRYABLE_FAILURE",
+			httpStatus: 403,
+			errorCode: "PUSH_AUTH_REJECTED",
 		});
 	});
 
@@ -469,5 +475,61 @@ describe("WebPushTransport.send (Section 20/22/33/45, mocked fetch only)", () =>
 				{ ttlSeconds: 60 },
 			),
 		).rejects.toMatchObject({ code: "NOTIFICATION_PUSH_CONFIG_INVALID" });
+	});
+});
+
+// ============================================================================
+// WebPushTransport.prepare -- global VAPID preflight (Phase 15-R2 Section C)
+// ============================================================================
+
+describe("WebPushTransport.prepare (Phase 15-R2 Section C)", () => {
+	it("resolves without error when VAPID env is valid, performing zero network calls", async () => {
+		const vapid = await generateVapidKeys();
+		const env: AppEnv = {
+			WEB_PUSH_VAPID_SUBJECT: "mailto:test@example.test",
+			WEB_PUSH_VAPID_PUBLIC_KEY: vapid.publicKey,
+			WEB_PUSH_VAPID_PRIVATE_KEY: vapid.privateKey,
+		};
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		try {
+			const transport = new WebPushTransport(env);
+			await expect(transport.prepare()).resolves.toBeUndefined();
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
+
+	it("throws NOTIFICATION_PUSH_CONFIG_INVALID when VAPID env is missing entirely", async () => {
+		const transport = new WebPushTransport({});
+		await expect(transport.prepare()).rejects.toMatchObject({
+			code: "NOTIFICATION_PUSH_CONFIG_INVALID",
+		});
+	});
+
+	it("throws NOTIFICATION_PUSH_CONFIG_INVALID when the private key is not valid base64url", async () => {
+		const vapid = await generateVapidKeys();
+		const env: AppEnv = {
+			WEB_PUSH_VAPID_SUBJECT: "mailto:test@example.test",
+			WEB_PUSH_VAPID_PUBLIC_KEY: vapid.publicKey,
+			WEB_PUSH_VAPID_PRIVATE_KEY: "not-valid-base64url!!!",
+		};
+		const transport = new WebPushTransport(env);
+		await expect(transport.prepare()).rejects.toMatchObject({
+			code: "NOTIFICATION_PUSH_CONFIG_INVALID",
+		});
+	});
+
+	it("throws NOTIFICATION_PUSH_CONFIG_INVALID when the public key is not a valid uncompressed P-256 point", async () => {
+		const vapid = await generateVapidKeys();
+		const env: AppEnv = {
+			WEB_PUSH_VAPID_SUBJECT: "mailto:test@example.test",
+			WEB_PUSH_VAPID_PUBLIC_KEY: encodeBase64Url(new Uint8Array(65)), // leading byte 0x00, not 0x04
+			WEB_PUSH_VAPID_PRIVATE_KEY: vapid.privateKey,
+		};
+		const transport = new WebPushTransport(env);
+		await expect(transport.prepare()).rejects.toMatchObject({
+			code: "NOTIFICATION_PUSH_CONFIG_INVALID",
+		});
 	});
 });
