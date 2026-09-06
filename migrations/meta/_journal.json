@@ -316,6 +316,13 @@
       "when": 1788675479242,
       "tag": "0044_harden_month_end_close_integrity",
       "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1788691331840,
+      "tag": "0045_add_scheduled_credit_card_due_notifications",
+      "breakpoints": true
     }
   ]
 }

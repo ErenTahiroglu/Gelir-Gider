@@ -5,7 +5,7 @@ import * as verificationModule from "../src/auth/verification";
 import * as webauthnModule from "../src/auth/webauthn";
 import type { Database } from "../src/db/client";
 import * as dbClientModule from "../src/db/client";
-import app from "../src/index";
+import { app } from "../src/index";
 
 interface ErrorResponseBody {
 	error: {
