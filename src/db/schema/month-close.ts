@@ -288,6 +288,10 @@ export const monthCloseRevisions = pgTable(
 			sql`(${table.route} = 'SHORT_TERM_GOAL') = (${table.targetGoalId} IS NOT NULL) AND (${table.route} = 'SHORT_TERM_GOAL') = (${table.targetGoalRevisionNo} IS NOT NULL) AND (${table.route} IN ('SHORT_TERM_GOAL', 'MEDIUM_TERM_RESERVE')) = (${table.targetBucketId} IS NOT NULL)`,
 		),
 		check(
+			"month_close_revisions_midas_account_route_check",
+			sql`(${table.route} IN ('SHORT_TERM_GOAL', 'MEDIUM_TERM_RESERVE')) = (${table.midasAccountId} IS NOT NULL)`,
+		),
+		check(
 			"month_close_revisions_shape_check",
 			sql`
 				(${table.route} = 'SHORT_TERM_GOAL' AND ${table.decision} = 'FULL' AND ${table.appliedAmount} = ${table.fullOfferAmount} AND ${table.midasAllocationTransferId} IS NOT NULL)

@@ -13,7 +13,8 @@ import {
 	monthCloses,
 } from "../db/schema/month-close";
 import { parseSignedAggregateMoneyString } from "../ledger/money";
-import { ensureUserExpenseSystemAccountsInTransaction } from "../ledger/system-expense-accounts";
+import { lockLedgerAccountsInTransaction } from "../ledger/posting";
+import { resolveUserExpenseSystemAccountsReadOnlyInTransaction } from "../ledger/system-expense-accounts";
 import { MidasError } from "../midas/errors";
 import {
 	createMidasAllocationTransferInTransaction,
@@ -269,6 +270,117 @@ interface MonthCloseFigures {
 	closeSurplusCents: bigint;
 }
 
+/**
+ * Read-only-resolved identities of the three expense-system ledger accounts
+ * month-close ever needs. `null` means no mapping row exists for that role
+ * (Section B: an unprovisioned role contributes exactly "0.00" expense and
+ * no ledger-account lock).
+ */
+interface ResolvedMonthCloseExpenseAccountIds {
+	mandatory: string | null;
+	discretionary: string | null;
+	unclassified: string | null;
+}
+
+/**
+ * STRICTLY READ-ONLY resolution of the expense-system-account identities
+ * (Phase 14-R1, Section B). Never provisions/inserts anything -- month-close
+ * only ever reads expense truth, it never creates the accounts.
+ */
+async function resolveMonthCloseExpenseAccountIdsInTransaction(
+	tx: DatabaseTransaction,
+	userId: string,
+): Promise<ResolvedMonthCloseExpenseAccountIds> {
+	const accounts = await resolveUserExpenseSystemAccountsReadOnlyInTransaction(
+		tx,
+		userId,
+	);
+	return {
+		mandatory: accounts.MANDATORY_EXPENSE,
+		discretionary: accounts.DISCRETIONARY_EXPENSE,
+		unclassified: accounts.UNCLASSIFIED_EXPENSE,
+	};
+}
+
+async function computeMonthCloseExpenseCentsInTransaction(
+	tx: DatabaseTransaction,
+	accountIds: ResolvedMonthCloseExpenseAccountIds,
+	start: Date,
+	end: Date,
+): Promise<{
+	mandatoryExpenseCents: bigint;
+	discretionaryExpenseCents: bigint;
+	unclassifiedExpenseCents: bigint;
+}> {
+	const mandatoryExpenseCents = accountIds.mandatory
+		? await computeAccountNetExpenseInTransaction(
+				tx,
+				accountIds.mandatory,
+				start,
+				end,
+			)
+		: 0n;
+	const discretionaryExpenseCents = accountIds.discretionary
+		? await computeAccountNetExpenseInTransaction(
+				tx,
+				accountIds.discretionary,
+				start,
+				end,
+			)
+		: 0n;
+	const unclassifiedExpenseCents = accountIds.unclassified
+		? await computeAccountNetExpenseInTransaction(
+				tx,
+				accountIds.unclassified,
+				start,
+				end,
+			)
+		: 0n;
+	return {
+		mandatoryExpenseCents,
+		discretionaryExpenseCents,
+		unclassifiedExpenseCents,
+	};
+}
+
+function buildMonthCloseFigures(
+	plan: ResolvedBudgetPlan,
+	mandatoryExpenseCents: bigint,
+	discretionaryExpenseCents: bigint,
+	unclassifiedExpenseCents: bigint,
+): MonthCloseFigures {
+	const mandatoryCeilingCents = parseSignedAggregateMoneyString(
+		plan.mandatoryCeiling,
+	).cents;
+	const discretionaryCeilingCents = parseSignedAggregateMoneyString(
+		plan.discretionaryCeiling,
+	).cents;
+
+	const mandatoryUnusedCents = computeMonthCloseUnusedCents(
+		mandatoryCeilingCents,
+		mandatoryExpenseCents,
+	);
+	const discretionaryUnusedCents = computeMonthCloseUnusedCents(
+		discretionaryCeilingCents,
+		discretionaryExpenseCents,
+	);
+
+	const closeSurplusCents = computeMonthCloseSurplusCents(
+		mandatoryUnusedCents,
+		discretionaryUnusedCents,
+	);
+
+	return {
+		plan,
+		mandatoryExpenseCents,
+		mandatoryUnusedCents,
+		discretionaryExpenseCents,
+		discretionaryUnusedCents,
+		unclassifiedExpenseCents,
+		closeSurplusCents,
+	};
+}
+
 type ResolvedState =
 	| ({ status: "OK" } & MonthCloseFigures)
 	| {
@@ -276,10 +388,24 @@ type ResolvedState =
 			reason:
 				| "MONTH_CLOSE_PERIOD_NOT_ENDED"
 				| "MONTH_CLOSE_BUDGET_PLAN_NOT_FOUND"
-				| "MONTH_CLOSE_BUDGET_PLAN_NOT_ACTIVE"
-				| "MONTH_CLOSE_UNCLASSIFIED_EXPENSES";
-	  };
+				| "MONTH_CLOSE_BUDGET_PLAN_NOT_ACTIVE";
+	  }
+	| ({
+			status: "BLOCKED";
+			reason: "MONTH_CLOSE_UNCLASSIFIED_EXPENSES";
+	  } & MonthCloseFigures);
 
+/**
+ * Read-only figure resolution used by `previewMonthClose`. (`closeMonth`
+ * resolves its own figures inline under the Section D lock sequence, since
+ * it must lock the budget-plan row and the required ledger accounts BEFORE
+ * computing the authoritative figures -- see Section D commentary in
+ * `closeMonth`.)
+ *
+ * When unclassified > 0, the real resolved figures are still returned
+ * (Section C: preview must expose the actual amounts, never dummy zeroed
+ * economics) alongside the BLOCKED reason.
+ */
 async function resolveMonthCloseFiguresInTransaction(
 	tx: DatabaseTransaction,
 	userId: string,
@@ -302,65 +428,37 @@ async function resolveMonthCloseFiguresInTransaction(
 	}
 
 	const { start, end } = getMonthCloseIstanbulPeriodBoundaries(periodMonth);
-	const accounts = await ensureUserExpenseSystemAccountsInTransaction(
+	const accountIds = await resolveMonthCloseExpenseAccountIdsInTransaction(
 		tx,
 		userId,
 	);
+	const {
+		mandatoryExpenseCents,
+		discretionaryExpenseCents,
+		unclassifiedExpenseCents,
+	} = await computeMonthCloseExpenseCentsInTransaction(
+		tx,
+		accountIds,
+		start,
+		end,
+	);
 
-	const mandatoryExpenseCents = await computeAccountNetExpenseInTransaction(
-		tx,
-		accounts.MANDATORY_EXPENSE,
-		start,
-		end,
-	);
-	const discretionaryExpenseCents = await computeAccountNetExpenseInTransaction(
-		tx,
-		accounts.DISCRETIONARY_EXPENSE,
-		start,
-		end,
-	);
-	const unclassifiedExpenseCents = await computeAccountNetExpenseInTransaction(
-		tx,
-		accounts.UNCLASSIFIED_EXPENSE,
-		start,
-		end,
+	const figures = buildMonthCloseFigures(
+		planResult,
+		mandatoryExpenseCents,
+		discretionaryExpenseCents,
+		unclassifiedExpenseCents,
 	);
 
 	if (unclassifiedExpenseCents > 0n) {
-		return { status: "BLOCKED", reason: "MONTH_CLOSE_UNCLASSIFIED_EXPENSES" };
+		return {
+			status: "BLOCKED",
+			reason: "MONTH_CLOSE_UNCLASSIFIED_EXPENSES",
+			...figures,
+		};
 	}
 
-	const mandatoryCeilingCents = parseSignedAggregateMoneyString(
-		planResult.mandatoryCeiling,
-	).cents;
-	const discretionaryCeilingCents = parseSignedAggregateMoneyString(
-		planResult.discretionaryCeiling,
-	).cents;
-
-	const mandatoryUnusedCents = computeMonthCloseUnusedCents(
-		mandatoryCeilingCents,
-		mandatoryExpenseCents,
-	);
-	const discretionaryUnusedCents = computeMonthCloseUnusedCents(
-		discretionaryCeilingCents,
-		discretionaryExpenseCents,
-	);
-
-	const closeSurplusCents = computeMonthCloseSurplusCents(
-		mandatoryUnusedCents,
-		discretionaryUnusedCents,
-	);
-
-	return {
-		status: "OK",
-		plan: planResult,
-		mandatoryExpenseCents,
-		mandatoryUnusedCents,
-		discretionaryExpenseCents,
-		discretionaryUnusedCents,
-		unclassifiedExpenseCents,
-		closeSurplusCents,
-	};
+	return { status: "OK", ...figures };
 }
 
 interface ResolvedRouting {
@@ -503,6 +601,54 @@ export async function previewMonthClose(
 			now,
 			false,
 		);
+
+		if (
+			resolved.status === "BLOCKED" &&
+			resolved.reason === "MONTH_CLOSE_UNCLASSIFIED_EXPENSES"
+		) {
+			// Section C (Phase 14-R1): expose the full REAL resolved figures even
+			// while blocked -- never collapse to dummy all-zero economics.
+			const fingerprint = await buildProposalFingerprint(
+				userId,
+				periodMonth,
+				resolved,
+				{
+					route: "NONE",
+					midasAccountId: null,
+					recommendedGoal: null,
+					fullOfferAmountCents: 0n,
+					unroutedRemainderIfFullCents: 0n,
+				},
+			);
+			return {
+				periodMonth,
+				budgetPlanId: resolved.plan.budgetPlanId,
+				budgetPlanRevisionNo: resolved.plan.revisionNo,
+				policyVersion: resolved.plan.policyVersion,
+				currency: resolved.plan.currency,
+				referenceIncome: resolved.plan.referenceIncome,
+				mandatory: {
+					ceiling: resolved.plan.mandatoryCeiling,
+					actualExpense: centsToMoney(resolved.mandatoryExpenseCents),
+					unused: centsToMoney(resolved.mandatoryUnusedCents),
+				},
+				discretionary: {
+					ceiling: resolved.plan.discretionaryCeiling,
+					actualExpense: centsToMoney(resolved.discretionaryExpenseCents),
+					unused: centsToMoney(resolved.discretionaryUnusedCents),
+				},
+				unclassifiedExpense: centsToMoney(resolved.unclassifiedExpenseCents),
+				closeSurplus: centsToMoney(resolved.closeSurplusCents),
+				midasAccountId: null,
+				midasUnallocatedBalance: null,
+				route: "BLOCKED",
+				recommendedGoal: null,
+				fullOfferAmount: null,
+				unroutedRemainderIfFull: null,
+				proposalFingerprint: fingerprint,
+				blockedReason: resolved.reason,
+			};
+		}
 
 		if (resolved.status === "BLOCKED") {
 			const fingerprint = await calculateMonthCloseProposalFingerprint({
@@ -749,14 +895,57 @@ export async function closeMonth(
 			monthClose: MonthCloseReadModel;
 			idempotentReplay: boolean;
 		}> => {
+			// Section A (Phase 14-R1): the candidate fingerprint MUST be
+			// reconstructed from THIS CALL's actual caller-supplied
+			// decision/partialAmount, using the STORED route as the
+			// (non-caller-supplied) route identity -- never from the stored
+			// revision's own decision/appliedAmount. Otherwise a changed retry
+			// (e.g. original FULL, retry with decision=SKIP, same idempotencyKey)
+			// would be incorrectly accepted as a replay instead of rejected.
+			const storedRoute = existingRev.route as MonthCloseRoute;
+			let candidateDecision: MonthCloseDecision;
+			let candidatePartialAmount: string | null = null;
+
+			if (storedRoute === "SHORT_TERM_GOAL") {
+				if (decision === undefined) {
+					throw new MonthCloseError(
+						"MONTH_CLOSE_IDEMPOTENCY_CONFLICT",
+						"decision (FULL, PARTIAL, or SKIP) must be supplied to validate a replay of a SHORT_TERM_GOAL-route month close",
+					);
+				}
+				candidateDecision = decision;
+				if (decision === "PARTIAL") {
+					// decision === "PARTIAL" implies parsedPartialAmount is defined
+					// (already enforced by the top-level input validation above).
+					candidatePartialAmount = (
+						parsedPartialAmount as { normalized: string; cents: bigint }
+					).normalized;
+				}
+			} else if (storedRoute === "MEDIUM_TERM_RESERVE") {
+				if (decision !== undefined || parsedPartialAmount !== undefined) {
+					throw new MonthCloseError(
+						"MONTH_CLOSE_IDEMPOTENCY_CONFLICT",
+						"decision/partialAmount must not be supplied to replay a MEDIUM_TERM_RESERVE-route month close",
+					);
+				}
+				candidateDecision = "AUTO_MEDIUM";
+			} else {
+				if (decision !== undefined || parsedPartialAmount !== undefined) {
+					throw new MonthCloseError(
+						"MONTH_CLOSE_IDEMPOTENCY_CONFLICT",
+						"decision/partialAmount must not be supplied to replay a NONE-route month close",
+					);
+				}
+				candidateDecision = "NO_ACTION";
+			}
+
 			const candidateFingerprint = await calculateMonthCloseApplyFingerprint({
 				userId,
 				periodMonth,
 				expectedProposalFingerprint,
-				effectiveRoute: existingRev.route as MonthCloseRoute,
-				decision: existingRev.decision as MonthCloseDecision,
-				partialAmount:
-					existingRev.decision === "PARTIAL" ? existingRev.appliedAmount : null,
+				effectiveRoute: storedRoute,
+				decision: candidateDecision,
+				partialAmount: candidatePartialAmount,
 				occurredAt,
 			});
 			if (candidateFingerprint !== existingRev.revisionFingerprint) {
@@ -860,15 +1049,74 @@ export async function closeMonth(
 			);
 		}
 
-		// This transaction now owns the month-close identity. Lock the Midas
-		// allocation state (if a Midas account exists) before resolving the
-		// authoritative proposal, so no concurrent allocation change can occur
-		// between our stale-proposal check and our liquidity check.
+		// This transaction now owns the month-close identity. Section D
+		// (Phase 14-R1): coherent expense snapshot / posting serialization.
+		// Global lock order (never inverted): budget-plan row -> ALL required
+		// ledger accounts (deterministic ascending id) -> Midas allocation state
+		// -> dependent goal/domain work.
+
+		// 1. Lock the authoritative monthly_budget_plans row FOR UPDATE (same
+		// pattern used by budget refresh/void in src/budget/service.ts).
+		await tx
+			.select({ id: monthlyBudgetPlans.id })
+			.from(monthlyBudgetPlans)
+			.where(eq(monthlyBudgetPlans.id, planResult.budgetPlanId))
+			.for("update")
+			.limit(1);
+
+		// Re-read the latest budget-plan revision now that the plan row is
+		// locked, so a concurrent budget-plan revision cannot race in between
+		// reading the figures that feed the stale-proposal fingerprint
+		// comparison below and locking the plan row.
+		const lockedPlanResult = await resolveActiveBudgetPlanInTransaction(
+			tx,
+			userId,
+			periodMonthDate,
+		);
+		if ("blockedReason" in lockedPlanResult) {
+			throw new MonthCloseError(
+				lockedPlanResult.blockedReason,
+				lockedPlanResult.blockedReason === "MONTH_CLOSE_BUDGET_PLAN_NOT_FOUND"
+					? `No monthly budget plan found for period "${periodMonth}"`
+					: `Monthly budget plan for period "${periodMonth}" is not ACTIVE`,
+			);
+		}
+
+		// 2. Resolve (READ-ONLY, Section B) the expense-system-account
+		// identities. A missing role contributes no id (and 0.00 expense).
+		const expenseAccountIds =
+			await resolveMonthCloseExpenseAccountIdsInTransaction(tx, userId);
+
+		// 3. Resolve the Midas account identity (if one exists) WITHOUT taking
+		// the Midas allocation lock yet.
 		const [midasAccountRow] = await tx
-			.select({ id: midasAccounts.id })
+			.select({
+				id: midasAccounts.id,
+				ledgerAccountId: midasAccounts.ledgerAccountId,
+			})
 			.from(midasAccounts)
 			.where(eq(midasAccounts.userId, userId))
 			.limit(1);
+
+		// 4. Build ONE set of all required ledger-account ids.
+		const requiredLedgerAccountIds = [
+			expenseAccountIds.mandatory,
+			expenseAccountIds.discretionary,
+			expenseAccountIds.unclassified,
+			midasAccountRow?.ledgerAccountId ?? null,
+		].filter((id): id is string => id !== null);
+
+		// 5. Lock ALL required ledger accounts together in deterministic
+		// ascending-id order using the existing primitive already used by
+		// src/long-term/service.ts for the analogous "lock N required accounts
+		// before Midas" problem.
+		await lockLedgerAccountsInTransaction({
+			tx,
+			userId,
+			accountIds: requiredLedgerAccountIds,
+		});
+
+		// 6. Only THEN acquire the Midas allocation lock.
 		if (midasAccountRow) {
 			await lockMidasAllocationStateInTransaction({
 				tx,
@@ -877,20 +1125,45 @@ export async function closeMonth(
 			});
 		}
 
-		const resolved = await resolveMonthCloseFiguresInTransaction(
+		// 7. Recompute final budget figures now that the relevant ledger
+		// accounts are locked. A concurrent journal entry touching these roles
+		// cannot transition DRAFT->POSTED until this transaction releases these
+		// locks: the existing journal-entry POSTED-transition trigger
+		// (trg_fn_guard_journal_entry_transition, migrations/0021_unusual_bug.sql)
+		// already locks every referenced ledger account
+		// (`FOR UPDATE OF la`, ascending `la.id` order) before permitting the
+		// transition -- so this makes the three expense reads one coherent
+		// posting boundary. This trigger is not weakened in any way.
+		const { start, end } = getMonthCloseIstanbulPeriodBoundaries(periodMonth);
+		const {
+			mandatoryExpenseCents,
+			discretionaryExpenseCents,
+			unclassifiedExpenseCents,
+		} = await computeMonthCloseExpenseCentsInTransaction(
 			tx,
-			userId,
-			periodMonth,
-			now,
-			true,
+			expenseAccountIds,
+			start,
+			end,
 		);
-		if (resolved.status === "BLOCKED") {
+
+		if (unclassifiedExpenseCents > 0n) {
 			throw new MonthCloseError(
-				resolved.reason,
-				`Month close for period "${periodMonth}" is blocked: ${resolved.reason}`,
+				"MONTH_CLOSE_UNCLASSIFIED_EXPENSES",
+				`Month close for period "${periodMonth}" is blocked: MONTH_CLOSE_UNCLASSIFIED_EXPENSES`,
 			);
 		}
 
+		const resolved: { status: "OK" } & MonthCloseFigures = {
+			status: "OK",
+			...buildMonthCloseFigures(
+				lockedPlanResult,
+				mandatoryExpenseCents,
+				discretionaryExpenseCents,
+				unclassifiedExpenseCents,
+			),
+		};
+
+		// 8. Recompute routing (goal selection, fallback).
 		const routing = await resolveMonthCloseRoutingInTransaction(
 			tx,
 			userId,

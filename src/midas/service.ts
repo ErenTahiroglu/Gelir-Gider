@@ -1227,6 +1227,16 @@ export async function ensureMidasSingletonBucketInTransaction({
 			`Existing singleton bucket "${row.id}" does not match the expected user/account/type contract`,
 		);
 	}
+	// The deterministic contract also covers the exact code and name: an
+	// existing singleton row must match byte-for-byte, or this is a hard
+	// reject (there is no UPDATE path here -- never silently accept or rename
+	// an immutable existing bucket).
+	if (row.code !== trimmedCode || row.name !== trimmedName) {
+		throw new MidasError(
+			"MIDAS_INVALID_STATE",
+			`Existing singleton bucket "${row.id}" code/name ("${row.code}"/"${row.name}") does not match the deterministic contract ("${trimmedCode}"/"${trimmedName}")`,
+		);
+	}
 
 	return {
 		id: row.id,

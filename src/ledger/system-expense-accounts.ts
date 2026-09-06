@@ -1,14 +1,17 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import type { DatabaseTransaction } from "../db/client";
+import { users } from "../db/schema/auth";
 import {
 	CREDIT_CARD_SYSTEM_ACCOUNT_ROLES,
 	type CreditCardSystemAccountRole,
 	creditCardSystemAccounts,
 } from "../db/schema/credit-card-ledger";
+import { ledgerAccounts } from "../db/schema/ledger";
 import {
 	type AccountType,
 	ensureDeterministicLedgerAccountInTransaction,
 } from "./accounts";
+import { LedgerError } from "./errors";
 
 /**
  * Neutral, domain-agnostic per-user system expense/equity ledger account roles.
@@ -146,4 +149,113 @@ export async function ensureUserExpenseSystemAccountsInTransaction(
 		UNCLASSIFIED_EXPENSE: unclassified,
 		OPENING_EQUITY: opening,
 	};
+}
+
+/**
+ * The subset of user expense system account roles month-close ever reads.
+ */
+export const MONTH_CLOSE_EXPENSE_SYSTEM_ACCOUNT_ROLES = [
+	"MANDATORY_EXPENSE",
+	"DISCRETIONARY_EXPENSE",
+	"UNCLASSIFIED_EXPENSE",
+] as const;
+export type MonthCloseExpenseSystemAccountRole =
+	(typeof MONTH_CLOSE_EXPENSE_SYSTEM_ACCOUNT_ROLES)[number];
+
+/**
+ * STRICTLY READ-ONLY sibling of `ensureUserExpenseSystemAccountsInTransaction`
+ * (Phase 14-R1, Section B). Never INSERTs/UPDATEs/DELETEs -- no ledger
+ * account or system-account-role row is ever provisioned here. A read-only
+ * caller (month-close preview, and month-close apply which only ever reads
+ * expense truth) must never have a mutating side effect.
+ *
+ * For each of the three expense roles month-close needs:
+ *  - If no `creditCardSystemAccounts` mapping row exists for that role, the
+ *    role's monthly expense is treated as exactly "0.00" (no supported
+ *    domain could have posted into an unprovisioned system role).
+ *  - If a mapping DOES exist, the linked `ledgerAccounts` row must be: same
+ *    user, accountType = 'EXPENSE', normalBalance = 'DEBIT', same user
+ *    currency, and unarchived. A malformed mapping is never repaired here --
+ *    it fails closed (throws `LedgerError`).
+ */
+export async function resolveUserExpenseSystemAccountsReadOnlyInTransaction(
+	tx: DatabaseTransaction,
+	userId: string,
+): Promise<Record<MonthCloseExpenseSystemAccountRole, string | null>> {
+	const [user] = await tx
+		.select({ currency: users.currency })
+		.from(users)
+		.where(eq(users.id, userId))
+		.limit(1);
+	if (!user) {
+		throw new LedgerError("LEDGER_USER_NOT_FOUND", "User not found");
+	}
+
+	const rows = await tx
+		.select({
+			role: creditCardSystemAccounts.role,
+			ledgerAccountId: creditCardSystemAccounts.ledgerAccountId,
+		})
+		.from(creditCardSystemAccounts)
+		.where(
+			and(
+				eq(creditCardSystemAccounts.userId, userId),
+				inArray(
+					creditCardSystemAccounts.role,
+					MONTH_CLOSE_EXPENSE_SYSTEM_ACCOUNT_ROLES as unknown as string[],
+				),
+			),
+		);
+
+	const roleMap = new Map<MonthCloseExpenseSystemAccountRole, string>();
+	for (const row of rows) {
+		roleMap.set(
+			row.role as MonthCloseExpenseSystemAccountRole,
+			row.ledgerAccountId,
+		);
+	}
+
+	const result = {} as Record<
+		MonthCloseExpenseSystemAccountRole,
+		string | null
+	>;
+
+	for (const role of MONTH_CLOSE_EXPENSE_SYSTEM_ACCOUNT_ROLES) {
+		const ledgerAccountId = roleMap.get(role);
+		if (!ledgerAccountId) {
+			result[role] = null;
+			continue;
+		}
+
+		const [account] = await tx
+			.select({
+				id: ledgerAccounts.id,
+				userId: ledgerAccounts.userId,
+				accountType: ledgerAccounts.accountType,
+				normalBalance: ledgerAccounts.normalBalance,
+				currency: ledgerAccounts.currency,
+				archivedAt: ledgerAccounts.archivedAt,
+			})
+			.from(ledgerAccounts)
+			.where(eq(ledgerAccounts.id, ledgerAccountId))
+			.limit(1);
+
+		if (
+			!account ||
+			account.userId !== userId ||
+			account.accountType !== "EXPENSE" ||
+			account.normalBalance !== "DEBIT" ||
+			account.currency !== user.currency ||
+			account.archivedAt !== null
+		) {
+			throw new LedgerError(
+				"LEDGER_INCOMPLETE_STATE",
+				`System expense account mapping for role "${role}" is malformed or invalid; refusing to repair it`,
+			);
+		}
+
+		result[role] = ledgerAccountId;
+	}
+
+	return result;
 }

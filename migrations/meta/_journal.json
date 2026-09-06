@@ -309,6 +309,13 @@
       "when": 1788640351847,
       "tag": "0043_add_month_end_surplus_close",
       "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1788675479242,
+      "tag": "0044_harden_month_end_close_integrity",
+      "breakpoints": true
     }
   ]
 }
