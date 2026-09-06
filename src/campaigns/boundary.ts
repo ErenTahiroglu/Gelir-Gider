@@ -238,11 +238,26 @@ export function mapDbError(err: unknown): never {
 		causeChain.includes("naked period anchor") ||
 		causeChain.includes("naked override anchor") ||
 		causeChain.includes("naked credit anchor") ||
-		causeChain.includes("has zero linked cards at commit")
+		causeChain.includes("naked candidate anchor") ||
+		causeChain.includes("has zero linked cards at commit") ||
+		causeChain.includes("naked card-scope drift") ||
+		causeChain.includes("must not change the bound card set")
 	) {
 		throw new CampaignError(
 			"CAMPAIGN_INVALID_STATE",
 			"Campaign domain anchor completeness violation",
+		);
+	}
+	if (
+		causeChain.includes("has no matching campaign_reward_credit") ||
+		causeChain.includes("void has no matching campaign_reward_credit") ||
+		causeChain.includes("must already be void before recording") ||
+		causeChain.includes("latest revision must be create") ||
+		causeChain.includes("more than one active reward credit identity")
+	) {
+		throw new CampaignError(
+			"CAMPAIGN_INVALID_STATE",
+			"Campaign/reward companion integrity violation",
 		);
 	}
 	if (
@@ -282,6 +297,17 @@ export function mapDbError(err: unknown): never {
 		throw new CampaignError(
 			"CAMPAIGN_IDEMPOTENCY_CONFLICT",
 			"Campaign reward credit idempotency key conflict",
+		);
+	}
+	if (
+		matchesDbConstraint(
+			err,
+			"campaign_review_candidate_revisions_user_idempotency_idx",
+		)
+	) {
+		throw new CampaignError(
+			"CAMPAIGN_IDEMPOTENCY_CONFLICT",
+			"Campaign review candidate idempotency key conflict",
 		);
 	}
 	if (

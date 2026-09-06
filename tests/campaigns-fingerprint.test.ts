@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
 	calculateCampaignOverrideFingerprint,
+	calculateCampaignPeriodAmendFingerprint,
+	calculateCampaignPeriodCreateRequestFingerprint,
 	calculateCampaignPeriodLifecycleFingerprint,
 	calculateCampaignPeriodRevisionFingerprint,
+	calculateCampaignReviewCandidateHash,
 	calculateCampaignRewardCreditFingerprint,
 	calculateCampaignSourceContentHash,
 } from "../src/campaigns/fingerprint";
@@ -124,23 +127,188 @@ describe("calculateCampaignPeriodLifecycleFingerprint", () => {
 });
 
 describe("calculateCampaignOverrideFingerprint", () => {
+	const overrideBase = {
+		userId: baseRevisionParams.userId,
+		campaignPeriodId: baseRevisionParams.campaignPeriodId,
+		purchaseEventId: "66666666-6666-6666-6666-666666666666",
+		reasonNote: null,
+		occurredAt: baseRevisionParams.occurredAt,
+		expectedRevisionNo: 0,
+	};
+
 	it("changes when the operation changes (INCLUDE vs EXCLUDE)", async () => {
-		const params = {
-			userId: baseRevisionParams.userId,
-			campaignPeriodId: baseRevisionParams.campaignPeriodId,
-			purchaseEventId: "66666666-6666-6666-6666-666666666666",
-			reasonNote: null,
-			occurredAt: baseRevisionParams.occurredAt,
-		};
 		const include = await calculateCampaignOverrideFingerprint({
-			...params,
+			...overrideBase,
 			operation: "INCLUDE",
 		});
 		const exclude = await calculateCampaignOverrideFingerprint({
-			...params,
+			...overrideBase,
 			operation: "EXCLUDE",
 		});
 		expect(include).not.toBe(exclude);
+	});
+
+	it("changes when expectedRevisionNo differs (OCC binding, Section M)", async () => {
+		const a = await calculateCampaignOverrideFingerprint({
+			...overrideBase,
+			operation: "INCLUDE",
+			expectedRevisionNo: 1,
+		});
+		const b = await calculateCampaignOverrideFingerprint({
+			...overrideBase,
+			operation: "INCLUDE",
+			expectedRevisionNo: 2,
+		});
+		expect(a).not.toBe(b);
+	});
+});
+
+describe("calculateCampaignPeriodCreateRequestFingerprint (Section A/C)", () => {
+	const createParams = {
+		userId: baseRevisionParams.userId,
+		provider: "AKBANK",
+		familyKey: "back-to-school",
+		periodKey: "2024-09",
+		title: baseRevisionParams.title,
+		startsOn: baseRevisionParams.startsOn,
+		endsOn: baseRevisionParams.endsOn,
+		ruleMode: baseRevisionParams.ruleMode,
+		targetSpendAmount: baseRevisionParams.targetSpendAmount,
+		requiredTransactionCount: baseRevisionParams.requiredTransactionCount,
+		minimumTransactionAmount: baseRevisionParams.minimumTransactionAmount,
+		stepSpendAmount: baseRevisionParams.stepSpendAmount,
+		rewardPointsPerStep: baseRevisionParams.rewardPointsPerStep,
+		maxSteps: baseRevisionParams.maxSteps,
+		rewardKind: baseRevisionParams.rewardKind,
+		rewardAccountId: baseRevisionParams.rewardAccountId,
+		expectedRewardPoints: baseRevisionParams.expectedRewardPoints,
+		merchantScopeMode: baseRevisionParams.merchantScopeMode,
+		requiredCanonicalMerchantNames:
+			baseRevisionParams.requiredCanonicalMerchantNames,
+		allowedMccCodes: baseRevisionParams.allowedMccCodes,
+		rewardExpiryDate: baseRevisionParams.rewardExpiryDate,
+		cardIds: baseRevisionParams.cardIds,
+		sourceSnapshotId: baseRevisionParams.sourceSnapshotId,
+		parserType: null,
+		parserVersion: null,
+		parserConfidence: null,
+		note: baseRevisionParams.note,
+		occurredAt: baseRevisionParams.occurredAt,
+	};
+
+	it("does not depend on any generated id -- identical for two calls", async () => {
+		const a =
+			await calculateCampaignPeriodCreateRequestFingerprint(createParams);
+		const b =
+			await calculateCampaignPeriodCreateRequestFingerprint(createParams);
+		expect(a).toBe(b);
+	});
+
+	it("changes when provider/familyKey/periodKey identity changes", async () => {
+		const a =
+			await calculateCampaignPeriodCreateRequestFingerprint(createParams);
+		const b = await calculateCampaignPeriodCreateRequestFingerprint({
+			...createParams,
+			periodKey: "2024-10",
+		});
+		expect(a).not.toBe(b);
+	});
+
+	it("changes when parser provenance changes", async () => {
+		const a =
+			await calculateCampaignPeriodCreateRequestFingerprint(createParams);
+		const b = await calculateCampaignPeriodCreateRequestFingerprint({
+			...createParams,
+			parserType: "html-table",
+			parserVersion: "1.0.0",
+		});
+		expect(a).not.toBe(b);
+	});
+});
+
+describe("calculateCampaignPeriodAmendFingerprint (Section C)", () => {
+	const amendParams = {
+		userId: baseRevisionParams.userId,
+		campaignPeriodId: baseRevisionParams.campaignPeriodId,
+		expectedRevisionNo: 2,
+		title: baseRevisionParams.title,
+		startsOn: baseRevisionParams.startsOn,
+		endsOn: baseRevisionParams.endsOn,
+		ruleMode: baseRevisionParams.ruleMode,
+		targetSpendAmount: baseRevisionParams.targetSpendAmount,
+		requiredTransactionCount: baseRevisionParams.requiredTransactionCount,
+		minimumTransactionAmount: baseRevisionParams.minimumTransactionAmount,
+		stepSpendAmount: baseRevisionParams.stepSpendAmount,
+		rewardPointsPerStep: baseRevisionParams.rewardPointsPerStep,
+		maxSteps: baseRevisionParams.maxSteps,
+		rewardKind: baseRevisionParams.rewardKind,
+		rewardAccountId: baseRevisionParams.rewardAccountId,
+		expectedRewardPoints: baseRevisionParams.expectedRewardPoints,
+		merchantScopeMode: baseRevisionParams.merchantScopeMode,
+		requiredCanonicalMerchantNames:
+			baseRevisionParams.requiredCanonicalMerchantNames,
+		allowedMccCodes: baseRevisionParams.allowedMccCodes,
+		rewardExpiryDate: baseRevisionParams.rewardExpiryDate,
+		cardIds: baseRevisionParams.cardIds,
+		sourceSnapshotId: baseRevisionParams.sourceSnapshotId,
+		parserType: null,
+		parserVersion: null,
+		parserConfidence: null,
+		note: baseRevisionParams.note,
+		occurredAt: baseRevisionParams.occurredAt,
+	};
+
+	it("changes when expectedRevisionNo differs even with byte-identical terms", async () => {
+		const a = await calculateCampaignPeriodAmendFingerprint(amendParams);
+		const b = await calculateCampaignPeriodAmendFingerprint({
+			...amendParams,
+			expectedRevisionNo: 3,
+		});
+		expect(a).not.toBe(b);
+	});
+});
+
+describe("calculateCampaignReviewCandidateHash (Section K)", () => {
+	const hashParams = {
+		campaignPeriodId: baseRevisionParams.campaignPeriodId,
+		sourceSnapshotId: "77777777-7777-7777-7777-777777777777",
+		title: baseRevisionParams.title,
+		startsOn: baseRevisionParams.startsOn,
+		endsOn: baseRevisionParams.endsOn,
+		ruleMode: baseRevisionParams.ruleMode,
+		targetSpendAmount: baseRevisionParams.targetSpendAmount,
+		requiredTransactionCount: baseRevisionParams.requiredTransactionCount,
+		minimumTransactionAmount: baseRevisionParams.minimumTransactionAmount,
+		stepSpendAmount: baseRevisionParams.stepSpendAmount,
+		rewardPointsPerStep: baseRevisionParams.rewardPointsPerStep,
+		maxSteps: baseRevisionParams.maxSteps,
+		rewardKind: baseRevisionParams.rewardKind,
+		rewardAccountId: baseRevisionParams.rewardAccountId,
+		expectedRewardPoints: baseRevisionParams.expectedRewardPoints,
+		merchantScopeMode: baseRevisionParams.merchantScopeMode,
+		requiredCanonicalMerchantNames:
+			baseRevisionParams.requiredCanonicalMerchantNames,
+		allowedMccCodes: baseRevisionParams.allowedMccCodes,
+		rewardExpiryDate: baseRevisionParams.rewardExpiryDate,
+		parserType: null,
+		parserVersion: null,
+		parserConfidence: null,
+		proposedCardIds: baseRevisionParams.cardIds,
+	};
+
+	it("is identical for identical proposed terms (dedup key)", async () => {
+		const a = await calculateCampaignReviewCandidateHash(hashParams);
+		const b = await calculateCampaignReviewCandidateHash(hashParams);
+		expect(a).toBe(b);
+	});
+
+	it("changes when the proposed reward amount differs", async () => {
+		const a = await calculateCampaignReviewCandidateHash(hashParams);
+		const b = await calculateCampaignReviewCandidateHash({
+			...hashParams,
+			expectedRewardPoints: "999.0000",
+		});
+		expect(a).not.toBe(b);
 	});
 });
 

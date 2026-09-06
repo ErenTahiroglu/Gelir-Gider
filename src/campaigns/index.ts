@@ -10,6 +10,7 @@ export {
 	validateMerchantAliasInput,
 } from "./merchant";
 export * from "./progress";
+export * from "./review-candidates";
 export * from "./rules";
 export * from "./service";
 export * from "./sources";

@@ -685,3 +685,200 @@ export const campaignRewardCreditRevisions = pgTable(
 		),
 	],
 );
+
+// ============================================================================
+// Campaign Review Candidates (Immutable Anchor + Append-only Revisions)
+// Phase 16-R1 Section K: source-change review candidates. A changed source
+// snapshot for an ACTIVE campaign creates a PENDING review candidate without
+// ever touching the currently confirmed campaign revision. Chain is
+// CREATE -> (APPLY | DISMISS), both terminal.
+// ============================================================================
+
+export const CAMPAIGN_REVIEW_CANDIDATE_STATUSES = [
+	"PENDING",
+	"APPLIED",
+	"DISMISSED",
+] as const;
+export type CampaignReviewCandidateStatus =
+	(typeof CAMPAIGN_REVIEW_CANDIDATE_STATUSES)[number];
+
+export const CAMPAIGN_REVIEW_CANDIDATE_OPERATIONS = [
+	"CREATE",
+	"APPLY",
+	"DISMISS",
+] as const;
+export type CampaignReviewCandidateOperation =
+	(typeof CAMPAIGN_REVIEW_CANDIDATE_OPERATIONS)[number];
+
+export const campaignReviewCandidates = pgTable(
+	"campaign_review_candidates",
+	{
+		id: uuid("id").defaultRandom().primaryKey().notNull(),
+		userId: uuid("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "restrict" }),
+		campaignPeriodId: uuid("campaign_period_id")
+			.notNull()
+			.references(() => campaignPeriods.id, { onDelete: "restrict" }),
+		sourceSnapshotId: uuid("source_snapshot_id")
+			.notNull()
+			.references(() => campaignSourceSnapshots.id, { onDelete: "restrict" }),
+		candidateHash: varchar("candidate_hash", { length: 64 }).notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+			.defaultNow()
+			.notNull(),
+	},
+	(table) => [
+		index("campaign_review_candidates_period_idx").on(table.campaignPeriodId),
+		index("campaign_review_candidates_user_idx").on(table.userId),
+		index("campaign_review_candidates_hash_idx").on(
+			table.campaignPeriodId,
+			table.candidateHash,
+		),
+		check(
+			"campaign_review_candidates_hash_check",
+			sql`${table.candidateHash} ~ '^[0-9a-f]{64}$'`,
+		),
+	],
+);
+
+export const campaignReviewCandidateRevisions = pgTable(
+	"campaign_review_candidate_revisions",
+	{
+		id: uuid("id").defaultRandom().primaryKey().notNull(),
+		userId: uuid("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "restrict" }),
+		candidateId: uuid("candidate_id")
+			.notNull()
+			.references(() => campaignReviewCandidates.id, { onDelete: "restrict" }),
+		revisionNo: integer("revision_no").notNull(),
+		previousRevisionId: uuid("previous_revision_id").references(
+			(): AnyPgColumn => campaignReviewCandidateRevisions.id,
+			{ onDelete: "restrict" },
+		),
+		operation: varchar("operation", { length: 10 }).notNull(),
+		status: varchar("status", { length: 10 }).notNull(),
+		title: varchar("title", { length: 200 }).notNull(),
+		startsOn: date("starts_on").notNull(),
+		endsOn: date("ends_on").notNull(),
+		ruleMode: varchar("rule_mode", { length: 24 }).notNull(),
+		targetSpendAmount: numeric("target_spend_amount", {
+			precision: 18,
+			scale: 2,
+		}),
+		requiredTransactionCount: integer("required_transaction_count"),
+		minimumTransactionAmount: numeric("minimum_transaction_amount", {
+			precision: 18,
+			scale: 2,
+		}),
+		stepSpendAmount: numeric("step_spend_amount", { precision: 18, scale: 2 }),
+		rewardPointsPerStep: numeric("reward_points_per_step", {
+			precision: 20,
+			scale: 4,
+		}),
+		maxSteps: integer("max_steps"),
+		rewardKind: varchar("reward_kind", { length: 20 }).notNull(),
+		rewardAccountId: uuid("reward_account_id").references(
+			() => rewardAccounts.id,
+			{ onDelete: "restrict" },
+		),
+		expectedRewardPoints: numeric("expected_reward_points", {
+			precision: 20,
+			scale: 4,
+		}),
+		merchantScopeMode: varchar("merchant_scope_mode", {
+			length: 24,
+		}).notNull(),
+		requiredCanonicalMerchantNames: jsonb("required_canonical_merchant_names"),
+		allowedMccCodes: jsonb("allowed_mcc_codes"),
+		rewardExpiryDate: date("reward_expiry_date"),
+		parserType: varchar("parser_type", { length: 60 }),
+		parserVersion: varchar("parser_version", { length: 40 }),
+		parserConfidence: numeric("parser_confidence", { precision: 5, scale: 4 }),
+		proposedCardIds: jsonb("proposed_card_ids").notNull(),
+		occurredAt: timestamp("occurred_at", {
+			withTimezone: true,
+			mode: "date",
+		}).notNull(),
+		idempotencyKey: varchar("idempotency_key", { length: 128 }).notNull(),
+		revisionFingerprint: varchar("revision_fingerprint", {
+			length: 64,
+		}).notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+			.defaultNow()
+			.notNull(),
+	},
+	(table) => [
+		uniqueIndex("campaign_review_candidate_revisions_candidate_rev_idx").on(
+			table.candidateId,
+			table.revisionNo,
+		),
+		uniqueIndex("campaign_review_candidate_revisions_user_idempotency_idx").on(
+			table.userId,
+			table.idempotencyKey,
+		),
+		uniqueIndex("campaign_review_candidate_revisions_prev_rev_idx")
+			.on(table.previousRevisionId)
+			.where(sql`${table.previousRevisionId} IS NOT NULL`),
+		index("campaign_review_candidate_revisions_candidate_idx").on(
+			table.candidateId,
+		),
+		check(
+			"campaign_review_candidate_revisions_rev_no_check",
+			sql`${table.revisionNo} > 0`,
+		),
+		check(
+			"campaign_review_candidate_revisions_op_check",
+			sql`${table.operation} IN ('CREATE', 'APPLY', 'DISMISS')`,
+		),
+		check(
+			"campaign_review_candidate_revisions_status_check",
+			sql`${table.status} IN ('PENDING', 'APPLIED', 'DISMISSED')`,
+		),
+		check(
+			"campaign_review_candidate_revisions_title_check",
+			sql`${table.title} = btrim(${table.title}) AND length(${table.title}) >= 1 AND length(${table.title}) <= 200`,
+		),
+		check(
+			"campaign_review_candidate_revisions_date_window_check",
+			sql`${table.startsOn} <= ${table.endsOn}`,
+		),
+		check(
+			"campaign_review_candidate_revisions_rule_mode_check",
+			sql`${table.ruleMode} IN ('TOTAL_SPEND', 'TRANSACTION_COUNT', 'REPEATABLE_SPEND')`,
+		),
+		check(
+			"campaign_review_candidate_revisions_reward_kind_check",
+			sql`${table.rewardKind} IN ('REWARD_POINTS', 'STATEMENT_CREDIT', 'INFORMATIONAL')`,
+		),
+		check(
+			"campaign_review_candidate_revisions_merchant_scope_check",
+			sql`${table.merchantScopeMode} IN ('ALL_MERCHANTS', 'MERCHANT_ALIASES', 'MANUAL_REVIEW_REQUIRED')`,
+		),
+		check(
+			"campaign_review_candidate_revisions_mcc_shape_check",
+			sql`${table.allowedMccCodes} IS NULL OR jsonb_typeof(${table.allowedMccCodes}) = 'array'`,
+		),
+		check(
+			"campaign_review_candidate_revisions_parser_confidence_check",
+			sql`${table.parserConfidence} IS NULL OR (${table.parserConfidence} >= 0 AND ${table.parserConfidence} <= 1)`,
+		),
+		check(
+			"campaign_review_candidate_revisions_parser_shape_check",
+			sql`(${table.parserType} IS NULL) = (${table.parserVersion} IS NULL)`,
+		),
+		check(
+			"campaign_review_candidate_revisions_proposed_card_ids_check",
+			sql`jsonb_typeof(${table.proposedCardIds}) = 'array'`,
+		),
+		check(
+			"campaign_review_candidate_revisions_fingerprint_check",
+			sql`${table.revisionFingerprint} ~ '^[0-9a-f]{64}$'`,
+		),
+		check(
+			"campaign_review_candidate_revisions_idempotency_check",
+			sql`${table.idempotencyKey} = btrim(${table.idempotencyKey}) AND length(${table.idempotencyKey}) >= 1 AND length(${table.idempotencyKey}) <= 128`,
+		),
+	],
+);

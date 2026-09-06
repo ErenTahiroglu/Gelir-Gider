@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	campaignFamilies,
@@ -10,6 +10,7 @@ import {
 	campaignRewardCreditRevisions,
 	campaignRewardCredits,
 } from "../db/schema/campaigns";
+import { creditCards } from "../db/schema/credit-cards";
 import {
 	recordRewardEarnInTransaction,
 	voidRewardEventInTransaction,
@@ -43,10 +44,20 @@ import {
 import { CampaignError } from "./errors";
 import {
 	calculateCampaignOverrideFingerprint,
+	calculateCampaignPeriodAmendFingerprint,
+	calculateCampaignPeriodCreateRequestFingerprint,
 	calculateCampaignPeriodLifecycleFingerprint,
-	calculateCampaignPeriodRevisionFingerprint,
 	calculateCampaignRewardCreditFingerprint,
 } from "./fingerprint";
+// NOTE: this creates a deliberate two-way import cycle with ./progress
+// (progress.ts imports getLatestRevisionInTransaction/
+// listLatestCampaignPurchaseOverridesInTransaction/
+// resolveActiveCampaignRewardCreditInTransaction from this module; this
+// module imports getCampaignProgressInTransaction from progress.ts). Every
+// binding on both sides is a hoisted function declaration referenced only
+// from inside other function bodies (never at module-evaluation time), so
+// the cycle resolves safely under ESM/CJS interop.
+import { getCampaignProgressInTransaction } from "./progress";
 import {
 	validateCampaignRewardShape,
 	validateCampaignRuleShape,
@@ -97,9 +108,18 @@ export interface CampaignPeriodRevisionReadModel {
 	createdAt: Date;
 }
 
-async function buildCampaignPeriodReadModelInTransaction(
+/**
+ * Section B (Phase 16-R1): builds the read model for the EXACT historical
+ * revision identified by `revisionId` (not necessarily the latest one for
+ * `campaignPeriodId`) plus that exact revision's own card companion set.
+ * `buildCampaignPeriodReadModelInTransaction` (latest-state builder) and
+ * `tryReplayCampaignPeriodRevisionByKey` (historical-replay builder) both
+ * delegate here so the row-shaping logic exists exactly once.
+ */
+async function buildCampaignPeriodReadModelForRevisionInTransaction(
 	tx: DatabaseTransaction,
 	campaignPeriodId: string,
+	revisionId: string,
 ): Promise<CampaignPeriodRevisionReadModel | null> {
 	const [row] = await tx
 		.select({
@@ -116,8 +136,12 @@ async function buildCampaignPeriodReadModelInTransaction(
 			campaignPeriodRevisions,
 			eq(campaignPeriodRevisions.campaignPeriodId, campaignPeriods.id),
 		)
-		.where(eq(campaignPeriods.id, campaignPeriodId))
-		.orderBy(desc(campaignPeriodRevisions.revisionNo))
+		.where(
+			and(
+				eq(campaignPeriods.id, campaignPeriodId),
+				eq(campaignPeriodRevisions.id, revisionId),
+			),
+		)
 		.limit(1);
 
 	if (!row) return null;
@@ -180,6 +204,36 @@ async function buildCampaignPeriodReadModelInTransaction(
 	};
 }
 
+/**
+ * Latest-state read model builder: resolves the latest revision id for
+ * `campaignPeriodId` then delegates to the revision-scoped builder above --
+ * no duplicated row-shaping logic (Section B).
+ */
+export async function buildCampaignPeriodReadModelInTransaction(
+	tx: DatabaseTransaction,
+	campaignPeriodId: string,
+): Promise<CampaignPeriodRevisionReadModel | null> {
+	const [latest] = await tx
+		.select({ id: campaignPeriodRevisions.id })
+		.from(campaignPeriodRevisions)
+		.where(eq(campaignPeriodRevisions.campaignPeriodId, campaignPeriodId))
+		.orderBy(desc(campaignPeriodRevisions.revisionNo))
+		.limit(1);
+	if (!latest) return null;
+	return buildCampaignPeriodReadModelForRevisionInTransaction(
+		tx,
+		campaignPeriodId,
+		latest.id,
+	);
+}
+
+/**
+ * Section B (Phase 16-R1): replays an idempotency key against the EXACT
+ * historical campaign_period_revisions row that owns it -- NOT whatever is
+ * currently latest for the campaign period. Retrying an old CREATE/CONFIRM/
+ * AMEND key after later lifecycle changes must return the historical
+ * snapshot the key originally produced.
+ */
 async function tryReplayCampaignPeriodRevisionByKey(
 	tx: DatabaseTransaction,
 	userId: string,
@@ -206,9 +260,10 @@ async function tryReplayCampaignPeriodRevisionByKey(
 		);
 	}
 
-	return buildCampaignPeriodReadModelInTransaction(
+	return buildCampaignPeriodReadModelForRevisionInTransaction(
 		tx,
 		existing.campaignPeriodId,
+		existing.id,
 	);
 }
 
@@ -485,43 +540,65 @@ export async function createCampaignPeriod(
 ): Promise<CampaignPeriodRevisionReadModel> {
 	const fields = normalizeCreateFields(params);
 
-	return runCampaignsTransaction(params.db, async (tx) => {
-		const fingerprint = await calculateCampaignPeriodRevisionFingerprint(
-			"CREATE",
-			{
-				userId: fields.userId,
-				campaignPeriodId: "PENDING",
-				title: fields.title,
-				startsOn: fields.startsOn,
-				endsOn: fields.endsOn,
-				ruleMode: fields.ruleMode,
-				targetSpendAmount: fields.targetSpendAmount,
-				requiredTransactionCount: fields.requiredTransactionCount,
-				minimumTransactionAmount: fields.minimumTransactionAmount,
-				stepSpendAmount: fields.stepSpendAmount,
-				rewardPointsPerStep: fields.rewardPointsPerStep,
-				maxSteps: fields.maxSteps,
-				rewardKind: fields.rewardKind,
-				rewardAccountId: fields.rewardAccountId,
-				expectedRewardPoints: fields.expectedRewardPoints,
-				merchantScopeMode: fields.merchantScopeMode,
-				requiredCanonicalMerchantNames: fields.requiredCanonicalMerchantNames,
-				allowedMccCodes: fields.allowedMccCodes,
-				rewardExpiryDate: fields.rewardExpiryDate,
-				cardIds: fields.cardIds,
-				sourceSnapshotId: fields.sourceSnapshotId,
-				note: fields.note,
-				occurredAt: fields.occurredAt,
-			},
-		);
+	// Section A (Phase 16-R1): ONE fingerprint, computed ONCE before any DB
+	// mutation, that depends on NO generated id (no campaignPeriodId). Used
+	// for both the early replay lookup and permanent storage below -- a
+	// legitimate exact CREATE retry always matches this value, whether the
+	// family/period rows already existed or not.
+	const fingerprint = await calculateCampaignPeriodCreateRequestFingerprint({
+		userId: fields.userId,
+		provider: fields.provider,
+		familyKey: fields.familyKey,
+		periodKey: fields.periodKey,
+		title: fields.title,
+		startsOn: fields.startsOn,
+		endsOn: fields.endsOn,
+		ruleMode: fields.ruleMode,
+		targetSpendAmount: fields.targetSpendAmount,
+		requiredTransactionCount: fields.requiredTransactionCount,
+		minimumTransactionAmount: fields.minimumTransactionAmount,
+		stepSpendAmount: fields.stepSpendAmount,
+		rewardPointsPerStep: fields.rewardPointsPerStep,
+		maxSteps: fields.maxSteps,
+		rewardKind: fields.rewardKind,
+		rewardAccountId: fields.rewardAccountId,
+		expectedRewardPoints: fields.expectedRewardPoints,
+		merchantScopeMode: fields.merchantScopeMode,
+		requiredCanonicalMerchantNames: fields.requiredCanonicalMerchantNames,
+		allowedMccCodes: fields.allowedMccCodes,
+		rewardExpiryDate: fields.rewardExpiryDate,
+		cardIds: fields.cardIds,
+		sourceSnapshotId: fields.sourceSnapshotId,
+		parserType: fields.parserType,
+		parserVersion: fields.parserVersion,
+		parserConfidence: fields.parserConfidence,
+		note: fields.note,
+		occurredAt: fields.occurredAt,
+	});
 
+	return runCampaignsTransaction(params.db, async (tx) => {
 		const replay = await tryReplayCampaignPeriodRevisionByKey(
 			tx,
 			fields.userId,
 			fields.idempotencyKey,
 			fingerprint,
 		);
-		if (replay) return replay;
+		if (replay) {
+			// Defense-in-depth (Section A): the fingerprint already binds
+			// provider/familyKey/periodKey, but verify the replay's owning
+			// family/period identity explicitly before returning it.
+			if (
+				replay.provider !== fields.provider ||
+				replay.familyKey !== fields.familyKey ||
+				replay.periodKey !== fields.periodKey
+			) {
+				throw new CampaignError(
+					"CAMPAIGN_IDEMPOTENCY_CONFLICT",
+					"Idempotency key reused with a different campaign family/period identity",
+				);
+			}
+			return replay;
+		}
 
 		// Ensure family exists (idempotent get-or-create).
 		let [family] = await tx
@@ -588,35 +665,6 @@ export async function createCampaignPeriod(
 			);
 		}
 
-		const exactFingerprint = await calculateCampaignPeriodRevisionFingerprint(
-			"CREATE",
-			{
-				userId: fields.userId,
-				campaignPeriodId: period.id,
-				title: fields.title,
-				startsOn: fields.startsOn,
-				endsOn: fields.endsOn,
-				ruleMode: fields.ruleMode,
-				targetSpendAmount: fields.targetSpendAmount,
-				requiredTransactionCount: fields.requiredTransactionCount,
-				minimumTransactionAmount: fields.minimumTransactionAmount,
-				stepSpendAmount: fields.stepSpendAmount,
-				rewardPointsPerStep: fields.rewardPointsPerStep,
-				maxSteps: fields.maxSteps,
-				rewardKind: fields.rewardKind,
-				rewardAccountId: fields.rewardAccountId,
-				expectedRewardPoints: fields.expectedRewardPoints,
-				merchantScopeMode: fields.merchantScopeMode,
-				requiredCanonicalMerchantNames: fields.requiredCanonicalMerchantNames,
-				allowedMccCodes: fields.allowedMccCodes,
-				rewardExpiryDate: fields.rewardExpiryDate,
-				cardIds: fields.cardIds,
-				sourceSnapshotId: fields.sourceSnapshotId,
-				note: fields.note,
-				occurredAt: fields.occurredAt,
-			},
-		);
-
 		const [revision] = await tx
 			.insert(campaignPeriodRevisions)
 			.values({
@@ -654,7 +702,7 @@ export async function createCampaignPeriod(
 				note: fields.note,
 				occurredAt: fields.occurredAt,
 				idempotencyKey: fields.idempotencyKey,
-				revisionFingerprint: exactFingerprint,
+				revisionFingerprint: fingerprint,
 			})
 			.returning();
 
@@ -911,34 +959,38 @@ export async function amendCampaignPeriod(
 	});
 
 	return runCampaignsTransaction(params.db, async (tx) => {
-		const fingerprint = await calculateCampaignPeriodRevisionFingerprint(
-			"AMEND",
-			{
-				userId,
-				campaignPeriodId,
-				title: fields.title,
-				startsOn: fields.startsOn,
-				endsOn: fields.endsOn,
-				ruleMode: fields.ruleMode,
-				targetSpendAmount: fields.targetSpendAmount,
-				requiredTransactionCount: fields.requiredTransactionCount,
-				minimumTransactionAmount: fields.minimumTransactionAmount,
-				stepSpendAmount: fields.stepSpendAmount,
-				rewardPointsPerStep: fields.rewardPointsPerStep,
-				maxSteps: fields.maxSteps,
-				rewardKind: fields.rewardKind,
-				rewardAccountId: fields.rewardAccountId,
-				expectedRewardPoints: fields.expectedRewardPoints,
-				merchantScopeMode: fields.merchantScopeMode,
-				requiredCanonicalMerchantNames: fields.requiredCanonicalMerchantNames,
-				allowedMccCodes: fields.allowedMccCodes,
-				rewardExpiryDate: fields.rewardExpiryDate,
-				cardIds: fields.cardIds,
-				sourceSnapshotId: fields.sourceSnapshotId,
-				note: fields.note,
-				occurredAt: fields.occurredAt,
-			},
-		);
+		// Section C (Phase 16-R1): the AMEND fingerprint binds
+		// expectedRevisionNo (true OCC) and parser provenance -- neither of
+		// which the legacy generic fingerprint bound.
+		const fingerprint = await calculateCampaignPeriodAmendFingerprint({
+			userId,
+			campaignPeriodId,
+			expectedRevisionNo,
+			title: fields.title,
+			startsOn: fields.startsOn,
+			endsOn: fields.endsOn,
+			ruleMode: fields.ruleMode,
+			targetSpendAmount: fields.targetSpendAmount,
+			requiredTransactionCount: fields.requiredTransactionCount,
+			minimumTransactionAmount: fields.minimumTransactionAmount,
+			stepSpendAmount: fields.stepSpendAmount,
+			rewardPointsPerStep: fields.rewardPointsPerStep,
+			maxSteps: fields.maxSteps,
+			rewardKind: fields.rewardKind,
+			rewardAccountId: fields.rewardAccountId,
+			expectedRewardPoints: fields.expectedRewardPoints,
+			merchantScopeMode: fields.merchantScopeMode,
+			requiredCanonicalMerchantNames: fields.requiredCanonicalMerchantNames,
+			allowedMccCodes: fields.allowedMccCodes,
+			rewardExpiryDate: fields.rewardExpiryDate,
+			cardIds: fields.cardIds,
+			sourceSnapshotId: fields.sourceSnapshotId,
+			parserType: fields.parserType,
+			parserVersion: fields.parserVersion,
+			parserConfidence: fields.parserConfidence,
+			note: fields.note,
+			occurredAt: fields.occurredAt,
+		});
 
 		const replay = await tryReplayCampaignPeriodRevisionByKey(
 			tx,
@@ -1162,6 +1214,14 @@ export interface RecordCampaignPurchaseOverrideParams {
 	campaignPeriodId: string;
 	purchaseEventId: string;
 	operation: unknown;
+	/**
+	 * Section M (Phase 16-R1): OCC contract for the override revision chain.
+	 * The FIRST override for a given (campaignPeriodId, purchaseEventId) pair
+	 * (no anchor exists yet) requires the CREATE-contract sentinel `0`.
+	 * Every subsequent INCLUDE/EXCLUDE/CLEAR call must bind the current
+	 * revision number; a stale value throws CAMPAIGN_REVISION_CONFLICT.
+	 */
+	expectedRevisionNo: number;
 	reasonNote?: string | null | undefined;
 	occurredAt: Date;
 	idempotencyKey: string;
@@ -1180,6 +1240,17 @@ export async function recordCampaignPurchaseOverride(
 		"purchaseEventId",
 	);
 	const operation = validateCampaignOverrideOperation(params.operation);
+	if (
+		typeof params.expectedRevisionNo !== "number" ||
+		!Number.isInteger(params.expectedRevisionNo) ||
+		params.expectedRevisionNo < 0
+	) {
+		throw new CampaignError(
+			"CAMPAIGN_INVALID_INPUT",
+			"expectedRevisionNo must be a non-negative integer (0 for the first override on a purchase)",
+		);
+	}
+	const expectedRevisionNo = params.expectedRevisionNo;
 	const reasonNote = validateCampaignOptionalText(
 		params.reasonNote,
 		"reasonNote",
@@ -1196,6 +1267,7 @@ export async function recordCampaignPurchaseOverride(
 			operation,
 			reasonNote,
 			occurredAt,
+			expectedRevisionNo,
 		});
 
 		const [existingRevByKey] = await tx
@@ -1230,6 +1302,10 @@ export async function recordCampaignPurchaseOverride(
 			};
 		}
 
+		// Section M: lock the anchor row FOR UPDATE (or observe that none
+		// exists yet) BEFORE resolving the latest revision, serializing the
+		// override revision chain at the application layer -- the DB trigger
+		// enforces the same lock as defense-in-depth.
 		let [override] = await tx
 			.select()
 			.from(campaignPurchaseOverrides)
@@ -1239,9 +1315,15 @@ export async function recordCampaignPurchaseOverride(
 					eq(campaignPurchaseOverrides.purchaseEventId, purchaseEventId),
 				),
 			)
-			.limit(1);
+			.for("update");
 
 		if (!override) {
+			if (expectedRevisionNo !== 0) {
+				throw new CampaignError(
+					"CAMPAIGN_REVISION_CONFLICT",
+					`No override exists yet for this purchase; expectedRevisionNo must be 0, found ${expectedRevisionNo}`,
+				);
+			}
 			const [inserted] = await tx
 				.insert(campaignPurchaseOverrides)
 				.values({ userId, campaignPeriodId, purchaseEventId })
@@ -1265,12 +1347,20 @@ export async function recordCampaignPurchaseOverride(
 			.orderBy(desc(campaignPurchaseOverrideRevisions.revisionNo))
 			.limit(1);
 
+		const currentRevisionNo = latestRev?.revisionNo ?? 0;
+		if (currentRevisionNo !== expectedRevisionNo) {
+			throw new CampaignError(
+				"CAMPAIGN_REVISION_CONFLICT",
+				`Expected override revision ${expectedRevisionNo} but found ${currentRevisionNo}`,
+			);
+		}
+
 		const [revision] = await tx
 			.insert(campaignPurchaseOverrideRevisions)
 			.values({
 				userId,
 				overrideId: override.id,
-				revisionNo: (latestRev?.revisionNo ?? 0) + 1,
+				revisionNo: currentRevisionNo + 1,
 				previousRevisionId: latestRev?.id ?? null,
 				operation,
 				reasonNote,
@@ -1355,25 +1445,131 @@ export interface ConfirmCampaignRewardCreditedParams {
 	userId: string;
 	campaignPeriodId: string;
 	actualPointAmount: string;
-	expectedPointAmount: string | null;
 	occurredAt: Date;
 	reasonNote?: string | null | undefined;
 	idempotencyKey: string;
 }
 
 /**
- * Section 20: implements confirmCampaignRewardCredited. Only valid when the
- * campaign period is ACTIVE/ENDED, rewardKind = REWARD_POINTS, and the
- * caller-supplied expected/actual comparison is honest (a different amount
- * requires a reasonNote). Atomically records the campaign reward-credit
- * companion and calls the EXACT existing recordRewardEarnInTransaction with
- * sourceType "CAMPAIGN" and sourceRef = campaignPeriodId. Qualification is
- * NOT checked against live purchase progress here -- callers must first read
- * getCampaignProgress and confirm qualificationStatus is
- * QUALIFIED_AWAITING_CREDIT; this function enforces the DB-authoritative
- * single-active-identity + reward-kind/lifecycle invariants, and progress
- * requalification is intentionally the caller's read-before-write
- * responsibility (mirrors every other domain's OCC contract).
+ * Section G (Phase 16-R1): authoritative resolver for the currently ACTIVE
+ * (non-VOID) reward credit identity for a campaign period. Selects ALL
+ * anchors for the period, resolves EACH one's own latest revision, and
+ * filters to operation != 'VOID'. Expects 0 or 1 results across every
+ * credit GENERATION for the period -- more than one active identity is a
+ * domain-integrity violation (defense in depth against the DB trigger).
+ * Replaces every prior ad-hoc single-row credit-resolution query.
+ */
+export async function resolveActiveCampaignRewardCreditInTransaction(
+	tx: DatabaseTransaction,
+	campaignPeriodId: string,
+): Promise<{
+	creditId: string;
+	revisionId: string;
+	rewardAccountId: string;
+	actualPointAmount: string;
+	expectedPointAmount: string | null;
+	rewardEventId: string;
+	revisionNo: number;
+} | null> {
+	const credits = await tx
+		.select({
+			id: campaignRewardCredits.id,
+			rewardAccountId: campaignRewardCredits.rewardAccountId,
+		})
+		.from(campaignRewardCredits)
+		.where(eq(campaignRewardCredits.campaignPeriodId, campaignPeriodId));
+
+	const active: {
+		creditId: string;
+		revisionId: string;
+		rewardAccountId: string;
+		actualPointAmount: string;
+		expectedPointAmount: string | null;
+		rewardEventId: string;
+		revisionNo: number;
+	}[] = [];
+
+	for (const credit of credits) {
+		const [latestRev] = await tx
+			.select()
+			.from(campaignRewardCreditRevisions)
+			.where(eq(campaignRewardCreditRevisions.creditId, credit.id))
+			.orderBy(desc(campaignRewardCreditRevisions.revisionNo))
+			.limit(1);
+		if (!latestRev || latestRev.operation === "VOID") continue;
+		active.push({
+			creditId: credit.id,
+			revisionId: latestRev.id,
+			rewardAccountId: credit.rewardAccountId,
+			actualPointAmount: latestRev.actualPointAmount,
+			expectedPointAmount: latestRev.expectedPointAmount,
+			rewardEventId: latestRev.rewardEventId,
+			revisionNo: latestRev.revisionNo,
+		});
+	}
+
+	if (active.length > 1) {
+		throw new CampaignError(
+			"CAMPAIGN_INVALID_STATE",
+			`Campaign period "${campaignPeriodId}" has more than one ACTIVE reward credit identity`,
+		);
+	}
+	return active[0] ?? null;
+}
+
+/**
+ * @deprecated Section G (Phase 16-R1): replaced by
+ * `resolveActiveCampaignRewardCreditInTransaction`, which correctly resolves
+ * the ACTIVE identity across every credit GENERATION for the period instead
+ * of an arbitrary `.limit(1)` row. Kept only as a thin compatibility alias.
+ */
+export async function getActiveCampaignRewardCreditInTransaction(
+	tx: DatabaseTransaction,
+	campaignPeriodId: string,
+): Promise<{ actualPointAmount: string; creditId: string } | null> {
+	const active = await resolveActiveCampaignRewardCreditInTransaction(
+		tx,
+		campaignPeriodId,
+	);
+	if (!active) return null;
+	return {
+		actualPointAmount: active.actualPointAmount,
+		creditId: active.creditId,
+	};
+}
+
+/**
+ * Section E/F/G (Phase 16-R1): implements confirmCampaignRewardCredited as
+ * the SOLE authoritative, DB-enforced qualification gate. Order of
+ * operations:
+ *   1. Early exact idempotency replay.
+ *   2. Lock the exact campaign_periods anchor row FOR UPDATE.
+ *   3. Re-read the latest campaign revision + card scope (under the lock).
+ *   4. Require lifecycle ACTIVE or ENDED.
+ *   5. Require rewardKind REWARD_POINTS.
+ *   6. Lock the campaign's bound credit_cards rows in deterministic
+ *      sorted-id order, so a concurrent purchase CREATE/UPDATE/VOID on those
+ *      cards cannot change the qualifying purchase set between this lock and
+ *      the final decision.
+ *   7. Authoritatively recompute progress INSIDE this transaction via
+ *      `getCampaignProgressInTransaction` (single source of truth -- no
+ *      duplicated rule logic).
+ *   8. Require qualificationStatus === QUALIFIED_AWAITING_CREDIT.
+ *   9. Resolve the AUTHORITATIVE expected reward points (never caller
+ *      input): TOTAL_SPEND/TRANSACTION_COUNT -> the confirmed revision's
+ *      stored expected_reward_points; REPEATABLE_SPEND -> the SAME
+ *      authoritative progress read model's derived expectedRewardPoints.
+ *  10. Enforce reason-note semantics: actual != authoritative expected
+ *      requires reasonNote.
+ *  11. Ensure no ACTIVE campaign reward credit already exists (via
+ *      `resolveActiveCampaignRewardCreditInTransaction`).
+ *  12. Create the Phase 12 EARN + campaign credit companion atomically.
+ *
+ * Lock ordering: campaign period -> credit cards (sorted) -> reward
+ * account/reward event internals (acquired inside
+ * `recordRewardEarnInTransaction`). No code path in the credit-card domain
+ * ever locks a campaign_periods row, so this ordering cannot deadlock against
+ * a concurrent purchase mutation.
  */
 export async function confirmCampaignRewardCredited(
 	params: ConfirmCampaignRewardCreditedParams,
@@ -1387,14 +1583,6 @@ export async function confirmCampaignRewardCredited(
 		params.actualPointAmount,
 		"actualPointAmount",
 	);
-	const expected =
-		params.expectedPointAmount === null ||
-		params.expectedPointAmount === undefined
-			? null
-			: parseCampaignPointQuantity(
-					params.expectedPointAmount,
-					"expectedPointAmount",
-				);
 	const occurredAt = validateCampaignOccurredAt(params.occurredAt);
 	const reasonNote = validateCampaignOptionalText(
 		params.reasonNote,
@@ -1403,18 +1591,9 @@ export async function confirmCampaignRewardCredited(
 	);
 	const idempotencyKey = validateCampaignIdempotencyKey(params.idempotencyKey);
 
-	if (
-		expected !== null &&
-		expected.normalized !== actual.normalized &&
-		reasonNote === null
-	) {
-		throw new CampaignError(
-			"CAMPAIGN_INVALID_INPUT",
-			"reasonNote is required when actualPointAmount differs from expectedPointAmount",
-		);
-	}
-
 	return runCampaignsTransaction(params.db, async (tx) => {
+		// Step 1: early exact idempotency replay, scoped globally by
+		// (userId, idempotencyKey) across every credit generation.
 		const [existingRevByKey] = await tx
 			.select()
 			.from(campaignRewardCreditRevisions)
@@ -1426,20 +1605,7 @@ export async function confirmCampaignRewardCredited(
 			)
 			.limit(1);
 
-		const expectedFingerprint = await calculateCampaignRewardCreditFingerprint({
-			userId,
-			campaignPeriodId,
-			operation: "CREATE",
-			rewardAccountId: "PENDING",
-			actualPointAmount: actual.normalized,
-			expectedPointAmount: expected?.normalized ?? null,
-			reasonNote,
-			occurredAt,
-		});
-
 		if (existingRevByKey) {
-			// Fingerprint binds rewardAccountId, so recompute using the
-			// existing credit's account for the replay comparison.
 			const [credit] = await tx
 				.select()
 				.from(campaignRewardCredits)
@@ -1457,7 +1623,7 @@ export async function confirmCampaignRewardCredited(
 				operation: "CREATE",
 				rewardAccountId: credit.rewardAccountId,
 				actualPointAmount: actual.normalized,
-				expectedPointAmount: expected?.normalized ?? null,
+				expectedPointAmount: existingRevByKey.expectedPointAmount,
 				reasonNote,
 				occurredAt,
 			});
@@ -1480,8 +1646,26 @@ export async function confirmCampaignRewardCredited(
 				occurredAt: existingRevByKey.occurredAt,
 			};
 		}
-		void expectedFingerprint;
 
+		// Step 2: lock the exact campaign_periods anchor row FOR UPDATE.
+		const [periodAnchor] = await tx
+			.select()
+			.from(campaignPeriods)
+			.where(
+				and(
+					eq(campaignPeriods.id, campaignPeriodId),
+					eq(campaignPeriods.userId, userId),
+				),
+			)
+			.for("update");
+		if (!periodAnchor) {
+			throw new CampaignError(
+				"CAMPAIGN_NOT_FOUND",
+				`Campaign period "${campaignPeriodId}" not found`,
+			);
+		}
+
+		// Step 3: re-read the latest revision + card scope AFTER the lock.
 		const latestPeriod = await getLatestRevisionInTransaction(
 			tx,
 			userId,
@@ -1493,12 +1677,14 @@ export async function confirmCampaignRewardCredited(
 				`Campaign period "${campaignPeriodId}" not found`,
 			);
 		}
+		// Step 4
 		if (!["ACTIVE", "ENDED"].includes(latestPeriod.row.lifecycleStatus)) {
 			throw new CampaignError(
 				"CAMPAIGN_NOT_ACTIVE",
 				`Campaign period "${campaignPeriodId}" is not ACTIVE/ENDED`,
 			);
 		}
+		// Step 5
 		if (latestPeriod.row.rewardKind !== "REWARD_POINTS") {
 			throw new CampaignError(
 				"CAMPAIGN_INVALID_STATE",
@@ -1513,24 +1699,73 @@ export async function confirmCampaignRewardCredited(
 			);
 		}
 
-		const [existingCredit] = await tx
-			.select()
-			.from(campaignRewardCredits)
-			.where(eq(campaignRewardCredits.campaignPeriodId, campaignPeriodId))
-			.limit(1);
-		if (existingCredit) {
-			const [latestExistingRev] = await tx
-				.select({ operation: campaignRewardCreditRevisions.operation })
-				.from(campaignRewardCreditRevisions)
-				.where(eq(campaignRewardCreditRevisions.creditId, existingCredit.id))
-				.orderBy(desc(campaignRewardCreditRevisions.revisionNo))
-				.limit(1);
-			if (latestExistingRev && latestExistingRev.operation !== "VOID") {
-				throw new CampaignError(
-					"CAMPAIGN_REWARD_ALREADY_CREDITED",
-					`Campaign period "${campaignPeriodId}" already has an active reward credit`,
-				);
-			}
+		// Step 6: lock the campaign's bound credit_cards rows in
+		// deterministic sorted-id order.
+		if (latestPeriod.cardIds.length > 0) {
+			const sortedUniqueCardIds = Array.from(
+				new Set(latestPeriod.cardIds.map((id) => id.toLowerCase())),
+			).sort();
+			await tx
+				.select({ id: creditCards.id })
+				.from(creditCards)
+				.where(inArray(creditCards.id, sortedUniqueCardIds))
+				.orderBy(asc(creditCards.id))
+				.for("update");
+		}
+
+		// Step 7: authoritatively recompute progress INSIDE this transaction.
+		const progress = await getCampaignProgressInTransaction(
+			tx,
+			userId,
+			campaignPeriodId,
+		);
+
+		// Step 8
+		if (progress.qualificationStatus !== "QUALIFIED_AWAITING_CREDIT") {
+			throw new CampaignError(
+				"CAMPAIGN_NOT_QUALIFIED",
+				`Campaign period "${campaignPeriodId}" is not currently QUALIFIED_AWAITING_CREDIT (found ${progress.qualificationStatus})`,
+			);
+		}
+
+		// Step 9: resolve the AUTHORITATIVE expected reward points.
+		const authoritativeExpectedRaw =
+			latestPeriod.row.ruleMode === "REPEATABLE_SPEND"
+				? progress.expectedRewardPoints
+				: latestPeriod.row.expectedRewardPoints;
+		if (!authoritativeExpectedRaw) {
+			throw new CampaignError(
+				"CAMPAIGN_INVALID_STATE",
+				`Campaign period "${campaignPeriodId}" has no authoritative expected reward point amount`,
+			);
+		}
+		const authoritativeExpected = parseCampaignPointQuantity(
+			authoritativeExpectedRaw,
+			"expectedRewardPoints",
+		);
+
+		// Step 10: reason-note semantics against the AUTHORITATIVE expected
+		// amount (exact decimal-string comparison, never float).
+		if (
+			authoritativeExpected.normalized !== actual.normalized &&
+			reasonNote === null
+		) {
+			throw new CampaignError(
+				"CAMPAIGN_INVALID_INPUT",
+				"reasonNote is required when actualPointAmount differs from the authoritative expected reward amount",
+			);
+		}
+
+		// Step 11: ensure no ACTIVE campaign reward credit already exists.
+		const activeCredit = await resolveActiveCampaignRewardCreditInTransaction(
+			tx,
+			campaignPeriodId,
+		);
+		if (activeCredit) {
+			throw new CampaignError(
+				"CAMPAIGN_REWARD_ALREADY_CREDITED",
+				`Campaign period "${campaignPeriodId}" already has an active reward credit`,
+			);
 		}
 
 		const finalFingerprint = await calculateCampaignRewardCreditFingerprint({
@@ -1539,11 +1774,13 @@ export async function confirmCampaignRewardCredited(
 			operation: "CREATE",
 			rewardAccountId,
 			actualPointAmount: actual.normalized,
-			expectedPointAmount: expected?.normalized ?? null,
+			expectedPointAmount: authoritativeExpected.normalized,
 			reasonNote,
 			occurredAt,
 		});
 
+		// Step 12: create the Phase 12 EARN + campaign credit companion
+		// atomically.
 		const [credit] = await tx
 			.insert(campaignRewardCredits)
 			.values({ userId, campaignPeriodId, rewardAccountId })
@@ -1576,7 +1813,7 @@ export async function confirmCampaignRewardCredited(
 				previousRevisionId: null,
 				operation: "CREATE",
 				actualPointAmount: actual.normalized,
-				expectedPointAmount: expected?.normalized ?? null,
+				expectedPointAmount: authoritativeExpected.normalized,
 				reasonNote,
 				occurredAt,
 				rewardEventId: rewardResult.event.rewardEventId,
@@ -1599,7 +1836,7 @@ export async function confirmCampaignRewardCredited(
 			revisionNo: 1,
 			operation: "CREATE",
 			actualPointAmount: actual.normalized,
-			expectedPointAmount: expected?.normalized ?? null,
+			expectedPointAmount: authoritativeExpected.normalized,
 			rewardEventId: rewardResult.event.rewardEventId,
 			reasonNote,
 			occurredAt,
@@ -1618,10 +1855,20 @@ export interface VoidCampaignRewardCreditParams {
 }
 
 /**
- * Section 22: VOID campaign reward credit -> exact VOID of the linked Phase
- * 12 reward EARN event, atomically. The campaign period returns to
- * QUALIFIED_AWAITING_CREDIT; a subsequent confirmCampaignRewardCredited call
- * creates a brand new reward event identity.
+ * Section G (Phase 16-R1): VOID campaign reward credit -> exact VOID of the
+ * linked Phase 12 reward EARN event, atomically. The campaign period returns
+ * to QUALIFIED_AWAITING_CREDIT; a subsequent confirmCampaignRewardCredited
+ * call creates a brand new reward event identity.
+ *
+ * Ordering: the EXISTING exact-idempotency-key replay check runs FIRST,
+ * globally across ALL of the period's credit revisions (by userId +
+ * idempotencyKey, not scoped to whichever credit row a naive `.limit(1)`
+ * happened to return) -- replaying an OLD VOID key (e.g. credit1's own VOID
+ * key) must succeed and return the historical credit1-VOID snapshot even
+ * after credit2 has since become active. Only when no matching historical
+ * key is found does this fall through to resolving and VOIDing the exact
+ * CURRENTLY-ACTIVE credit identity via
+ * `resolveActiveCampaignRewardCreditInTransaction`.
  */
 export async function voidCampaignRewardCredit(
 	params: VoidCampaignRewardCreditParams,
@@ -1643,42 +1890,8 @@ export async function voidCampaignRewardCredit(
 	const idempotencyKey = validateCampaignIdempotencyKey(params.idempotencyKey);
 
 	return runCampaignsTransaction(params.db, async (tx) => {
-		const [credit] = await tx
-			.select()
-			.from(campaignRewardCredits)
-			.where(eq(campaignRewardCredits.campaignPeriodId, campaignPeriodId))
-			.limit(1);
-		if (!credit || credit.userId !== userId) {
-			throw new CampaignError(
-				"CAMPAIGN_NOT_FOUND",
-				`No reward credit found for campaign period "${campaignPeriodId}"`,
-			);
-		}
-
-		const [latestRev] = await tx
-			.select()
-			.from(campaignRewardCreditRevisions)
-			.where(eq(campaignRewardCreditRevisions.creditId, credit.id))
-			.orderBy(desc(campaignRewardCreditRevisions.revisionNo))
-			.limit(1);
-		if (!latestRev) {
-			throw new CampaignError(
-				"CAMPAIGN_INVALID_STATE",
-				"Reward credit has no revisions",
-			);
-		}
-
-		const fingerprint = await calculateCampaignRewardCreditFingerprint({
-			userId,
-			campaignPeriodId,
-			operation: "VOID",
-			rewardAccountId: credit.rewardAccountId,
-			actualPointAmount: latestRev.actualPointAmount,
-			expectedPointAmount: latestRev.expectedPointAmount,
-			reasonNote,
-			occurredAt,
-		});
-
+		// Historical replay lookup FIRST, globally across every credit
+		// generation for the period (not scoped to any single credit row).
 		const [existingRevByKey] = await tx
 			.select()
 			.from(campaignRewardCreditRevisions)
@@ -1689,17 +1902,44 @@ export async function voidCampaignRewardCredit(
 				),
 			)
 			.limit(1);
+
 		if (existingRevByKey) {
-			if (existingRevByKey.revisionFingerprint !== fingerprint) {
+			const [historicalCredit] = await tx
+				.select()
+				.from(campaignRewardCredits)
+				.where(
+					and(
+						eq(campaignRewardCredits.id, existingRevByKey.creditId),
+						eq(campaignRewardCredits.campaignPeriodId, campaignPeriodId),
+					),
+				)
+				.limit(1);
+			if (!historicalCredit) {
+				throw new CampaignError(
+					"CAMPAIGN_IDEMPOTENCY_CONFLICT",
+					"Idempotency key reused for a different campaign period",
+				);
+			}
+			const replayFingerprint = await calculateCampaignRewardCreditFingerprint({
+				userId,
+				campaignPeriodId,
+				operation: "VOID",
+				rewardAccountId: historicalCredit.rewardAccountId,
+				actualPointAmount: existingRevByKey.actualPointAmount,
+				expectedPointAmount: existingRevByKey.expectedPointAmount,
+				reasonNote,
+				occurredAt,
+			});
+			if (existingRevByKey.revisionFingerprint !== replayFingerprint) {
 				throw new CampaignError(
 					"CAMPAIGN_IDEMPOTENCY_CONFLICT",
 					"Idempotency key reused with a different VOID payload",
 				);
 			}
 			return {
-				creditId: credit.id,
+				creditId: historicalCredit.id,
 				campaignPeriodId,
-				rewardAccountId: credit.rewardAccountId,
+				rewardAccountId: historicalCredit.rewardAccountId,
 				revisionNo: existingRevByKey.revisionNo,
 				operation: "VOID",
 				actualPointAmount: existingRevByKey.actualPointAmount,
@@ -1710,24 +1950,54 @@ export async function voidCampaignRewardCredit(
 			};
 		}
 
-		if (latestRev.revisionNo !== expectedRevisionNo) {
+		// No historical key match: resolve and VOID the exact
+		// CURRENTLY-ACTIVE credit identity (Section G).
+		const active = await resolveActiveCampaignRewardCreditInTransaction(
+			tx,
+			campaignPeriodId,
+		);
+		if (!active) {
+			throw new CampaignError(
+				"CAMPAIGN_NOT_FOUND",
+				`No active reward credit found for campaign period "${campaignPeriodId}"`,
+			);
+		}
+
+		const [credit] = await tx
+			.select()
+			.from(campaignRewardCredits)
+			.where(eq(campaignRewardCredits.id, active.creditId))
+			.limit(1);
+		if (!credit || credit.userId !== userId) {
+			throw new CampaignError(
+				"CAMPAIGN_NOT_FOUND",
+				`No reward credit found for campaign period "${campaignPeriodId}"`,
+			);
+		}
+
+		if (active.revisionNo !== expectedRevisionNo) {
 			throw new CampaignError(
 				"CAMPAIGN_REVISION_CONFLICT",
-				`Expected reward credit revision ${expectedRevisionNo} but found ${latestRev.revisionNo}`,
+				`Expected reward credit revision ${expectedRevisionNo} but found ${active.revisionNo}`,
 			);
 		}
-		if (latestRev.operation === "VOID") {
-			throw new CampaignError(
-				"CAMPAIGN_INVALID_STATE",
-				"Reward credit is already VOID",
-			);
-		}
+
+		const fingerprint = await calculateCampaignRewardCreditFingerprint({
+			userId,
+			campaignPeriodId,
+			operation: "VOID",
+			rewardAccountId: credit.rewardAccountId,
+			actualPointAmount: active.actualPointAmount,
+			expectedPointAmount: active.expectedPointAmount,
+			reasonNote,
+			occurredAt,
+		});
 
 		// VOID the linked Phase 12 EARN event first (same transaction), then
 		// record the VOID revision on the campaign side referencing it.
 		await voidRewardEventInTransaction(tx, {
 			userId,
-			rewardEventId: latestRev.rewardEventId,
+			rewardEventId: active.rewardEventId,
 			expectedRevisionNo: 1,
 			reasonNote,
 			idempotencyKey: `campaign-reward-credit-void:${credit.id}`,
@@ -1738,14 +2008,14 @@ export async function voidCampaignRewardCredit(
 			.values({
 				userId,
 				creditId: credit.id,
-				revisionNo: latestRev.revisionNo + 1,
-				previousRevisionId: latestRev.id,
+				revisionNo: active.revisionNo + 1,
+				previousRevisionId: active.revisionId,
 				operation: "VOID",
-				actualPointAmount: latestRev.actualPointAmount,
-				expectedPointAmount: latestRev.expectedPointAmount,
+				actualPointAmount: active.actualPointAmount,
+				expectedPointAmount: active.expectedPointAmount,
 				reasonNote,
 				occurredAt,
-				rewardEventId: latestRev.rewardEventId,
+				rewardEventId: active.rewardEventId,
 				idempotencyKey,
 				revisionFingerprint: fingerprint,
 			})
@@ -1764,40 +2034,11 @@ export async function voidCampaignRewardCredit(
 			rewardAccountId: credit.rewardAccountId,
 			revisionNo: revision.revisionNo,
 			operation: "VOID",
-			actualPointAmount: latestRev.actualPointAmount,
-			expectedPointAmount: latestRev.expectedPointAmount,
-			rewardEventId: latestRev.rewardEventId,
+			actualPointAmount: active.actualPointAmount,
+			expectedPointAmount: active.expectedPointAmount,
+			rewardEventId: active.rewardEventId,
 			reasonNote,
 			occurredAt,
 		};
 	});
-}
-
-/**
- * Returns the currently active (non-VOID) reward credit for a campaign
- * period, if any.
- */
-export async function getActiveCampaignRewardCreditInTransaction(
-	tx: DatabaseTransaction,
-	campaignPeriodId: string,
-): Promise<{ actualPointAmount: string; creditId: string } | null> {
-	const [credit] = await tx
-		.select()
-		.from(campaignRewardCredits)
-		.where(eq(campaignRewardCredits.campaignPeriodId, campaignPeriodId))
-		.limit(1);
-	if (!credit) return null;
-
-	const [latestRev] = await tx
-		.select()
-		.from(campaignRewardCreditRevisions)
-		.where(eq(campaignRewardCreditRevisions.creditId, credit.id))
-		.orderBy(desc(campaignRewardCreditRevisions.revisionNo))
-		.limit(1);
-	if (!latestRev || latestRev.operation === "VOID") return null;
-
-	return {
-		actualPointAmount: latestRev.actualPointAmount,
-		creditId: credit.id,
-	};
 }

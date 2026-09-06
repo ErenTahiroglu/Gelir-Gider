@@ -92,6 +92,236 @@ export async function calculateCampaignPeriodRevisionFingerprint(
 	]);
 }
 
+/**
+ * Section A/C (Phase 16-R1): the CREATE-specific request fingerprint. Unlike
+ * `calculateCampaignPeriodRevisionFingerprint`, this binds NO generated id
+ * (no campaignPeriodId/campaignFamilyId/revisionId) so a legitimate exact
+ * CREATE retry (before or after the family/period rows exist) always
+ * produces the identical value -- computed once, before any DB mutation, and
+ * used for both the early replay lookup and permanent storage. Additionally
+ * binds provider/familyKey/periodKey (the identity a CREATE establishes) and
+ * parser provenance (parserType/parserVersion/parserConfidence), which the
+ * legacy fingerprint omitted entirely.
+ */
+export interface CampaignPeriodCreateRequestFingerprintParams {
+	userId: string;
+	provider: string;
+	familyKey: string;
+	periodKey: string;
+	title: string;
+	startsOn: string;
+	endsOn: string;
+	ruleMode: string;
+	targetSpendAmount: string | null;
+	requiredTransactionCount: number | null;
+	minimumTransactionAmount: string | null;
+	stepSpendAmount: string | null;
+	rewardPointsPerStep: string | null;
+	maxSteps: number | null;
+	rewardKind: string;
+	rewardAccountId: string | null;
+	expectedRewardPoints: string | null;
+	merchantScopeMode: string;
+	requiredCanonicalMerchantNames: string[] | null;
+	allowedMccCodes: string[] | null;
+	rewardExpiryDate: string | null;
+	cardIds: string[];
+	sourceSnapshotId: string | null;
+	parserType: string | null;
+	parserVersion: string | null;
+	parserConfidence: number | null;
+	note: string | null;
+	occurredAt: Date;
+}
+
+export async function calculateCampaignPeriodCreateRequestFingerprint(
+	params: CampaignPeriodCreateRequestFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"campaign-period-create-request-v1",
+		params.userId.trim().toLowerCase(),
+		params.provider,
+		params.familyKey,
+		params.periodKey,
+		params.title,
+		params.startsOn,
+		params.endsOn,
+		params.ruleMode,
+		params.targetSpendAmount,
+		params.requiredTransactionCount,
+		params.minimumTransactionAmount,
+		params.stepSpendAmount,
+		params.rewardPointsPerStep,
+		params.maxSteps,
+		params.rewardKind,
+		params.rewardAccountId?.trim().toLowerCase() ?? null,
+		params.expectedRewardPoints,
+		params.merchantScopeMode,
+		params.requiredCanonicalMerchantNames
+			? [...params.requiredCanonicalMerchantNames].sort()
+			: null,
+		params.allowedMccCodes ? [...params.allowedMccCodes].sort() : null,
+		params.rewardExpiryDate,
+		[...params.cardIds].map((id) => id.trim().toLowerCase()).sort(),
+		params.sourceSnapshotId?.trim().toLowerCase() ?? null,
+		params.parserType,
+		params.parserVersion,
+		params.parserConfidence,
+		params.note,
+		params.occurredAt.toISOString(),
+	]);
+}
+
+/**
+ * Section C (Phase 16-R1): the AMEND-specific fingerprint. Binds
+ * expectedRevisionNo (true OCC semantics -- the same idempotency key retried
+ * against a different expectedRevisionNo must CONFLICT even when every other
+ * term is byte-identical) and parser provenance, neither of which the legacy
+ * generic fingerprint bound.
+ */
+export interface CampaignPeriodAmendFingerprintParams
+	extends Omit<
+		CampaignPeriodCreateRequestFingerprintParams,
+		"provider" | "familyKey" | "periodKey"
+	> {
+	campaignPeriodId: string;
+	expectedRevisionNo: number;
+}
+
+export async function calculateCampaignPeriodAmendFingerprint(
+	params: CampaignPeriodAmendFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"campaign-period-amend-v1",
+		params.userId.trim().toLowerCase(),
+		params.campaignPeriodId.trim().toLowerCase(),
+		params.expectedRevisionNo,
+		params.title,
+		params.startsOn,
+		params.endsOn,
+		params.ruleMode,
+		params.targetSpendAmount,
+		params.requiredTransactionCount,
+		params.minimumTransactionAmount,
+		params.stepSpendAmount,
+		params.rewardPointsPerStep,
+		params.maxSteps,
+		params.rewardKind,
+		params.rewardAccountId?.trim().toLowerCase() ?? null,
+		params.expectedRewardPoints,
+		params.merchantScopeMode,
+		params.requiredCanonicalMerchantNames
+			? [...params.requiredCanonicalMerchantNames].sort()
+			: null,
+		params.allowedMccCodes ? [...params.allowedMccCodes].sort() : null,
+		params.rewardExpiryDate,
+		[...params.cardIds].map((id) => id.trim().toLowerCase()).sort(),
+		params.sourceSnapshotId?.trim().toLowerCase() ?? null,
+		params.parserType,
+		params.parserVersion,
+		params.parserConfidence,
+		params.note,
+		params.occurredAt.toISOString(),
+	]);
+}
+
+/**
+ * Section K (Phase 16-R1): the semantic hash used to dedup review candidates.
+ * Computed over the SAME normalized-term fields as the CREATE request
+ * fingerprint (minus identity fields that are not part of the "proposed
+ * terms" surface), plus the proposed card scope. Two proposals with
+ * byte-identical semantic content hash identically regardless of
+ * idempotency key or occurredAt -- this is a content-addressed dedup key,
+ * not a request-replay fingerprint.
+ */
+export interface CampaignReviewCandidateHashParams {
+	campaignPeriodId: string;
+	sourceSnapshotId: string;
+	title: string;
+	startsOn: string;
+	endsOn: string;
+	ruleMode: string;
+	targetSpendAmount: string | null;
+	requiredTransactionCount: number | null;
+	minimumTransactionAmount: string | null;
+	stepSpendAmount: string | null;
+	rewardPointsPerStep: string | null;
+	maxSteps: number | null;
+	rewardKind: string;
+	rewardAccountId: string | null;
+	expectedRewardPoints: string | null;
+	merchantScopeMode: string;
+	requiredCanonicalMerchantNames: string[] | null;
+	allowedMccCodes: string[] | null;
+	rewardExpiryDate: string | null;
+	parserType: string | null;
+	parserVersion: string | null;
+	parserConfidence: number | null;
+	proposedCardIds: string[];
+}
+
+export async function calculateCampaignReviewCandidateHash(
+	params: CampaignReviewCandidateHashParams,
+): Promise<string> {
+	return sha256Hex([
+		"campaign-review-candidate-hash-v1",
+		params.campaignPeriodId.trim().toLowerCase(),
+		params.sourceSnapshotId.trim().toLowerCase(),
+		params.title,
+		params.startsOn,
+		params.endsOn,
+		params.ruleMode,
+		params.targetSpendAmount,
+		params.requiredTransactionCount,
+		params.minimumTransactionAmount,
+		params.stepSpendAmount,
+		params.rewardPointsPerStep,
+		params.maxSteps,
+		params.rewardKind,
+		params.rewardAccountId?.trim().toLowerCase() ?? null,
+		params.expectedRewardPoints,
+		params.merchantScopeMode,
+		params.requiredCanonicalMerchantNames
+			? [...params.requiredCanonicalMerchantNames].sort()
+			: null,
+		params.allowedMccCodes ? [...params.allowedMccCodes].sort() : null,
+		params.rewardExpiryDate,
+		params.parserType,
+		params.parserVersion,
+		params.parserConfidence,
+		[...params.proposedCardIds].map((id) => id.trim().toLowerCase()).sort(),
+	]);
+}
+
+/**
+ * Section K (Phase 16-R1): fingerprint for a review candidate's terminal
+ * lifecycle revision (APPLY | DISMISS). Binds the candidate identity,
+ * operation, the campaign's expectedRevisionNo the caller applied against
+ * (APPLY-only OCC; null for DISMISS), occurredAt, and an optional note.
+ */
+export interface CampaignReviewCandidateLifecycleFingerprintParams {
+	userId: string;
+	candidateId: string;
+	operation: string;
+	expectedCampaignRevisionNo: number | null;
+	occurredAt: Date;
+	note: string | null;
+}
+
+export async function calculateCampaignReviewCandidateLifecycleFingerprint(
+	params: CampaignReviewCandidateLifecycleFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"campaign-review-candidate-lifecycle-v1",
+		params.userId.trim().toLowerCase(),
+		params.candidateId.trim().toLowerCase(),
+		params.operation,
+		params.expectedCampaignRevisionNo,
+		params.occurredAt.toISOString(),
+		params.note,
+	]);
+}
+
 export interface CampaignPeriodLifecycleFingerprintParams {
 	userId: string;
 	campaignPeriodId: string;
@@ -122,19 +352,28 @@ export interface CampaignOverrideFingerprintParams {
 	operation: string;
 	reasonNote: string | null;
 	occurredAt: Date;
+	/**
+	 * Section M (Phase 16-R1): the OCC expectedRevisionNo the caller bound
+	 * this request to. Binding it means the same idempotency key retried
+	 * against a different expectedRevisionNo (even with byte-identical other
+	 * fields) produces a different fingerprint -- CAMPAIGN_IDEMPOTENCY_CONFLICT
+	 * rather than a silent replay of a stale intent.
+	 */
+	expectedRevisionNo: number;
 }
 
 export async function calculateCampaignOverrideFingerprint(
 	params: CampaignOverrideFingerprintParams,
 ): Promise<string> {
 	return sha256Hex([
-		"campaign-purchase-override-v1",
+		"campaign-purchase-override-v2",
 		params.userId.trim().toLowerCase(),
 		params.campaignPeriodId.trim().toLowerCase(),
 		params.purchaseEventId.trim().toLowerCase(),
 		params.operation,
 		params.reasonNote,
 		params.occurredAt.toISOString(),
+		params.expectedRevisionNo,
 	]);
 }
 
