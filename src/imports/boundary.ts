@@ -136,10 +136,13 @@ export function mapToImportError(err: unknown): ImportError {
 	}
 
 	// Idempotency conflict
-	if (chain.includes("import_row_revisions_user_idempotency_idx")) {
+	if (
+		chain.includes("import_row_revisions_user_idempotency_idx") ||
+		chain.includes("import_mutation_receipts_user_key_idx")
+	) {
 		return new ImportError(
 			"IMPORT_IDEMPOTENCY_CONFLICT",
-			"Duplicate idempotency key used for import row revision",
+			"Duplicate idempotency key used for import mutation",
 		);
 	}
 
@@ -186,17 +189,59 @@ export function mapToImportError(err: unknown): ImportError {
 	if (
 		chain.includes("card id mismatch") ||
 		chain.includes("amount mismatch") ||
-		chain.includes("income source mismatch")
+		chain.includes("purchase date mismatch") ||
+		chain.includes("income source mismatch") ||
+		chain.includes("destination account mismatch") ||
+		chain.includes("received date mismatch") ||
+		chain.includes("canonical transaction id mismatch") ||
+		chain.includes("exact duplicate result") ||
+		chain.includes("claim scope mismatch")
 	) {
 		return new ImportError(
 			"IMPORT_TARGET_MISMATCH",
-			"Import result target does not match row payload",
+			"Import result target or claim does not match row payload",
 		);
 	}
 
-	// Fallback
-	const rawMessage = err instanceof Error ? err.message : String(err);
-	return new ImportError("IMPORT_INVALID_INPUT", rawMessage);
+	if (
+		chain.includes("target credit card liability event") ||
+		chain.includes("target income receipt") ||
+		chain.includes("is void")
+	) {
+		return new ImportError(
+			"IMPORT_TARGET_MISMATCH",
+			"Target domain entity is VOID or invalid",
+		);
+	}
+
+	if (
+		chain.includes("naked claim") ||
+		chain.includes("has no matching created or linked_existing result")
+	) {
+		return new ImportError(
+			"IMPORT_INVALID_STATE",
+			"External identity claim has no authoritative result at commit",
+		);
+	}
+
+	if (
+		chain.includes("invalid keys in") ||
+		chain.includes("invalid amount format") ||
+		chain.includes("shorttermgoalid required") ||
+		chain.includes("cannot modify amount") ||
+		chain.includes("must copy forward")
+	) {
+		return new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"Import row payload or transition is invalid",
+		);
+	}
+
+	// Sanitized fallback: Never return raw error messages containing SQL/schema/driver details
+	return new ImportError(
+		"IMPORT_DATABASE_ERROR",
+		"An unexpected database error occurred during import processing",
+	);
 }
 
 /**

@@ -15,6 +15,13 @@ export const MAX_PROVIDER_LENGTH = 64;
 export const MAX_PARSER_TYPE_LENGTH = 64;
 export const MAX_PARSER_VERSION_LENGTH = 32;
 
+const UUID_REGEX =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isValidUuid(val: unknown): val is string {
+	return typeof val === "string" && UUID_REGEX.test(val.trim());
+}
+
 export interface RawCardPurchaseInput {
 	recordType: "CREDIT_CARD_PURCHASE";
 	cardId?: string | null | undefined;
@@ -80,7 +87,6 @@ export interface NormalizedIncomeReceiptPayload {
 
 export interface NormalizedUnsupportedPayload {
 	recordType: "UNSUPPORTED";
-	rawRecord: Record<string, unknown>;
 	reason: string;
 }
 
@@ -130,9 +136,12 @@ export function validateAndNormalizeBatchMeta(input: {
 	if (
 		!input.userId ||
 		typeof input.userId !== "string" ||
-		input.userId.trim() === ""
+		!isValidUuid(input.userId)
 	) {
-		throw new ImportError("IMPORT_INVALID_INPUT", "userId is required");
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"valid userId UUID is required",
+		);
 	}
 
 	if (!input.provider || typeof input.provider !== "string") {
@@ -227,7 +236,7 @@ export function validateAndNormalizeBatchMeta(input: {
 	}
 
 	return {
-		validUserId: input.userId.trim(),
+		validUserId: input.userId.trim().toLowerCase(),
 		validProvider,
 		validSourceKind: input.sourceKind,
 		validContentHash: input.sourceContentHash.trim().toLowerCase(),
@@ -268,10 +277,19 @@ export async function normalizeImportRow(
 			: null;
 
 	if (input.recordType === "CREDIT_CARD_PURCHASE") {
-		const cardId =
-			typeof input.cardId === "string" && input.cardId.trim().length > 0
-				? input.cardId.trim()
-				: null;
+		let cardId: string | null = null;
+		if (input.cardId != null && typeof input.cardId === "string") {
+			const trimmed = input.cardId.trim();
+			if (trimmed.length > 0) {
+				if (!isValidUuid(trimmed)) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						`Row ${rowOrdinal}: invalid cardId UUID: "${input.cardId}"`,
+					);
+				}
+				cardId = trimmed.toLowerCase();
+			}
+		}
 
 		const occurredDate =
 			input.occurredAt instanceof Date
@@ -321,11 +339,22 @@ export async function normalizeImportRow(
 			}
 		}
 
-		const shortTermGoalId =
-			typeof input.shortTermGoalId === "string" &&
-			input.shortTermGoalId.trim().length > 0
-				? input.shortTermGoalId.trim()
-				: null;
+		let shortTermGoalId: string | null = null;
+		if (
+			input.shortTermGoalId != null &&
+			typeof input.shortTermGoalId === "string"
+		) {
+			const trimmed = input.shortTermGoalId.trim();
+			if (trimmed.length > 0) {
+				if (!isValidUuid(trimmed)) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						`Row ${rowOrdinal}: invalid shortTermGoalId UUID: "${input.shortTermGoalId}"`,
+					);
+				}
+				shortTermGoalId = trimmed.toLowerCase();
+			}
+		}
 
 		if (purchaseCategory === "SHORT_TERM_PURCHASE" && !shortTermGoalId) {
 			throw new ImportError(
@@ -343,7 +372,7 @@ export async function normalizeImportRow(
 
 		const merchant =
 			typeof input.merchant === "string" && input.merchant.trim().length > 0
-				? input.merchant.trim().slice(0, 255)
+				? input.merchant.trim().slice(0, 200)
 				: null;
 
 		const description =
@@ -401,17 +430,39 @@ export async function normalizeImportRow(
 	}
 
 	if (input.recordType === "INCOME_RECEIPT") {
-		const incomeSourceId =
-			typeof input.incomeSourceId === "string" &&
-			input.incomeSourceId.trim().length > 0
-				? input.incomeSourceId.trim()
-				: null;
+		let incomeSourceId: string | null = null;
+		if (
+			input.incomeSourceId != null &&
+			typeof input.incomeSourceId === "string"
+		) {
+			const trimmed = input.incomeSourceId.trim();
+			if (trimmed.length > 0) {
+				if (!isValidUuid(trimmed)) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						`Row ${rowOrdinal}: invalid incomeSourceId UUID: "${input.incomeSourceId}"`,
+					);
+				}
+				incomeSourceId = trimmed.toLowerCase();
+			}
+		}
 
-		const destinationAccountId =
-			typeof input.destinationAccountId === "string" &&
-			input.destinationAccountId.trim().length > 0
-				? input.destinationAccountId.trim()
-				: null;
+		let destinationAccountId: string | null = null;
+		if (
+			input.destinationAccountId != null &&
+			typeof input.destinationAccountId === "string"
+		) {
+			const trimmed = input.destinationAccountId.trim();
+			if (trimmed.length > 0) {
+				if (!isValidUuid(trimmed)) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						`Row ${rowOrdinal}: invalid destinationAccountId UUID: "${input.destinationAccountId}"`,
+					);
+				}
+				destinationAccountId = trimmed.toLowerCase();
+			}
+		}
 
 		const receivedDate =
 			input.receivedAt instanceof Date
@@ -480,8 +531,7 @@ export async function normalizeImportRow(
 	if (input.recordType === "UNSUPPORTED") {
 		const payload: NormalizedUnsupportedPayload = {
 			recordType: "UNSUPPORTED",
-			rawRecord: input.rawRecord ?? {},
-			reason: input.reason ?? "Unsupported record type",
+			reason: (input.reason ?? "Unsupported record type").slice(0, 500),
 		};
 
 		const semanticFingerprint = await computeUnsupportedSemanticFingerprint({

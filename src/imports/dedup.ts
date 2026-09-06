@@ -1,6 +1,6 @@
-import { and, eq, inArray, ne } from "drizzle-orm";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { formatIstanbulPurchaseDate } from "../credit-cards/calendar";
+import type { DatabaseTransaction } from "../db/client";
 import {
 	creditCardLiabilityEventRevisions,
 	creditCardLiabilityEvents,
@@ -20,7 +20,8 @@ import type {
 export interface DuplicateCandidateMatch {
 	rowOrdinal: number;
 	candidateType: ImportDuplicateCandidateType;
-	candidateId: string;
+	candidateId: string; // Target UUID for CREDIT_CARD_PURCHASE / INCOME_RECEIPT / IMPORT_ROW
+	candidateRowOrdinal?: number | undefined; // For intra-batch rows before UUID resolution
 	reasonCode: ImportDuplicateReasonCode;
 }
 
@@ -65,7 +66,8 @@ export function analyzeIntraBatchDuplicates(
 						list.push({
 							rowOrdinal: ord,
 							candidateType: "IMPORT_ROW",
-							candidateId: `ROW_ORDINAL_${otherOrd}`,
+							candidateId: "", // Will be populated with target row UUID during batch insertion
+							candidateRowOrdinal: otherOrd,
 							reasonCode: "SAME_BATCH_SEMANTICS",
 						});
 						candidatesByOrdinal.set(ord, list);
@@ -79,10 +81,10 @@ export function analyzeIntraBatchDuplicates(
 }
 
 /**
- * Checks strong external identity claims and existing domain entities for candidate duplicates.
+ * Checks strong external identity claims and existing domain entities for candidate duplicates against latest authoritative truth.
  */
 export async function analyzeDuplicatesAgainstDb(
-	tx: NodePgDatabase,
+	tx: DatabaseTransaction,
 	userId: string,
 	provider: string,
 	rows: NormalizedImportRow[],
@@ -156,11 +158,24 @@ export async function analyzeDuplicatesAgainstDb(
 		}
 
 		// 3. Conservative Candidate duplicate check against DB if not EXACT_DUPLICATE
+		// MUST join ONLY the latest revision of each liability event / income receipt
 		if (finalStatus !== "EXACT_DUPLICATE" && r.occurredAt) {
 			if (r.recordType === "CREDIT_CARD_PURCHASE") {
 				const cardPayload = r.payload as NormalizedCardPurchasePayload;
 				if (cardPayload.cardId) {
 					const purchaseDate = formatIstanbulPurchaseDate(r.occurredAt);
+
+					const latestCcRevSubquery = tx
+						.select({
+							eventId: creditCardLiabilityEventRevisions.eventId,
+							maxRevNo:
+								sql<number>`max(${creditCardLiabilityEventRevisions.revisionNo})`.as(
+									"max_rev_no",
+								),
+						})
+						.from(creditCardLiabilityEventRevisions)
+						.groupBy(creditCardLiabilityEventRevisions.eventId)
+						.as("latest_cc_rev");
 
 					const matchingEvents = await tx
 						.select({
@@ -173,6 +188,19 @@ export async function analyzeDuplicatesAgainstDb(
 							eq(
 								creditCardLiabilityEvents.id,
 								creditCardLiabilityEventRevisions.eventId,
+							),
+						)
+						.innerJoin(
+							latestCcRevSubquery,
+							and(
+								eq(
+									creditCardLiabilityEventRevisions.eventId,
+									latestCcRevSubquery.eventId,
+								),
+								eq(
+									creditCardLiabilityEventRevisions.revisionNo,
+									latestCcRevSubquery.maxRevNo,
+								),
 							),
 						)
 						.where(
@@ -214,6 +242,18 @@ export async function analyzeDuplicatesAgainstDb(
 			} else if (r.recordType === "INCOME_RECEIPT") {
 				const incPayload = r.payload as NormalizedIncomeReceiptPayload;
 				if (incPayload.incomeSourceId && incPayload.destinationAccountId) {
+					const latestIncRevSubquery = tx
+						.select({
+							receiptId: incomeReceiptRevisions.incomeReceiptId,
+							maxRevNo:
+								sql<number>`max(${incomeReceiptRevisions.revisionNo})`.as(
+									"max_rev_no",
+								),
+						})
+						.from(incomeReceiptRevisions)
+						.groupBy(incomeReceiptRevisions.incomeReceiptId)
+						.as("latest_inc_rev");
+
 					const matchingReceipts = await tx
 						.select({
 							id: incomeReceipts.id,
@@ -223,6 +263,19 @@ export async function analyzeDuplicatesAgainstDb(
 						.innerJoin(
 							incomeReceiptRevisions,
 							eq(incomeReceipts.id, incomeReceiptRevisions.incomeReceiptId),
+						)
+						.innerJoin(
+							latestIncRevSubquery,
+							and(
+								eq(
+									incomeReceiptRevisions.incomeReceiptId,
+									latestIncRevSubquery.receiptId,
+								),
+								eq(
+									incomeReceiptRevisions.revisionNo,
+									latestIncRevSubquery.maxRevNo,
+								),
+							),
 						)
 						.where(
 							and(

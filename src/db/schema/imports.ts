@@ -402,6 +402,10 @@ export const importRowResults = pgTable(
 			() => canonicalTransactions.id,
 			{ onDelete: "restrict" },
 		),
+		externalIdentityClaimId: uuid("external_identity_claim_id").references(
+			(): AnyPgColumn => importExternalIdentityClaims.id,
+			{ onDelete: "restrict" },
+		),
 		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
 			.defaultNow()
 			.notNull(),
@@ -413,6 +417,7 @@ export const importRowResults = pgTable(
 			table.targetType,
 			table.targetId,
 		),
+		index("import_row_results_claim_idx").on(table.externalIdentityClaimId),
 		check(
 			"import_row_results_kind_check",
 			sql`${table.resultKind} IN ('CREATED', 'LINKED_EXISTING', 'EXACT_DUPLICATE')`,
@@ -424,6 +429,67 @@ export const importRowResults = pgTable(
 		check(
 			"import_row_results_target_id_check",
 			sql`${table.targetId} = btrim(${table.targetId}) AND length(${table.targetId}) BETWEEN 1 AND 64`,
+		),
+	],
+);
+
+// ============================================================================
+// 7. import_mutation_idempotency_receipts (immutable mutation replay)
+// ============================================================================
+
+export const IMPORT_MUTATION_OPERATIONS = [
+	"RESOLVE_MAPPINGS",
+	"CONFIRM_IMPORT",
+	"LINK_EXISTING",
+	"SKIP",
+	"APPLY",
+] as const;
+export type ImportMutationOperation =
+	(typeof IMPORT_MUTATION_OPERATIONS)[number];
+
+export const importMutationIdempotencyReceipts = pgTable(
+	"import_mutation_idempotency_receipts",
+	{
+		id: uuid("id").defaultRandom().primaryKey().notNull(),
+		userId: uuid("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "restrict" }),
+		idempotencyKey: varchar("idempotency_key", { length: 128 }).notNull(),
+		operation: varchar("operation", { length: 32 }).notNull(),
+		requestFingerprint: varchar("request_fingerprint", {
+			length: 64,
+		}).notNull(),
+		importRowId: uuid("import_row_id")
+			.notNull()
+			.references(() => importRows.id, { onDelete: "restrict" }),
+		importRowRevisionId: uuid("import_row_revision_id")
+			.notNull()
+			.references(() => importRowRevisions.id, { onDelete: "restrict" }),
+		importRowResultId: uuid("import_row_result_id").references(
+			() => importRowResults.id,
+			{ onDelete: "restrict" },
+		),
+		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+			.defaultNow()
+			.notNull(),
+	},
+	(table) => [
+		uniqueIndex("import_mutation_receipts_user_key_idx").on(
+			table.userId,
+			table.idempotencyKey,
+		),
+		index("import_mutation_receipts_row_idx").on(table.importRowId),
+		check(
+			"import_mutation_receipts_op_check",
+			sql`${table.operation} IN ('RESOLVE_MAPPINGS', 'CONFIRM_IMPORT', 'LINK_EXISTING', 'SKIP', 'APPLY')`,
+		),
+		check(
+			"import_mutation_receipts_key_check",
+			sql`${table.idempotencyKey} = btrim(${table.idempotencyKey}) AND length(${table.idempotencyKey}) BETWEEN 1 AND 128`,
+		),
+		check(
+			"import_mutation_receipts_fp_check",
+			sql`${table.requestFingerprint} ~ '^[0-9a-f]{64}$'`,
 		),
 	],
 );

@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { recordCreditCardPurchaseInTransaction } from "../credit-cards/purchases";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
@@ -11,12 +11,12 @@ import {
 	type ImportRecordType,
 	type ImportResultKind,
 	type ImportResultTargetType,
-	type ImportRowOperation,
 	type ImportRowStatus,
 	type ImportSourceKind,
 	importBatches,
 	importDuplicateCandidates,
 	importExternalIdentityClaims,
+	importMutationIdempotencyReceipts,
 	importRowResults,
 	importRowRevisions,
 	importRows,
@@ -27,11 +27,14 @@ import { withImportTransaction } from "./boundary";
 import { analyzeDuplicatesAgainstDb } from "./dedup";
 import { ImportError } from "./errors";
 import {
+	computeApplyRequestFingerprint,
 	computeChildIdempotencyKey,
+	computeResolveRequestFingerprint,
 	computeRevisionFingerprint,
 	computeSourceContentHash,
 } from "./fingerprint";
 import {
+	isValidUuid,
 	MAX_IMPORT_BATCH_ROWS,
 	type NormalizedCardPurchasePayload,
 	type NormalizedImportPayload,
@@ -98,9 +101,259 @@ export interface ImportRowDetail {
 				targetType: ImportResultTargetType;
 				targetId: string;
 				canonicalTransactionId: string | null;
+				externalIdentityClaimId?: string | null | undefined;
 		  }
 		| null
 		| undefined;
+}
+
+export interface ResolveImportRowParams {
+	userId: string;
+	importRowId: string;
+	expectedRevisionNo: number;
+	action: "CONFIRM_IMPORT" | "LINK_EXISTING" | "RESOLVE_MAPPINGS" | "SKIP";
+	resolvedMappings?: {
+		cardId?: string | null | undefined;
+		purchaseCategory?:
+			| "MANDATORY"
+			| "DISCRETIONARY"
+			| "SHORT_TERM_PURCHASE"
+			| "UNCLASSIFIED"
+			| null
+			| undefined;
+		shortTermGoalId?: string | null | undefined;
+		incomeSourceId?: string | null | undefined;
+		destinationAccountId?: string | null | undefined;
+	};
+	linkTarget?: {
+		targetType: ImportResultTargetType;
+		targetId: string;
+	};
+	reasonNote?: string | null | undefined;
+	idempotencyKey: string;
+}
+
+export interface ApplyImportRowParams {
+	userId: string;
+	importRowId: string;
+	expectedRevisionNo: number;
+	idempotencyKey: string;
+}
+
+/**
+ * Builds the read model for a specific historical revision and its associated result.
+ */
+export async function buildImportRowReadModelForRevisionInTransaction(
+	tx: DatabaseTransaction,
+	importRowId: string,
+	revisionId: string,
+): Promise<ImportRowDetail> {
+	const [row] = await tx
+		.select()
+		.from(importRows)
+		.where(eq(importRows.id, importRowId))
+		.limit(1);
+
+	if (!row) {
+		throw new ImportError("IMPORT_ROW_NOT_FOUND", "Import row not found");
+	}
+
+	const [rev] = await tx
+		.select()
+		.from(importRowRevisions)
+		.where(eq(importRowRevisions.id, revisionId))
+		.limit(1);
+
+	if (!rev) {
+		throw new ImportError(
+			"IMPORT_REVISION_CONFLICT",
+			"Historical revision not found",
+		);
+	}
+
+	const candidates = await tx
+		.select({
+			candidateType: importDuplicateCandidates.candidateType,
+			candidateId: importDuplicateCandidates.candidateId,
+			reasonCode: importDuplicateCandidates.reasonCode,
+		})
+		.from(importDuplicateCandidates)
+		.where(eq(importDuplicateCandidates.importRowId, importRowId));
+
+	const [res] = await tx
+		.select()
+		.from(importRowResults)
+		.where(eq(importRowResults.importRowId, importRowId))
+		.limit(1);
+
+	return {
+		id: row.id,
+		userId: row.userId,
+		batchId: row.batchId,
+		rowOrdinal: row.rowOrdinal,
+		recordType: row.recordType as ImportRecordType,
+		latestRevisionNo: rev.revisionNo,
+		status: rev.status as ImportRowStatus,
+		payload: rev.payload as NormalizedImportPayload,
+		occurredAt: rev.occurredAt,
+		externalIdentityPresent: row.externalTransactionIdHash !== null,
+		duplicateCandidates: candidates.map((c) => ({
+			candidateType: c.candidateType as ImportDuplicateCandidateType,
+			candidateId: c.candidateId,
+			reasonCode: c.reasonCode as ImportDuplicateReasonCode,
+		})),
+		result: res
+			? {
+					resultKind: res.resultKind as ImportResultKind,
+					targetType: res.targetType as ImportResultTargetType,
+					targetId: res.targetId,
+					canonicalTransactionId: res.canonicalTransactionId,
+					externalIdentityClaimId: res.externalIdentityClaimId,
+				}
+			: null,
+	};
+}
+
+/**
+ * Builds the latest read model for an import row.
+ */
+export async function buildImportRowReadModelInTransaction(
+	tx: DatabaseTransaction,
+	importRowId: string,
+): Promise<ImportRowDetail> {
+	const [row] = await tx
+		.select()
+		.from(importRows)
+		.where(eq(importRows.id, importRowId))
+		.limit(1);
+
+	if (!row) {
+		throw new ImportError("IMPORT_ROW_NOT_FOUND", "Import row not found");
+	}
+
+	const [latestRev] = await tx
+		.select()
+		.from(importRowRevisions)
+		.where(eq(importRowRevisions.importRowId, importRowId))
+		.orderBy(desc(importRowRevisions.revisionNo))
+		.limit(1);
+
+	if (!latestRev) {
+		throw new ImportError(
+			"IMPORT_INVALID_STATE",
+			"Import row has no revisions",
+		);
+	}
+
+	return await buildImportRowReadModelForRevisionInTransaction(
+		tx,
+		importRowId,
+		latestRev.id,
+	);
+}
+
+/**
+ * Builds summary metrics for an import batch.
+ */
+export async function buildImportBatchSummaryInTransaction(
+	tx: DatabaseTransaction,
+	batchId: string,
+): Promise<ImportBatchSummary> {
+	const [batch] = await tx
+		.select()
+		.from(importBatches)
+		.where(eq(importBatches.id, batchId))
+		.limit(1);
+
+	if (!batch) {
+		throw new ImportError("IMPORT_BATCH_NOT_FOUND", "Import batch not found");
+	}
+
+	const latestRevsSubquery = tx
+		.select({
+			importRowId: importRowRevisions.importRowId,
+			maxRevNo: sql<number>`max(${importRowRevisions.revisionNo})`.as(
+				"max_rev_no",
+			),
+		})
+		.from(importRowRevisions)
+		.innerJoin(importRows, eq(importRowRevisions.importRowId, importRows.id))
+		.where(eq(importRows.batchId, batchId))
+		.groupBy(importRowRevisions.importRowId)
+		.as("latest_row_revs");
+
+	const statusRows = await tx
+		.select({
+			status: importRowRevisions.status,
+		})
+		.from(importRowRevisions)
+		.innerJoin(
+			latestRevsSubquery,
+			and(
+				eq(importRowRevisions.importRowId, latestRevsSubquery.importRowId),
+				eq(importRowRevisions.revisionNo, latestRevsSubquery.maxRevNo),
+			),
+		);
+
+	let readyCount = 0;
+	let needsReviewCount = 0;
+	let possibleDuplicateCount = 0;
+	let exactDuplicateCount = 0;
+	let appliedCount = 0;
+	let linkedCount = 0;
+	let skippedCount = 0;
+	let unsupportedCount = 0;
+
+	for (const r of statusRows) {
+		switch (r.status) {
+			case "READY":
+				readyCount++;
+				break;
+			case "NEEDS_REVIEW":
+				needsReviewCount++;
+				break;
+			case "POSSIBLE_DUPLICATE":
+				possibleDuplicateCount++;
+				break;
+			case "EXACT_DUPLICATE":
+				exactDuplicateCount++;
+				break;
+			case "APPLIED":
+				appliedCount++;
+				break;
+			case "LINKED_EXISTING":
+				linkedCount++;
+				break;
+			case "SKIPPED":
+				skippedCount++;
+				break;
+			case "UNSUPPORTED":
+				unsupportedCount++;
+				break;
+		}
+	}
+
+	return {
+		id: batch.id,
+		userId: batch.userId,
+		provider: batch.provider,
+		sourceKind: batch.sourceKind as ImportSourceKind,
+		sourceContentHash: batch.sourceContentHash,
+		sourceFileName: batch.sourceFileName,
+		parserType: batch.parserType,
+		parserVersion: batch.parserVersion,
+		observedAt: batch.observedAt,
+		createdAt: batch.createdAt,
+		totalRows: statusRows.length,
+		readyCount,
+		needsReviewCount,
+		possibleDuplicateCount,
+		exactDuplicateCount,
+		appliedCount,
+		linkedCount,
+		skippedCount,
+		unsupportedCount,
+	};
 }
 
 /**
@@ -114,6 +367,17 @@ export async function stageImportBatch(
 	rows: ImportRowDetail[];
 	idempotentReplay: boolean;
 }> {
+	// Strict DB-independent validation BEFORE transaction
+	if (params.sourceContent && params.sourceContentHash) {
+		const computed = await computeSourceContentHash(params.sourceContent);
+		if (computed !== params.sourceContentHash.trim().toLowerCase()) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				"sourceContentHash does not match computed SHA-256 of sourceContent",
+			);
+		}
+	}
+
 	let contentHash = params.sourceContentHash;
 	if (!contentHash && params.sourceContent) {
 		contentHash = await computeSourceContentHash(params.sourceContent);
@@ -142,9 +406,45 @@ export async function stageImportBatch(
 		);
 	}
 
+	// Normalize all rows before DB
+	const normalizedRows: ReturnType<typeof normalizeImportRow> extends Promise<
+		infer R
+	>
+		? R[]
+		: never = [];
+
+	for (let i = 0; i < params.rows.length; i++) {
+		const r = params.rows[i];
+		if (!r) continue;
+		normalizedRows.push(await normalizeImportRow(meta.validUserId, i, r));
+	}
+
 	return await withImportTransaction(db, async (tx) => {
-		// 1. Check for historical batch with same identity
-		const [existingBatch] = await tx
+		// 1. Conflict-safe batch insert
+		await tx
+			.insert(importBatches)
+			.values({
+				userId: meta.validUserId,
+				provider: meta.validProvider,
+				sourceKind: meta.validSourceKind,
+				sourceContentHash: meta.validContentHash,
+				sourceFileName: meta.validFileName,
+				parserType: meta.validParserType,
+				parserVersion: meta.validParserVersion,
+				observedAt: meta.validObservedAt,
+			})
+			.onConflictDoNothing({
+				target: [
+					importBatches.userId,
+					importBatches.provider,
+					importBatches.sourceContentHash,
+					importBatches.parserType,
+					importBatches.parserVersion,
+				],
+			});
+
+		// 2. Re-read batch identity
+		const [batch] = await tx
 			.select()
 			.from(importBatches)
 			.where(
@@ -158,25 +458,31 @@ export async function stageImportBatch(
 			)
 			.limit(1);
 
-		if (existingBatch) {
-			const batchDetails = await getImportBatchWithDetails(
-				tx,
-				meta.validUserId,
-				existingBatch.id,
+		if (!batch) {
+			throw new ImportError(
+				"IMPORT_DATABASE_ERROR",
+				"Failed to retrieve import batch record",
 			);
+		}
+
+		// Check if rows already exist for this batch
+		const existingRows = await tx
+			.select({ id: importRows.id })
+			.from(importRows)
+			.where(eq(importRows.batchId, batch.id))
+			.limit(1);
+
+		if (existingRows.length > 0) {
+			const summary = await buildImportBatchSummaryInTransaction(tx, batch.id);
+			const rowDetails = await listImportRowsInTransaction(tx, batch.id);
 			return {
-				batch: batchDetails.batch,
-				rows: batchDetails.rows,
+				batch: summary,
+				rows: rowDetails,
 				idempotentReplay: true,
 			};
 		}
 
-		// 2. Normalize all rows asynchronously
-		const normalizedRows = await Promise.all(
-			params.rows.map((r, i) => normalizeImportRow(meta.validUserId, i, r)),
-		);
-
-		// 3. Analyze duplicate candidates against DB and intra-batch
+		// 3. Fresh Staging: Run duplicate analysis against latest DB truth
 		const dedupResult = await analyzeDuplicatesAgainstDb(
 			tx,
 			meta.validUserId,
@@ -184,207 +490,281 @@ export async function stageImportBatch(
 			normalizedRows,
 		);
 
-		// 4. Insert batch anchor
-		const [newBatch] = await tx
-			.insert(importBatches)
-			.values({
-				userId: meta.validUserId,
-				provider: meta.validProvider,
-				sourceKind: meta.validSourceKind,
-				sourceContentHash: meta.validContentHash,
-				sourceFileName: meta.validFileName,
-				parserType: meta.validParserType,
-				parserVersion: meta.validParserVersion,
-				observedAt: meta.validObservedAt,
-			})
-			.returning();
-
-		if (!newBatch) {
-			throw new ImportError(
-				"IMPORT_INVALID_STATE",
-				"Failed to create import batch",
-			);
+		// Assign UUIDs for all rows upfront so intra-batch candidate IDs reference actual row UUIDs
+		const rowIdByOrdinal = new Map<number, string>();
+		for (const item of dedupResult.rowsWithStatus) {
+			rowIdByOrdinal.set(item.row.rowOrdinal, crypto.randomUUID());
 		}
 
-		const stagedRows: ImportRowDetail[] = [];
+		const stagedRowDetails: ImportRowDetail[] = [];
 
-		// 5. Insert rows, initial revision #1 (STAGE), duplicate candidates
 		for (const item of dedupResult.rowsWithStatus) {
-			const { row, finalStatus, candidates } = item;
+			const rowId =
+				rowIdByOrdinal.get(item.row.rowOrdinal) ?? crypto.randomUUID();
+			const r = item.row;
+			const finalStatus = item.finalStatus;
 
-			const [insertedRow] = await tx
-				.insert(importRows)
-				.values({
-					userId: meta.validUserId,
-					batchId: newBatch.id,
-					rowOrdinal: row.rowOrdinal,
-					recordType: row.recordType,
-					rawRowHash: row.rawRowHash,
-					semanticFingerprint: row.semanticFingerprint,
-					externalTransactionIdHash: row.externalTransactionIdHash,
-				})
-				.returning();
+			// Insert row anchor
+			await tx.insert(importRows).values({
+				id: rowId,
+				userId: meta.validUserId,
+				batchId: batch.id,
+				rowOrdinal: r.rowOrdinal,
+				recordType: r.recordType,
+				rawRowHash: r.rawRowHash,
+				semanticFingerprint: r.semanticFingerprint,
+				externalTransactionIdHash: r.externalTransactionIdHash,
+			});
 
-			if (!insertedRow) {
-				throw new ImportError(
-					"IMPORT_INVALID_STATE",
-					`Failed to insert import row at ordinal ${row.rowOrdinal}`,
-				);
+			let stagedResult:
+				| {
+						resultKind: ImportResultKind;
+						targetType: ImportResultTargetType;
+						targetId: string;
+						canonicalTransactionId: string | null;
+						externalIdentityClaimId?: string | null | undefined;
+				  }
+				| undefined;
+
+			// If staged directly as EXACT_DUPLICATE, bind exact authoritative result & claim
+			if (
+				finalStatus === "EXACT_DUPLICATE" &&
+				r.externalTransactionIdHash &&
+				r.recordType !== "UNSUPPORTED"
+			) {
+				let scopeId: string | null = null;
+				if (r.recordType === "CREDIT_CARD_PURCHASE") {
+					scopeId = (r.payload as NormalizedCardPurchasePayload).cardId;
+				} else if (r.recordType === "INCOME_RECEIPT") {
+					scopeId = (r.payload as NormalizedIncomeReceiptPayload)
+						.destinationAccountId;
+				}
+
+				if (scopeId) {
+					const [existingClaim] = await tx
+						.select()
+						.from(importExternalIdentityClaims)
+						.where(
+							and(
+								eq(importExternalIdentityClaims.userId, meta.validUserId),
+								eq(importExternalIdentityClaims.provider, meta.validProvider),
+								eq(importExternalIdentityClaims.recordType, r.recordType),
+								eq(importExternalIdentityClaims.scopeId, scopeId),
+								eq(
+									importExternalIdentityClaims.externalTransactionIdHash,
+									r.externalTransactionIdHash,
+								),
+							),
+						)
+						.limit(1);
+
+					if (existingClaim) {
+						const [ownerResult] = await tx
+							.select()
+							.from(importRowResults)
+							.where(
+								eq(importRowResults.importRowId, existingClaim.importRowId),
+							)
+							.limit(1);
+
+						if (ownerResult) {
+							await tx.insert(importRowResults).values({
+								userId: meta.validUserId,
+								importRowId: rowId,
+								resultKind: "EXACT_DUPLICATE",
+								targetType: ownerResult.targetType,
+								targetId: ownerResult.targetId,
+								canonicalTransactionId: ownerResult.canonicalTransactionId,
+								externalIdentityClaimId: existingClaim.id,
+							});
+
+							stagedResult = {
+								resultKind: "EXACT_DUPLICATE",
+								targetType: ownerResult.targetType as ImportResultTargetType,
+								targetId: ownerResult.targetId,
+								canonicalTransactionId: ownerResult.canonicalTransactionId,
+								externalIdentityClaimId: existingClaim.id,
+							};
+						}
+					}
+				}
 			}
 
-			const revFingerprint = await computeRevisionFingerprint({
-				importRowId: insertedRow.id,
+			// Insert initial revision (revision_no = 1, operation = STAGE)
+			const revisionFingerprint = await computeRevisionFingerprint({
+				importRowId: rowId,
 				revisionNo: 1,
 				operation: "STAGE",
 				status: finalStatus,
-				payload: row.payload,
+				payload: r.payload,
 			});
 
-			const [insertedRev] = await tx
-				.insert(importRowRevisions)
-				.values({
-					userId: meta.validUserId,
-					importRowId: insertedRow.id,
-					revisionNo: 1,
-					previousRevisionId: null,
-					operation: "STAGE",
-					status: finalStatus,
-					payload: row.payload,
-					occurredAt: row.occurredAt,
-					revisionFingerprint: revFingerprint,
-				})
-				.returning();
-
-			if (!insertedRev) {
-				throw new ImportError(
-					"IMPORT_INVALID_STATE",
-					`Failed to insert initial revision for row ${insertedRow.id}`,
-				);
-			}
+			await tx.insert(importRowRevisions).values({
+				userId: meta.validUserId,
+				importRowId: rowId,
+				revisionNo: 1,
+				operation: "STAGE",
+				status: finalStatus,
+				payload: r.payload,
+				occurredAt: r.occurredAt,
+				revisionFingerprint,
+			});
 
 			// Insert duplicate candidates
-			for (const c of candidates) {
+			const resolvedCandidates: ImportRowDetail["duplicateCandidates"] = [];
+			for (const c of item.candidates) {
+				const candidateTargetId =
+					c.candidateType === "IMPORT_ROW" &&
+					c.candidateRowOrdinal !== undefined
+						? (rowIdByOrdinal.get(c.candidateRowOrdinal) ?? c.candidateId)
+						: c.candidateId;
+
 				await tx.insert(importDuplicateCandidates).values({
 					userId: meta.validUserId,
-					importRowId: insertedRow.id,
+					importRowId: rowId,
 					candidateType: c.candidateType,
-					candidateId: c.candidateId,
+					candidateId: candidateTargetId,
+					reasonCode: c.reasonCode,
+				});
+
+				resolvedCandidates.push({
+					candidateType: c.candidateType,
+					candidateId: candidateTargetId,
 					reasonCode: c.reasonCode,
 				});
 			}
 
-			stagedRows.push({
-				id: insertedRow.id,
-				userId: insertedRow.userId,
-				batchId: newBatch.id,
-				rowOrdinal: insertedRow.rowOrdinal,
-				recordType: insertedRow.recordType as ImportRecordType,
+			stagedRowDetails.push({
+				id: rowId,
+				userId: meta.validUserId,
+				batchId: batch.id,
+				rowOrdinal: r.rowOrdinal,
+				recordType: r.recordType,
 				latestRevisionNo: 1,
-				status: finalStatus as ImportRowStatus,
-				payload: row.payload,
-				occurredAt: row.occurredAt,
-				externalIdentityPresent: insertedRow.externalTransactionIdHash !== null,
-				duplicateCandidates: candidates.map((c) => ({
-					candidateType: c.candidateType,
-					candidateId: c.candidateId,
-					reasonCode: c.reasonCode,
-				})),
-				result: null,
+				status: finalStatus,
+				payload: r.payload,
+				occurredAt: r.occurredAt,
+				externalIdentityPresent: r.externalTransactionIdHash !== null,
+				duplicateCandidates: resolvedCandidates,
+				result: stagedResult,
 			});
 		}
 
-		const summary: ImportBatchSummary = {
-			id: newBatch.id,
-			userId: newBatch.userId,
-			provider: newBatch.provider,
-			sourceKind: newBatch.sourceKind as ImportSourceKind,
-			sourceContentHash: newBatch.sourceContentHash,
-			sourceFileName: newBatch.sourceFileName,
-			parserType: newBatch.parserType,
-			parserVersion: newBatch.parserVersion,
-			observedAt: newBatch.observedAt,
-			createdAt: newBatch.createdAt,
-			totalRows: stagedRows.length,
-			readyCount: stagedRows.filter((r) => r.status === "READY").length,
-			needsReviewCount: stagedRows.filter((r) => r.status === "NEEDS_REVIEW")
-				.length,
-			possibleDuplicateCount: stagedRows.filter(
-				(r) => r.status === "POSSIBLE_DUPLICATE",
-			).length,
-			exactDuplicateCount: stagedRows.filter(
-				(r) => r.status === "EXACT_DUPLICATE",
-			).length,
-			appliedCount: 0,
-			linkedCount: 0,
-			skippedCount: 0,
-			unsupportedCount: stagedRows.filter((r) => r.status === "UNSUPPORTED")
-				.length,
-		};
+		const summary = await buildImportBatchSummaryInTransaction(tx, batch.id);
 
 		return {
 			batch: summary,
-			rows: stagedRows,
+			rows: stagedRowDetails,
 			idempotentReplay: false,
 		};
 	});
 }
 
-export interface ResolveImportRowParams {
-	userId: string;
-	importRowId: string;
-	expectedRevisionNo: number;
-	action: "RESOLVE_MAPPINGS" | "CONFIRM_IMPORT" | "LINK_EXISTING" | "SKIP";
-	reasonNote?: string | null | undefined;
-	idempotencyKey?: string | null | undefined;
-	resolvedMappings?:
-		| {
-				cardId?: string | null | undefined;
-				purchaseCategory?:
-					| "MANDATORY"
-					| "DISCRETIONARY"
-					| "SHORT_TERM_PURCHASE"
-					| "UNCLASSIFIED"
-					| null
-					| undefined;
-				shortTermGoalId?: string | null | undefined;
-				incomeSourceId?: string | null | undefined;
-				destinationAccountId?: string | null | undefined;
-		  }
-		| undefined;
-	linkTarget?:
-		| {
-				targetType: "CREDIT_CARD_PURCHASE" | "INCOME_RECEIPT";
-				targetId: string;
-		  }
-		| undefined;
-}
-
 /**
- * Resolves an import row (updates mappings, confirms duplicate, links existing, or skips).
+ * Resolves an import row through user review actions (CONFIRM_IMPORT, LINK_EXISTING, RESOLVE_MAPPINGS, SKIP).
  */
 export async function resolveImportRow(
 	db: Database | DatabaseTransaction,
 	params: ResolveImportRowParams,
-): Promise<ImportRowDetail> {
-	if (!params.userId || typeof params.userId !== "string") {
-		throw new ImportError("IMPORT_INVALID_INPUT", "userId is required");
+): Promise<{ row: ImportRowDetail; idempotentReplay: boolean }> {
+	// 1. Strict validation before DB
+	if (!isValidUuid(params.userId)) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"valid userId UUID is required",
+		);
 	}
-	if (!params.importRowId || typeof params.importRowId !== "string") {
-		throw new ImportError("IMPORT_INVALID_INPUT", "importRowId is required");
+	if (!isValidUuid(params.importRowId)) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"valid importRowId UUID is required",
+		);
 	}
 	if (
-		params.expectedRevisionNo == null ||
+		!params.idempotencyKey ||
+		typeof params.idempotencyKey !== "string" ||
+		params.idempotencyKey.trim().length === 0 ||
+		params.idempotencyKey.trim().length > 128
+	) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"idempotencyKey is required and must be between 1 and 128 characters",
+		);
+	}
+	const validKey = params.idempotencyKey.trim();
+
+	if (
 		!Number.isInteger(params.expectedRevisionNo) ||
 		params.expectedRevisionNo < 1
 	) {
 		throw new ImportError(
 			"IMPORT_INVALID_INPUT",
-			"Valid expectedRevisionNo >= 1 is required",
+			"expectedRevisionNo must be an integer >= 1",
 		);
 	}
 
+	const allowedActions = [
+		"CONFIRM_IMPORT",
+		"LINK_EXISTING",
+		"RESOLVE_MAPPINGS",
+		"SKIP",
+	];
+	if (!allowedActions.includes(params.action)) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			`Invalid action "${params.action}". Must be CONFIRM_IMPORT, LINK_EXISTING, RESOLVE_MAPPINGS, or SKIP`,
+		);
+	}
+
+	const requestFingerprint = await computeResolveRequestFingerprint({
+		userId: params.userId.toLowerCase(),
+		importRowId: params.importRowId.toLowerCase(),
+		expectedRevisionNo: params.expectedRevisionNo,
+		action: params.action,
+		resolvedMappings: params.resolvedMappings,
+		linkTarget: params.linkTarget,
+		reasonNote: params.reasonNote,
+	});
+
 	return await withImportTransaction(db, async (tx) => {
-		// 1. Lock import_rows row
+		// 2. Historical Replay First: Check mutation idempotency receipts
+		const [receipt] = await tx
+			.select()
+			.from(importMutationIdempotencyReceipts)
+			.where(
+				and(
+					eq(importMutationIdempotencyReceipts.userId, params.userId),
+					eq(importMutationIdempotencyReceipts.idempotencyKey, validKey),
+				),
+			)
+			.limit(1);
+
+		if (receipt) {
+			if (
+				receipt.operation !== params.action ||
+				receipt.requestFingerprint !== requestFingerprint ||
+				receipt.importRowId !== params.importRowId
+			) {
+				throw new ImportError(
+					"IMPORT_IDEMPOTENCY_CONFLICT",
+					"Idempotency key has already been used for a different request",
+				);
+			}
+
+			const historicalDetail =
+				await buildImportRowReadModelForRevisionInTransaction(
+					tx,
+					receipt.importRowId,
+					receipt.importRowRevisionId,
+				);
+
+			return {
+				row: historicalDetail,
+				idempotentReplay: true,
+			};
+		}
+
+		// 3. Lock row for update and retrieve latest state
 		const [row] = await tx
 			.select()
 			.from(importRows)
@@ -394,579 +774,45 @@ export async function resolveImportRow(
 					eq(importRows.userId, params.userId),
 				),
 			)
-			.for("update");
+			.for("update")
+			.limit(1);
 
 		if (!row) {
-			throw new ImportError(
-				"IMPORT_ROW_NOT_FOUND",
-				`Import row ${params.importRowId} not found`,
-			);
+			throw new ImportError("IMPORT_ROW_NOT_FOUND", "Import row not found");
 		}
 
-		// 2. Fetch latest revision
-		const [latestRev] = await tx
+		const [currentRev] = await tx
 			.select()
 			.from(importRowRevisions)
 			.where(eq(importRowRevisions.importRowId, row.id))
 			.orderBy(desc(importRowRevisions.revisionNo))
 			.limit(1);
 
-		if (!latestRev) {
+		if (!currentRev) {
 			throw new ImportError(
 				"IMPORT_INVALID_STATE",
-				`No revisions found for row ${row.id}`,
+				"Import row has no revisions",
 			);
 		}
 
-		// 3. Check OCC
-		if (latestRev.revisionNo !== params.expectedRevisionNo) {
+		if (currentRev.revisionNo !== params.expectedRevisionNo) {
 			throw new ImportError(
 				"IMPORT_REVISION_CONFLICT",
-				`Revision conflict: expected ${params.expectedRevisionNo}, found ${latestRev.revisionNo}`,
+				`Expected revision ${params.expectedRevisionNo} but row is at revision ${currentRev.revisionNo}`,
 			);
 		}
 
-		// 4. Check terminal states
 		if (
-			latestRev.status === "APPLIED" ||
-			latestRev.status === "LINKED_EXISTING" ||
-			latestRev.status === "SKIPPED" ||
-			latestRev.status === "EXACT_DUPLICATE"
+			["APPLIED", "LINKED_EXISTING", "SKIPPED", "EXACT_DUPLICATE"].includes(
+				currentRev.status,
+			)
 		) {
 			throw new ImportError(
 				"IMPORT_INVALID_STATE",
-				`Cannot resolve row in terminal status ${latestRev.status}`,
+				`Cannot resolve import row in terminal status ${currentRev.status}`,
 			);
 		}
 
-		let nextOperation: ImportRowOperation = "RESOLVE";
-		let nextStatus: ImportRowStatus = latestRev.status as ImportRowStatus;
-		let nextPayload: NormalizedImportPayload =
-			latestRev.payload as NormalizedImportPayload;
-
-		if (params.action === "SKIP") {
-			nextOperation = "SKIP";
-			nextStatus = "SKIPPED";
-		} else if (params.action === "CONFIRM_IMPORT") {
-			if (latestRev.status !== "POSSIBLE_DUPLICATE") {
-				throw new ImportError(
-					"IMPORT_INVALID_STATE",
-					`CONFIRM_IMPORT is only valid from POSSIBLE_DUPLICATE status (current: ${latestRev.status})`,
-				);
-			}
-			nextOperation = "RESOLVE";
-			nextStatus = "READY";
-		} else if (params.action === "RESOLVE_MAPPINGS") {
-			if (row.recordType === "UNSUPPORTED") {
-				throw new ImportError(
-					"IMPORT_UNSUPPORTED_RECORD",
-					"Cannot resolve mappings for UNSUPPORTED record",
-				);
-			}
-
-			nextOperation = "RESOLVE";
-			const mappings = params.resolvedMappings ?? {};
-
-			if (row.recordType === "CREDIT_CARD_PURCHASE") {
-				const current = latestRev.payload as NormalizedCardPurchasePayload;
-				const cardId =
-					mappings.cardId !== undefined ? mappings.cardId : current.cardId;
-				const purchaseCategory =
-					mappings.purchaseCategory !== undefined
-						? mappings.purchaseCategory
-						: current.purchaseCategory;
-				const shortTermGoalId =
-					mappings.shortTermGoalId !== undefined
-						? mappings.shortTermGoalId
-						: current.shortTermGoalId;
-
-				if (purchaseCategory === "SHORT_TERM_PURCHASE" && !shortTermGoalId) {
-					throw new ImportError(
-						"IMPORT_INVALID_INPUT",
-						"shortTermGoalId is required when purchaseCategory is SHORT_TERM_PURCHASE",
-					);
-				}
-				if (purchaseCategory !== "SHORT_TERM_PURCHASE" && shortTermGoalId) {
-					throw new ImportError(
-						"IMPORT_INVALID_INPUT",
-						"shortTermGoalId is forbidden when purchaseCategory is not SHORT_TERM_PURCHASE",
-					);
-				}
-
-				nextPayload = {
-					...current,
-					cardId,
-					purchaseCategory,
-					shortTermGoalId,
-				};
-
-				const isReady = cardId !== null && purchaseCategory !== null;
-				nextStatus = isReady ? "READY" : "NEEDS_REVIEW";
-			} else if (row.recordType === "INCOME_RECEIPT") {
-				const current = latestRev.payload as NormalizedIncomeReceiptPayload;
-				const incomeSourceId =
-					mappings.incomeSourceId !== undefined
-						? mappings.incomeSourceId
-						: current.incomeSourceId;
-				const destinationAccountId =
-					mappings.destinationAccountId !== undefined
-						? mappings.destinationAccountId
-						: current.destinationAccountId;
-
-				nextPayload = {
-					...current,
-					incomeSourceId,
-					destinationAccountId,
-				};
-
-				const isReady =
-					incomeSourceId !== null && destinationAccountId !== null;
-				nextStatus = isReady ? "READY" : "NEEDS_REVIEW";
-			}
-		} else if (params.action === "LINK_EXISTING") {
-			if (row.recordType === "UNSUPPORTED") {
-				throw new ImportError(
-					"IMPORT_UNSUPPORTED_RECORD",
-					"Cannot link UNSUPPORTED record",
-				);
-			}
-			if (!params.linkTarget?.targetId) {
-				throw new ImportError(
-					"IMPORT_INVALID_INPUT",
-					"linkTarget with targetId and targetType is required for LINK_EXISTING",
-				);
-			}
-
-			const targetId = params.linkTarget.targetId.trim();
-			const targetType = params.linkTarget.targetType;
-
-			if (row.recordType === "CREDIT_CARD_PURCHASE") {
-				if (targetType !== "CREDIT_CARD_PURCHASE") {
-					throw new ImportError(
-						"IMPORT_TARGET_MISMATCH",
-						`Target type ${targetType} does not match row recordType ${row.recordType}`,
-					);
-				}
-
-				const cardPayload = latestRev.payload as NormalizedCardPurchasePayload;
-				const [eventRow] = await tx
-					.select({
-						id: creditCardLiabilityEvents.id,
-						creditCardId: creditCardLiabilityEvents.creditCardId,
-						eventType: creditCardLiabilityEvents.eventType,
-						canonicalTransactionId:
-							creditCardLiabilityEvents.canonicalTransactionId,
-						amount: creditCardLiabilityEventRevisions.amount,
-					})
-					.from(creditCardLiabilityEvents)
-					.innerJoin(
-						creditCardLiabilityEventRevisions,
-						eq(
-							creditCardLiabilityEvents.id,
-							creditCardLiabilityEventRevisions.eventId,
-						),
-					)
-					.where(
-						and(
-							eq(creditCardLiabilityEvents.id, targetId),
-							eq(creditCardLiabilityEvents.userId, params.userId),
-						),
-					)
-					.orderBy(desc(creditCardLiabilityEventRevisions.revisionNo))
-					.limit(1);
-
-				if (!eventRow) {
-					throw new ImportError(
-						"IMPORT_TARGET_NOT_FOUND",
-						`Credit card liability event ${targetId} not found`,
-					);
-				}
-				if (eventRow.eventType !== "PURCHASE") {
-					throw new ImportError(
-						"IMPORT_TARGET_MISMATCH",
-						`Target event must have eventType PURCHASE, got ${eventRow.eventType}`,
-					);
-				}
-
-				if (
-					cardPayload.cardId &&
-					eventRow.creditCardId !== cardPayload.cardId
-				) {
-					throw new ImportError(
-						"IMPORT_TARGET_MISMATCH",
-						`Card ID mismatch: event has ${eventRow.creditCardId}, row has ${cardPayload.cardId}`,
-					);
-				}
-				if (eventRow.amount !== cardPayload.amount) {
-					throw new ImportError(
-						"IMPORT_TARGET_MISMATCH",
-						`Amount mismatch: event has ${eventRow.amount}, row has ${cardPayload.amount}`,
-					);
-				}
-
-				// Insert row result
-				await tx.insert(importRowResults).values({
-					userId: params.userId,
-					importRowId: row.id,
-					resultKind: "LINKED_EXISTING",
-					targetType: "CREDIT_CARD_PURCHASE",
-					targetId: eventRow.id,
-					canonicalTransactionId: eventRow.canonicalTransactionId,
-				});
-
-				// Insert external claim if external ID hash is present
-				if (row.externalTransactionIdHash) {
-					const [batch] = await tx
-						.select({ provider: importBatches.provider })
-						.from(importBatches)
-						.where(eq(importBatches.id, row.batchId))
-						.limit(1);
-
-					if (batch) {
-						await tx.insert(importExternalIdentityClaims).values({
-							userId: params.userId,
-							provider: batch.provider,
-							recordType: "CREDIT_CARD_PURCHASE",
-							scopeId: eventRow.creditCardId,
-							externalTransactionIdHash: row.externalTransactionIdHash,
-							importRowId: row.id,
-						});
-					}
-				}
-			} else if (row.recordType === "INCOME_RECEIPT") {
-				if (targetType !== "INCOME_RECEIPT") {
-					throw new ImportError(
-						"IMPORT_TARGET_MISMATCH",
-						`Target type ${targetType} does not match row recordType ${row.recordType}`,
-					);
-				}
-
-				const incPayload = latestRev.payload as NormalizedIncomeReceiptPayload;
-				const [receiptRow] = await tx
-					.select({
-						id: incomeReceipts.id,
-						sourceId: incomeReceipts.sourceId,
-						canonicalTransactionId: incomeReceipts.canonicalTransactionId,
-						destinationAccountId: incomeReceiptRevisions.destinationAccountId,
-						amount: incomeReceiptRevisions.amount,
-					})
-					.from(incomeReceipts)
-					.innerJoin(
-						incomeReceiptRevisions,
-						eq(incomeReceipts.id, incomeReceiptRevisions.incomeReceiptId),
-					)
-					.where(
-						and(
-							eq(incomeReceipts.id, targetId),
-							eq(incomeReceipts.userId, params.userId),
-						),
-					)
-					.orderBy(desc(incomeReceiptRevisions.revisionNo))
-					.limit(1);
-
-				if (!receiptRow) {
-					throw new ImportError(
-						"IMPORT_TARGET_NOT_FOUND",
-						`Income receipt ${targetId} not found`,
-					);
-				}
-
-				if (
-					incPayload.incomeSourceId &&
-					receiptRow.sourceId !== incPayload.incomeSourceId
-				) {
-					throw new ImportError(
-						"IMPORT_TARGET_MISMATCH",
-						`Income source mismatch: receipt has ${receiptRow.sourceId}, row has ${incPayload.incomeSourceId}`,
-					);
-				}
-				if (
-					incPayload.destinationAccountId &&
-					receiptRow.destinationAccountId !== incPayload.destinationAccountId
-				) {
-					throw new ImportError(
-						"IMPORT_TARGET_MISMATCH",
-						`Destination account mismatch: receipt has ${receiptRow.destinationAccountId}, row has ${incPayload.destinationAccountId}`,
-					);
-				}
-				if (receiptRow.amount !== incPayload.amount) {
-					throw new ImportError(
-						"IMPORT_TARGET_MISMATCH",
-						`Amount mismatch: receipt has ${receiptRow.amount}, row has ${incPayload.amount}`,
-					);
-				}
-
-				await tx.insert(importRowResults).values({
-					userId: params.userId,
-					importRowId: row.id,
-					resultKind: "LINKED_EXISTING",
-					targetType: "INCOME_RECEIPT",
-					targetId: receiptRow.id,
-					canonicalTransactionId: receiptRow.canonicalTransactionId,
-				});
-
-				if (row.externalTransactionIdHash) {
-					const [batch] = await tx
-						.select({ provider: importBatches.provider })
-						.from(importBatches)
-						.where(eq(importBatches.id, row.batchId))
-						.limit(1);
-
-					if (batch) {
-						await tx.insert(importExternalIdentityClaims).values({
-							userId: params.userId,
-							provider: batch.provider,
-							recordType: "INCOME_RECEIPT",
-							scopeId: receiptRow.destinationAccountId,
-							externalTransactionIdHash: row.externalTransactionIdHash,
-							importRowId: row.id,
-						});
-					}
-				}
-			}
-
-			nextOperation = "LINK";
-			nextStatus = "LINKED_EXISTING";
-		}
-
-		const nextRevNo = latestRev.revisionNo + 1;
-		const revFingerprint = await computeRevisionFingerprint({
-			importRowId: row.id,
-			revisionNo: nextRevNo,
-			operation: nextOperation,
-			status: nextStatus,
-			payload: nextPayload,
-			reasonNote: params.reasonNote,
-			idempotencyKey: params.idempotencyKey,
-		});
-
-		const [newRev] = await tx
-			.insert(importRowRevisions)
-			.values({
-				userId: params.userId,
-				importRowId: row.id,
-				revisionNo: nextRevNo,
-				previousRevisionId: latestRev.id,
-				operation: nextOperation,
-				status: nextStatus,
-				payload: nextPayload,
-				reasonNote: params.reasonNote ?? null,
-				occurredAt: latestRev.occurredAt,
-				idempotencyKey: params.idempotencyKey ?? null,
-				revisionFingerprint: revFingerprint,
-			})
-			.returning();
-
-		if (!newRev) {
-			throw new ImportError(
-				"IMPORT_INVALID_STATE",
-				"Failed to insert resolution revision",
-			);
-		}
-
-		// Fetch candidates and result
-		const candidates = await tx
-			.select()
-			.from(importDuplicateCandidates)
-			.where(eq(importDuplicateCandidates.importRowId, row.id));
-
-		const [result] = await tx
-			.select()
-			.from(importRowResults)
-			.where(eq(importRowResults.importRowId, row.id))
-			.limit(1);
-
-		return {
-			id: row.id,
-			userId: row.userId,
-			batchId: row.batchId,
-			rowOrdinal: row.rowOrdinal,
-			recordType: row.recordType as ImportRecordType,
-			latestRevisionNo: newRev.revisionNo,
-			status: newRev.status as ImportRowStatus,
-			payload: newRev.payload as NormalizedImportPayload,
-			occurredAt: newRev.occurredAt,
-			externalIdentityPresent: row.externalTransactionIdHash !== null,
-			duplicateCandidates: candidates.map((c) => ({
-				candidateType: c.candidateType as ImportDuplicateCandidateType,
-				candidateId: c.candidateId,
-				reasonCode: c.reasonCode as ImportDuplicateReasonCode,
-			})),
-			result: result
-				? {
-						resultKind: result.resultKind as ImportResultKind,
-						targetType: result.targetType as ImportResultTargetType,
-						targetId: result.targetId,
-						canonicalTransactionId: result.canonicalTransactionId,
-					}
-				: null,
-		};
-	});
-}
-
-export interface ApplyImportRowParams {
-	userId: string;
-	importRowId: string;
-	expectedRevisionNo: number;
-	idempotencyKey?: string | null | undefined;
-}
-
-export interface ApplyImportRowResult {
-	row: ImportRowDetail;
-	idempotentReplay: boolean;
-	resultKind: ImportResultKind;
-	targetType: ImportResultTargetType;
-	targetId: string;
-	canonicalTransactionId: string | null;
-}
-
-/**
- * Applies a single READY import row to authoritative financial domains.
- */
-export async function applyImportRow(
-	db: Database | DatabaseTransaction,
-	params: ApplyImportRowParams,
-): Promise<ApplyImportRowResult> {
-	if (!params.userId || typeof params.userId !== "string") {
-		throw new ImportError("IMPORT_INVALID_INPUT", "userId is required");
-	}
-	if (!params.importRowId || typeof params.importRowId !== "string") {
-		throw new ImportError("IMPORT_INVALID_INPUT", "importRowId is required");
-	}
-	if (
-		params.expectedRevisionNo == null ||
-		!Number.isInteger(params.expectedRevisionNo) ||
-		params.expectedRevisionNo < 1
-	) {
-		throw new ImportError(
-			"IMPORT_INVALID_INPUT",
-			"Valid expectedRevisionNo >= 1 is required",
-		);
-	}
-
-	return await withImportTransaction(db, async (tx) => {
-		// 1. Lock import_rows row FOR UPDATE
-		const [row] = await tx
-			.select()
-			.from(importRows)
-			.where(
-				and(
-					eq(importRows.id, params.importRowId),
-					eq(importRows.userId, params.userId),
-				),
-			)
-			.for("update");
-
-		if (!row) {
-			throw new ImportError(
-				"IMPORT_ROW_NOT_FOUND",
-				`Import row ${params.importRowId} not found`,
-			);
-		}
-
-		// 2. Fetch latest revision
-		const [latestRev] = await tx
-			.select()
-			.from(importRowRevisions)
-			.where(eq(importRowRevisions.importRowId, row.id))
-			.orderBy(desc(importRowRevisions.revisionNo))
-			.limit(1);
-
-		if (!latestRev) {
-			throw new ImportError(
-				"IMPORT_INVALID_STATE",
-				`No revisions found for row ${row.id}`,
-			);
-		}
-
-		// 3. Idempotent replay check if already terminal APPLIED
-		if (latestRev.status === "APPLIED") {
-			const [existingResult] = await tx
-				.select()
-				.from(importRowResults)
-				.where(eq(importRowResults.importRowId, row.id))
-				.limit(1);
-
-			if (existingResult) {
-				const candidates = await tx
-					.select()
-					.from(importDuplicateCandidates)
-					.where(eq(importDuplicateCandidates.importRowId, row.id));
-
-				return {
-					row: {
-						id: row.id,
-						userId: row.userId,
-						batchId: row.batchId,
-						rowOrdinal: row.rowOrdinal,
-						recordType: row.recordType as ImportRecordType,
-						latestRevisionNo: latestRev.revisionNo,
-						status: "APPLIED",
-						payload: latestRev.payload as NormalizedImportPayload,
-						occurredAt: latestRev.occurredAt,
-						externalIdentityPresent: row.externalTransactionIdHash !== null,
-						duplicateCandidates: candidates.map((c) => ({
-							candidateType: c.candidateType as ImportDuplicateCandidateType,
-							candidateId: c.candidateId,
-							reasonCode: c.reasonCode as ImportDuplicateReasonCode,
-						})),
-						result: {
-							resultKind: existingResult.resultKind as ImportResultKind,
-							targetType: existingResult.targetType as ImportResultTargetType,
-							targetId: existingResult.targetId,
-							canonicalTransactionId: existingResult.canonicalTransactionId,
-						},
-					},
-					idempotentReplay: true,
-					resultKind: existingResult.resultKind as ImportResultKind,
-					targetType: existingResult.targetType as ImportResultTargetType,
-					targetId: existingResult.targetId,
-					canonicalTransactionId: existingResult.canonicalTransactionId,
-				};
-			}
-		}
-
-		// 4. Check OCC
-		if (latestRev.revisionNo !== params.expectedRevisionNo) {
-			throw new ImportError(
-				"IMPORT_REVISION_CONFLICT",
-				`Revision conflict: expected ${params.expectedRevisionNo}, found ${latestRev.revisionNo}`,
-			);
-		}
-
-		// 5. Verify status is READY
-		if (latestRev.status === "NEEDS_REVIEW") {
-			throw new ImportError(
-				"IMPORT_NEEDS_REVIEW",
-				"Cannot APPLY row in NEEDS_REVIEW status. Resolve missing mappings first.",
-			);
-		}
-		if (latestRev.status === "POSSIBLE_DUPLICATE") {
-			throw new ImportError(
-				"IMPORT_POSSIBLE_DUPLICATE",
-				"Cannot APPLY row in POSSIBLE_DUPLICATE status. Explicitly confirm or link first.",
-			);
-		}
-		if (latestRev.status === "UNSUPPORTED") {
-			throw new ImportError(
-				"IMPORT_UNSUPPORTED_RECORD",
-				"Cannot APPLY UNSUPPORTED record",
-			);
-		}
-		if (latestRev.status === "EXACT_DUPLICATE") {
-			throw new ImportError(
-				"IMPORT_EXACT_DUPLICATE",
-				"Cannot APPLY EXACT_DUPLICATE row",
-			);
-		}
-		if (latestRev.status !== "READY") {
-			throw new ImportError(
-				"IMPORT_INVALID_STATE",
-				`Cannot APPLY row with status ${latestRev.status}`,
-			);
-		}
-
-		// Fetch batch info for provider and observedAt
 		const [batch] = await tx
 			.select()
 			.from(importBatches)
@@ -974,589 +820,1544 @@ export async function applyImportRow(
 			.limit(1);
 
 		if (!batch) {
-			throw new ImportError("IMPORT_BATCH_NOT_FOUND", "Import batch not found");
+			throw new ImportError("IMPORT_BATCH_NOT_FOUND", "Parent batch not found");
 		}
 
-		const nextRevNo = latestRev.revisionNo + 1;
-		let targetId: string;
-		let targetType: ImportResultTargetType;
-		let canonicalTxId: string | null = null;
+		let nextStatus: ImportRowStatus;
+		let nextPayload: NormalizedImportPayload;
+		let operation: "RESOLVE" | "LINK" | "SKIP";
+		let createdResultId: string | null = null;
 
-		if (row.recordType === "CREDIT_CARD_PURCHASE") {
-			targetType = "CREDIT_CARD_PURCHASE";
-			const cardPayload = latestRev.payload as NormalizedCardPurchasePayload;
-
-			if (!cardPayload.cardId) {
+		if (params.action === "CONFIRM_IMPORT") {
+			if (currentRev.status !== "POSSIBLE_DUPLICATE") {
 				throw new ImportError(
-					"IMPORT_NEEDS_REVIEW",
-					"cardId is required to apply credit card purchase",
-				);
-			}
-			if (!cardPayload.purchaseCategory) {
-				throw new ImportError(
-					"IMPORT_NEEDS_REVIEW",
-					"purchaseCategory is required to apply credit card purchase",
+					"IMPORT_INVALID_STATE",
+					`CONFIRM_IMPORT is only valid from POSSIBLE_DUPLICATE, current is ${currentRev.status}`,
 				);
 			}
 
-			const childIdempotencyKey = await computeChildIdempotencyKey(
-				"IMPORT_CARD",
-				row.id,
-				nextRevNo,
-			);
+			// Strong external identity check must not be bypassed by CONFIRM_IMPORT
+			if (row.externalTransactionIdHash && row.recordType !== "UNSUPPORTED") {
+				let scopeId: string | null = null;
+				if (row.recordType === "CREDIT_CARD_PURCHASE") {
+					scopeId = (currentRev.payload as NormalizedCardPurchasePayload)
+						.cardId;
+				} else if (row.recordType === "INCOME_RECEIPT") {
+					scopeId = (currentRev.payload as NormalizedIncomeReceiptPayload)
+						.destinationAccountId;
+				}
 
-			const purchaseRes = await recordCreditCardPurchaseInTransaction({
-				tx,
-				userId: params.userId,
-				cardId: cardPayload.cardId,
-				amount: cardPayload.amount,
-				purchaseCategory: cardPayload.purchaseCategory,
-				shortTermGoalId: cardPayload.shortTermGoalId ?? undefined,
-				merchant: cardPayload.merchant ?? undefined,
-				description: cardPayload.description ?? undefined,
-				installmentCount: cardPayload.installmentCount ?? undefined,
-				occurredAt: new Date(cardPayload.occurredAt),
-				idempotencyKey: childIdempotencyKey,
-			});
+				if (scopeId) {
+					const [existingClaim] = await tx
+						.select()
+						.from(importExternalIdentityClaims)
+						.where(
+							and(
+								eq(importExternalIdentityClaims.userId, params.userId),
+								eq(importExternalIdentityClaims.provider, batch.provider),
+								eq(importExternalIdentityClaims.recordType, row.recordType),
+								eq(importExternalIdentityClaims.scopeId, scopeId),
+								eq(
+									importExternalIdentityClaims.externalTransactionIdHash,
+									row.externalTransactionIdHash,
+								),
+							),
+						)
+						.limit(1);
 
-			targetId = purchaseRes.eventId;
+					if (existingClaim) {
+						throw new ImportError(
+							"IMPORT_EXACT_DUPLICATE",
+							"Cannot CONFIRM_IMPORT: strong external identity claim already exists",
+						);
+					}
+				}
+			}
 
-			const [event] = await tx
-				.select({
-					canonicalTransactionId:
-						creditCardLiabilityEvents.canonicalTransactionId,
-				})
-				.from(creditCardLiabilityEvents)
-				.where(eq(creditCardLiabilityEvents.id, targetId))
-				.limit(1);
+			nextStatus = "READY";
+			nextPayload = currentRev.payload as NormalizedImportPayload; // exact copy-forward
+			operation = "RESOLVE";
+		} else if (params.action === "RESOLVE_MAPPINGS") {
+			if (!params.resolvedMappings) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					"resolvedMappings is required for RESOLVE_MAPPINGS action",
+				);
+			}
 
-			canonicalTxId = event?.canonicalTransactionId ?? null;
+			if (row.recordType === "CREDIT_CARD_PURCHASE") {
+				const cur = currentRev.payload as NormalizedCardPurchasePayload;
+				const newCardId =
+					params.resolvedMappings.cardId !== undefined
+						? params.resolvedMappings.cardId
+						: cur.cardId;
 
-			// Insert external identity claim if hash present
-			if (row.externalTransactionIdHash) {
-				await tx.insert(importExternalIdentityClaims).values({
-					userId: params.userId,
-					provider: batch.provider,
+				if (newCardId && !isValidUuid(newCardId)) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						"resolved cardId must be a valid UUID",
+					);
+				}
+
+				const newCat =
+					params.resolvedMappings.purchaseCategory !== undefined
+						? params.resolvedMappings.purchaseCategory
+						: cur.purchaseCategory;
+
+				const newGoalId =
+					params.resolvedMappings.shortTermGoalId !== undefined
+						? params.resolvedMappings.shortTermGoalId
+						: cur.shortTermGoalId;
+
+				if (newGoalId && !isValidUuid(newGoalId)) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						"resolved shortTermGoalId must be a valid UUID",
+					);
+				}
+
+				if (newCat === "SHORT_TERM_PURCHASE" && !newGoalId) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						"shortTermGoalId is required when purchaseCategory is SHORT_TERM_PURCHASE",
+					);
+				}
+
+				const updatedPayload: NormalizedCardPurchasePayload = {
 					recordType: "CREDIT_CARD_PURCHASE",
-					scopeId: cardPayload.cardId,
-					externalTransactionIdHash: row.externalTransactionIdHash,
-					importRowId: row.id,
-				});
-			}
-		} else if (row.recordType === "INCOME_RECEIPT") {
-			targetType = "INCOME_RECEIPT";
-			const incPayload = latestRev.payload as NormalizedIncomeReceiptPayload;
+					cardId: newCardId ? newCardId.toLowerCase() : null,
+					occurredAt: cur.occurredAt,
+					amount: cur.amount,
+					purchaseCategory: newCat ?? null,
+					shortTermGoalId:
+						newCat === "SHORT_TERM_PURCHASE" && newGoalId
+							? newGoalId.toLowerCase()
+							: null,
+					merchant: cur.merchant,
+					description: cur.description,
+					installmentCount: cur.installmentCount,
+				};
 
-			if (!incPayload.incomeSourceId) {
-				throw new ImportError(
-					"IMPORT_NEEDS_REVIEW",
-					"incomeSourceId is required to apply income receipt",
-				);
-			}
-			if (!incPayload.destinationAccountId) {
-				throw new ImportError(
-					"IMPORT_NEEDS_REVIEW",
-					"destinationAccountId is required to apply income receipt",
-				);
-			}
+				nextPayload = updatedPayload;
 
-			const childIdempotencyKey = await computeChildIdempotencyKey(
-				"IMPORT_INCOME",
-				row.id,
-				nextRevNo,
-			);
+				// Check if newly resolved cardId reveals an existing strong claim
+				if (updatedPayload.cardId && row.externalTransactionIdHash) {
+					const [existingClaim] = await tx
+						.select()
+						.from(importExternalIdentityClaims)
+						.where(
+							and(
+								eq(importExternalIdentityClaims.userId, params.userId),
+								eq(importExternalIdentityClaims.provider, batch.provider),
+								eq(
+									importExternalIdentityClaims.recordType,
+									"CREDIT_CARD_PURCHASE",
+								),
+								eq(importExternalIdentityClaims.scopeId, updatedPayload.cardId),
+								eq(
+									importExternalIdentityClaims.externalTransactionIdHash,
+									row.externalTransactionIdHash,
+								),
+							),
+						)
+						.limit(1);
 
-			const incomeRes = await createIncomeReceiptInTransaction({
-				tx,
-				userId: params.userId,
-				sourceId: incPayload.incomeSourceId,
-				destinationAccountId: incPayload.destinationAccountId,
-				receivedAt: new Date(incPayload.receivedAt),
-				amount: incPayload.amount,
-				note: incPayload.note ?? undefined,
-				idempotencyKey: childIdempotencyKey,
-				provenance: {
-					type: "IMPORT",
-					ref: row.id,
-					payloadHash: row.semanticFingerprint,
-					observedAt: batch.observedAt,
-				},
-			});
+					if (existingClaim) {
+						const [ownerResult] = await tx
+							.select()
+							.from(importRowResults)
+							.where(
+								eq(importRowResults.importRowId, existingClaim.importRowId),
+							)
+							.limit(1);
 
-			targetId = incomeRes.incomeReceipt.incomeReceiptId;
-			canonicalTxId = incomeRes.incomeReceipt.canonicalTransactionId;
+						if (ownerResult) {
+							nextStatus = "EXACT_DUPLICATE";
+							operation = "RESOLVE";
 
-			// Insert external identity claim if hash present
-			if (row.externalTransactionIdHash) {
-				await tx.insert(importExternalIdentityClaims).values({
-					userId: params.userId,
-					provider: batch.provider,
+							const [res] = await tx
+								.insert(importRowResults)
+								.values({
+									userId: params.userId,
+									importRowId: row.id,
+									resultKind: "EXACT_DUPLICATE",
+									targetType: ownerResult.targetType,
+									targetId: ownerResult.targetId,
+									canonicalTransactionId: ownerResult.canonicalTransactionId,
+									externalIdentityClaimId: existingClaim.id,
+								})
+								.returning({ id: importRowResults.id });
+
+							createdResultId = res?.id ?? null;
+						} else {
+							nextStatus = "READY";
+							operation = "RESOLVE";
+						}
+					} else {
+						nextStatus =
+							updatedPayload.cardId && updatedPayload.purchaseCategory
+								? "READY"
+								: "NEEDS_REVIEW";
+						operation = "RESOLVE";
+					}
+				} else {
+					nextStatus =
+						updatedPayload.cardId && updatedPayload.purchaseCategory
+							? "READY"
+							: "NEEDS_REVIEW";
+					operation = "RESOLVE";
+				}
+			} else if (row.recordType === "INCOME_RECEIPT") {
+				const cur = currentRev.payload as NormalizedIncomeReceiptPayload;
+				const newSourceId =
+					params.resolvedMappings.incomeSourceId !== undefined
+						? params.resolvedMappings.incomeSourceId
+						: cur.incomeSourceId;
+
+				if (newSourceId && !isValidUuid(newSourceId)) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						"resolved incomeSourceId must be a valid UUID",
+					);
+				}
+
+				const newDestId =
+					params.resolvedMappings.destinationAccountId !== undefined
+						? params.resolvedMappings.destinationAccountId
+						: cur.destinationAccountId;
+
+				if (newDestId && !isValidUuid(newDestId)) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						"resolved destinationAccountId must be a valid UUID",
+					);
+				}
+
+				const updatedPayload: NormalizedIncomeReceiptPayload = {
 					recordType: "INCOME_RECEIPT",
-					scopeId: incPayload.destinationAccountId,
-					externalTransactionIdHash: row.externalTransactionIdHash,
-					importRowId: row.id,
-				});
+					incomeSourceId: newSourceId ? newSourceId.toLowerCase() : null,
+					destinationAccountId: newDestId ? newDestId.toLowerCase() : null,
+					receivedAt: cur.receivedAt,
+					amount: cur.amount,
+					note: cur.note,
+				};
+
+				nextPayload = updatedPayload;
+
+				// Check if newly resolved destination reveals a strong claim
+				if (
+					updatedPayload.destinationAccountId &&
+					row.externalTransactionIdHash
+				) {
+					const [existingClaim] = await tx
+						.select()
+						.from(importExternalIdentityClaims)
+						.where(
+							and(
+								eq(importExternalIdentityClaims.userId, params.userId),
+								eq(importExternalIdentityClaims.provider, batch.provider),
+								eq(importExternalIdentityClaims.recordType, "INCOME_RECEIPT"),
+								eq(
+									importExternalIdentityClaims.scopeId,
+									updatedPayload.destinationAccountId,
+								),
+								eq(
+									importExternalIdentityClaims.externalTransactionIdHash,
+									row.externalTransactionIdHash,
+								),
+							),
+						)
+						.limit(1);
+
+					if (existingClaim) {
+						const [ownerResult] = await tx
+							.select()
+							.from(importRowResults)
+							.where(
+								eq(importRowResults.importRowId, existingClaim.importRowId),
+							)
+							.limit(1);
+
+						if (ownerResult) {
+							nextStatus = "EXACT_DUPLICATE";
+							operation = "RESOLVE";
+
+							const [res] = await tx
+								.insert(importRowResults)
+								.values({
+									userId: params.userId,
+									importRowId: row.id,
+									resultKind: "EXACT_DUPLICATE",
+									targetType: ownerResult.targetType,
+									targetId: ownerResult.targetId,
+									canonicalTransactionId: ownerResult.canonicalTransactionId,
+									externalIdentityClaimId: existingClaim.id,
+								})
+								.returning({ id: importRowResults.id });
+
+							createdResultId = res?.id ?? null;
+						} else {
+							nextStatus = "READY";
+							operation = "RESOLVE";
+						}
+					} else {
+						nextStatus =
+							updatedPayload.incomeSourceId &&
+							updatedPayload.destinationAccountId
+								? "READY"
+								: "NEEDS_REVIEW";
+						operation = "RESOLVE";
+					}
+				} else {
+					nextStatus =
+						updatedPayload.incomeSourceId && updatedPayload.destinationAccountId
+							? "READY"
+							: "NEEDS_REVIEW";
+					operation = "RESOLVE";
+				}
+			} else {
+				throw new ImportError(
+					"IMPORT_UNSUPPORTED_RECORD",
+					"Cannot resolve mappings on UNSUPPORTED record type",
+				);
 			}
+		} else if (params.action === "LINK_EXISTING") {
+			if (!params.linkTarget?.targetId) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					"linkTarget is required for LINK_EXISTING action",
+				);
+			}
+
+			if (!isValidUuid(params.linkTarget.targetId)) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					"linkTarget.targetId must be a valid UUID",
+				);
+			}
+
+			operation = "LINK";
+			nextStatus = "LINKED_EXISTING";
+			nextPayload = currentRev.payload as NormalizedImportPayload; // exact copy-forward
+
+			let targetCanonicalTxId: string;
+			let claimIdToBind: string | null = null;
+
+			if (params.linkTarget.targetType === "CREDIT_CARD_PURCHASE") {
+				if (row.recordType !== "CREDIT_CARD_PURCHASE") {
+					throw new ImportError(
+						"IMPORT_TARGET_MISMATCH",
+						"Target type does not match row recordType",
+					);
+				}
+
+				const [cardEvent] = await tx
+					.select()
+					.from(creditCardLiabilityEvents)
+					.where(
+						and(
+							eq(creditCardLiabilityEvents.id, params.linkTarget.targetId),
+							eq(creditCardLiabilityEvents.userId, params.userId),
+						),
+					)
+					.limit(1);
+
+				if (!cardEvent) {
+					throw new ImportError(
+						"IMPORT_TARGET_NOT_FOUND",
+						"Target credit card liability event not found",
+					);
+				}
+
+				if (cardEvent.eventType !== "PURCHASE") {
+					throw new ImportError(
+						"IMPORT_TARGET_MISMATCH",
+						"Target event must be a PURCHASE",
+					);
+				}
+
+				const [latestRev] = await tx
+					.select()
+					.from(creditCardLiabilityEventRevisions)
+					.where(eq(creditCardLiabilityEventRevisions.eventId, cardEvent.id))
+					.orderBy(desc(creditCardLiabilityEventRevisions.revisionNo))
+					.limit(1);
+
+				if (!latestRev || latestRev.operation === "VOID") {
+					throw new ImportError(
+						"IMPORT_TARGET_NOT_FOUND",
+						"Target credit card liability event is VOID or missing revisions",
+					);
+				}
+
+				const cardPayload = currentRev.payload as NormalizedCardPurchasePayload;
+				if (!cardPayload.cardId) {
+					throw new ImportError(
+						"IMPORT_MISSING_CARD_MAPPING",
+						"Row must have a resolved cardId before linking",
+					);
+				}
+
+				if (cardEvent.creditCardId !== cardPayload.cardId) {
+					throw new ImportError(
+						"IMPORT_TARGET_MISMATCH",
+						"Target card event belongs to a different card",
+					);
+				}
+
+				if (latestRev.amount !== cardPayload.amount) {
+					throw new ImportError(
+						"IMPORT_TARGET_MISMATCH",
+						"Target amount does not match row payload amount",
+					);
+				}
+
+				targetCanonicalTxId = cardEvent.canonicalTransactionId;
+
+				// If row has external ID hash, insert claim before linking
+				if (row.externalTransactionIdHash) {
+					const [newClaim] = await tx
+						.insert(importExternalIdentityClaims)
+						.values({
+							userId: params.userId,
+							provider: batch.provider,
+							recordType: "CREDIT_CARD_PURCHASE",
+							scopeId: cardPayload.cardId,
+							externalTransactionIdHash: row.externalTransactionIdHash,
+							importRowId: row.id,
+						})
+						.onConflictDoNothing()
+						.returning({ id: importExternalIdentityClaims.id });
+
+					if (newClaim) {
+						claimIdToBind = newClaim.id;
+					} else {
+						const [existingClaim] = await tx
+							.select()
+							.from(importExternalIdentityClaims)
+							.where(
+								and(
+									eq(importExternalIdentityClaims.userId, params.userId),
+									eq(importExternalIdentityClaims.provider, batch.provider),
+									eq(
+										importExternalIdentityClaims.recordType,
+										"CREDIT_CARD_PURCHASE",
+									),
+									eq(importExternalIdentityClaims.scopeId, cardPayload.cardId),
+									eq(
+										importExternalIdentityClaims.externalTransactionIdHash,
+										row.externalTransactionIdHash,
+									),
+								),
+							)
+							.limit(1);
+
+						claimIdToBind = existingClaim?.id ?? null;
+					}
+				}
+			} else if (params.linkTarget.targetType === "INCOME_RECEIPT") {
+				if (row.recordType !== "INCOME_RECEIPT") {
+					throw new ImportError(
+						"IMPORT_TARGET_MISMATCH",
+						"Target type does not match row recordType",
+					);
+				}
+
+				const [receiptRecord] = await tx
+					.select()
+					.from(incomeReceipts)
+					.where(
+						and(
+							eq(incomeReceipts.id, params.linkTarget.targetId),
+							eq(incomeReceipts.userId, params.userId),
+						),
+					)
+					.limit(1);
+
+				if (!receiptRecord) {
+					throw new ImportError(
+						"IMPORT_TARGET_NOT_FOUND",
+						"Target income receipt not found",
+					);
+				}
+
+				const [latestRev] = await tx
+					.select()
+					.from(incomeReceiptRevisions)
+					.where(eq(incomeReceiptRevisions.incomeReceiptId, receiptRecord.id))
+					.orderBy(desc(incomeReceiptRevisions.revisionNo))
+					.limit(1);
+
+				if (!latestRev || latestRev.operation === "VOID") {
+					throw new ImportError(
+						"IMPORT_TARGET_NOT_FOUND",
+						"Target income receipt is VOID or missing revisions",
+					);
+				}
+
+				const incPayload = currentRev.payload as NormalizedIncomeReceiptPayload;
+				if (!incPayload.incomeSourceId || !incPayload.destinationAccountId) {
+					throw new ImportError(
+						"IMPORT_MISSING_INCOME_MAPPING",
+						"Row must have resolved incomeSourceId and destinationAccountId before linking",
+					);
+				}
+
+				if (receiptRecord.sourceId !== incPayload.incomeSourceId) {
+					throw new ImportError(
+						"IMPORT_TARGET_MISMATCH",
+						"Target income receipt belongs to a different income source",
+					);
+				}
+
+				if (
+					latestRev.destinationAccountId !== incPayload.destinationAccountId
+				) {
+					throw new ImportError(
+						"IMPORT_TARGET_MISMATCH",
+						"Target income receipt destination account mismatch",
+					);
+				}
+
+				if (latestRev.amount !== incPayload.amount) {
+					throw new ImportError(
+						"IMPORT_TARGET_MISMATCH",
+						"Target income receipt amount mismatch",
+					);
+				}
+
+				targetCanonicalTxId = receiptRecord.canonicalTransactionId;
+
+				// If row has external ID hash, insert claim
+				if (row.externalTransactionIdHash) {
+					const [newClaim] = await tx
+						.insert(importExternalIdentityClaims)
+						.values({
+							userId: params.userId,
+							provider: batch.provider,
+							recordType: "INCOME_RECEIPT",
+							scopeId: incPayload.destinationAccountId,
+							externalTransactionIdHash: row.externalTransactionIdHash,
+							importRowId: row.id,
+						})
+						.onConflictDoNothing()
+						.returning({ id: importExternalIdentityClaims.id });
+
+					if (newClaim) {
+						claimIdToBind = newClaim.id;
+					} else {
+						const [existingClaim] = await tx
+							.select()
+							.from(importExternalIdentityClaims)
+							.where(
+								and(
+									eq(importExternalIdentityClaims.userId, params.userId),
+									eq(importExternalIdentityClaims.provider, batch.provider),
+									eq(importExternalIdentityClaims.recordType, "INCOME_RECEIPT"),
+									eq(
+										importExternalIdentityClaims.scopeId,
+										incPayload.destinationAccountId,
+									),
+									eq(
+										importExternalIdentityClaims.externalTransactionIdHash,
+										row.externalTransactionIdHash,
+									),
+								),
+							)
+							.limit(1);
+
+						claimIdToBind = existingClaim?.id ?? null;
+					}
+				}
+			} else {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					"Unsupported link target type",
+				);
+			}
+
+			const [resultRec] = await tx
+				.insert(importRowResults)
+				.values({
+					userId: params.userId,
+					importRowId: row.id,
+					resultKind: "LINKED_EXISTING",
+					targetType: params.linkTarget.targetType,
+					targetId: params.linkTarget.targetId,
+					canonicalTransactionId: targetCanonicalTxId,
+					externalIdentityClaimId: claimIdToBind,
+				})
+				.returning({ id: importRowResults.id });
+
+			createdResultId = resultRec?.id ?? null;
+		} else if (params.action === "SKIP") {
+			operation = "SKIP";
+			nextStatus = "SKIPPED";
+			nextPayload = currentRev.payload as NormalizedImportPayload; // exact copy-forward
 		} else {
 			throw new ImportError(
-				"IMPORT_UNSUPPORTED_RECORD",
-				`Cannot apply record of type ${row.recordType}`,
+				"IMPORT_INVALID_INPUT",
+				"Unsupported resolve action",
 			);
 		}
 
-		// Insert row result
-		const [rowResult] = await tx
-			.insert(importRowResults)
-			.values({
-				userId: params.userId,
-				importRowId: row.id,
-				resultKind: "CREATED",
-				targetType,
-				targetId,
-				canonicalTransactionId: canonicalTxId,
-			})
-			.returning();
-
-		if (!rowResult) {
-			throw new ImportError(
-				"IMPORT_INVALID_STATE",
-				"Failed to insert import row result",
-			);
-		}
-
-		// Insert terminal revision #N (APPLIED)
-		const revFingerprint = await computeRevisionFingerprint({
+		const nextRevisionNo = currentRev.revisionNo + 1;
+		const revisionFingerprint = await computeRevisionFingerprint({
 			importRowId: row.id,
-			revisionNo: nextRevNo,
-			operation: "APPLY",
-			status: "APPLIED",
-			payload: latestRev.payload,
-			idempotencyKey: params.idempotencyKey ?? null,
+			revisionNo: nextRevisionNo,
+			operation,
+			status: nextStatus,
+			payload: nextPayload,
+			reasonNote: params.reasonNote,
+			idempotencyKey: validKey,
 		});
 
-		const [appliedRev] = await tx
+		const [newRev] = await tx
 			.insert(importRowRevisions)
 			.values({
 				userId: params.userId,
 				importRowId: row.id,
-				revisionNo: nextRevNo,
-				previousRevisionId: latestRev.id,
-				operation: "APPLY",
-				status: "APPLIED",
-				payload: latestRev.payload as NormalizedImportPayload,
-				occurredAt: latestRev.occurredAt,
-				idempotencyKey: params.idempotencyKey ?? null,
-				revisionFingerprint: revFingerprint,
+				revisionNo: nextRevisionNo,
+				previousRevisionId: currentRev.id,
+				operation,
+				status: nextStatus,
+				payload: nextPayload,
+				reasonNote: params.reasonNote ?? null,
+				occurredAt: currentRev.occurredAt,
+				idempotencyKey: validKey,
+				revisionFingerprint,
 			})
 			.returning();
 
-		if (!appliedRev) {
+		if (!newRev) {
 			throw new ImportError(
-				"IMPORT_INVALID_STATE",
-				"Failed to append terminal APPLIED revision",
+				"IMPORT_DATABASE_ERROR",
+				"Failed to insert new revision",
 			);
 		}
 
-		const candidates = await tx
-			.select()
-			.from(importDuplicateCandidates)
-			.where(eq(importDuplicateCandidates.importRowId, row.id));
+		// Insert mutation receipt
+		await tx.insert(importMutationIdempotencyReceipts).values({
+			userId: params.userId,
+			idempotencyKey: validKey,
+			operation: params.action,
+			requestFingerprint,
+			importRowId: row.id,
+			importRowRevisionId: newRev.id,
+			importRowResultId: createdResultId,
+		});
+
+		const detail = await buildImportRowReadModelForRevisionInTransaction(
+			tx,
+			row.id,
+			newRev.id,
+		);
 
 		return {
-			row: {
-				id: row.id,
-				userId: row.userId,
-				batchId: row.batchId,
-				rowOrdinal: row.rowOrdinal,
-				recordType: row.recordType as ImportRecordType,
-				latestRevisionNo: appliedRev.revisionNo,
-				status: "APPLIED",
-				payload: appliedRev.payload as NormalizedImportPayload,
-				occurredAt: appliedRev.occurredAt,
-				externalIdentityPresent: row.externalTransactionIdHash !== null,
-				duplicateCandidates: candidates.map((c) => ({
-					candidateType: c.candidateType as ImportDuplicateCandidateType,
-					candidateId: c.candidateId,
-					reasonCode: c.reasonCode as ImportDuplicateReasonCode,
-				})),
-				result: {
+			row: detail,
+			idempotentReplay: false,
+		};
+	});
+}
+
+/**
+ * Applies a ready import row, delegating safely to authoritative financial domain primitives.
+ */
+export async function applyImportRow(
+	db: Database | DatabaseTransaction,
+	params: ApplyImportRowParams,
+): Promise<{ row: ImportRowDetail; idempotentReplay: boolean }> {
+	// Strict validation before DB
+	if (!isValidUuid(params.userId)) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"valid userId UUID is required",
+		);
+	}
+	if (!isValidUuid(params.importRowId)) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"valid importRowId UUID is required",
+		);
+	}
+	if (
+		!params.idempotencyKey ||
+		typeof params.idempotencyKey !== "string" ||
+		params.idempotencyKey.trim().length === 0 ||
+		params.idempotencyKey.trim().length > 128
+	) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"idempotencyKey is required and must be between 1 and 128 characters",
+		);
+	}
+	const validKey = params.idempotencyKey.trim();
+
+	if (
+		!Number.isInteger(params.expectedRevisionNo) ||
+		params.expectedRevisionNo < 1
+	) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"expectedRevisionNo must be an integer >= 1",
+		);
+	}
+
+	const requestFingerprint = await computeApplyRequestFingerprint({
+		userId: params.userId.toLowerCase(),
+		importRowId: params.importRowId.toLowerCase(),
+		expectedRevisionNo: params.expectedRevisionNo,
+	});
+
+	return await withImportTransaction(db, async (tx) => {
+		// 1. Historical Replay First
+		const [receipt] = await tx
+			.select()
+			.from(importMutationIdempotencyReceipts)
+			.where(
+				and(
+					eq(importMutationIdempotencyReceipts.userId, params.userId),
+					eq(importMutationIdempotencyReceipts.idempotencyKey, validKey),
+				),
+			)
+			.limit(1);
+
+		if (receipt) {
+			if (
+				receipt.operation !== "APPLY" ||
+				receipt.requestFingerprint !== requestFingerprint ||
+				receipt.importRowId !== params.importRowId
+			) {
+				throw new ImportError(
+					"IMPORT_IDEMPOTENCY_CONFLICT",
+					"Idempotency key has already been used for a different apply request",
+				);
+			}
+
+			const historicalDetail =
+				await buildImportRowReadModelForRevisionInTransaction(
+					tx,
+					receipt.importRowId,
+					receipt.importRowRevisionId,
+				);
+
+			return {
+				row: historicalDetail,
+				idempotentReplay: true,
+			};
+		}
+
+		// 2. Lock row FOR UPDATE
+		const [row] = await tx
+			.select()
+			.from(importRows)
+			.where(
+				and(
+					eq(importRows.id, params.importRowId),
+					eq(importRows.userId, params.userId),
+				),
+			)
+			.for("update")
+			.limit(1);
+
+		if (!row) {
+			throw new ImportError("IMPORT_ROW_NOT_FOUND", "Import row not found");
+		}
+
+		const [currentRev] = await tx
+			.select()
+			.from(importRowRevisions)
+			.where(eq(importRowRevisions.importRowId, row.id))
+			.orderBy(desc(importRowRevisions.revisionNo))
+			.limit(1);
+
+		if (!currentRev) {
+			throw new ImportError(
+				"IMPORT_INVALID_STATE",
+				"Import row has no revisions",
+			);
+		}
+
+		if (currentRev.revisionNo !== params.expectedRevisionNo) {
+			throw new ImportError(
+				"IMPORT_REVISION_CONFLICT",
+				`Expected revision ${params.expectedRevisionNo} but row is at revision ${currentRev.revisionNo}`,
+			);
+		}
+
+		if (currentRev.status !== "READY") {
+			throw new ImportError(
+				"IMPORT_INVALID_STATE",
+				`Cannot apply import row in status ${currentRev.status} (must be READY)`,
+			);
+		}
+
+		const [batch] = await tx
+			.select()
+			.from(importBatches)
+			.where(eq(importBatches.id, row.batchId))
+			.limit(1);
+
+		if (!batch) {
+			throw new ImportError("IMPORT_BATCH_NOT_FOUND", "Parent batch not found");
+		}
+
+		const nextRevisionNo = currentRev.revisionNo + 1;
+		let resultRecordId: string | null = null;
+		let nextStatus: ImportRowStatus = "APPLIED";
+		const payload = currentRev.payload as NormalizedImportPayload; // exact copy-forward
+
+		// 3. Strong External ID Claim & Delegation
+		if (row.externalTransactionIdHash && row.recordType !== "UNSUPPORTED") {
+			let scopeId: string;
+			if (row.recordType === "CREDIT_CARD_PURCHASE") {
+				const cp = payload as NormalizedCardPurchasePayload;
+				if (!cp.cardId) {
+					throw new ImportError(
+						"IMPORT_MISSING_CARD_MAPPING",
+						"cardId required for credit card purchase apply",
+					);
+				}
+				scopeId = cp.cardId;
+			} else {
+				const ip = payload as NormalizedIncomeReceiptPayload;
+				if (!ip.destinationAccountId) {
+					throw new ImportError(
+						"IMPORT_MISSING_INCOME_MAPPING",
+						"destinationAccountId required for income receipt apply",
+					);
+				}
+				scopeId = ip.destinationAccountId;
+			}
+
+			// Try to insert claim
+			await tx
+				.insert(importExternalIdentityClaims)
+				.values({
+					userId: params.userId,
+					provider: batch.provider,
+					recordType: row.recordType,
+					scopeId,
+					externalTransactionIdHash: row.externalTransactionIdHash,
+					importRowId: row.id,
+				})
+				.onConflictDoNothing();
+
+			// Re-read confirmed claim
+			const [confirmedClaim] = await tx
+				.select()
+				.from(importExternalIdentityClaims)
+				.where(
+					and(
+						eq(importExternalIdentityClaims.userId, params.userId),
+						eq(importExternalIdentityClaims.provider, batch.provider),
+						eq(importExternalIdentityClaims.recordType, row.recordType),
+						eq(importExternalIdentityClaims.scopeId, scopeId),
+						eq(
+							importExternalIdentityClaims.externalTransactionIdHash,
+							row.externalTransactionIdHash,
+						),
+					),
+				)
+				.limit(1);
+
+			if (!confirmedClaim) {
+				throw new ImportError(
+					"IMPORT_DATABASE_ERROR",
+					"Failed to resolve confirmed external identity claim",
+				);
+			}
+
+			if (confirmedClaim.importRowId === row.id) {
+				// Current row owns the claim! Proceed with financial mutation.
+				const childIdempotencyKey = await computeChildIdempotencyKey(
+					"IMPORT_ROW_APPLY",
+					params.userId,
+					row.id,
+					nextRevisionNo.toString(),
+				);
+
+				let targetType: ImportResultTargetType;
+				let targetId: string;
+				let canonicalTxId: string;
+
+				if (row.recordType === "CREDIT_CARD_PURCHASE") {
+					const cardPayload = payload as NormalizedCardPurchasePayload;
+					if (!cardPayload.cardId) {
+						throw new ImportError(
+							"IMPORT_MISSING_CARD_MAPPING",
+							"cardId mapping is required for credit card purchase apply",
+						);
+					}
+					const purchaseResult = await recordCreditCardPurchaseInTransaction({
+						tx,
+						userId: params.userId,
+						cardId: cardPayload.cardId,
+						amount: cardPayload.amount,
+						occurredAt: new Date(cardPayload.occurredAt),
+						purchaseCategory:
+							cardPayload.purchaseCategory === "SHORT_TERM_PURCHASE"
+								? "SHORT_TERM_PURCHASE"
+								: cardPayload.purchaseCategory === "MANDATORY"
+									? "MANDATORY"
+									: cardPayload.purchaseCategory === "DISCRETIONARY"
+										? "DISCRETIONARY"
+										: "UNCLASSIFIED",
+						shortTermGoalId:
+							cardPayload.purchaseCategory === "SHORT_TERM_PURCHASE"
+								? (cardPayload.shortTermGoalId ?? undefined)
+								: undefined,
+						merchant: cardPayload.merchant ?? undefined,
+						description: cardPayload.description ?? undefined,
+						installmentCount: cardPayload.installmentCount ?? undefined,
+						idempotencyKey: childIdempotencyKey,
+					});
+
+					targetType = "CREDIT_CARD_PURCHASE";
+					targetId = purchaseResult.eventId;
+
+					const [ccEv] = await tx
+						.select({
+							canonicalTransactionId:
+								creditCardLiabilityEvents.canonicalTransactionId,
+						})
+						.from(creditCardLiabilityEvents)
+						.where(eq(creditCardLiabilityEvents.id, purchaseResult.eventId))
+						.limit(1);
+
+					canonicalTxId = ccEv?.canonicalTransactionId ?? "";
+				} else if (row.recordType === "INCOME_RECEIPT") {
+					const incomePayload = payload as NormalizedIncomeReceiptPayload;
+					if (
+						!incomePayload.incomeSourceId ||
+						!incomePayload.destinationAccountId
+					) {
+						throw new ImportError(
+							"IMPORT_MISSING_INCOME_MAPPING",
+							"incomeSourceId and destinationAccountId mappings are required for income receipt apply",
+						);
+					}
+					const receiptResult = await createIncomeReceiptInTransaction({
+						tx,
+						userId: params.userId,
+						sourceId: incomePayload.incomeSourceId,
+						destinationAccountId: incomePayload.destinationAccountId,
+						amount: incomePayload.amount,
+						receivedAt: new Date(incomePayload.receivedAt),
+						note: incomePayload.note ?? undefined,
+						idempotencyKey: childIdempotencyKey,
+						provenance: {
+							type: "IMPORT",
+							ref: row.id,
+							payloadHash: row.rawRowHash,
+							observedAt: batch.observedAt,
+						},
+					});
+
+					targetType = "INCOME_RECEIPT";
+					targetId = receiptResult.incomeReceipt.incomeReceiptId;
+					canonicalTxId = receiptResult.incomeReceipt.canonicalTransactionId;
+				} else {
+					throw new ImportError(
+						"IMPORT_UNSUPPORTED_RECORD",
+						"Cannot apply UNSUPPORTED record type",
+					);
+				}
+
+				const [resultRecord] = await tx
+					.insert(importRowResults)
+					.values({
+						userId: params.userId,
+						importRowId: row.id,
+						resultKind: "CREATED",
+						targetType,
+						targetId,
+						canonicalTransactionId: canonicalTxId,
+						externalIdentityClaimId: confirmedClaim.id,
+					})
+					.returning({ id: importRowResults.id });
+
+				resultRecordId = resultRecord?.id ?? null;
+				nextStatus = "APPLIED";
+			} else {
+				// Another row already owns this claim! DO NOT call financial domain (0 financial delta).
+				const [winnerResult] = await tx
+					.select()
+					.from(importRowResults)
+					.where(eq(importRowResults.importRowId, confirmedClaim.importRowId))
+					.limit(1);
+
+				if (!winnerResult) {
+					throw new ImportError(
+						"IMPORT_DATABASE_ERROR",
+						"Claim winner row has no authoritative result",
+					);
+				}
+
+				const [resultRecord] = await tx
+					.insert(importRowResults)
+					.values({
+						userId: params.userId,
+						importRowId: row.id,
+						resultKind: "EXACT_DUPLICATE",
+						targetType: winnerResult.targetType,
+						targetId: winnerResult.targetId,
+						canonicalTransactionId: winnerResult.canonicalTransactionId,
+						externalIdentityClaimId: confirmedClaim.id,
+					})
+					.returning({ id: importRowResults.id });
+
+				resultRecordId = resultRecord?.id ?? null;
+				nextStatus = "EXACT_DUPLICATE";
+			}
+		} else {
+			// Row without external identity
+			const childIdempotencyKey = await computeChildIdempotencyKey(
+				"IMPORT_ROW_APPLY",
+				params.userId,
+				row.id,
+				nextRevisionNo.toString(),
+			);
+
+			let targetType: ImportResultTargetType;
+			let targetId: string;
+			let canonicalTxId: string;
+
+			if (row.recordType === "CREDIT_CARD_PURCHASE") {
+				const cardPayload = payload as NormalizedCardPurchasePayload;
+				if (!cardPayload.cardId) {
+					throw new ImportError(
+						"IMPORT_MISSING_CARD_MAPPING",
+						"cardId mapping is required for credit card purchase apply",
+					);
+				}
+				const purchaseResult = await recordCreditCardPurchaseInTransaction({
+					tx,
+					userId: params.userId,
+					cardId: cardPayload.cardId,
+					amount: cardPayload.amount,
+					occurredAt: new Date(cardPayload.occurredAt),
+					purchaseCategory:
+						cardPayload.purchaseCategory === "SHORT_TERM_PURCHASE"
+							? "SHORT_TERM_PURCHASE"
+							: cardPayload.purchaseCategory === "MANDATORY"
+								? "MANDATORY"
+								: cardPayload.purchaseCategory === "DISCRETIONARY"
+									? "DISCRETIONARY"
+									: "UNCLASSIFIED",
+					shortTermGoalId:
+						cardPayload.purchaseCategory === "SHORT_TERM_PURCHASE"
+							? (cardPayload.shortTermGoalId ?? undefined)
+							: undefined,
+					merchant: cardPayload.merchant ?? undefined,
+					description: cardPayload.description ?? undefined,
+					installmentCount: cardPayload.installmentCount ?? undefined,
+					idempotencyKey: childIdempotencyKey,
+				});
+
+				targetType = "CREDIT_CARD_PURCHASE";
+				targetId = purchaseResult.eventId;
+
+				const [ccEv] = await tx
+					.select({
+						canonicalTransactionId:
+							creditCardLiabilityEvents.canonicalTransactionId,
+					})
+					.from(creditCardLiabilityEvents)
+					.where(eq(creditCardLiabilityEvents.id, purchaseResult.eventId))
+					.limit(1);
+
+				canonicalTxId = ccEv?.canonicalTransactionId ?? "";
+			} else if (row.recordType === "INCOME_RECEIPT") {
+				const incomePayload = payload as NormalizedIncomeReceiptPayload;
+				if (
+					!incomePayload.incomeSourceId ||
+					!incomePayload.destinationAccountId
+				) {
+					throw new ImportError(
+						"IMPORT_MISSING_INCOME_MAPPING",
+						"incomeSourceId and destinationAccountId mappings are required for income receipt apply",
+					);
+				}
+				const receiptResult = await createIncomeReceiptInTransaction({
+					tx,
+					userId: params.userId,
+					sourceId: incomePayload.incomeSourceId,
+					destinationAccountId: incomePayload.destinationAccountId,
+					amount: incomePayload.amount,
+					receivedAt: new Date(incomePayload.receivedAt),
+					note: incomePayload.note ?? undefined,
+					idempotencyKey: childIdempotencyKey,
+					provenance: {
+						type: "IMPORT",
+						ref: row.id,
+						payloadHash: row.rawRowHash,
+						observedAt: batch.observedAt,
+					},
+				});
+
+				targetType = "INCOME_RECEIPT";
+				targetId = receiptResult.incomeReceipt.incomeReceiptId;
+				canonicalTxId = receiptResult.incomeReceipt.canonicalTransactionId;
+			} else {
+				throw new ImportError(
+					"IMPORT_UNSUPPORTED_RECORD",
+					"Cannot apply UNSUPPORTED record type",
+				);
+			}
+
+			const [resultRecord] = await tx
+				.insert(importRowResults)
+				.values({
+					userId: params.userId,
+					importRowId: row.id,
 					resultKind: "CREATED",
 					targetType,
 					targetId,
 					canonicalTransactionId: canonicalTxId,
-				},
-			},
+					externalIdentityClaimId: null,
+				})
+				.returning({ id: importRowResults.id });
+
+			resultRecordId = resultRecord?.id ?? null;
+			nextStatus = "APPLIED";
+		}
+
+		// Insert new revision
+		const revisionFingerprint = await computeRevisionFingerprint({
+			importRowId: row.id,
+			revisionNo: nextRevisionNo,
+			operation: "APPLY",
+			status: nextStatus,
+			payload,
+			idempotencyKey: validKey,
+		});
+
+		const [newRev] = await tx
+			.insert(importRowRevisions)
+			.values({
+				userId: params.userId,
+				importRowId: row.id,
+				revisionNo: nextRevisionNo,
+				previousRevisionId: currentRev.id,
+				operation: "APPLY",
+				status: nextStatus,
+				payload,
+				occurredAt: currentRev.occurredAt,
+				idempotencyKey: validKey,
+				revisionFingerprint,
+			})
+			.returning();
+
+		if (!newRev) {
+			throw new ImportError(
+				"IMPORT_DATABASE_ERROR",
+				"Failed to insert applied revision",
+			);
+		}
+
+		// Insert mutation receipt
+		await tx.insert(importMutationIdempotencyReceipts).values({
+			userId: params.userId,
+			idempotencyKey: validKey,
+			operation: "APPLY",
+			requestFingerprint,
+			importRowId: row.id,
+			importRowRevisionId: newRev.id,
+			importRowResultId: resultRecordId,
+		});
+
+		const detail = await buildImportRowReadModelForRevisionInTransaction(
+			tx,
+			row.id,
+			newRev.id,
+		);
+
+		return {
+			row: detail,
 			idempotentReplay: false,
-			resultKind: "CREATED",
-			targetType,
-			targetId,
-			canonicalTransactionId: canonicalTxId,
 		};
 	});
 }
 
-export interface ApplyReadyImportRowsResult {
-	batchId: string;
-	totalRows: number;
-	appliedCount: number;
-	alreadyAppliedCount: number;
-	skippedOrPendingCount: number;
-	failedCount: number;
-	errors: Array<{
-		rowId: string;
-		rowOrdinal: number;
-		error: string;
-	}>;
-}
-
 /**
- * Resumable batch apply orchestration.
- * Processes rows in stable rowOrdinal ASC order where each row is an independent atomic transaction.
+ * Applies all READY import rows for a given batch.
  */
 export async function applyReadyImportRows(
-	db: Database,
+	db: Database | DatabaseTransaction,
 	params: { userId: string; batchId: string },
-): Promise<ApplyReadyImportRowsResult> {
-	if (!params.userId || typeof params.userId !== "string") {
-		throw new ImportError("IMPORT_INVALID_INPUT", "userId is required");
-	}
-	if (!params.batchId || typeof params.batchId !== "string") {
-		throw new ImportError("IMPORT_INVALID_INPUT", "batchId is required");
-	}
-
-	const batchRows = await db
-		.select({
-			id: importRows.id,
-			rowOrdinal: importRows.rowOrdinal,
-		})
-		.from(importRows)
-		.where(
-			and(
-				eq(importRows.userId, params.userId),
-				eq(importRows.batchId, params.batchId),
-			),
-		)
-		.orderBy(importRows.rowOrdinal);
-
-	let appliedCount = 0;
-	let alreadyAppliedCount = 0;
-	let skippedOrPendingCount = 0;
-	let failedCount = 0;
-	const errors: Array<{ rowId: string; rowOrdinal: number; error: string }> =
-		[];
-
-	for (const r of batchRows) {
-		// Fetch latest revision for this row
-		const [latestRev] = await db
-			.select({
-				revisionNo: importRowRevisions.revisionNo,
-				status: importRowRevisions.status,
-			})
-			.from(importRowRevisions)
-			.where(eq(importRowRevisions.importRowId, r.id))
-			.orderBy(desc(importRowRevisions.revisionNo))
-			.limit(1);
-
-		if (!latestRev) {
-			skippedOrPendingCount++;
-			continue;
-		}
-
-		if (latestRev.status === "APPLIED") {
-			alreadyAppliedCount++;
-			continue;
-		}
-
-		if (latestRev.status !== "READY") {
-			skippedOrPendingCount++;
-			continue;
-		}
-
-		try {
-			await applyImportRow(db, {
-				userId: params.userId,
-				importRowId: r.id,
-				expectedRevisionNo: latestRev.revisionNo,
-			});
-			appliedCount++;
-		} catch (err) {
-			failedCount++;
-			errors.push({
-				rowId: r.id,
-				rowOrdinal: r.rowOrdinal,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-	}
-
-	return {
-		batchId: params.batchId,
-		totalRows: batchRows.length,
-		appliedCount,
-		alreadyAppliedCount,
-		skippedOrPendingCount,
-		failedCount,
-		errors,
-	};
-}
-
-/**
- * Previews an import batch without mutating state.
- */
-export async function previewImportBatch(
-	db: Database | DatabaseTransaction,
-	userId: string,
-	batchId: string,
 ): Promise<{
-	batch: ImportBatchSummary;
-	rows: ImportRowDetail[];
+	appliedCount: number;
+	failedCount: number;
+	results: Array<{
+		importRowId: string;
+		status: "APPLIED" | "EXACT_DUPLICATE" | "FAILED";
+		errorCode?: string | undefined;
+		errorMessage?: string | undefined;
+		result?: ImportRowDetail["result"];
+	}>;
 }> {
-	return await getImportBatchWithDetails(db, userId, batchId);
-}
-
-/**
- * Gets a single batch with full details and summary.
- */
-export async function getImportBatchWithDetails(
-	db: Database | DatabaseTransaction,
-	userId: string,
-	batchId: string,
-): Promise<{
-	batch: ImportBatchSummary;
-	rows: ImportRowDetail[];
-}> {
-	const [batch] = await db
-		.select()
-		.from(importBatches)
-		.where(and(eq(importBatches.id, batchId), eq(importBatches.userId, userId)))
-		.limit(1);
-
-	if (!batch) {
+	if (!isValidUuid(params.userId)) {
 		throw new ImportError(
-			"IMPORT_BATCH_NOT_FOUND",
-			`Import batch ${batchId} not found`,
+			"IMPORT_INVALID_INPUT",
+			"valid userId UUID is required",
+		);
+	}
+	if (!isValidUuid(params.batchId)) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"valid batchId UUID is required",
 		);
 	}
 
-	const rows = await db
-		.select()
-		.from(importRows)
-		.where(and(eq(importRows.batchId, batchId), eq(importRows.userId, userId)))
-		.orderBy(importRows.rowOrdinal);
+	const rows = await listImportRows(db, params.batchId);
+	const readyRows = rows.filter((r) => r.status === "READY");
 
-	const rowIds = rows.map((r) => r.id);
-
-	let allRevisions: Array<{
-		id: string;
+	let appliedCount = 0;
+	let failedCount = 0;
+	const results: Array<{
 		importRowId: string;
-		revisionNo: number;
-		status: string;
-		payload: unknown;
-		occurredAt: Date | null;
+		status: "APPLIED" | "EXACT_DUPLICATE" | "FAILED";
+		errorCode?: string | undefined;
+		errorMessage?: string | undefined;
+		result?: ImportRowDetail["result"];
 	}> = [];
 
-	let allCandidates: Array<{
-		importRowId: string;
-		candidateType: string;
-		candidateId: string;
-		reasonCode: string;
-	}> = [];
+	for (const r of readyRows) {
+		const deterministicKey = await computeChildIdempotencyKey(
+			"IMPORT_APPLY_READY_ROW",
+			params.userId,
+			r.id,
+			r.latestRevisionNo.toString(),
+		);
 
-	let allResults: Array<{
-		importRowId: string;
-		resultKind: string;
-		targetType: string;
-		targetId: string;
-		canonicalTransactionId: string | null;
-	}> = [];
+		try {
+			const res = await applyImportRow(db, {
+				userId: params.userId,
+				importRowId: r.id,
+				expectedRevisionNo: r.latestRevisionNo,
+				idempotencyKey: deterministicKey,
+			});
 
-	if (rowIds.length > 0) {
-		allRevisions = await db
-			.select({
-				id: importRowRevisions.id,
-				importRowId: importRowRevisions.importRowId,
-				revisionNo: importRowRevisions.revisionNo,
-				status: importRowRevisions.status,
-				payload: importRowRevisions.payload,
-				occurredAt: importRowRevisions.occurredAt,
-			})
-			.from(importRowRevisions)
-			.where(inArray(importRowRevisions.importRowId, rowIds))
-			.orderBy(
-				importRowRevisions.importRowId,
-				desc(importRowRevisions.revisionNo),
-			);
-
-		allCandidates = await db
-			.select({
-				importRowId: importDuplicateCandidates.importRowId,
-				candidateType: importDuplicateCandidates.candidateType,
-				candidateId: importDuplicateCandidates.candidateId,
-				reasonCode: importDuplicateCandidates.reasonCode,
-			})
-			.from(importDuplicateCandidates)
-			.where(inArray(importDuplicateCandidates.importRowId, rowIds));
-
-		allResults = await db
-			.select({
-				importRowId: importRowResults.importRowId,
-				resultKind: importRowResults.resultKind,
-				targetType: importRowResults.targetType,
-				targetId: importRowResults.targetId,
-				canonicalTransactionId: importRowResults.canonicalTransactionId,
-			})
-			.from(importRowResults)
-			.where(inArray(importRowResults.importRowId, rowIds));
-	}
-
-	// Map latest revision per row
-	const latestRevByRowId = new Map<string, (typeof allRevisions)[0]>();
-	for (const rev of allRevisions) {
-		if (!latestRevByRowId.has(rev.importRowId)) {
-			latestRevByRowId.set(rev.importRowId, rev);
+			if (
+				res.row.status === "APPLIED" ||
+				res.row.status === "EXACT_DUPLICATE"
+			) {
+				appliedCount++;
+				results.push({
+					importRowId: r.id,
+					status: res.row.status,
+					result: res.row.result,
+				});
+			} else {
+				failedCount++;
+				results.push({
+					importRowId: r.id,
+					status: "FAILED",
+					errorCode: "IMPORT_INVALID_STATE",
+					errorMessage: "Row did not transition to APPLIED or EXACT_DUPLICATE",
+				});
+			}
+		} catch (err) {
+			failedCount++;
+			const code =
+				err instanceof ImportError ? err.code : "IMPORT_DATABASE_ERROR";
+			const msg =
+				err instanceof ImportError ? err.message : "Failed to apply import row";
+			results.push({
+				importRowId: r.id,
+				status: "FAILED",
+				errorCode: code,
+				errorMessage: msg,
+			});
 		}
 	}
 
-	const candidatesByRowId = new Map<string, typeof allCandidates>();
-	for (const c of allCandidates) {
-		const list = candidatesByRowId.get(c.importRowId) ?? [];
-		list.push(c);
-		candidatesByRowId.set(c.importRowId, list);
+	return {
+		appliedCount,
+		failedCount,
+		results,
+	};
+}
+
+/**
+ * Previews import staging results in dry-run mode (without persisting).
+ */
+export async function previewImportBatch(
+	db: Database | DatabaseTransaction,
+	params: StageImportBatchParams,
+): Promise<{
+	batchMeta: ImportBatchSummary;
+	rows: ImportRowDetail[];
+}> {
+	let contentHash = params.sourceContentHash;
+	if (!contentHash && params.sourceContent) {
+		contentHash = await computeSourceContentHash(params.sourceContent);
+	}
+	if (!contentHash) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"Either sourceContent or sourceContentHash is required",
+		);
 	}
 
-	const resultByRowId = new Map<string, (typeof allResults)[0]>();
-	for (const res of allResults) {
-		resultByRowId.set(res.importRowId, res);
-	}
-
-	const rowDetails: ImportRowDetail[] = rows.map((r) => {
-		const latest = latestRevByRowId.get(r.id);
-		const candList = candidatesByRowId.get(r.id) ?? [];
-		const res = resultByRowId.get(r.id);
-
-		return {
-			id: r.id,
-			userId: r.userId,
-			batchId: r.batchId,
-			rowOrdinal: r.rowOrdinal,
-			recordType: r.recordType as ImportRecordType,
-			latestRevisionNo: latest?.revisionNo ?? 1,
-			status: (latest?.status ?? "NEEDS_REVIEW") as ImportRowStatus,
-			payload: (latest?.payload ?? {}) as NormalizedImportPayload,
-			occurredAt: latest?.occurredAt ?? null,
-			externalIdentityPresent: r.externalTransactionIdHash !== null,
-			duplicateCandidates: candList.map((c) => ({
-				candidateType: c.candidateType as ImportDuplicateCandidateType,
-				candidateId: c.candidateId,
-				reasonCode: c.reasonCode as ImportDuplicateReasonCode,
-			})),
-			result: res
-				? {
-						resultKind: res.resultKind as ImportResultKind,
-						targetType: res.targetType as ImportResultTargetType,
-						targetId: res.targetId,
-						canonicalTransactionId: res.canonicalTransactionId,
-					}
-				: null,
-		};
+	const meta = validateAndNormalizeBatchMeta({
+		...params,
+		sourceContentHash: contentHash,
 	});
 
-	const summary: ImportBatchSummary = {
-		id: batch.id,
-		userId: batch.userId,
-		provider: batch.provider,
-		sourceKind: batch.sourceKind as ImportSourceKind,
-		sourceContentHash: batch.sourceContentHash,
-		sourceFileName: batch.sourceFileName,
-		parserType: batch.parserType,
-		parserVersion: batch.parserVersion,
-		observedAt: batch.observedAt,
-		createdAt: batch.createdAt,
-		totalRows: rowDetails.length,
-		readyCount: rowDetails.filter((r) => r.status === "READY").length,
-		needsReviewCount: rowDetails.filter((r) => r.status === "NEEDS_REVIEW")
-			.length,
-		possibleDuplicateCount: rowDetails.filter(
-			(r) => r.status === "POSSIBLE_DUPLICATE",
-		).length,
-		exactDuplicateCount: rowDetails.filter(
-			(r) => r.status === "EXACT_DUPLICATE",
-		).length,
-		appliedCount: rowDetails.filter((r) => r.status === "APPLIED").length,
-		linkedCount: rowDetails.filter((r) => r.status === "LINKED_EXISTING")
-			.length,
-		skippedCount: rowDetails.filter((r) => r.status === "SKIPPED").length,
-		unsupportedCount: rowDetails.filter((r) => r.status === "UNSUPPORTED")
-			.length,
-	};
+	const normalizedRows: ReturnType<typeof normalizeImportRow> extends Promise<
+		infer R
+	>
+		? R[]
+		: never = [];
 
-	return {
-		batch: summary,
-		rows: rowDetails,
-	};
+	for (let i = 0; i < params.rows.length; i++) {
+		const r = params.rows[i];
+		if (!r) continue;
+		normalizedRows.push(await normalizeImportRow(meta.validUserId, i, r));
+	}
+
+	return await withImportTransaction(db, async (tx) => {
+		const dedupResult = await analyzeDuplicatesAgainstDb(
+			tx,
+			meta.validUserId,
+			meta.validProvider,
+			normalizedRows,
+		);
+
+		let readyCount = 0;
+		let needsReviewCount = 0;
+		let possibleDuplicateCount = 0;
+		let exactDuplicateCount = 0;
+		let unsupportedCount = 0;
+
+		const rowDetails: ImportRowDetail[] = [];
+		const previewBatchId = "00000000-0000-0000-0000-000000000000";
+
+		for (const item of dedupResult.rowsWithStatus) {
+			const r = item.row;
+			const finalStatus = item.finalStatus;
+
+			switch (finalStatus) {
+				case "READY":
+					readyCount++;
+					break;
+				case "NEEDS_REVIEW":
+					needsReviewCount++;
+					break;
+				case "POSSIBLE_DUPLICATE":
+					possibleDuplicateCount++;
+					break;
+				case "EXACT_DUPLICATE":
+					exactDuplicateCount++;
+					break;
+				case "UNSUPPORTED":
+					unsupportedCount++;
+					break;
+			}
+
+			let targetResult: ImportRowDetail["result"] = null;
+
+			// If EXACT_DUPLICATE, resolve existing target evidence for preview
+			if (
+				finalStatus === "EXACT_DUPLICATE" &&
+				r.externalTransactionIdHash &&
+				r.recordType !== "UNSUPPORTED"
+			) {
+				let scopeId: string | null = null;
+				if (r.recordType === "CREDIT_CARD_PURCHASE") {
+					scopeId = (r.payload as NormalizedCardPurchasePayload).cardId;
+				} else if (r.recordType === "INCOME_RECEIPT") {
+					scopeId = (r.payload as NormalizedIncomeReceiptPayload)
+						.destinationAccountId;
+				}
+
+				if (scopeId) {
+					const [claim] = await tx
+						.select()
+						.from(importExternalIdentityClaims)
+						.where(
+							and(
+								eq(importExternalIdentityClaims.userId, meta.validUserId),
+								eq(importExternalIdentityClaims.provider, meta.validProvider),
+								eq(importExternalIdentityClaims.recordType, r.recordType),
+								eq(importExternalIdentityClaims.scopeId, scopeId),
+								eq(
+									importExternalIdentityClaims.externalTransactionIdHash,
+									r.externalTransactionIdHash,
+								),
+							),
+						)
+						.limit(1);
+
+					if (claim) {
+						const [ownerResult] = await tx
+							.select()
+							.from(importRowResults)
+							.where(eq(importRowResults.importRowId, claim.importRowId))
+							.limit(1);
+
+						if (ownerResult) {
+							targetResult = {
+								resultKind: "EXACT_DUPLICATE",
+								targetType: ownerResult.targetType as ImportResultTargetType,
+								targetId: ownerResult.targetId,
+								canonicalTransactionId: ownerResult.canonicalTransactionId,
+								externalIdentityClaimId: claim.id,
+							};
+						}
+					}
+				}
+			}
+
+			rowDetails.push({
+				id: `preview-row-${r.rowOrdinal}`,
+				userId: meta.validUserId,
+				batchId: previewBatchId,
+				rowOrdinal: r.rowOrdinal,
+				recordType: r.recordType,
+				latestRevisionNo: 1,
+				status: finalStatus,
+				payload: r.payload,
+				occurredAt: r.occurredAt,
+				externalIdentityPresent: r.externalTransactionIdHash !== null,
+				duplicateCandidates: item.candidates.map((c) => ({
+					candidateType: c.candidateType,
+					candidateId: c.candidateId,
+					reasonCode: c.reasonCode,
+				})),
+				result: targetResult,
+			});
+		}
+
+		const batchSummary: ImportBatchSummary = {
+			id: previewBatchId,
+			userId: meta.validUserId,
+			provider: meta.validProvider,
+			sourceKind: meta.validSourceKind,
+			sourceContentHash: meta.validContentHash,
+			sourceFileName: meta.validFileName,
+			parserType: meta.validParserType,
+			parserVersion: meta.validParserVersion,
+			observedAt: meta.validObservedAt,
+			createdAt: new Date(),
+			totalRows: normalizedRows.length,
+			readyCount,
+			needsReviewCount,
+			possibleDuplicateCount,
+			exactDuplicateCount,
+			appliedCount: 0,
+			linkedCount: 0,
+			skippedCount: 0,
+			unsupportedCount,
+		};
+
+		return {
+			batchMeta: batchSummary,
+			rows: rowDetails,
+		};
+	});
 }
 
+/**
+ * Retrieves a single batch by ID.
+ */
 export async function getImportBatch(
 	db: Database | DatabaseTransaction,
-	userId: string,
 	batchId: string,
 ): Promise<ImportBatchSummary> {
-	const res = await getImportBatchWithDetails(db, userId, batchId);
-	return res.batch;
+	if (!isValidUuid(batchId)) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"valid batchId UUID is required",
+		);
+	}
+	return await withImportTransaction(db, async (tx) => {
+		return await buildImportBatchSummaryInTransaction(tx, batchId);
+	});
 }
 
+/**
+ * Lists import batches for a user.
+ */
 export async function listImportBatches(
 	db: Database | DatabaseTransaction,
 	userId: string,
 ): Promise<ImportBatchSummary[]> {
-	const batches = await db
-		.select()
-		.from(importBatches)
-		.where(eq(importBatches.userId, userId))
-		.orderBy(desc(importBatches.createdAt));
-
-	const summaries: ImportBatchSummary[] = [];
-	for (const b of batches) {
-		const res = await getImportBatchWithDetails(db, userId, b.id);
-		summaries.push(res.batch);
-	}
-	return summaries;
-}
-
-export async function getImportRow(
-	db: Database | DatabaseTransaction,
-	userId: string,
-	rowId: string,
-): Promise<ImportRowDetail> {
-	const [row] = await db
-		.select()
-		.from(importRows)
-		.where(and(eq(importRows.id, rowId), eq(importRows.userId, userId)))
-		.limit(1);
-
-	if (!row) {
+	if (!isValidUuid(userId)) {
 		throw new ImportError(
-			"IMPORT_ROW_NOT_FOUND",
-			`Import row ${rowId} not found`,
+			"IMPORT_INVALID_INPUT",
+			"valid userId UUID is required",
 		);
 	}
+	return await withImportTransaction(db, async (tx) => {
+		const batches = await tx
+			.select({ id: importBatches.id })
+			.from(importBatches)
+			.where(eq(importBatches.userId, userId))
+			.orderBy(desc(importBatches.createdAt));
 
-	const batchDetails = await getImportBatchWithDetails(db, userId, row.batchId);
-	const found = batchDetails.rows.find((r) => r.id === rowId);
-	if (!found) {
-		throw new ImportError(
-			"IMPORT_ROW_NOT_FOUND",
-			`Import row ${rowId} not found in batch`,
-		);
-	}
-	return found;
+		const summaries: ImportBatchSummary[] = [];
+		for (const b of batches) {
+			summaries.push(await buildImportBatchSummaryInTransaction(tx, b.id));
+		}
+		return summaries;
+	});
 }
 
-export async function listImportRows(
-	db: Database | DatabaseTransaction,
-	userId: string,
+/**
+ * Helper to list all rows for a batch inside a transaction.
+ */
+async function listImportRowsInTransaction(
+	tx: DatabaseTransaction,
 	batchId: string,
 ): Promise<ImportRowDetail[]> {
-	const res = await getImportBatchWithDetails(db, userId, batchId);
-	return res.rows;
+	const rows = await tx
+		.select({ id: importRows.id })
+		.from(importRows)
+		.where(eq(importRows.batchId, batchId))
+		.orderBy(importRows.rowOrdinal);
+
+	const rowDetails: ImportRowDetail[] = [];
+	for (const r of rows) {
+		rowDetails.push(await buildImportRowReadModelInTransaction(tx, r.id));
+	}
+	return rowDetails;
+}
+
+/**
+ * Retrieves a single import row detail.
+ */
+export async function getImportRow(
+	db: Database | DatabaseTransaction,
+	importRowId: string,
+): Promise<ImportRowDetail> {
+	if (!isValidUuid(importRowId)) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"valid importRowId UUID is required",
+		);
+	}
+	return await withImportTransaction(db, async (tx) => {
+		return await buildImportRowReadModelInTransaction(tx, importRowId);
+	});
+}
+
+/**
+ * Lists all import rows for a batch.
+ */
+export async function listImportRows(
+	db: Database | DatabaseTransaction,
+	batchId: string,
+): Promise<ImportRowDetail[]> {
+	if (!isValidUuid(batchId)) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"valid batchId UUID is required",
+		);
+	}
+	return await withImportTransaction(db, async (tx) => {
+		return await listImportRowsInTransaction(tx, batchId);
+	});
 }

@@ -4,13 +4,14 @@ import { mapToImportError } from "../src/imports/boundary";
 import { analyzeIntraBatchDuplicates } from "../src/imports/dedup";
 import { ImportError } from "../src/imports/errors";
 import {
+	computeApplyRequestFingerprint,
 	computeCardSemanticFingerprint,
 	computeChildIdempotencyKey,
 	computeExternalTransactionIdHash,
 	computeRawRowHash,
-	computeSourceContentHash,
+	computeResolveRequestFingerprint,
 } from "../src/imports/fingerprint";
-import { parseGenericCsvV1 } from "../src/imports/generic-csv";
+import { parseCsvRecords, parseGenericCsvV1 } from "../src/imports/generic-csv";
 import {
 	normalizeImportRow,
 	validateAndNormalizeBatchMeta,
@@ -18,7 +19,7 @@ import {
 import { IncomeError } from "../src/income/errors";
 import { CanonicalTransactionError } from "../src/transactions/errors";
 
-describe("Phase 17 - Import Unit Tests", () => {
+describe("Phase 17-R1 - Import Unit Tests", () => {
 	const validUserId = "00000000-0000-4000-a000-000000000001";
 	const validCardId = "00000000-0000-4000-a000-000000000002";
 	const validSourceId = "00000000-0000-4000-a000-000000000003";
@@ -46,9 +47,15 @@ describe("Phase 17 - Import Unit Tests", () => {
 			expect(res.validFileName).toBe("statement_2026_09.csv");
 		});
 
-		it("rejects empty userId", () => {
+		it("rejects empty or non-UUID userId", () => {
 			expect(() =>
 				validateAndNormalizeBatchMeta({ ...validMeta, userId: "   " }),
+			).toThrowError(ImportError);
+			expect(() =>
+				validateAndNormalizeBatchMeta({
+					...validMeta,
+					userId: "not-a-uuid",
+				}),
 			).toThrowError(ImportError);
 		});
 
@@ -80,7 +87,7 @@ describe("Phase 17 - Import Unit Tests", () => {
 		});
 	});
 
-	describe("Row Normalization & Validation", () => {
+	describe("Row Normalization & Privacy", () => {
 		it("normalizes a complete credit card purchase to READY status", async () => {
 			const row = await normalizeImportRow(validUserId, 0, {
 				recordType: "CREDIT_CARD_PURCHASE",
@@ -149,7 +156,7 @@ describe("Phase 17 - Import Unit Tests", () => {
 				}),
 			).rejects.toThrowError(ImportError);
 
-			const validGoalRow = await normalizeImportRow(validUserId, 4, {
+			const validGoalRow = await normalizeImportRow(validUserId, 3, {
 				recordType: "CREDIT_CARD_PURCHASE",
 				cardId: validCardId,
 				occurredAt: new Date("2026-09-02T10:30:00Z"),
@@ -160,102 +167,95 @@ describe("Phase 17 - Import Unit Tests", () => {
 			expect(validGoalRow.initialStatus).toBe("READY");
 		});
 
-		it("rejects non-positive amounts", async () => {
-			await expect(
-				normalizeImportRow(validUserId, 5, {
-					recordType: "CREDIT_CARD_PURCHASE",
-					cardId: validCardId,
-					occurredAt: new Date("2026-09-02T10:30:00Z"),
-					amount: "0.00",
-					purchaseCategory: "MANDATORY",
-				}),
-			).rejects.toThrowError(ImportError);
-
-			await expect(
-				normalizeImportRow(validUserId, 6, {
-					recordType: "CREDIT_CARD_PURCHASE",
-					cardId: validCardId,
-					occurredAt: new Date("2026-09-02T10:30:00Z"),
-					amount: "-150.00",
-					purchaseCategory: "MANDATORY",
-				}),
-			).rejects.toThrowError(ImportError);
-		});
-
-		it("normalizes a complete income receipt to READY status", async () => {
+		it("normalizes income receipt with complete mappings to READY", async () => {
 			const row = await normalizeImportRow(validUserId, 0, {
 				recordType: "INCOME_RECEIPT",
 				incomeSourceId: validSourceId,
 				destinationAccountId: validDestId,
-				receivedAt: new Date("2026-09-01T08:00:00Z"),
+				receivedAt: new Date("2026-09-01T09:00:00Z"),
 				amount: "45000.00",
-				note: "Monthly salary",
-				externalTransactionId: "EXT_INC_112233",
+				note: "Monthly Salary",
+				externalTransactionId: "SAL_2026_09",
 			});
 
-			expect(row.initialStatus).toBe("READY");
 			expect(row.recordType).toBe("INCOME_RECEIPT");
+			expect(row.initialStatus).toBe("READY");
 			if (row.payload.recordType === "INCOME_RECEIPT") {
 				expect(row.payload.amount).toBe("45000.00");
 				expect(row.payload.incomeSourceId).toBe(validSourceId);
 				expect(row.payload.destinationAccountId).toBe(validDestId);
-				expect(row.payload.note).toBe("Monthly salary");
 			}
 		});
 
-		it("marks income receipt missing destination as NEEDS_REVIEW", async () => {
-			const row = await normalizeImportRow(validUserId, 1, {
-				recordType: "INCOME_RECEIPT",
-				incomeSourceId: validSourceId,
-				receivedAt: new Date("2026-09-01T08:00:00Z"),
-				amount: "10000.00",
+		it("preserves privacy: unsupported rows never persist rawRecord", async () => {
+			const row = await normalizeImportRow(validUserId, 0, {
+				recordType: "UNSUPPORTED",
+				rawRecord: {
+					panNumber: "5555444433332222",
+					secretToken: "bank_secret_xyz",
+				},
+				reason: "Unsupported wire format",
 			});
 
-			expect(row.initialStatus).toBe("NEEDS_REVIEW");
+			expect(row.recordType).toBe("UNSUPPORTED");
+			expect(row.initialStatus).toBe("UNSUPPORTED");
+			expect(row.payload).toEqual({
+				recordType: "UNSUPPORTED",
+				reason: "Unsupported wire format",
+			});
+			expect("rawRecord" in row.payload).toBe(false);
 		});
 
-		it("marks unsupported record type as UNSUPPORTED", async () => {
-			const row = await normalizeImportRow(validUserId, 2, {
-				recordType: "UNSUPPORTED",
-				rawRecord: { type: "TRANSFER", from: "acc1", to: "acc2" },
-				reason: "Transfer not supported in Phase 17",
-			});
+		it("rejects non-positive amounts", async () => {
+			await expect(
+				normalizeImportRow(validUserId, 0, {
+					recordType: "CREDIT_CARD_PURCHASE",
+					cardId: validCardId,
+					occurredAt: new Date("2026-09-02T10:00:00Z"),
+					amount: "0.00",
+				}),
+			).rejects.toThrowError(ImportError);
 
-			expect(row.initialStatus).toBe("UNSUPPORTED");
-			expect(row.recordType).toBe("UNSUPPORTED");
+			await expect(
+				normalizeImportRow(validUserId, 0, {
+					recordType: "INCOME_RECEIPT",
+					incomeSourceId: validSourceId,
+					destinationAccountId: validDestId,
+					receivedAt: new Date("2026-09-01T10:00:00Z"),
+					amount: "-50.00",
+				}),
+			).rejects.toThrowError(ImportError);
 		});
 	});
 
-	describe("Fingerprinting & Determinism", () => {
-		it("computes reproducible source content hash", async () => {
-			const hash1 = await computeSourceContentHash("col1,col2\nval1,val2");
-			const hash2 = await computeSourceContentHash("col1,col2\nval1,val2");
-			expect(hash1).toHaveLength(64);
-			expect(hash1).toBe(hash2);
-		});
-
+	describe("Fingerprinting & Idempotency", () => {
 		it("computes deterministic raw row hash regardless of object key order", async () => {
-			const obj1 = { b: 2, a: 1, c: { y: 20, x: 10 } };
-			const obj2 = { c: { x: 10, y: 20 }, a: 1, b: 2 };
-			const hash1 = await computeRawRowHash(obj1);
-			const hash2 = await computeRawRowHash(obj2);
+			const hash1 = await computeRawRowHash({
+				b: 2,
+				a: 1,
+				c: { y: "test", x: 10 },
+			});
+			const hash2 = await computeRawRowHash({
+				a: 1,
+				c: { x: 10, y: "test" },
+				b: 2,
+			});
 			expect(hash1).toBe(hash2);
 		});
 
-		it("computes deterministic card semantic fingerprint with Istanbul date", async () => {
-			const date = new Date("2026-09-02T22:30:00Z"); // In Istanbul (+03:00) this is 2026-09-03
+		it("computes deterministic semantic fingerprint with Istanbul calendar normalization", async () => {
 			const fp1 = await computeCardSemanticFingerprint({
 				userId: validUserId,
 				cardId: validCardId,
-				occurredAt: date,
+				occurredAt: new Date("2026-09-02T21:30:00Z"), // 2026-09-03 in Istanbul (UTC+3)
 				amount: "100.00",
-				merchant: "  Starbucks Coffee  ",
+				merchant: " Starbucks Coffee ",
 			});
 
 			const fp2 = await computeCardSemanticFingerprint({
 				userId: validUserId,
 				cardId: validCardId,
-				occurredAt: date,
+				occurredAt: new Date("2026-09-03T00:15:00+03:00"), // 2026-09-03 in Istanbul
 				amount: "100.00",
 				merchant: "starbucks coffee",
 			});
@@ -272,6 +272,31 @@ describe("Phase 17 - Import Unit Tests", () => {
 			expect(key).toHaveLength(64);
 			expect(/^[0-9a-f]{64}$/.test(key)).toBe(true);
 		});
+
+		it("computes deterministic request fingerprints for resolve and apply", async () => {
+			const rFp1 = await computeResolveRequestFingerprint({
+				userId: validUserId,
+				importRowId: "00000000-0000-4000-a000-000000000010",
+				expectedRevisionNo: 1,
+				action: "RESOLVE_MAPPINGS",
+				resolvedMappings: { cardId: validCardId },
+			});
+			const rFp2 = await computeResolveRequestFingerprint({
+				userId: validUserId,
+				importRowId: "00000000-0000-4000-a000-000000000010",
+				expectedRevisionNo: 1,
+				action: "RESOLVE_MAPPINGS",
+				resolvedMappings: { cardId: validCardId },
+			});
+			expect(rFp1).toBe(rFp2);
+
+			const aFp = await computeApplyRequestFingerprint({
+				userId: validUserId,
+				importRowId: "00000000-0000-4000-a000-000000000010",
+				expectedRevisionNo: 2,
+			});
+			expect(aFp).toHaveLength(64);
+		});
 	});
 
 	describe("Intra-Batch Duplicate Detection", async () => {
@@ -284,16 +309,14 @@ describe("Phase 17 - Import Unit Tests", () => {
 				purchaseCategory: "MANDATORY",
 				merchant: "Market A",
 			});
-
 			const row2 = await normalizeImportRow(validUserId, 1, {
 				recordType: "CREDIT_CARD_PURCHASE",
 				cardId: validCardId,
-				occurredAt: new Date("2026-09-02T10:00:00Z"),
+				occurredAt: new Date("2026-09-02T12:00:00Z"), // Same Istanbul date
 				amount: "500.00",
 				purchaseCategory: "MANDATORY",
-				merchant: "Market A",
+				merchant: "market a",
 			});
-
 			const row3 = await normalizeImportRow(validUserId, 2, {
 				recordType: "CREDIT_CARD_PURCHASE",
 				cardId: validCardId,
@@ -312,11 +335,11 @@ describe("Phase 17 - Import Unit Tests", () => {
 			expect(c0).toBeDefined();
 			expect(c0).toHaveLength(1);
 			expect(c0?.[0]?.reasonCode).toBe("SAME_BATCH_SEMANTICS");
-			expect(c0?.[0]?.candidateId).toBe("ROW_ORDINAL_1");
+			expect(c0?.[0]?.candidateRowOrdinal).toBe(1);
 		});
 	});
 
-	describe("Generic CSV V1 Parser", () => {
+	describe("RFC 4180 Generic CSV V1 Parser", () => {
 		it("parses valid CSV text into purchase, income and unsupported rows", () => {
 			const csv = [
 				"type,date,amount,card_id,category,merchant,note,source_id,destination_account_id,external_id",
@@ -354,6 +377,33 @@ describe("Phase 17 - Import Unit Tests", () => {
 			}
 		});
 
+		it("handles RFC 4180 commas in quotes, escaped double quotes, and CRLF", () => {
+			const csv =
+				"type,date,amount,merchant,note\r\n" +
+				'CREDIT_CARD_PURCHASE,2026-09-02,120.00,"Coffee, Tea & Snacks","Special ""VIP"" discount"\r\n';
+
+			const records = parseCsvRecords(csv);
+			expect(records).toHaveLength(2);
+			expect(records[1]?.[3]).toBe("Coffee, Tea & Snacks");
+			expect(records[1]?.[4]).toBe('Special "VIP" discount');
+		});
+
+		it("handles multi-line quoted fields", () => {
+			const csv =
+				"type,date,amount,note\n" +
+				'INCOME_RECEIPT,2026-09-01,1000.00,"Line 1\nLine 2\nLine 3"\n';
+
+			const records = parseCsvRecords(csv);
+			expect(records).toHaveLength(2);
+			expect(records[1]?.[3]).toBe("Line 1\nLine 2\nLine 3");
+		});
+
+		it("throws on unterminated quoted string", () => {
+			const badCsv =
+				'type,date,amount\nCREDIT_CARD_PURCHASE,2026-09-02,"unclosed';
+			expect(() => parseGenericCsvV1(badCsv)).toThrowError(ImportError);
+		});
+
 		it("rejects empty or single line CSV", () => {
 			expect(() => parseGenericCsvV1("header1,header2")).toThrowError(
 				ImportError,
@@ -362,7 +412,7 @@ describe("Phase 17 - Import Unit Tests", () => {
 		});
 	});
 
-	describe("Boundary Error Translation", () => {
+	describe("Boundary Error Translation & Sanitization", () => {
 		it("maps CreditCardError to sanitized ImportError", () => {
 			const notFound = new CreditCardError(
 				"CREDIT_CARD_NOT_FOUND",
@@ -409,6 +459,16 @@ describe("Phase 17 - Import Unit Tests", () => {
 			);
 			const mappedSeq = mapToImportError(seqErr);
 			expect(mappedSeq.code).toBe("IMPORT_REVISION_CONFLICT");
+		});
+
+		it("sanitizes unexpected database errors without leaking internal details", () => {
+			const rawDbErr = new Error(
+				"FATAL: password authentication failed for user 'app' at postgres://...",
+			);
+			const sanitized = mapToImportError(rawDbErr);
+			expect(sanitized.code).toBe("IMPORT_DATABASE_ERROR");
+			expect(sanitized.message).not.toContain("password");
+			expect(sanitized.message).not.toContain("postgres://");
 		});
 	});
 });

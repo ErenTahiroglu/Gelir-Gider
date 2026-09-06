@@ -15,10 +15,11 @@ function getField(
 }
 
 /**
- * Pure, safe parser for GENERIC_CSV_V1 format.
- * Expects CSV text with header row.
+ * Pure RFC 4180 compliant CSV tokenizer/parser.
+ * Correctly handles commas inside quotes, escaped double quotes (""),
+ * CRLF/LF line breaks, and multi-line quoted fields.
  */
-export function parseGenericCsvV1(csvContent: string): RawImportRowInput[] {
+export function parseCsvRecords(csvContent: string): string[][] {
 	if (typeof csvContent !== "string") {
 		throw new ImportError(
 			"IMPORT_INVALID_INPUT",
@@ -26,59 +27,127 @@ export function parseGenericCsvV1(csvContent: string): RawImportRowInput[] {
 		);
 	}
 
-	const lines = csvContent
-		.split(/\r?\n/)
-		.map((l) => l.trim())
-		.filter((l) => l.length > 0);
+	const records: string[][] = [];
+	let currentRecord: string[] = [];
+	let currentField = "";
+	let inQuotes = false;
+	let i = 0;
+	const len = csvContent.length;
 
-	if (lines.length < 2) {
+	while (i < len) {
+		const char = csvContent[i];
+
+		if (inQuotes) {
+			if (char === '"') {
+				// Look ahead for escaped quote ("")
+				if (i + 1 < len && csvContent[i + 1] === '"') {
+					currentField += '"';
+					i += 2;
+					continue;
+				}
+				// End of quoted field
+				inQuotes = false;
+				i++;
+				continue;
+			}
+			currentField += char;
+			i++;
+		} else {
+			if (char === '"') {
+				if (currentField.length === 0) {
+					inQuotes = true;
+					i++;
+					continue;
+				}
+				// Quote inside unquoted field
+				currentField += char;
+				i++;
+			} else if (char === ",") {
+				currentRecord.push(currentField);
+				currentField = "";
+				i++;
+			} else if (char === "\r") {
+				if (i + 1 < len && csvContent[i + 1] === "\n") {
+					i++; // skip \r, next is \n
+				}
+				currentRecord.push(currentField);
+				currentField = "";
+				records.push(currentRecord);
+				currentRecord = [];
+				i++;
+			} else if (char === "\n") {
+				currentRecord.push(currentField);
+				currentField = "";
+				records.push(currentRecord);
+				currentRecord = [];
+				i++;
+			} else {
+				currentField += char;
+				i++;
+			}
+		}
+	}
+
+	if (inQuotes) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"Unterminated quoted string in CSV content",
+		);
+	}
+
+	// Push trailing field/record if any content exists
+	if (currentField.length > 0 || currentRecord.length > 0) {
+		currentRecord.push(currentField);
+		records.push(currentRecord);
+	}
+
+	// Filter out trailing completely empty records
+	while (
+		records.length > 0 &&
+		records[records.length - 1]?.length === 1 &&
+		records[records.length - 1]?.[0] === ""
+	) {
+		records.pop();
+	}
+
+	return records;
+}
+
+/**
+ * Pure, safe parser for GENERIC_CSV_V1 format.
+ * Expects CSV text with header row.
+ */
+export function parseGenericCsvV1(csvContent: string): RawImportRowInput[] {
+	const records = parseCsvRecords(csvContent);
+
+	if (records.length < 2) {
 		throw new ImportError(
 			"IMPORT_INVALID_INPUT",
 			"CSV content must contain a header row and at least one data row",
 		);
 	}
 
-	const headerLine = lines[0];
-	if (!headerLine) {
+	const headerRow = records[0];
+	if (
+		!headerRow ||
+		headerRow.length === 0 ||
+		headerRow.every((h) => !h.trim())
+	) {
 		throw new ImportError("IMPORT_INVALID_INPUT", "CSV header row is empty");
 	}
 
-	const headers = headerLine.split(",").map((h) =>
-		h
-			.trim()
-			.toLowerCase()
-			.replace(/^["']|["']$/g, ""),
-	);
-
+	const headers = headerRow.map((h) => h.trim().toLowerCase());
 	const rows: RawImportRowInput[] = [];
 
-	for (let i = 1; i < lines.length; i++) {
-		const line = lines[i];
-		if (!line) continue;
-
-		// Basic comma splitting respecting simple quoted fields
-		const values: string[] = [];
-		let current = "";
-		let inQuotes = false;
-
-		for (let c = 0; c < line.length; c++) {
-			const char = line[c];
-			if (char === '"') {
-				inQuotes = !inQuotes;
-			} else if (char === "," && !inQuotes) {
-				values.push(current.trim().replace(/^["']|["']$/g, ""));
-				current = "";
-			} else {
-				current += char;
-			}
-		}
-		values.push(current.trim().replace(/^["']|["']$/g, ""));
+	for (let i = 1; i < records.length; i++) {
+		const record = records[i];
+		if (!record || (record.length === 1 && record[0] === "")) continue;
 
 		const rowObj: Record<string, string> = {};
 		for (let h = 0; h < headers.length; h++) {
 			const head = headers[h];
 			if (head) {
-				rowObj[head] = values[h] ?? "";
+				rowObj[head] = record[h] ?? "";
 			}
 		}
 

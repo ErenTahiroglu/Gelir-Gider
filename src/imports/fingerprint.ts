@@ -146,10 +146,48 @@ export async function computeRevisionFingerprint(params: {
  * Computes a deterministic bounded 64-char child idempotency key for domain primitive delegation.
  */
 export async function computeChildIdempotencyKey(
-	prefix: string,
-	rowId: string,
-	revisionNo: number,
+	...keys: (string | number)[]
 ): Promise<string> {
-	const raw = `${prefix}:${rowId}:${revisionNo}`;
+	const raw = keys.map((k) => String(k)).join(":");
 	return await computeSha256Hex(raw);
+}
+
+/**
+ * Computes request fingerprint for resolveImportRow mutations.
+ */
+export async function computeResolveRequestFingerprint(params: {
+	userId: string;
+	importRowId: string;
+	expectedRevisionNo: number;
+	action: string;
+	resolvedMappings?: Record<string, unknown> | null | undefined;
+	linkTarget?: Record<string, unknown> | null | undefined;
+	reasonNote?: string | null | undefined;
+}): Promise<string> {
+	const rawString = [
+		params.userId,
+		params.importRowId,
+		params.expectedRevisionNo.toString(),
+		params.action,
+		canonicalJsonStringify(params.resolvedMappings ?? {}),
+		canonicalJsonStringify(params.linkTarget ?? {}),
+		(params.reasonNote ?? "").trim(),
+	].join("|");
+	return await computeSha256Hex(rawString);
+}
+
+/**
+ * Computes request fingerprint for applyImportRow mutations.
+ */
+export async function computeApplyRequestFingerprint(params: {
+	userId: string;
+	importRowId: string;
+	expectedRevisionNo: number;
+}): Promise<string> {
+	const rawString = [
+		params.userId,
+		params.importRowId,
+		params.expectedRevisionNo.toString(),
+	].join("|");
+	return await computeSha256Hex(rawString);
 }
