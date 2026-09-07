@@ -2128,13 +2128,22 @@ export async function voidCreditCardPurchaseWithSplit(
 			occurredAt: validOccurredAt,
 		});
 
+		// When the caller omits occurredAt, the split VOID has already resolved a
+		// deterministic effective timestamp -- a fresh VOID falls back to the
+		// previous split revision's occurredAt, and a historical replay returns
+		// the stored VOID revision's occurredAt (mode: "date", always a Date).
+		// Reuse that exact value for the coordinated purchase VOID so a retry of
+		// an already-committed command can never feed a fresh wall-clock time
+		// into the purchase VOID fingerprint under the same idempotency key.
+		const effectiveOccurredAt = validOccurredAt ?? splitRes.split.occurredAt;
+
 		const purchaseRes = await voidCreditCardPurchaseInTransaction({
 			tx,
 			userId: params.userId,
 			eventId: params.purchaseEventId,
 			expectedRevisionNo: params.purchaseExpectedRevisionNo,
 			reasonNote: params.reasonNote ?? null,
-			occurredAt: validOccurredAt ?? new Date(),
+			occurredAt: effectiveOccurredAt,
 			idempotencyKey: params.purchaseIdempotencyKey,
 			isCoordinatedWithSplit: true,
 		});
