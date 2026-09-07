@@ -12,6 +12,9 @@ export interface AppEnv {
 	WEB_PUSH_VAPID_SUBJECT?: string | undefined;
 	WEB_PUSH_VAPID_PUBLIC_KEY?: string | undefined;
 	WEB_PUSH_VAPID_PRIVATE_KEY?: string | undefined;
+	BACKUP_ENCRYPTION_KEY?: string | undefined;
+	BACKUP_ENCRYPTION_KEY_ID?: string | undefined;
+	BACKUP_BUCKET?: R2Bucket | undefined;
 }
 
 export function getDatabaseUrl(env: AppEnv): string {
@@ -168,4 +171,76 @@ export function getWebPushVapidConfig(env: AppEnv): WebPushVapidConfig {
  */
 export function getWebPushVapidPublicKey(env: AppEnv): string {
 	return getWebPushVapidConfig(env).publicKey;
+}
+
+function decodeBase64UrlStrictBytes(value: string): Uint8Array {
+	if (!BASE64URL_STRICT_PATTERN.test(value)) {
+		throw new Error("value must be strict base64url (no padding, no +/)");
+	}
+	const padded = value + "=".repeat((4 - (value.length % 4)) % 4);
+	const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+	let binary: string;
+	try {
+		binary = atob(base64);
+	} catch {
+		throw new Error("value is not valid base64url");
+	}
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) {
+		bytes[i] = binary.charCodeAt(i);
+	}
+	return bytes;
+}
+
+/**
+ * Validates and decodes `BACKUP_ENCRYPTION_KEY`: strict unpadded base64url
+ * (no `+`, `/`, `=`) that decodes to EXACTLY 32 bytes (an AES-256-GCM key).
+ * Lazy -- called only from inside the backup service/crypto boundary at the
+ * point a backup or restore is actually attempted, never eagerly at Worker
+ * module load. Throws a plain `Error` and never echoes the raw secret value.
+ */
+export function getBackupEncryptionKey(env: AppEnv): Uint8Array {
+	const raw = env.BACKUP_ENCRYPTION_KEY;
+	if (!raw || raw.trim() === "") {
+		throw new Error("BACKUP_ENCRYPTION_KEY is required");
+	}
+	const trimmed = raw.trim();
+	let bytes: Uint8Array;
+	try {
+		bytes = decodeBase64UrlStrictBytes(trimmed);
+	} catch {
+		throw new Error("BACKUP_ENCRYPTION_KEY must be valid base64url");
+	}
+	if (bytes.length !== 32) {
+		throw new Error("BACKUP_ENCRYPTION_KEY must decode to exactly 32 bytes");
+	}
+	return bytes;
+}
+
+/**
+ * Returns the active backup encryption key identifier. `BACKUP_ENCRYPTION_KEY_ID`
+ * is OPTIONAL -- if unset it defaults to `"v1"`, since a single-operator
+ * deployment starting out has exactly one key generation. Once a key is ever
+ * rotated, the operator is expected to set this explicitly so newly created
+ * backups carry the correct identifier (old backups keep whatever keyId they
+ * were encrypted under, recorded in their own envelope header).
+ */
+export function getBackupKeyId(env: AppEnv): string {
+	const raw = env.BACKUP_ENCRYPTION_KEY_ID;
+	if (!raw || raw.trim() === "") {
+		return "v1";
+	}
+	return raw.trim();
+}
+
+/**
+ * Lazily resolves the R2 bucket binding used for encrypted database backups.
+ * Throws a plain `Error` if the binding is absent (e.g. local dev without an
+ * R2 binding configured) -- never attempted eagerly at module load.
+ */
+export function getBackupBucket(env: AppEnv): R2Bucket {
+	if (!env.BACKUP_BUCKET) {
+		throw new Error("BACKUP_BUCKET binding is required");
+	}
+	return env.BACKUP_BUCKET;
 }

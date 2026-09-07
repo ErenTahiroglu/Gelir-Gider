@@ -1,398 +1,405 @@
 {
-  "version": "7",
-  "dialect": "postgresql",
-  "entries": [
-    {
-      "idx": 0,
-      "version": "7",
-      "when": 1788418149798,
-      "tag": "0000_bootstrap",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "7",
-      "when": 1788418513001,
-      "tag": "0001_broken_chameleon",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "7",
-      "when": 1788419967065,
-      "tag": "0002_aberrant_lockjaw",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "7",
-      "when": 1788420669081,
-      "tag": "0003_curvy_deathbird",
-      "breakpoints": true
-    },
-    {
-      "idx": 4,
-      "version": "7",
-      "when": 1788421161894,
-      "tag": "0004_bent_madripoor",
-      "breakpoints": true
-    },
-    {
-      "idx": 5,
-      "version": "7",
-      "when": 1788422902919,
-      "tag": "0005_purple_vision",
-      "breakpoints": true
-    },
-    {
-      "idx": 6,
-      "version": "7",
-      "when": 1788424977733,
-      "tag": "0006_fluffy_giant_girl",
-      "breakpoints": true
-    },
-    {
-      "idx": 7,
-      "version": "7",
-      "when": 1788442429668,
-      "tag": "0007_magical_deadpool",
-      "breakpoints": true
-    },
-    {
-      "idx": 8,
-      "version": "7",
-      "when": 1788443967223,
-      "tag": "0008_harden_ledger_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 9,
-      "version": "7",
-      "when": 1788444850656,
-      "tag": "0009_serialize_ledger_account_state",
-      "breakpoints": true
-    },
-    {
-      "idx": 10,
-      "version": "7",
-      "when": 1788445291691,
-      "tag": "0010_calm_skin",
-      "breakpoints": true
-    },
-    {
-      "idx": 11,
-      "version": "7",
-      "when": 1788446694027,
-      "tag": "0011_amused_grim_reaper",
-      "breakpoints": true
-    },
-    {
-      "idx": 12,
-      "version": "7",
-      "when": 1788447611318,
-      "tag": "0012_spooky_giant_man",
-      "breakpoints": true
-    },
-    {
-      "idx": 13,
-      "version": "7",
-      "when": 1788448275733,
-      "tag": "0013_sudden_hellcat",
-      "breakpoints": true
-    },
-    {
-      "idx": 14,
-      "version": "7",
-      "when": 1788469064634,
-      "tag": "0014_blue_martin_li",
-      "breakpoints": true
-    },
-    {
-      "idx": 15,
-      "version": "7",
-      "when": 1788470298903,
-      "tag": "0015_harden_income_projection_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 16,
-      "version": "7",
-      "when": 1788471654007,
-      "tag": "0016_brief_unicorn",
-      "breakpoints": true
-    },
-    {
-      "idx": 17,
-      "version": "7",
-      "when": 1788472909186,
-      "tag": "0017_harden_income_settlement_serialization",
-      "breakpoints": true
-    },
-    {
-      "idx": 18,
-      "version": "7",
-      "when": 1788475458601,
-      "tag": "0018_mushy_sleepwalker",
-      "breakpoints": true
-    },
-    {
-      "idx": 19,
-      "version": "7",
-      "when": 1788476717410,
-      "tag": "0019_harden_budget_plan_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 20,
-      "version": "7",
-      "when": 1788480000000,
-      "tag": "0020_midas_virtual_earmark_foundation",
-      "breakpoints": true
-    },
-    {
-      "idx": 21,
-      "version": "7",
-      "when": 1788508955375,
-      "tag": "0021_unusual_bug",
-      "breakpoints": true
-    },
-    {
-      "idx": 22,
-      "version": "7",
-      "when": 1788513405930,
-      "tag": "0022_hot_mystique",
-      "breakpoints": true
-    },
-    {
-      "idx": 23,
-      "version": "7",
-      "when": 1788520000000,
-      "tag": "0023_short_term_goals_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 24,
-      "version": "7",
-      "when": 1788519567699,
-      "tag": "0024_wise_hannibal_king",
-      "breakpoints": true
-    },
-    {
-      "idx": 25,
-      "version": "7",
-      "when": 1788528362742,
-      "tag": "0025_classy_shinobi_shaw",
-      "breakpoints": true
-    },
-    {
-      "idx": 26,
-      "version": "7",
-      "when": 1788535532621,
-      "tag": "0026_foamy_black_bolt",
-      "breakpoints": true
-    },
-    {
-      "idx": 27,
-      "version": "7",
-      "when": 1788539196082,
-      "tag": "0027_harden_credit_card_liability_payment_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 28,
-      "version": "7",
-      "when": 1788592869798,
-      "tag": "0028_close_credit_card_canonical_and_lifecycle_gaps",
-      "breakpoints": true
-    },
-    {
-      "idx": 29,
-      "version": "7",
-      "when": 1788594544000,
-      "tag": "0029_close_credit_card_domain_integrity_gaps",
-      "breakpoints": true
-    },
-    {
-      "idx": 30,
-      "version": "7",
-      "when": 1788596350000,
-      "tag": "0030_enforce_credit_card_canonical_anchor_completeness",
-      "breakpoints": true
-    },
-    {
-      "idx": 31,
-      "version": "7",
-      "when": 1788597872536,
-      "tag": "0031_people_obligations_and_settlements",
-      "breakpoints": true
-    },
-    {
-      "idx": 32,
-      "version": "7",
-      "when": 1788602474445,
-      "tag": "0032_harden_people_obligation_settlement_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 33,
-      "version": "7",
-      "when": 1788606262146,
-      "tag": "0033_close_people_domain_integrity_gaps",
-      "breakpoints": true
-    },
-    {
-      "idx": 34,
-      "version": "7",
-      "when": 1788611294358,
-      "tag": "0034_nosy_smiling_tiger",
-      "breakpoints": true
-    },
-    {
-      "idx": 35,
-      "version": "7",
-      "when": 1788614208757,
-      "tag": "0035_clever_rattler",
-      "breakpoints": true
-    },
-    {
-      "idx": 36,
-      "version": "7",
-      "when": 1788616978892,
-      "tag": "0036_close_credit_card_shared_split_integrity_gaps",
-      "breakpoints": true
-    },
-    {
-      "idx": 37,
-      "version": "7",
-      "when": 1788620856236,
-      "tag": "0037_close_final_shared_split_integrity_gaps",
-      "breakpoints": true
-    },
-    {
-      "idx": 38,
-      "version": "7",
-      "when": 1788624163415,
-      "tag": "0038_add_rewards_domain",
-      "breakpoints": true
-    },
-    {
-      "idx": 39,
-      "version": "7",
-      "when": 1788629292011,
-      "tag": "0039_harden_rewards_domain_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 40,
-      "version": "7",
-      "when": 1788631341441,
-      "tag": "0040_giant_power_pack",
-      "breakpoints": true
-    },
-    {
-      "idx": 41,
-      "version": "7",
-      "when": 1788635334239,
-      "tag": "0041_add_long_term_investment_domain",
-      "breakpoints": true
-    },
-    {
-      "idx": 42,
-      "version": "7",
-      "when": 1788637302143,
-      "tag": "0042_harden_long_term_send_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 43,
-      "version": "7",
-      "when": 1788640351847,
-      "tag": "0043_add_month_end_surplus_close",
-      "breakpoints": true
-    },
-    {
-      "idx": 44,
-      "version": "7",
-      "when": 1788675479242,
-      "tag": "0044_harden_month_end_close_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 45,
-      "version": "7",
-      "when": 1788691331840,
-      "tag": "0045_add_scheduled_credit_card_due_notifications",
-      "breakpoints": true
-    },
-    {
-      "idx": 46,
-      "version": "7",
-      "when": 1788694730915,
-      "tag": "0046_harden_scheduled_notification_delivery_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 47,
-      "version": "7",
-      "when": 1788704896248,
-      "tag": "0047_harden_notification_dispatch_race_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 48,
-      "version": "7",
-      "when": 1788708189742,
-      "tag": "0048_add_credit_card_campaign_tracking",
-      "breakpoints": true
-    },
-    {
-      "idx": 49,
-      "version": "7",
-      "when": 1788714548735,
-      "tag": "0049_harden_campaign_qualification_and_reward_integrity",
-      "breakpoints": true
-    },
-    {
-      "idx": 50,
-      "version": "7",
-      "when": 1788718098748,
-      "tag": "0050_close_final_campaign_review_workflow_gaps",
-      "breakpoints": true
-    },
-    {
-      "idx": 51,
-      "version": "7",
-      "when": 1788721976154,
-      "tag": "0051_close_campaign_review_idempotency_gaps",
-      "breakpoints": true
-    },
-    {
-      "idx": 52,
-      "version": "7",
-      "when": 1788724151312,
-      "tag": "0052_colossal_luminals",
-      "breakpoints": true
-    },
-    {
-      "idx": 53,
-      "version": "7",
-      "when": 1788725913227,
-      "tag": "0053_ordinary_ken_ellis",
-      "breakpoints": true
-    },
-    {
-      "idx": 54,
-      "version": "7",
-      "when": 1788757000000,
-      "tag": "0054_harden_import_contracts_and_receipt_authority",
-      "breakpoints": true
-    },
-    {
-      "idx": 55,
-      "version": "7",
-      "when": 1788780000000,
-      "tag": "0055_finalize_import_link_and_receipt_integrity",
-      "breakpoints": true
-    }
-  ]
+	"version": "7",
+	"dialect": "postgresql",
+	"entries": [
+		{
+			"idx": 0,
+			"version": "7",
+			"when": 1788418149798,
+			"tag": "0000_bootstrap",
+			"breakpoints": true
+		},
+		{
+			"idx": 1,
+			"version": "7",
+			"when": 1788418513001,
+			"tag": "0001_broken_chameleon",
+			"breakpoints": true
+		},
+		{
+			"idx": 2,
+			"version": "7",
+			"when": 1788419967065,
+			"tag": "0002_aberrant_lockjaw",
+			"breakpoints": true
+		},
+		{
+			"idx": 3,
+			"version": "7",
+			"when": 1788420669081,
+			"tag": "0003_curvy_deathbird",
+			"breakpoints": true
+		},
+		{
+			"idx": 4,
+			"version": "7",
+			"when": 1788421161894,
+			"tag": "0004_bent_madripoor",
+			"breakpoints": true
+		},
+		{
+			"idx": 5,
+			"version": "7",
+			"when": 1788422902919,
+			"tag": "0005_purple_vision",
+			"breakpoints": true
+		},
+		{
+			"idx": 6,
+			"version": "7",
+			"when": 1788424977733,
+			"tag": "0006_fluffy_giant_girl",
+			"breakpoints": true
+		},
+		{
+			"idx": 7,
+			"version": "7",
+			"when": 1788442429668,
+			"tag": "0007_magical_deadpool",
+			"breakpoints": true
+		},
+		{
+			"idx": 8,
+			"version": "7",
+			"when": 1788443967223,
+			"tag": "0008_harden_ledger_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 9,
+			"version": "7",
+			"when": 1788444850656,
+			"tag": "0009_serialize_ledger_account_state",
+			"breakpoints": true
+		},
+		{
+			"idx": 10,
+			"version": "7",
+			"when": 1788445291691,
+			"tag": "0010_calm_skin",
+			"breakpoints": true
+		},
+		{
+			"idx": 11,
+			"version": "7",
+			"when": 1788446694027,
+			"tag": "0011_amused_grim_reaper",
+			"breakpoints": true
+		},
+		{
+			"idx": 12,
+			"version": "7",
+			"when": 1788447611318,
+			"tag": "0012_spooky_giant_man",
+			"breakpoints": true
+		},
+		{
+			"idx": 13,
+			"version": "7",
+			"when": 1788448275733,
+			"tag": "0013_sudden_hellcat",
+			"breakpoints": true
+		},
+		{
+			"idx": 14,
+			"version": "7",
+			"when": 1788469064634,
+			"tag": "0014_blue_martin_li",
+			"breakpoints": true
+		},
+		{
+			"idx": 15,
+			"version": "7",
+			"when": 1788470298903,
+			"tag": "0015_harden_income_projection_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 16,
+			"version": "7",
+			"when": 1788471654007,
+			"tag": "0016_brief_unicorn",
+			"breakpoints": true
+		},
+		{
+			"idx": 17,
+			"version": "7",
+			"when": 1788472909186,
+			"tag": "0017_harden_income_settlement_serialization",
+			"breakpoints": true
+		},
+		{
+			"idx": 18,
+			"version": "7",
+			"when": 1788475458601,
+			"tag": "0018_mushy_sleepwalker",
+			"breakpoints": true
+		},
+		{
+			"idx": 19,
+			"version": "7",
+			"when": 1788476717410,
+			"tag": "0019_harden_budget_plan_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 20,
+			"version": "7",
+			"when": 1788480000000,
+			"tag": "0020_midas_virtual_earmark_foundation",
+			"breakpoints": true
+		},
+		{
+			"idx": 21,
+			"version": "7",
+			"when": 1788508955375,
+			"tag": "0021_unusual_bug",
+			"breakpoints": true
+		},
+		{
+			"idx": 22,
+			"version": "7",
+			"when": 1788513405930,
+			"tag": "0022_hot_mystique",
+			"breakpoints": true
+		},
+		{
+			"idx": 23,
+			"version": "7",
+			"when": 1788520000000,
+			"tag": "0023_short_term_goals_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 24,
+			"version": "7",
+			"when": 1788519567699,
+			"tag": "0024_wise_hannibal_king",
+			"breakpoints": true
+		},
+		{
+			"idx": 25,
+			"version": "7",
+			"when": 1788528362742,
+			"tag": "0025_classy_shinobi_shaw",
+			"breakpoints": true
+		},
+		{
+			"idx": 26,
+			"version": "7",
+			"when": 1788535532621,
+			"tag": "0026_foamy_black_bolt",
+			"breakpoints": true
+		},
+		{
+			"idx": 27,
+			"version": "7",
+			"when": 1788539196082,
+			"tag": "0027_harden_credit_card_liability_payment_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 28,
+			"version": "7",
+			"when": 1788592869798,
+			"tag": "0028_close_credit_card_canonical_and_lifecycle_gaps",
+			"breakpoints": true
+		},
+		{
+			"idx": 29,
+			"version": "7",
+			"when": 1788594544000,
+			"tag": "0029_close_credit_card_domain_integrity_gaps",
+			"breakpoints": true
+		},
+		{
+			"idx": 30,
+			"version": "7",
+			"when": 1788596350000,
+			"tag": "0030_enforce_credit_card_canonical_anchor_completeness",
+			"breakpoints": true
+		},
+		{
+			"idx": 31,
+			"version": "7",
+			"when": 1788597872536,
+			"tag": "0031_people_obligations_and_settlements",
+			"breakpoints": true
+		},
+		{
+			"idx": 32,
+			"version": "7",
+			"when": 1788602474445,
+			"tag": "0032_harden_people_obligation_settlement_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 33,
+			"version": "7",
+			"when": 1788606262146,
+			"tag": "0033_close_people_domain_integrity_gaps",
+			"breakpoints": true
+		},
+		{
+			"idx": 34,
+			"version": "7",
+			"when": 1788611294358,
+			"tag": "0034_nosy_smiling_tiger",
+			"breakpoints": true
+		},
+		{
+			"idx": 35,
+			"version": "7",
+			"when": 1788614208757,
+			"tag": "0035_clever_rattler",
+			"breakpoints": true
+		},
+		{
+			"idx": 36,
+			"version": "7",
+			"when": 1788616978892,
+			"tag": "0036_close_credit_card_shared_split_integrity_gaps",
+			"breakpoints": true
+		},
+		{
+			"idx": 37,
+			"version": "7",
+			"when": 1788620856236,
+			"tag": "0037_close_final_shared_split_integrity_gaps",
+			"breakpoints": true
+		},
+		{
+			"idx": 38,
+			"version": "7",
+			"when": 1788624163415,
+			"tag": "0038_add_rewards_domain",
+			"breakpoints": true
+		},
+		{
+			"idx": 39,
+			"version": "7",
+			"when": 1788629292011,
+			"tag": "0039_harden_rewards_domain_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 40,
+			"version": "7",
+			"when": 1788631341441,
+			"tag": "0040_giant_power_pack",
+			"breakpoints": true
+		},
+		{
+			"idx": 41,
+			"version": "7",
+			"when": 1788635334239,
+			"tag": "0041_add_long_term_investment_domain",
+			"breakpoints": true
+		},
+		{
+			"idx": 42,
+			"version": "7",
+			"when": 1788637302143,
+			"tag": "0042_harden_long_term_send_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 43,
+			"version": "7",
+			"when": 1788640351847,
+			"tag": "0043_add_month_end_surplus_close",
+			"breakpoints": true
+		},
+		{
+			"idx": 44,
+			"version": "7",
+			"when": 1788675479242,
+			"tag": "0044_harden_month_end_close_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 45,
+			"version": "7",
+			"when": 1788691331840,
+			"tag": "0045_add_scheduled_credit_card_due_notifications",
+			"breakpoints": true
+		},
+		{
+			"idx": 46,
+			"version": "7",
+			"when": 1788694730915,
+			"tag": "0046_harden_scheduled_notification_delivery_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 47,
+			"version": "7",
+			"when": 1788704896248,
+			"tag": "0047_harden_notification_dispatch_race_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 48,
+			"version": "7",
+			"when": 1788708189742,
+			"tag": "0048_add_credit_card_campaign_tracking",
+			"breakpoints": true
+		},
+		{
+			"idx": 49,
+			"version": "7",
+			"when": 1788714548735,
+			"tag": "0049_harden_campaign_qualification_and_reward_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 50,
+			"version": "7",
+			"when": 1788718098748,
+			"tag": "0050_close_final_campaign_review_workflow_gaps",
+			"breakpoints": true
+		},
+		{
+			"idx": 51,
+			"version": "7",
+			"when": 1788721976154,
+			"tag": "0051_close_campaign_review_idempotency_gaps",
+			"breakpoints": true
+		},
+		{
+			"idx": 52,
+			"version": "7",
+			"when": 1788724151312,
+			"tag": "0052_colossal_luminals",
+			"breakpoints": true
+		},
+		{
+			"idx": 53,
+			"version": "7",
+			"when": 1788725913227,
+			"tag": "0053_ordinary_ken_ellis",
+			"breakpoints": true
+		},
+		{
+			"idx": 54,
+			"version": "7",
+			"when": 1788757000000,
+			"tag": "0054_harden_import_contracts_and_receipt_authority",
+			"breakpoints": true
+		},
+		{
+			"idx": 55,
+			"version": "7",
+			"when": 1788780000000,
+			"tag": "0055_finalize_import_link_and_receipt_integrity",
+			"breakpoints": true
+		},
+		{
+			"idx": 56,
+			"version": "7",
+			"when": 1788800000000,
+			"tag": "0056_add_backup_audit_domain",
+			"breakpoints": true
+		}
+	]
 }

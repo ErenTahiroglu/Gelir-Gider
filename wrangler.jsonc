@@ -4,7 +4,7 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2026-09-03",
 	"triggers": {
-		"crons": ["0 * * * *"]
+		"crons": ["0 * * * *", "17 2 * * *"]
 	},
 	"ratelimits": [
 		{
@@ -14,6 +14,12 @@
 				"limit": 20,
 				"period": 60
 			}
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "BACKUP_BUCKET",
+			"bucket_name": "gelir-gider-backups"
 		}
 	]
 }
