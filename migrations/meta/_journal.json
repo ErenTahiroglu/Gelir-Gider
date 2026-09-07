@@ -414,6 +414,13 @@
       "when": 1788840000000,
       "tag": "0058_fix_credit_card_canonical_payload_null_key_bypass",
       "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1788860000000,
+      "tag": "0059_harden_remaining_database_null_semantics",
+      "breakpoints": true
     }
   ]
 }
