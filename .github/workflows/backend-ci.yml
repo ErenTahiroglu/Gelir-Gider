@@ -1,0 +1,42 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Backend Quality & Release Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js (LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Clean install dependencies
+        run: npm ci
+
+      - name: Run Quality Gate (Typegen, Typecheck, Lint, Format, Unit Tests)
+        run: npm run check
+
+      - name: Cloudflare Worker Bundle & Deploy Dry-Run
+        run: npx wrangler deploy --dry-run
+
+      - name: Dependency Security Audit
+        run: npm audit --audit-level=high
+
+      - name: Verify Schema Drift
+        run: npx drizzle-kit generate
+
+      - name: Ensure Clean Working Tree
+        run: git diff --exit-code

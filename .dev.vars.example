@@ -1,5 +1,38 @@
-DATABASE_URL=postgresql://USER:PASSWORD@HOST/DATABASE
+# ==============================================================================
+# GELIR-GIDER BACKEND - ENVIRONMENT CONFIGURATION TEMPLATE
+# ==============================================================================
+# Copy this file to .dev.vars for local development.
+# NEVER commit real production secrets, passwords, private keys, or credentials.
+# ==============================================================================
+
+# Database Connection (Neon PostgreSQL serverless pooler or direct connection string)
+DATABASE_URL=postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require
+
+# WebAuthn / Passkey Authentication Configuration
 WEBAUTHN_RP_ID=localhost
 WEBAUTHN_RP_NAME=Gelir Gider
 WEBAUTHN_ORIGIN=http://localhost:8787
+
+# SHA-256 hash of single-user bootstrap token (64 lowercase hex characters)
 BOOTSTRAP_TOKEN_HASH=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+# Web Push Notification VAPID Configuration (RFC 8292)
+# WEB_PUSH_VAPID_SUBJECT must be a mailto: URI or https:// URL
+WEB_PUSH_VAPID_SUBJECT=mailto:admin@example.com
+# 65-byte uncompressed P-256 public key encoded as strict unpadded base64url
+WEB_PUSH_VAPID_PUBLIC_KEY=BExamplePublicKeyInBase64UrlFormatMustBe65BytesUncompressedP256KeyHere
+# 32-byte P-256 private scalar encoded as strict unpadded base64url
+WEB_PUSH_VAPID_PRIVATE_KEY=ExamplePrivateKeyInBase64Url32BytesHere
+
+# Backup Envelope Encryption Configuration (AES-256-GCM)
+# 32-byte raw encryption key encoded as strict unpadded base64url
+BACKUP_ENCRYPTION_KEY=Example32ByteBase64UrlKeyHereWithoutPadding
+# Key generation identifier (optional, defaults to "v1")
+BACKUP_ENCRYPTION_KEY_ID=v1
+
+# ==============================================================================
+# CLOUDFLARE WORKER BINDINGS (Configured in wrangler.jsonc, not in secrets)
+# ==============================================================================
+# - AUTH_RATE_LIMITER: Cloudflare Rate Limiting binding (namespace_id: 731001)
+# - BACKUP_BUCKET: Cloudflare R2 Bucket binding (bucket_name: gelir-gider-backups)
+# ==============================================================================
