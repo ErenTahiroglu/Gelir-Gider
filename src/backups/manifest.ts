@@ -1,4 +1,6 @@
+import { getTableConfig } from "drizzle-orm/pg-core";
 import { BackupError } from "./errors";
+import { getBackupTableDescriptors } from "./registry";
 
 /**
  * A single table's exported rows plus their content hash. Rows are plain
@@ -19,12 +21,44 @@ export interface ManifestTableEntry {
 	tableContentHash: string;
 }
 
+/**
+ * A structural (never financial) descriptor of one table's columns as they
+ * exist in the ACTUAL Drizzle registry at backup time. `columnType` is the
+ * Drizzle discriminator string (e.g. "PgUUID", "PgText", "PgTimestamp",
+ * "PgCustomColumn") -- the same discriminator `scripts/restore-backup.ts`
+ * already keys denormalization decisions off of -- rather than the raw SQL
+ * `dataType`, since it is what is actually meaningful for compatibility.
+ */
+export interface SchemaColumnDescriptor {
+	columnName: string;
+	columnType: string;
+	notNull: boolean;
+}
+
+/** Columns sorted by `columnName` for a deterministic fingerprint. */
+export interface SchemaTableDescriptor {
+	tableName: string;
+	columns: SchemaColumnDescriptor[];
+}
+
+/**
+ * A snapshot of the application's schema (column names/types/nullability
+ * only -- never row data) at backup time, used to detect a backup produced
+ * under an incompatible application schema BEFORE any restore mutation is
+ * attempted (Phase 18-R1 Section C). Tables sorted by `tableName`.
+ */
+export interface BackupManifestSchema {
+	tables: SchemaTableDescriptor[];
+	schemaFingerprint: string;
+}
+
 export interface BackupManifest {
 	formatVersion: string;
 	backupId: string;
 	createdAt: string;
 	tables: ManifestTableEntry[];
 	manifestHash: string;
+	schema: BackupManifestSchema;
 }
 
 export interface BackupSnapshotPayload {
@@ -106,6 +140,33 @@ export async function computeTableContentHash(
 	return { sortedRows, hash };
 }
 
+/**
+ * Builds the schema descriptor from the ACTUAL Drizzle registry (never a
+ * manually maintained list, mirroring `discoverBackupTableRegistry`'s own
+ * anti-drift rationale), sorted deterministically (tables by `tableName`,
+ * columns within each table by `columnName`) so `schemaFingerprint` is
+ * stable across runs with no actual schema change.
+ */
+export async function buildManifestSchema(): Promise<BackupManifestSchema> {
+	const descriptors = getBackupTableDescriptors();
+	const tables: SchemaTableDescriptor[] = descriptors
+		.map((descriptor) => {
+			const config = getTableConfig(descriptor.table);
+			const columns: SchemaColumnDescriptor[] = config.columns
+				.map((column) => ({
+					columnName: column.name,
+					columnType: column.columnType,
+					notNull: column.notNull,
+				}))
+				.sort((a, b) => a.columnName.localeCompare(b.columnName));
+			return { tableName: descriptor.tableName, columns };
+		})
+		.sort((a, b) => a.tableName.localeCompare(b.tableName));
+
+	const schemaFingerprint = await sha256Hex(stringifyCanonical(tables));
+	return { tables, schemaFingerprint };
+}
+
 export interface BuildManifestParams {
 	formatVersion: string;
 	backupId: string;
@@ -129,12 +190,14 @@ export async function buildManifest(
 			tables: tableEntries,
 		}),
 	);
+	const schema = await buildManifestSchema();
 	return {
 		formatVersion: params.formatVersion,
 		backupId: params.backupId,
 		createdAt: params.createdAt,
 		tables: tableEntries,
 		manifestHash,
+		schema,
 	};
 }
 
@@ -203,6 +266,120 @@ export async function verifySnapshotAgainstManifest(
 		throw new BackupError(
 			"BACKUP_VERIFICATION_FAILED",
 			"Backup manifest hash does not match its own recomputed value",
+		);
+	}
+}
+
+/**
+ * Verifies a decrypted backup's schema descriptor (Phase 18-R1 Section C):
+ *   - every table entry is well-formed and non-duplicated
+ *   - every column entry is well-formed and non-duplicated within its table
+ *   - the schema descriptor enumerates EXACTLY the same set of tables as the
+ *     backup's own row-data payload (internal consistency -- not a
+ *     comparison against the live registry)
+ *   - no table in the schema descriptor is absent from the CURRENT local
+ *     application registry ("unexpected registry table" -- a table later
+ *     removed from the application, referenced by an old backup)
+ *   - the recomputed `schemaFingerprint` matches the stored one
+ * Always runs AFTER successful AES-GCM decryption, as part of the existing
+ * verification pipeline in `verifyEncryptedBackupSummary`/
+ * `decryptAndParseBackup`. Throws `BACKUP_VERIFICATION_FAILED` on ANY
+ * violation.
+ */
+export async function verifyManifestSchemaAgainstRegistry(
+	payload: BackupSnapshotPayload,
+): Promise<void> {
+	const schema = payload.manifest.schema;
+	if (
+		typeof schema !== "object" ||
+		schema === null ||
+		!Array.isArray(schema.tables) ||
+		typeof schema.schemaFingerprint !== "string"
+	) {
+		throw new BackupError(
+			"BACKUP_VERIFICATION_FAILED",
+			"Backup manifest is missing a valid schema descriptor",
+		);
+	}
+
+	const seenTableNames = new Set<string>();
+	for (const table of schema.tables) {
+		if (
+			typeof table !== "object" ||
+			table === null ||
+			typeof table.tableName !== "string" ||
+			table.tableName === "" ||
+			!Array.isArray(table.columns)
+		) {
+			throw new BackupError(
+				"BACKUP_VERIFICATION_FAILED",
+				"Backup manifest schema descriptor contains a malformed table entry",
+			);
+		}
+		if (seenTableNames.has(table.tableName)) {
+			throw new BackupError(
+				"BACKUP_VERIFICATION_FAILED",
+				`Backup manifest schema descriptor contains duplicate table "${table.tableName}"`,
+			);
+		}
+		seenTableNames.add(table.tableName);
+
+		const seenColumnNames = new Set<string>();
+		for (const column of table.columns) {
+			if (
+				typeof column !== "object" ||
+				column === null ||
+				typeof column.columnName !== "string" ||
+				column.columnName === "" ||
+				typeof column.columnType !== "string" ||
+				column.columnType === "" ||
+				typeof column.notNull !== "boolean"
+			) {
+				throw new BackupError(
+					"BACKUP_VERIFICATION_FAILED",
+					`Backup manifest schema descriptor for table "${table.tableName}" contains a malformed column entry`,
+				);
+			}
+			if (seenColumnNames.has(column.columnName)) {
+				throw new BackupError(
+					"BACKUP_VERIFICATION_FAILED",
+					`Backup manifest schema descriptor for table "${table.tableName}" contains duplicate column "${column.columnName}"`,
+				);
+			}
+			seenColumnNames.add(column.columnName);
+		}
+	}
+
+	const payloadTableNames = new Set(payload.tables.map((t) => t.tableName));
+	const enumeratesExactlyPayloadTables =
+		seenTableNames.size === payloadTableNames.size &&
+		[...seenTableNames].every((name) => payloadTableNames.has(name));
+	if (!enumeratesExactlyPayloadTables) {
+		throw new BackupError(
+			"BACKUP_VERIFICATION_FAILED",
+			"Backup manifest schema descriptor does not enumerate exactly the tables present in the backup's row data",
+		);
+	}
+
+	const registryTableNames = new Set(
+		getBackupTableDescriptors().map((d) => d.tableName),
+	);
+	for (const tableName of seenTableNames) {
+		if (!registryTableNames.has(tableName)) {
+			throw new BackupError(
+				"BACKUP_VERIFICATION_FAILED",
+				`Backup manifest schema descriptor references table "${tableName}" that is not present in the current application registry`,
+			);
+		}
+	}
+
+	const recomputedFingerprint = await sha256Hex(
+		stringifyCanonical(schema.tables),
+	);
+	if (recomputedFingerprint !== schema.schemaFingerprint) {
+		throw new BackupError(
+			"BACKUP_VERIFICATION_FAILED",
+			"Backup manifest schema fingerprint does not match its own recomputed value",
 		);
 	}
 }

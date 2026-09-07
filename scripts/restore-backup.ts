@@ -38,7 +38,12 @@ import { createDatabase } from "../src/db/client";
 import type { BackupEnvelope } from "../src/backups/crypto";
 import { envelopeKeyIdMatches } from "../src/backups/crypto";
 import { decryptAndParseBackup } from "../src/backups/verify";
-import type { BackupSnapshotPayload } from "../src/backups/manifest";
+import { exportDatabaseSnapshot } from "../src/backups/export";
+import type {
+	BackupSnapshotPayload,
+	SchemaTableDescriptor,
+} from "../src/backups/manifest";
+import { verifySnapshotAgainstManifest } from "../src/backups/manifest";
 
 // ============================================================================
 // Pure, DB-less logic (unit tested in tests/backups-restore-planning.test.ts)
@@ -125,6 +130,40 @@ export function checkSchemaCompatibility(
 		missingTables,
 		missingColumns,
 	};
+}
+
+/**
+ * Converts a backup's decrypted schema descriptor (Phase 18-R1 Section C)
+ * into the generic `TableShapeDescriptor[]` shape `checkSchemaCompatibility`
+ * already accepts, so the "was this backup produced by a schema compatible
+ * with what this codebase currently expects?" check (Section C.4) reuses
+ * that existing pure comparison function directly instead of a parallel one.
+ */
+export function schemaDescriptorToShape(
+	tables: SchemaTableDescriptor[],
+): TableShapeDescriptor[] {
+	return tables.map((table) => ({
+		tableName: table.tableName,
+		columns: table.columns.map((c) => c.columnName),
+	}));
+}
+
+/**
+ * Builds a deterministic `LOCK TABLE ... IN ACCESS EXCLUSIVE MODE` statement
+ * covering every given table name, in the exact order given (the caller must
+ * pass a fixed, deterministic order -- the same topological order already
+ * computed for the restore itself -- to avoid any lock-ordering deadlock
+ * risk). CRITICAL: `tableNames` must come ONLY from the trusted local schema
+ * registry (`getBackupTableDescriptors()`/`getTableConfig(table).name`),
+ * NEVER from the untrusted decrypted backup content itself, even though in
+ * practice they should match. This function itself is agnostic to where its
+ * input came from -- the caller (`main()` below) is what enforces that
+ * constraint by only ever calling it with `computeRestoreOrderFromSchema()`'s
+ * output.
+ */
+export function buildLockTableSql(tableNames: string[]): string {
+	const quoted = tableNames.map((name) => `"${name}"`).join(", ");
+	return `LOCK TABLE ${quoted} IN ACCESS EXCLUSIVE MODE`;
 }
 
 /**
@@ -380,6 +419,32 @@ async function main(): Promise<void> {
 		tableName: d.tableName,
 		columns: getTableConfig(d.table).columns.map((c) => c.name),
 	}));
+
+	// Section C.4: was this backup produced by a schema compatible with what
+	// THIS codebase currently expects? Compared BEFORE the live-target-DB
+	// check and BEFORE any mutation. Reuses `checkSchemaCompatibility`
+	// directly (expected = current registry, actual = the backup's own
+	// decrypted schema descriptor) rather than a parallel comparison
+	// function. Works correctly even for a table with ZERO rows in the
+	// backup, since the schema descriptor captures columns independent of
+	// row presence.
+	const backupSchemaShapes = schemaDescriptorToShape(
+		payload.manifest.schema.tables,
+	);
+	const backupCompatibility = checkSchemaCompatibility(
+		expectedShapes,
+		backupSchemaShapes,
+	);
+	if (!backupCompatibility.compatible) {
+		console.error(
+			`Backup schema is not compatible with the current application schema: ` +
+				`missing tables ${backupCompatibility.missingTables.join(", ")}; ` +
+				`missing columns ${JSON.stringify(backupCompatibility.missingColumns)}`,
+		);
+		process.exitCode = 1;
+		return;
+	}
+
 	const actualShapes = await fetchActualShapes(
 		db,
 		expectedShapes.map((t) => t.tableName),
@@ -399,6 +464,33 @@ async function main(): Promise<void> {
 	const tableByName = new Map(payload.tables.map((t) => [t.tableName, t]));
 
 	await db.transaction(async (tx) => {
+		// Block all concurrent application writes to every backed-up table for
+		// the duration of this transaction, in the SAME deterministic
+		// (topological) order the restore itself uses, to avoid any
+		// lock-ordering deadlock risk. `restoreOrder` comes ONLY from the
+		// trusted local schema registry (`computeRestoreOrderFromSchema`) --
+		// NEVER from the decrypted backup content.
+		await tx.execute(sql.raw(buildLockTableSql(restoreOrder)));
+
+		// Re-check the target is empty INSIDE this same locked transaction --
+		// the earlier `isTargetEmpty` check ran on a separate, unprotected
+		// connection before this transaction even opened, so a concurrent
+		// write could have slipped through the gap. Refuse to restore if the
+		// target is no longer empty.
+		// biome-ignore lint/suspicious/noExplicitAny: dynamically typed Database/tx
+		const lockedRowCounts = await countRowsPerTable(tx as any, descriptors);
+		if (!isTargetEmpty(lockedRowCounts)) {
+			throw new Error(
+				"Refusing to restore: target database is no longer empty (a " +
+					"concurrent write occurred between the initial precheck and " +
+					"acquiring the table locks). Non-zero tables: " +
+					Object.entries(lockedRowCounts)
+						.filter(([, c]) => c > 0)
+						.map(([t]) => t)
+						.join(", "),
+			);
+		}
+
 		for (const tableName of restoreOrder) {
 			const snapshot = tableByName.get(tableName);
 			if (!snapshot || snapshot.rows.length === 0) continue;
@@ -413,6 +505,19 @@ async function main(): Promise<void> {
 		}
 		// Force evaluation of any deferred constraint triggers before commit.
 		await tx.execute(sql`SET CONSTRAINTS ALL IMMEDIATE`);
+
+		// Post-write verification: re-read EVERY restored table from `tx`
+		// (reusing `exportDatabaseSnapshot`, the exact same
+		// read-every-registry-table-and-hash logic the backup itself used) and
+		// compare row counts + content hashes against the backup's own
+		// manifest (reusing `verifySnapshotAgainstManifest`). ANY mismatch
+		// throws here, rolling back the entire transaction -- never commit a
+		// partially-verified restore.
+		const reExported = await exportDatabaseSnapshot(tx);
+		await verifySnapshotAgainstManifest({
+			manifest: payload.manifest,
+			tables: reExported.tables,
+		});
 	});
 
 	console.log(

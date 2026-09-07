@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { toBackupBucket } from "./backups/bucket";
+import { BackupError } from "./backups/errors";
 import { runBackupRetention } from "./backups/retention";
 import { runDatabaseBackup } from "./backups/service";
 import type { AppEnv } from "./config/env";
@@ -37,28 +38,21 @@ app.use("*", securityHeadersMiddleware);
 // exactly one HTTP_REQUEST_COMPLETED/HTTP_REQUEST_FAILED event. Never logs
 // the query string, request body, cookies, or Authorization header --
 // only method, path, status, requestId, and duration.
+// Failure-path logging is centralized entirely in `app.onError` below (which
+// has the real status code being returned) -- this middleware never logs on
+// the failure path itself, only rethrows, so a downstream exception never
+// produces two HTTP_REQUEST_FAILED events for the same request.
 app.use("*", async (c, next) => {
 	const startedAt = Date.now();
-	try {
-		await next();
-		logOperationalEvent({
-			level: "info",
-			eventCode: "HTTP_REQUEST_COMPLETED",
-			component: "http",
-			requestId: c.get("requestId") ?? null,
-			durationMs: Date.now() - startedAt,
-			statusCode: c.res.status,
-		});
-	} catch (err) {
-		logOperationalEvent({
-			level: "error",
-			eventCode: "HTTP_REQUEST_FAILED",
-			component: "http",
-			requestId: c.get("requestId") ?? null,
-			durationMs: Date.now() - startedAt,
-		});
-		throw err;
-	}
+	await next();
+	logOperationalEvent({
+		level: "info",
+		eventCode: "HTTP_REQUEST_COMPLETED",
+		component: "http",
+		requestId: c.get("requestId") ?? null,
+		durationMs: Date.now() - startedAt,
+		statusCode: c.res.status,
+	});
 });
 
 app.get("/health", (c) => {
@@ -172,6 +166,11 @@ export default {
 		if (controller.cron === BACKUP_CRON) {
 			ctx.waitUntil(
 				(async () => {
+					// Tracks whether a specific, already-sanitized BACKUP_FAILED event
+					// has already been logged for this invocation, so the catch-all
+					// below never logs a second generic BACKUP_FAILED for the same
+					// outcome (Phase 18-R1 Section G.1/G.2).
+					let loggedFailure = false;
 					try {
 						logOperationalEvent({
 							level: "info",
@@ -197,6 +196,14 @@ export default {
 								eventCode: "BACKUP_COMPLETED",
 								component: "scheduled",
 							});
+						} else if (result.status === "IN_PROGRESS") {
+							// Benign, expected outcome for a legitimate concurrent/retried
+							// invocation -- never an error, never rethrown.
+							logOperationalEvent({
+								level: "info",
+								eventCode: "BACKUP_IN_PROGRESS",
+								component: "scheduled",
+							});
 						} else {
 							logOperationalEvent({
 								level: "error",
@@ -204,6 +211,7 @@ export default {
 								component: "scheduled",
 								safeCode: result.safeErrorCode,
 							});
+							loggedFailure = true;
 						}
 
 						// Retention is fully independent of backup success/failure --
@@ -220,10 +228,24 @@ export default {
 							});
 						}
 
-						if (result.status !== "COMPLETED") {
+						if (result.status === "FAILED") {
 							throw new Error("Scheduled backup run failed");
 						}
-					} catch {
+					} catch (err) {
+						// Only log here when nothing more specific was already logged
+						// above -- covers config-resolution failures (before
+						// runDatabaseBackup is even called) and any unexpected exception
+						// thrown by runDatabaseBackup itself.
+						if (!loggedFailure) {
+							const safeCode =
+								err instanceof BackupError ? err.code : "BACKUP_CONFIG_INVALID";
+							logOperationalEvent({
+								level: "error",
+								eventCode: "BACKUP_FAILED",
+								component: "scheduled",
+								safeCode,
+							});
+						}
 						throw new Error("Scheduled backup run failed");
 					}
 				})(),

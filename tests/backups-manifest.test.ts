@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 import { BackupError } from "../src/backups/errors";
 import {
 	buildManifest,
+	buildManifestSchema,
 	computeTableContentHash,
+	type SchemaTableDescriptor,
 	type TableSnapshot,
+	verifyManifestSchemaAgainstRegistry,
 	verifySnapshotAgainstManifest,
 } from "../src/backups/manifest";
+import { getBackupTableDescriptors } from "../src/backups/registry";
 
 describe("Backup manifest", () => {
 	it("computes a stable content hash regardless of input row order", async () => {
@@ -125,6 +129,219 @@ describe("Backup manifest", () => {
 		];
 		await expect(
 			verifySnapshotAgainstManifest({ manifest, tables: extendedTables }),
+		).rejects.toBeInstanceOf(BackupError);
+	});
+});
+
+describe("Backup manifest schema fingerprint (Phase 18-R1 Section C)", () => {
+	it("builds a deterministic schema fingerprint across repeated calls with no schema change", async () => {
+		const a = await buildManifestSchema();
+		const b = await buildManifestSchema();
+		expect(a.schemaFingerprint).toBe(b.schemaFingerprint);
+		expect(a.schemaFingerprint).toMatch(/^[0-9a-f]{64}$/);
+	});
+
+	it("sorts tables by tableName and columns by columnName", async () => {
+		const schema = await buildManifestSchema();
+		const tableNames = schema.tables.map((t) => t.tableName);
+		expect(tableNames).toEqual([...tableNames].sort());
+		for (const table of schema.tables) {
+			const columnNames = table.columns.map((c) => c.columnName);
+			expect(columnNames).toEqual([...columnNames].sort());
+		}
+	});
+
+	it("enumerates every table in the real backup registry", async () => {
+		const schema = await buildManifestSchema();
+		const registryNames = getBackupTableDescriptors()
+			.map((d) => d.tableName)
+			.sort();
+		expect(schema.tables.map((t) => t.tableName)).toEqual(registryNames);
+	});
+
+	it("buildManifest includes the schema descriptor", async () => {
+		const { sortedRows, hash } = await computeTableContentHash([{ id: "u1" }]);
+		const manifest = await buildManifest({
+			formatVersion: "V1",
+			backupId: "20260907",
+			createdAt: "2026-09-07T00:00:00.000Z",
+			tables: [
+				{
+					tableName: "users",
+					rowCount: 1,
+					rows: sortedRows,
+					tableContentHash: hash,
+				},
+			],
+		});
+		expect(manifest.schema.tables.length).toBeGreaterThan(0);
+		expect(manifest.schema.schemaFingerprint).toMatch(/^[0-9a-f]{64}$/);
+	});
+});
+
+describe("verifyManifestSchemaAgainstRegistry (Phase 18-R1 Section C)", () => {
+	async function buildValidSchemaPayload() {
+		const schema = await buildManifestSchema();
+		const tables = await Promise.all(
+			schema.tables.map(async (t) => {
+				const { sortedRows, hash } = await computeTableContentHash([]);
+				return {
+					tableName: t.tableName,
+					rowCount: 0,
+					rows: sortedRows,
+					tableContentHash: hash,
+				};
+			}),
+		);
+		const manifest = {
+			formatVersion: "V1",
+			backupId: "20260907",
+			createdAt: "2026-09-07T00:00:00.000Z",
+			tables: tables.map((t) => ({
+				tableName: t.tableName,
+				rowCount: t.rowCount,
+				tableContentHash: t.tableContentHash,
+			})),
+			manifestHash: "irrelevant-for-this-check",
+			schema,
+		};
+		return { manifest, tables };
+	}
+
+	it("accepts a correctly constructed schema descriptor without throwing", async () => {
+		const { manifest, tables } = await buildValidSchemaPayload();
+		await expect(
+			verifyManifestSchemaAgainstRegistry({ manifest, tables }),
+		).resolves.toBeUndefined();
+	});
+
+	it("rejects a duplicate table name in the schema descriptor", async () => {
+		const { manifest, tables } = await buildValidSchemaPayload();
+		const duplicated: SchemaTableDescriptor[] = [
+			...manifest.schema.tables,
+			manifest.schema.tables[0] as SchemaTableDescriptor,
+		];
+		await expect(
+			verifyManifestSchemaAgainstRegistry({
+				manifest: {
+					...manifest,
+					schema: { ...manifest.schema, tables: duplicated },
+				},
+				tables,
+			}),
+		).rejects.toBeInstanceOf(BackupError);
+	});
+
+	it("rejects a table in the schema descriptor absent from the current local registry (removed table)", async () => {
+		const { manifest, tables } = await buildValidSchemaPayload();
+		const withUnexpectedTable: SchemaTableDescriptor[] = [
+			...manifest.schema.tables,
+			{
+				tableName: "no_longer_exists",
+				columns: [{ columnName: "id", columnType: "PgUUID", notNull: true }],
+			},
+		];
+		const extendedTables = [
+			...tables,
+			{
+				tableName: "no_longer_exists",
+				rowCount: 0,
+				rows: [],
+				tableContentHash: (await computeTableContentHash([])).hash,
+			},
+		];
+		await expect(
+			verifyManifestSchemaAgainstRegistry({
+				manifest: {
+					...manifest,
+					schema: { ...manifest.schema, tables: withUnexpectedTable },
+				},
+				tables: extendedTables,
+			}),
+		).rejects.toBeInstanceOf(BackupError);
+	});
+
+	it("rejects when the schema descriptor does not enumerate exactly the tables present in the row-data payload", async () => {
+		const { manifest, tables } = await buildValidSchemaPayload();
+		// Drop one table from the schema descriptor while leaving it in the
+		// row-data payload -- internal inconsistency.
+		const trimmedSchemaTables = manifest.schema.tables.slice(1);
+		await expect(
+			verifyManifestSchemaAgainstRegistry({
+				manifest: {
+					...manifest,
+					schema: { ...manifest.schema, tables: trimmedSchemaTables },
+				},
+				tables,
+			}),
+		).rejects.toBeInstanceOf(BackupError);
+	});
+
+	it("rejects a duplicate column name within one table's descriptor", async () => {
+		const { manifest, tables } = await buildValidSchemaPayload();
+		const [first, ...rest] = manifest.schema.tables;
+		const tampered: SchemaTableDescriptor[] = [
+			{
+				tableName: (first as SchemaTableDescriptor).tableName,
+				columns: [
+					...(first as SchemaTableDescriptor).columns,
+					(first as SchemaTableDescriptor).columns[0] as {
+						columnName: string;
+						columnType: string;
+						notNull: boolean;
+					},
+				],
+			},
+			...rest,
+		];
+		await expect(
+			verifyManifestSchemaAgainstRegistry({
+				manifest: {
+					...manifest,
+					schema: { ...manifest.schema, tables: tampered },
+				},
+				tables,
+			}),
+		).rejects.toBeInstanceOf(BackupError);
+	});
+
+	it("rejects a malformed column descriptor (missing columnType)", async () => {
+		const { manifest, tables } = await buildValidSchemaPayload();
+		const [first, ...rest] = manifest.schema.tables;
+		const tampered: SchemaTableDescriptor[] = [
+			{
+				tableName: (first as SchemaTableDescriptor).tableName,
+				columns: [
+					{ columnName: "bogus_column", notNull: true } as unknown as {
+						columnName: string;
+						columnType: string;
+						notNull: boolean;
+					},
+				],
+			},
+			...rest,
+		];
+		await expect(
+			verifyManifestSchemaAgainstRegistry({
+				manifest: {
+					...manifest,
+					schema: { ...manifest.schema, tables: tampered },
+				},
+				tables,
+			}),
+		).rejects.toBeInstanceOf(BackupError);
+	});
+
+	it("rejects a schemaFingerprint mismatch (recomputed vs stored)", async () => {
+		const { manifest, tables } = await buildValidSchemaPayload();
+		await expect(
+			verifyManifestSchemaAgainstRegistry({
+				manifest: {
+					...manifest,
+					schema: { ...manifest.schema, schemaFingerprint: "0".repeat(64) },
+				},
+				tables,
+			}),
 		).rejects.toBeInstanceOf(BackupError);
 	});
 });

@@ -112,7 +112,7 @@ export const backupRunAttempts = pgTable(
 		),
 		check(
 			"backup_run_attempts_no_check",
-			sql`${table.attemptNo} > 0 AND ${table.attemptNo} <= 5`,
+			sql`${table.attemptNo} > 0 AND ${table.attemptNo} <= 10`,
 		),
 		check(
 			"backup_run_attempts_ciphertext_sha256_check",

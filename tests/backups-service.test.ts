@@ -5,6 +5,8 @@ import type {
 } from "../src/backups/bucket";
 import { computeTableContentHash } from "../src/backups/manifest";
 import type { Database } from "../src/db/client";
+import { users } from "../src/db/schema/auth";
+import { backupRunAttempts, backupRuns } from "../src/db/schema/backups";
 
 vi.mock("../src/backups/export", async () => {
 	const actual = await vi.importActual<typeof import("../src/backups/export")>(
@@ -17,66 +19,200 @@ vi.mock("../src/backups/export", async () => {
 });
 
 import { exportDatabaseSnapshot } from "../src/backups/export";
-import { runDatabaseBackup } from "../src/backups/service";
+import { getBackupTableDescriptors } from "../src/backups/registry";
+import {
+	BACKUP_MAX_EVENTS_PER_RUN,
+	BACKUP_STARTED_STALE_AFTER_MS,
+	runDatabaseBackup,
+} from "../src/backups/service";
 
 const USER_ID = "11111111-1111-1111-1111-111111111111";
-const RUN_ID = "22222222-2222-2222-2222-222222222222";
 const ENCRYPTION_KEY = new Uint8Array(32).fill(7);
 const SCHEDULED_AT = new Date("2026-09-07T02:17:00.000Z");
 
 // ============================================================================
-// A queue-based fake Database, mirroring the call-order-based mocking
-// pattern used in tests/campaigns-review-candidates.test.ts: each
-// chain-terminating call resolves to the next queued response, in the exact
-// order runDatabaseBackup's orchestration issues them (traced from source).
+// A small, purpose-built in-memory fake `Database`. It does NOT attempt to
+// generically interpret arbitrary Drizzle SQL (that would require
+// reimplementing a query planner) -- it only needs to support the exact,
+// known call shapes `src/backups/service.ts` issues: `select(...).from(t)`
+// (optionally `.where(eq(col, val))`, `.orderBy(desc(col))`, `.limit(n)`) and
+// `insert(t).values(row)` (optionally `.onConflictDoNothing(...)` or
+// `.returning(cols)`). `where`'s `eq(...)` condition is decoded via
+// Drizzle's own `SQL.queryChunks` (a `Param` chunk carries the value, a
+// Column chunk carries the SQL column name), which is resilient to argument
+// order and avoids hand-parsing SQL text.
 // ============================================================================
 
-function createQueueDb(responses: unknown[][]): {
-	db: Database;
-	events: string[];
-} {
-	let i = 0;
-	const events: string[] = [];
+interface FakeRow extends Record<string, unknown> {
+	id: string;
+}
 
-	function nextResponse(label: string): unknown[] {
-		events.push(label);
-		if (i >= responses.length) {
-			throw new Error(`FakeDb: no queued response for call #${i} (${label})`);
+function extractEqCondition(cond: unknown): {
+	columnName: string;
+	value: unknown;
+} {
+	const chunks = (cond as { queryChunks: unknown[] }).queryChunks;
+	const param = chunks.find(
+		(c) =>
+			(c as { constructor: { name: string } })?.constructor?.name === "Param",
+	) as { value: unknown } | undefined;
+	const column = chunks.find(
+		(c) =>
+			c !== null &&
+			typeof c === "object" &&
+			"name" in (c as object) &&
+			(c as { constructor: { name: string } }).constructor?.name !== "Param" &&
+			(c as { constructor: { name: string } }).constructor?.name !==
+				"StringChunk",
+	) as { name: string } | undefined;
+	if (!param || !column) {
+		throw new Error("FakeDb: could not decode eq() condition");
+	}
+	return { columnName: column.name, value: param.value };
+}
+
+function columnJsKey(table: unknown, sqlColumnName: string): string {
+	for (const [jsKey, col] of Object.entries(table as Record<string, unknown>)) {
+		if (
+			col &&
+			typeof col === "object" &&
+			(col as { name?: unknown }).name === sqlColumnName
+		) {
+			return jsKey;
 		}
-		const value = responses[i];
-		i++;
-		if (value === undefined)
-			throw new Error(`FakeDb: queued response #${i - 1} was undefined`);
-		return value;
+	}
+	throw new Error(`FakeDb: unknown column "${sqlColumnName}"`);
+}
+
+interface FakeDbHandle {
+	db: Database;
+	runsRows: FakeRow[];
+	attemptsRows: FakeRow[];
+	usersRows: FakeRow[];
+}
+
+function createFakeDatabase(seedUserId: string): FakeDbHandle {
+	const usersRows: FakeRow[] = [{ id: seedUserId }];
+	const runsRows: FakeRow[] = [];
+	const attemptsRows: FakeRow[] = [];
+	let counter = 0;
+	const genId = () => `gen-${++counter}`;
+
+	function tableStore(table: unknown): FakeRow[] {
+		if (table === users) return usersRows;
+		if (table === backupRuns) return runsRows;
+		if (table === backupRunAttempts) return attemptsRows;
+		throw new Error("FakeDb: unrecognized table");
 	}
 
-	function chain(label: string) {
-		const obj = {
-			from: () => obj,
-			where: () => obj,
-			limit: () => obj,
-			values: () => obj,
-			onConflictDoNothing: () => obj,
-			// biome-ignore lint/suspicious/noThenProperty: intentional thenable mock query builder
-			then: (resolve: (v: unknown) => void, reject: (e: unknown) => void) => {
-				try {
-					resolve(nextResponse(label));
-				} catch (err) {
-					reject(err);
-				}
-			},
-		};
-		return obj;
+	function makeDbx() {
+		function select(_cols?: unknown) {
+			let table: unknown;
+			let rows: FakeRow[] = [];
+			let limitN: number | undefined;
+			const builder = {
+				from(t: unknown) {
+					table = t;
+					rows = [...tableStore(t)];
+					return builder;
+				},
+				where(cond: unknown) {
+					const { columnName, value } = extractEqCondition(cond);
+					const jsKey = columnJsKey(table, columnName);
+					rows = rows.filter((r) => r[jsKey] === value);
+					return builder;
+				},
+				orderBy(_col: unknown) {
+					// Only ever used for `desc(backupRunAttempts.attemptNo)` in this
+					// codebase.
+					rows = [...rows].sort(
+						(a, b) => (b.attemptNo as number) - (a.attemptNo as number),
+					);
+					return builder;
+				},
+				limit(n: number) {
+					limitN = n;
+					return builder;
+				},
+				// biome-ignore lint/suspicious/noThenProperty: intentional thenable mock query builder
+				then(resolve: (v: unknown) => void, reject: (e: unknown) => void) {
+					try {
+						resolve(limitN !== undefined ? rows.slice(0, limitN) : rows);
+					} catch (e) {
+						reject(e);
+					}
+				},
+			};
+			return builder;
+		}
+
+		function insert(table: unknown) {
+			let valuesToInsert: FakeRow | undefined;
+			let conflictTarget: unknown;
+			let returning = false;
+			const builder = {
+				values(v: Record<string, unknown>) {
+					valuesToInsert = v as FakeRow;
+					return builder;
+				},
+				onConflictDoNothing(_opts?: unknown) {
+					conflictTarget = true;
+					return builder;
+				},
+				returning(_cols?: unknown) {
+					returning = true;
+					return builder;
+				},
+				// biome-ignore lint/suspicious/noThenProperty: intentional thenable mock query builder
+				then(resolve: (v: unknown) => void, reject: (e: unknown) => void) {
+					try {
+						const store = tableStore(table);
+						if (conflictTarget && table === backupRuns) {
+							const exists = store.some(
+								(r) =>
+									r.userId === valuesToInsert?.userId &&
+									r.backupId === valuesToInsert?.backupId,
+							);
+							if (exists) {
+								resolve([]);
+								return;
+							}
+						}
+						const row: FakeRow = { id: genId(), ...valuesToInsert };
+						store.push(row);
+						resolve(returning ? [{ id: row.id }] : [row]);
+					} catch (e) {
+						reject(e);
+					}
+				},
+			};
+			return builder;
+		}
+
+		// A no-op: this single-threaded fake never actually contends on the
+		// lock, so the explicit `FOR UPDATE` lock statement `reserveExecution`
+		// issues before its decision read has nothing to serialize against
+		// here -- it only needs to not throw "unsupported operation".
+		async function execute(_query: unknown) {
+			return { rows: [] };
+		}
+
+		return { select, insert, execute };
 	}
 
 	const db = {
-		select: () => chain("select"),
-		insert: () => chain("insert"),
-		transaction: vi.fn(async (work: (tx: unknown) => unknown) => work({})),
+		...makeDbx(),
+		transaction: vi.fn(async (work: (tx: unknown) => unknown) =>
+			work(makeDbx()),
+		),
 	} as unknown as Database;
 
-	return { db, events };
+	return { db, runsRows, attemptsRows, usersRows };
 }
+
+// ============================================================================
+// FakeBucket (unchanged conventions from the pre-Phase-18-R1 test)
+// ============================================================================
 
 class FakeBucket implements BackupBucket {
 	store = new Map<
@@ -86,6 +222,7 @@ class FakeBucket implements BackupBucket {
 	calls: string[] = [];
 	failPut = false;
 	corruptOnGet = false;
+	corruptMetadataOnGet: Record<string, string> | null = null;
 
 	async put(
 		key: string,
@@ -105,6 +242,7 @@ class FakeBucket implements BackupBucket {
 		const entry = this.store.get(key);
 		if (!entry) return null;
 		let bytes = entry.bytes;
+		let customMetadata = entry.customMetadata;
 		if (this.corruptOnGet) {
 			bytes = new TextEncoder().encode(
 				JSON.stringify({
@@ -113,11 +251,14 @@ class FakeBucket implements BackupBucket {
 				}),
 			);
 		}
+		if (this.corruptMetadataOnGet) {
+			customMetadata = { ...customMetadata, ...this.corruptMetadataOnGet };
+		}
 		return {
 			key,
 			size: bytes.length,
 			uploaded: new Date(),
-			customMetadata: entry.customMetadata,
+			customMetadata,
 			arrayBuffer: async () => bytes.buffer as ArrayBuffer,
 		};
 	}
@@ -151,21 +292,69 @@ class FakeBucket implements BackupBucket {
 	}
 }
 
+function createDeferred<T>() {
+	let resolve!: (v: T) => void;
+	const promise = new Promise<T>((r) => {
+		resolve = r;
+	});
+	return { promise, resolve };
+}
+
+/** A FakeBucket whose `put` blocks until the test explicitly releases it,
+ * used to simulate one invocation "pausing" mid-Phase-2 while a second
+ * invocation runs concurrently against the same reservation state. */
+class PausableFakeBucket extends FakeBucket {
+	putStarted = createDeferred<void>();
+	putGate = createDeferred<void>();
+
+	override async put(
+		key: string,
+		value: Uint8Array,
+		options?: { customMetadata?: Record<string, string> },
+	) {
+		this.calls.push(`put:${key}`);
+		this.putStarted.resolve();
+		await this.putGate.promise;
+		this.store.set(key, {
+			bytes: value,
+			customMetadata: options?.customMetadata,
+		});
+		if (this.failPut) throw new Error("simulated R2 put failure");
+	}
+}
+
+/**
+ * `buildManifestSchema()` (Phase 18-R1 Section C) enumerates the ENTIRE real
+ * table registry, and `verifyManifestSchemaAgainstRegistry` requires the
+ * snapshot payload's own table set to match it exactly. So this fixture
+ * builds one (mostly empty) TableSnapshot per REAL registry table, with a
+ * single row only for `users`, rather than a hand-picked subset.
+ */
 async function makeSmallSnapshot() {
-	const { sortedRows, hash } = await computeTableContentHash([
-		{ id: "u1", displayName: "Eren" },
-	]);
-	return {
-		tables: [
-			{
-				tableName: "users",
-				rowCount: 1,
+	const descriptors = getBackupTableDescriptors();
+	const tables = await Promise.all(
+		descriptors.map(async (descriptor) => {
+			if (descriptor.tableName === "users") {
+				const { sortedRows, hash } = await computeTableContentHash([
+					{ id: "u1", displayName: "Eren" },
+				]);
+				return {
+					tableName: "users",
+					rowCount: 1,
+					rows: sortedRows,
+					tableContentHash: hash,
+				};
+			}
+			const { sortedRows, hash } = await computeTableContentHash([]);
+			return {
+				tableName: descriptor.tableName,
+				rowCount: 0,
 				rows: sortedRows,
 				tableContentHash: hash,
-			},
-		],
-		plaintextSizeBytes: 100,
-	};
+			};
+		}),
+	);
+	return { tables, plaintextSizeBytes: 100 };
 }
 
 beforeEach(() => {
@@ -173,19 +362,11 @@ beforeEach(() => {
 });
 
 describe("runDatabaseBackup", () => {
-	it("happy path: STARTED -> COMPLETED, uploads before completing, verifies readback", async () => {
+	it("happy path: reserves STARTED -> COMPLETED, uploads before completing, verifies readback", async () => {
 		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
 			await makeSmallSnapshot(),
 		);
-
-		const { db } = createQueueDb([
-			[{ id: USER_ID }], // select users
-			[], // insert backupRuns onConflictDoNothing
-			[{ id: RUN_ID }], // select backupRuns id
-			[], // select existing attempts (none)
-			[], // insert STARTED attempt
-			[], // insert COMPLETED attempt
-		]);
+		const { db, attemptsRows } = createFakeDatabase(USER_ID);
 		const bucket = new FakeBucket();
 
 		const result = await runDatabaseBackup({
@@ -200,28 +381,16 @@ describe("runDatabaseBackup", () => {
 		expect(result.objectKey).toMatch(
 			/^gelir-gider\/v1\/2026\/09\/07\/\d+\.ggbak$/,
 		);
-
-		// R2-first ordering: put must happen before the object is declared
-		// COMPLETED (there is no direct signal from FakeBucket to the attempt
-		// insert, but the object must exist in the store by the time
-		// runDatabaseBackup returns COMPLETED).
 		expect(bucket.calls[0]).toMatch(/^put:/);
 		expect(bucket.store.size).toBe(1);
+		expect(attemptsRows.map((a) => a.status)).toEqual(["STARTED", "COMPLETED"]);
 	});
 
 	it("upload failure produces a FAILED result and never a COMPLETED attempt", async () => {
 		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
 			await makeSmallSnapshot(),
 		);
-
-		const { db } = createQueueDb([
-			[{ id: USER_ID }],
-			[],
-			[{ id: RUN_ID }],
-			[],
-			[],
-			[],
-		]);
+		const { db, attemptsRows } = createFakeDatabase(USER_ID);
 		const bucket = new FakeBucket();
 		bucket.failPut = true;
 
@@ -237,21 +406,14 @@ describe("runDatabaseBackup", () => {
 		expect(result.safeErrorCode).toBe("BACKUP_UPLOAD_FAILED");
 		expect(result.objectKey).toBeNull();
 		expect(bucket.store.size).toBe(0);
+		expect(attemptsRows.map((a) => a.status)).toEqual(["STARTED", "FAILED"]);
 	});
 
-	it("post-upload verification mismatch produces a FAILED result and best-effort deletes the object", async () => {
+	it("post-upload verification mismatch (content hash) produces a FAILED result and best-effort deletes the object", async () => {
 		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
 			await makeSmallSnapshot(),
 		);
-
-		const { db } = createQueueDb([
-			[{ id: USER_ID }],
-			[],
-			[{ id: RUN_ID }],
-			[],
-			[],
-			[],
-		]);
+		const { db } = createFakeDatabase(USER_ID);
 		const bucket = new FakeBucket();
 		bucket.corruptOnGet = true;
 
@@ -265,15 +427,35 @@ describe("runDatabaseBackup", () => {
 
 		expect(result.status).toBe("FAILED");
 		expect(result.safeErrorCode).toBe("BACKUP_VERIFICATION_FAILED");
-		// Best-effort cleanup: the object it just wrote should have been removed.
 		expect(bucket.store.size).toBe(0);
+	});
+
+	it("post-upload verification mismatch (R2 custom metadata field) is caught even when the hash matches", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db } = createFakeDatabase(USER_ID);
+		const bucket = new FakeBucket();
+		bucket.corruptMetadataOnGet = { formatVersion: "V9" };
+
+		const result = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+
+		expect(result.status).toBe("FAILED");
+		expect(result.safeErrorCode).toBe("BACKUP_VERIFICATION_FAILED");
 	});
 
 	it("throws a sanitized BACKUP_ANCHOR_FAILED-triggering path when no user row exists", async () => {
 		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
 			await makeSmallSnapshot(),
 		);
-		const { db } = createQueueDb([[]]); // select users -> empty
+		const { db, usersRows } = createFakeDatabase(USER_ID);
+		usersRows.length = 0;
 		const bucket = new FakeBucket();
 
 		await expect(
@@ -285,5 +467,235 @@ describe("runDatabaseBackup", () => {
 				scheduledAt: SCHEDULED_AT,
 			}),
 		).rejects.toMatchObject({ code: "BACKUP_ANCHOR_FAILED" });
+	});
+
+	it("a duplicate invocation after COMPLETED returns the historical result with ZERO uploads", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db } = createFakeDatabase(USER_ID);
+		const bucket = new FakeBucket();
+
+		const first = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(first.status).toBe("COMPLETED");
+		expect(bucket.calls.filter((c) => c.startsWith("put:")).length).toBe(1);
+
+		const second = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(second.status).toBe("COMPLETED");
+		expect(second.objectKey).toBe(first.objectKey);
+		// No additional uploads for the duplicate/retried invocation.
+		expect(bucket.calls.filter((c) => c.startsWith("put:")).length).toBe(1);
+	});
+
+	it("a concurrent invocation while another is live gets IN_PROGRESS with ZERO uploads; the first still completes normally with exactly one upload", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db } = createFakeDatabase(USER_ID);
+		const bucket = new PausableFakeBucket();
+
+		const pendingA = runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+
+		// Wait until invocation A has reserved STARTED, run Phase 2 up through
+		// calling bucket.put, and is now blocked inside it.
+		await bucket.putStarted.promise;
+		expect(bucket.calls.filter((c) => c.startsWith("put:")).length).toBe(1);
+
+		const resultB = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(resultB.status).toBe("IN_PROGRESS");
+		expect(resultB.objectKey).toBeNull();
+		// B performed zero uploads.
+		expect(bucket.calls.filter((c) => c.startsWith("put:")).length).toBe(1);
+
+		bucket.putGate.resolve();
+		const resultA = await pendingA;
+		expect(resultA.status).toBe("COMPLETED");
+		expect(bucket.calls.filter((c) => c.startsWith("put:")).length).toBe(1);
+	});
+
+	it("a FAILED execution allows the next invocation to reserve the next logical execution and reach COMPLETED", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db, attemptsRows } = createFakeDatabase(USER_ID);
+		const bucket = new FakeBucket();
+		bucket.failPut = true;
+
+		const failed = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(failed.status).toBe("FAILED");
+
+		bucket.failPut = false;
+		const succeeded = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(succeeded.status).toBe("COMPLETED");
+		expect(attemptsRows.map((a) => a.status)).toEqual([
+			"STARTED",
+			"FAILED",
+			"STARTED",
+			"COMPLETED",
+		]);
+	});
+
+	it("two failed logical executions still allow a third execution to reach COMPLETED (bound raised to 10)", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db, attemptsRows } = createFakeDatabase(USER_ID);
+		const bucket = new FakeBucket();
+		bucket.failPut = true;
+
+		await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(attemptsRows).toHaveLength(4); // STARTED,FAILED,STARTED,FAILED
+
+		bucket.failPut = false;
+		const third = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(third.status).toBe("COMPLETED");
+		expect(attemptsRows).toHaveLength(6); // + STARTED,COMPLETED
+	});
+
+	it("a stale STARTED event resolves to BACKUP_OUTCOME_UNKNOWN and allows a bounded retry", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db, runsRows, attemptsRows } = createFakeDatabase(USER_ID);
+		const bucket = new FakeBucket();
+
+		// Seed a run with a STARTED event well past the staleness window,
+		// simulating a crashed/abandoned prior invocation.
+		const runId = "run-1";
+		runsRows.push({
+			id: runId,
+			userId: USER_ID,
+			backupId: "20260907",
+			scheduledFor: SCHEDULED_AT,
+		});
+		attemptsRows.push({
+			id: "att-1",
+			backupRunId: runId,
+			attemptNo: 1,
+			status: "STARTED",
+			objectKey: null,
+			occurredAt: new Date(Date.now() - BACKUP_STARTED_STALE_AFTER_MS - 60_000),
+		});
+
+		const result = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+
+		expect(result.status).toBe("COMPLETED");
+		const statuses = attemptsRows.map((a) => a.status);
+		expect(statuses).toEqual(["STARTED", "FAILED", "STARTED", "COMPLETED"]);
+		const staleFailedEvent = attemptsRows.find((a) => a.attemptNo === 2);
+		expect(staleFailedEvent?.safeErrorCode).toBe("BACKUP_OUTCOME_UNKNOWN");
+	});
+
+	it("exhausting the attempt budget produces a graceful FAILED result, never an unhandled exception", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db, runsRows, attemptsRows } = createFakeDatabase(USER_ID);
+		const bucket = new FakeBucket();
+
+		const runId = "run-budget";
+		runsRows.push({
+			id: runId,
+			userId: USER_ID,
+			backupId: "20260907",
+			scheduledFor: SCHEDULED_AT,
+		});
+		// Seed exactly BACKUP_MAX_EVENTS_PER_RUN events: 5 logical executions,
+		// each STARTED immediately FAILED, leaving zero budget for a 6th.
+		for (let i = 0; i < BACKUP_MAX_EVENTS_PER_RUN; i += 2) {
+			attemptsRows.push({
+				id: `att-${i}`,
+				backupRunId: runId,
+				attemptNo: i + 1,
+				status: "STARTED",
+				objectKey: null,
+				occurredAt: new Date(),
+			});
+			attemptsRows.push({
+				id: `att-${i + 1}`,
+				backupRunId: runId,
+				attemptNo: i + 2,
+				status: "FAILED",
+				objectKey: null,
+				occurredAt: new Date(),
+				safeErrorCode: "BACKUP_UPLOAD_FAILED",
+			});
+		}
+		expect(attemptsRows).toHaveLength(BACKUP_MAX_EVENTS_PER_RUN);
+
+		const result = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+
+		expect(result.status).toBe("FAILED");
+		expect(result.safeErrorCode).toBeTruthy();
+		// No new reservation was made -- zero R2 work was ever attempted.
+		expect(bucket.calls).toHaveLength(0);
+		expect(attemptsRows).toHaveLength(BACKUP_MAX_EVENTS_PER_RUN);
 	});
 });

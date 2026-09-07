@@ -1,7 +1,10 @@
 import { type BackupEnvelope, decryptBackupPayload } from "./crypto";
 import { BackupError } from "./errors";
 import type { BackupSnapshotPayload } from "./manifest";
-import { verifySnapshotAgainstManifest } from "./manifest";
+import {
+	verifyManifestSchemaAgainstRegistry,
+	verifySnapshotAgainstManifest,
+} from "./manifest";
 
 /**
  * Sanitized backup summary: safe to log, print, or return from any
@@ -87,6 +90,7 @@ export async function verifyEncryptedBackupSummary(
 	const plaintext = await decryptBackupPayload({ envelope, key });
 	const payload = parseSnapshotPayload(plaintext);
 	await verifySnapshotAgainstManifest(payload);
+	await verifyManifestSchemaAgainstRegistry(payload);
 
 	const tableCounts: Record<string, number> = {};
 	for (const table of payload.manifest.tables) {
@@ -117,5 +121,6 @@ export async function decryptAndParseBackup(
 	const plaintext = await decryptBackupPayload({ envelope, key });
 	const payload = parseSnapshotPayload(plaintext);
 	await verifySnapshotAgainstManifest(payload);
+	await verifyManifestSchemaAgainstRegistry(payload);
 	return payload;
 }

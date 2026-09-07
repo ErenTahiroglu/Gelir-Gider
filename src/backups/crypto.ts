@@ -67,21 +67,30 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 
 /**
  * The AAD bound into the AES-GCM authentication tag: a fixed, deterministic
- * JSON serialization of exactly `{ magic, formatVersion, backupId, createdAt }`
- * (in this key order). Any mutation of the IV, ciphertext, or ANY of these
- * four header fields makes AES-GCM tag verification fail on decrypt.
+ * JSON serialization of exactly
+ * `{ magic, formatVersion, backupId, createdAt, keyId, algorithm }` (in this
+ * key order). Any mutation of the IV, ciphertext, or ANY of these six header
+ * fields makes AES-GCM tag verification fail on decrypt -- `keyId` and
+ * `algorithm` are included (as of Phase 18-R1) alongside the original four so
+ * an attacker with write access to storage cannot swap either field without
+ * invalidating the auth tag (a defense-in-depth gap, not a cryptographic
+ * attack on its own, since neither field is secret).
  */
 function buildAad(header: {
 	magic: string;
 	formatVersion: string;
 	backupId: string;
 	createdAt: string;
+	keyId: string;
+	algorithm: string;
 }): Uint8Array {
 	const json = JSON.stringify({
 		magic: header.magic,
 		formatVersion: header.formatVersion,
 		backupId: header.backupId,
 		createdAt: header.createdAt,
+		keyId: header.keyId,
+		algorithm: header.algorithm,
 	});
 	return new TextEncoder().encode(json);
 }
@@ -130,6 +139,8 @@ export async function encryptBackupPayload(
 		formatVersion: BACKUP_ENVELOPE_FORMAT_VERSION,
 		backupId: params.backupId,
 		createdAt: params.createdAt,
+		keyId: params.keyId,
+		algorithm: BACKUP_ENVELOPE_ALGORITHM,
 	});
 
 	let cipherBuffer: ArrayBuffer;
@@ -167,6 +178,24 @@ export async function encryptBackupPayload(
 	};
 }
 
+/** Matches `deriveBackupId` in `src/backups/service.ts`: an 8-digit `YYYYMMDD`. */
+const BACKUP_ID_SHAPE = /^\d{8}$/;
+
+/** Bounded, matching how other identifiers (e.g. keyId elsewhere) are constrained. */
+const MAX_KEY_ID_LENGTH = 64;
+
+const EXPECTED_ENVELOPE_KEYS = [
+	"magic",
+	"formatVersion",
+	"backupId",
+	"createdAt",
+	"keyId",
+	"algorithm",
+	"ivBase64",
+	"ciphertextBase64",
+	"ciphertextSha256",
+] as const;
+
 function assertEnvelopeShape(
 	envelope: unknown,
 ): asserts envelope is BackupEnvelope {
@@ -177,18 +206,23 @@ function assertEnvelopeShape(
 		);
 	}
 	const e = envelope as Record<string, unknown>;
-	const requiredStringFields = [
-		"magic",
-		"formatVersion",
-		"backupId",
-		"createdAt",
-		"keyId",
-		"algorithm",
-		"ivBase64",
-		"ciphertextBase64",
-		"ciphertextSha256",
-	];
-	for (const field of requiredStringFields) {
+
+	// The envelope must have EXACTLY the expected key set -- no extra/missing
+	// top-level keys, guarding against a malformed/tampered envelope
+	// smuggling extra data.
+	const actualKeys = Object.keys(e);
+	const expectedKeySet = new Set<string>(EXPECTED_ENVELOPE_KEYS);
+	if (
+		actualKeys.length !== EXPECTED_ENVELOPE_KEYS.length ||
+		!actualKeys.every((key) => expectedKeySet.has(key))
+	) {
+		throw new BackupError(
+			"BACKUP_INVALID_ENVELOPE",
+			"Backup envelope does not have exactly the expected set of fields",
+		);
+	}
+
+	for (const field of EXPECTED_ENVELOPE_KEYS) {
 		if (typeof e[field] !== "string" || e[field] === "") {
 			throw new BackupError(
 				"BACKUP_INVALID_ENVELOPE",
@@ -218,6 +252,31 @@ function assertEnvelopeShape(
 		throw new BackupError(
 			"BACKUP_INVALID_ENVELOPE",
 			"Backup envelope ciphertext hash is not a valid SHA-256 hex digest",
+		);
+	}
+	if (!BACKUP_ID_SHAPE.test(e.backupId as string)) {
+		throw new BackupError(
+			"BACKUP_INVALID_ENVELOPE",
+			"Backup envelope backupId is not a valid YYYYMMDD identifier",
+		);
+	}
+	if (Number.isNaN(Date.parse(e.createdAt as string))) {
+		throw new BackupError(
+			"BACKUP_INVALID_ENVELOPE",
+			"Backup envelope createdAt is not a valid timestamp",
+		);
+	}
+	if ((e.keyId as string).length > MAX_KEY_ID_LENGTH) {
+		throw new BackupError(
+			"BACKUP_INVALID_ENVELOPE",
+			"Backup envelope keyId exceeds the maximum allowed length",
+		);
+	}
+	const ivBytes = base64ToBytes(e.ivBase64 as string);
+	if (ivBytes.length !== IV_BYTES) {
+		throw new BackupError(
+			"BACKUP_INVALID_ENVELOPE",
+			`Backup envelope IV must decode to exactly ${IV_BYTES} bytes`,
 		);
 	}
 }
@@ -264,6 +323,8 @@ export async function decryptBackupPayload(
 		formatVersion: envelope.formatVersion,
 		backupId: envelope.backupId,
 		createdAt: envelope.createdAt,
+		keyId: envelope.keyId,
+		algorithm: envelope.algorithm,
 	});
 
 	try {

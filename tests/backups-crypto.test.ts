@@ -157,3 +157,110 @@ describe("Backup crypto (GG_BACKUP_V1 envelope)", () => {
 		expect(envelopeKeyIdMatches(envelope, "v1")).toBe(false);
 	});
 });
+
+describe("Backup crypto envelope hardening (Phase 18-R1 Section E)", () => {
+	it("rejects decryption when keyId is tampered post-encryption (now AAD-bound)", async () => {
+		const envelope = await encryptBackupPayload({
+			...BASE_PARAMS,
+			plaintext: "keyid aad test",
+		});
+		const tampered = { ...envelope, keyId: "v-attacker" };
+		await expect(
+			decryptBackupPayload({ envelope: tampered, key: KEY_A }),
+		).rejects.toBeInstanceOf(BackupError);
+	});
+
+	it("rejects decryption when algorithm is tampered to an unrecognized value (both shape-check AND AAD now reject it)", async () => {
+		// `algorithm` currently only ever has one valid value, so
+		// `assertEnvelopeShape`'s existing "algorithm not supported" check
+		// already rejects ANY tampered value before AAD verification is even
+		// reached -- the AAD binding added in this phase is defense-in-depth
+		// for a future multi-algorithm world, not independently observable
+		// with today's single-algorithm shape check. This test documents that
+		// tampering the field is rejected either way.
+		const envelope = await encryptBackupPayload({
+			...BASE_PARAMS,
+			plaintext: "algorithm aad test",
+		});
+		const tampered = {
+			...envelope,
+			algorithm: "AES-128-GCM",
+		} as unknown as typeof envelope;
+		await expect(
+			decryptBackupPayload({ envelope: tampered, key: KEY_A }),
+		).rejects.toMatchObject({ code: "BACKUP_INVALID_ENVELOPE" });
+	});
+
+	it("rejects an envelope with an IV that does not decode to exactly 12 bytes", async () => {
+		const envelope = await encryptBackupPayload({
+			...BASE_PARAMS,
+			plaintext: "iv length test",
+		});
+		const shortIv = btoa("short"); // 5 raw bytes, not 12
+		const tampered = { ...envelope, ivBase64: shortIv };
+		await expect(
+			decryptBackupPayload({ envelope: tampered, key: KEY_A }),
+		).rejects.toMatchObject({ code: "BACKUP_INVALID_ENVELOPE" });
+	});
+
+	it("rejects an envelope with an empty keyId", async () => {
+		const envelope = await encryptBackupPayload({
+			...BASE_PARAMS,
+			plaintext: "x",
+		});
+		const tampered = { ...envelope, keyId: "" };
+		await expect(
+			decryptBackupPayload({ envelope: tampered, key: KEY_A }),
+		).rejects.toMatchObject({ code: "BACKUP_INVALID_ENVELOPE" });
+	});
+
+	it("rejects an envelope with a keyId exceeding the maximum allowed length", async () => {
+		const envelope = await encryptBackupPayload({
+			...BASE_PARAMS,
+			plaintext: "x",
+		});
+		const tampered = { ...envelope, keyId: "v".repeat(65) };
+		await expect(
+			decryptBackupPayload({ envelope: tampered, key: KEY_A }),
+		).rejects.toMatchObject({ code: "BACKUP_INVALID_ENVELOPE" });
+	});
+
+	it("rejects an envelope with an invalid createdAt timestamp", async () => {
+		const envelope = await encryptBackupPayload({
+			...BASE_PARAMS,
+			plaintext: "x",
+		});
+		const tampered = { ...envelope, createdAt: "not-a-real-timestamp" };
+		await expect(
+			decryptBackupPayload({ envelope: tampered, key: KEY_A }),
+		).rejects.toMatchObject({ code: "BACKUP_INVALID_ENVELOPE" });
+	});
+
+	it("rejects an envelope with a malformed backupId (not an 8-digit YYYYMMDD)", async () => {
+		const envelope = await encryptBackupPayload({
+			...BASE_PARAMS,
+			plaintext: "x",
+		});
+		const tampered = { ...envelope, backupId: "2026-09-07" };
+		await expect(
+			decryptBackupPayload({ envelope: tampered, key: KEY_A }),
+		).rejects.toMatchObject({ code: "BACKUP_INVALID_ENVELOPE" });
+	});
+
+	it("rejects an envelope carrying an extra, unexpected top-level key", async () => {
+		const envelope = await encryptBackupPayload({
+			...BASE_PARAMS,
+			plaintext: "x",
+		});
+		const tampered = {
+			...envelope,
+			extraSmuggledField: "should not be allowed",
+		};
+		await expect(
+			decryptBackupPayload({
+				envelope: tampered as unknown as typeof envelope,
+				key: KEY_A,
+			}),
+		).rejects.toMatchObject({ code: "BACKUP_INVALID_ENVELOPE" });
+	});
+});
