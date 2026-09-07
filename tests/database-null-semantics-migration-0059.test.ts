@@ -46,8 +46,8 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		}
 	}
 
-	it("audited all database functions and confirmed total count is 145", () => {
-		expect(effectiveFunctions.size).toBe(145);
+	it("audited all database functions and confirmed total count is 147", () => {
+		expect(effectiveFunctions.size).toBe(147);
 	});
 
 	it("confirms migration 0059 defines the latest active version of all 8 target functions", () => {

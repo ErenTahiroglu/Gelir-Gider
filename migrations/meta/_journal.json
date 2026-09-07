@@ -421,6 +421,13 @@
       "when": 1788860000000,
       "tag": "0059_harden_remaining_database_null_semantics",
       "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1788880000000,
+      "tag": "0060_seal_canonical_payload_key_presence",
+      "breakpoints": true
     }
   ]
 }
