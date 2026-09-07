@@ -386,6 +386,13 @@
       "when": 1788757000000,
       "tag": "0054_harden_import_contracts_and_receipt_authority",
       "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "7",
+      "when": 1788780000000,
+      "tag": "0055_finalize_import_link_and_receipt_integrity",
+      "breakpoints": true
     }
   ]
 }

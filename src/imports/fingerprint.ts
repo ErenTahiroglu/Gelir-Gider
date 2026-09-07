@@ -27,22 +27,48 @@ export async function computeSourceContentHash(
 
 /**
  * Deterministically stringifies any JS object by recursively sorting object keys.
+ * Protected against circular references, depth overflows, and unserializable types.
  */
-export function canonicalJsonStringify(obj: unknown): string {
+export function canonicalJsonStringify(
+	obj: unknown,
+	seen: Set<unknown> = new Set<unknown>(),
+	depth: number = 0,
+): string {
+	if (depth > 50) {
+		throw new Error("Maximum object depth exceeded in canonicalJsonStringify");
+	}
 	if (obj === null || typeof obj !== "object") {
-		return JSON.stringify(obj);
+		if (
+			typeof obj === "bigint" ||
+			typeof obj === "symbol" ||
+			typeof obj === "function"
+		) {
+			throw new Error(`Unserializable value type: ${typeof obj}`);
+		}
+		const res = JSON.stringify(obj);
+		return res === undefined ? "null" : res;
 	}
-	if (Array.isArray(obj)) {
-		return `[${obj.map((item) => canonicalJsonStringify(item)).join(",")}]`;
+	if (seen.has(obj)) {
+		throw new Error("Circular reference detected in canonicalJsonStringify");
 	}
-	const keys = Object.keys(obj as Record<string, unknown>).sort();
-	const entries = keys.map(
-		(key) =>
-			`${JSON.stringify(key)}:${canonicalJsonStringify(
-				(obj as Record<string, unknown>)[key],
-			)}`,
-	);
-	return `{${entries.join(",")}}`;
+	seen.add(obj);
+	try {
+		if (Array.isArray(obj)) {
+			return `[${obj.map((item) => canonicalJsonStringify(item, seen, depth + 1)).join(",")}]`;
+		}
+		const keys = Object.keys(obj as Record<string, unknown>).sort();
+		const entries = keys.map(
+			(key) =>
+				`${JSON.stringify(key)}:${canonicalJsonStringify(
+					(obj as Record<string, unknown>)[key],
+					seen,
+					depth + 1,
+				)}`,
+		);
+		return `{${entries.join(",")}}`;
+	} finally {
+		seen.delete(obj);
+	}
 }
 
 /**

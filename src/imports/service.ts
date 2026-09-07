@@ -6,6 +6,7 @@ import {
 	creditCardLiabilityEvents,
 } from "../db/schema/credit-card-ledger";
 import {
+	IMPORT_RESULT_TARGET_TYPES,
 	type ImportDuplicateCandidateType,
 	type ImportDuplicateReasonCode,
 	type ImportRecordType,
@@ -36,6 +37,7 @@ import {
 import {
 	isValidUuid,
 	MAX_IMPORT_BATCH_ROWS,
+	MAX_SOURCE_CONTENT_BYTES,
 	type NormalizedCardPurchasePayload,
 	type NormalizedImportPayload,
 	type NormalizedIncomeReceiptPayload,
@@ -391,12 +393,25 @@ export async function stageImportBatch(
 	if (
 		params.sourceContent !== undefined &&
 		params.sourceContent !== null &&
-		typeof params.sourceContent !== "string"
+		typeof params.sourceContent !== "string" &&
+		!(params.sourceContent instanceof Uint8Array)
 	) {
 		throw new ImportError(
 			"IMPORT_INVALID_INPUT",
-			"sourceContent must be a string",
+			"sourceContent must be a string or Uint8Array",
 		);
+	}
+	if (params.sourceContent !== undefined && params.sourceContent !== null) {
+		const byteLength =
+			typeof params.sourceContent === "string"
+				? new TextEncoder().encode(params.sourceContent).length
+				: params.sourceContent.byteLength;
+		if (byteLength > MAX_SOURCE_CONTENT_BYTES) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`sourceContent byte size exceeds maximum of ${MAX_SOURCE_CONTENT_BYTES} bytes (got ${byteLength})`,
+			);
+		}
 	}
 	if (
 		params.sourceContentHash !== undefined &&
@@ -430,9 +445,36 @@ export async function stageImportBatch(
 		);
 	}
 
+	const allowedStageBatchKeys = new Set([
+		"userId",
+		"provider",
+		"sourceKind",
+		"sourceContent",
+		"sourceContentHash",
+		"sourceFileName",
+		"parserType",
+		"parserVersion",
+		"observedAt",
+		"rows",
+	]);
+	for (const key of Object.keys(params)) {
+		if (!allowedStageBatchKeys.has(key)) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`Unknown property "${key}" in stageImportBatch params`,
+			);
+		}
+	}
+
 	const meta = validateAndNormalizeBatchMeta({
-		...params,
+		userId: params.userId,
+		provider: params.provider,
+		sourceKind: params.sourceKind,
 		sourceContentHash: contentHash,
+		sourceFileName: params.sourceFileName,
+		parserType: params.parserType,
+		parserVersion: params.parserVersion,
+		observedAt: params.observedAt,
 	});
 
 	if (!Array.isArray(params.rows)) {
@@ -763,6 +805,7 @@ export async function resolveImportRow(
 		);
 	}
 
+	let normalizedReasonNote: string | null = null;
 	if (params.reasonNote !== undefined && params.reasonNote !== null) {
 		if (typeof params.reasonNote !== "string") {
 			throw new ImportError(
@@ -770,18 +813,33 @@ export async function resolveImportRow(
 				"reasonNote must be a string",
 			);
 		}
-		if (params.reasonNote.trim().length > 500) {
+		const trimmed = params.reasonNote.trim();
+		if (trimmed.length > 500) {
 			throw new ImportError(
 				"IMPORT_INVALID_INPUT",
 				"reasonNote must not exceed 500 characters",
 			);
 		}
+		normalizedReasonNote = trimmed.length > 0 ? trimmed : null;
 	}
 
+	const allowedMappingKeys = new Set([
+		"cardId",
+		"purchaseCategory",
+		"shortTermGoalId",
+		"incomeSourceId",
+		"destinationAccountId",
+	]);
 	if (
 		params.resolvedMappings !== undefined &&
 		params.resolvedMappings !== null
 	) {
+		if (params.action !== "RESOLVE_MAPPINGS") {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				"resolvedMappings is only allowed for RESOLVE_MAPPINGS action",
+			);
+		}
 		if (
 			typeof params.resolvedMappings !== "object" ||
 			Array.isArray(params.resolvedMappings)
@@ -790,6 +848,14 @@ export async function resolveImportRow(
 				"IMPORT_INVALID_INPUT",
 				"resolvedMappings must be an object",
 			);
+		}
+		for (const key of Object.keys(params.resolvedMappings)) {
+			if (!allowedMappingKeys.has(key)) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Unknown property "${key}" in resolvedMappings`,
+				);
+			}
 		}
 	}
 
@@ -804,33 +870,38 @@ export async function resolveImportRow(
 				"linkTarget is required for LINK_EXISTING action",
 			);
 		}
+		const linkKeys = Object.keys(params.linkTarget);
+		if (
+			linkKeys.length !== 2 ||
+			!linkKeys.includes("targetType") ||
+			!linkKeys.includes("targetId")
+		) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				"linkTarget must contain only targetType and targetId",
+			);
+		}
 		if (!isValidUuid(params.linkTarget.targetId)) {
 			throw new ImportError(
 				"IMPORT_INVALID_INPUT",
 				"linkTarget.targetId must be a valid UUID",
 			);
 		}
-		const allowedTargetTypes = [
-			"CREDIT_CARD_TRANSACTION",
-			"CREDIT_CARD_SPLIT",
-			"INCOME",
-		];
-		if (!allowedTargetTypes.includes(params.linkTarget.targetType)) {
-			throw new ImportError(
-				"IMPORT_INVALID_INPUT",
-				`linkTarget.targetType must be one of: ${allowedTargetTypes.join(", ")}`,
-			);
-		}
-	} else if (params.linkTarget !== undefined && params.linkTarget !== null) {
 		if (
-			typeof params.linkTarget !== "object" ||
-			Array.isArray(params.linkTarget)
+			!IMPORT_RESULT_TARGET_TYPES.includes(
+				params.linkTarget.targetType as ImportResultTargetType,
+			)
 		) {
 			throw new ImportError(
 				"IMPORT_INVALID_INPUT",
-				"linkTarget must be an object",
+				`linkTarget.targetType must be one of: ${IMPORT_RESULT_TARGET_TYPES.join(", ")}`,
 			);
 		}
+	} else if (params.linkTarget !== undefined && params.linkTarget !== null) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"linkTarget is only allowed for LINK_EXISTING action",
+		);
 	}
 
 	const requestFingerprint = await computeResolveRequestFingerprint({
@@ -840,7 +911,7 @@ export async function resolveImportRow(
 		action: params.action,
 		resolvedMappings: params.resolvedMappings,
 		linkTarget: params.linkTarget,
-		reasonNote: params.reasonNote,
+		reasonNote: normalizedReasonNote,
 	});
 
 	return await withImportTransaction(db, async (tx) => {
@@ -1040,6 +1111,15 @@ export async function resolveImportRow(
 			}
 
 			if (row.recordType === "CREDIT_CARD_PURCHASE") {
+				if (
+					params.resolvedMappings.incomeSourceId !== undefined ||
+					params.resolvedMappings.destinationAccountId !== undefined
+				) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						"incomeSourceId and destinationAccountId are not valid mapping fields for CREDIT_CARD_PURCHASE",
+					);
+				}
 				const cur = currentRev.payload as NormalizedCardPurchasePayload;
 				const newCardId =
 					params.resolvedMappings.cardId !== undefined
@@ -1162,6 +1242,16 @@ export async function resolveImportRow(
 					operation = "RESOLVE";
 				}
 			} else if (row.recordType === "INCOME_RECEIPT") {
+				if (
+					params.resolvedMappings.cardId !== undefined ||
+					params.resolvedMappings.purchaseCategory !== undefined ||
+					params.resolvedMappings.shortTermGoalId !== undefined
+				) {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						"cardId, purchaseCategory, and shortTermGoalId are not valid mapping fields for INCOME_RECEIPT",
+					);
+				}
 				const cur = currentRev.payload as NormalizedIncomeReceiptPayload;
 				const newSourceId =
 					params.resolvedMappings.incomeSourceId !== undefined
@@ -1630,7 +1720,7 @@ export async function resolveImportRow(
 			operation,
 			status: nextStatus,
 			payload: nextPayload,
-			reasonNote: params.reasonNote,
+			reasonNote: normalizedReasonNote,
 			idempotencyKey: validKey,
 		});
 
@@ -1644,7 +1734,7 @@ export async function resolveImportRow(
 				operation,
 				status: nextStatus,
 				payload: nextPayload,
-				reasonNote: params.reasonNote ?? null,
+				reasonNote: normalizedReasonNote,
 				occurredAt: currentRev.occurredAt,
 				idempotencyKey: validKey,
 				revisionFingerprint,

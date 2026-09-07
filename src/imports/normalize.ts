@@ -2,6 +2,7 @@ import { validatePurchaseCategory } from "../credit-cards/calendar";
 import { parseMoneyString } from "../ledger/money";
 import { ImportError } from "./errors";
 import {
+	canonicalJsonStringify,
 	computeCardSemanticFingerprint,
 	computeExternalTransactionIdHash,
 	computeIncomeSemanticFingerprint,
@@ -14,6 +15,8 @@ export const MAX_FILENAME_LENGTH = 255;
 export const MAX_PROVIDER_LENGTH = 64;
 export const MAX_PARSER_TYPE_LENGTH = 64;
 export const MAX_PARSER_VERSION_LENGTH = 32;
+export const MAX_SOURCE_CONTENT_BYTES = 10 * 1024 * 1024; // 10MB
+export const MAX_RAW_RECORD_SERIALIZED_BYTES = 64 * 1024; // 64KB
 
 const UUID_REGEX =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -306,7 +309,48 @@ export async function normalizeImportRow(
 		);
 	}
 
-	const rawRowHash = await computeRawRowHash(input);
+	if (input.rawRecord !== undefined && input.rawRecord !== null) {
+		if (typeof input.rawRecord !== "object" || Array.isArray(input.rawRecord)) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`Row ${rowOrdinal}: rawRecord must be an object`,
+			);
+		}
+		try {
+			const serialized = canonicalJsonStringify(input.rawRecord);
+			const byteLen = new TextEncoder().encode(serialized).length;
+			if (byteLen > MAX_RAW_RECORD_SERIALIZED_BYTES) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: rawRecord serialized size exceeds maximum of ${MAX_RAW_RECORD_SERIALIZED_BYTES} bytes (got ${byteLen})`,
+				);
+			}
+		} catch (err) {
+			if (err instanceof ImportError) {
+				throw err;
+			}
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`Row ${rowOrdinal}: rawRecord contains circular reference or unserializable data`,
+				{ cause: err },
+			);
+		}
+	}
+
+	let rawRowHash: string;
+	try {
+		rawRowHash = await computeRawRowHash(input);
+	} catch (err) {
+		if (err instanceof ImportError) {
+			throw err;
+		}
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			`Row ${rowOrdinal}: failed to compute raw row hash: ${err instanceof Error ? err.message : String(err)}`,
+			{ cause: err },
+		);
+	}
+
 	const externalTransactionIdHash =
 		typeof input.externalTransactionId === "string" &&
 		input.externalTransactionId.trim().length > 0
