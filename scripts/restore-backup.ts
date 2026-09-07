@@ -43,7 +43,11 @@ import type {
 	BackupSnapshotPayload,
 	SchemaTableDescriptor,
 } from "../src/backups/manifest";
-import { verifySnapshotAgainstManifest } from "../src/backups/manifest";
+import {
+	buildManifestSchema,
+	compareSchemaDescriptorsExact,
+	verifySnapshotAgainstManifest,
+} from "../src/backups/manifest";
 
 // ============================================================================
 // Pure, DB-less logic (unit tested in tests/backups-restore-planning.test.ts)
@@ -326,6 +330,19 @@ async function countRowsPerTable(
  * expected table in the target database. This is the one live-DB-dependent
  * half of `checkSchemaCompatibility` (the function itself stays pure and
  * unit-testable over two already-resolved shape descriptors).
+ *
+ * Design note (Phase 18-R2 Section C.4): this check stays name-based only
+ * (table/column presence), deliberately NOT extended with
+ * `information_schema.columns`' `is_nullable`/`data_type`. Postgres's raw SQL
+ * `data_type` strings do not map cleanly onto Drizzle's `columnType`
+ * discriminator (e.g. multiple Postgres types can back one Drizzle column
+ * type and vice versa), so a naive extension risks false-positive rejections
+ * on a perfectly fine target schema. The mandatory, authoritative gate for
+ * type/nullability compatibility is `compareSchemaDescriptorsExact` above
+ * (backup schema vs. current application schema, both built via
+ * `buildManifestSchema()`) -- this live-target-DB check remains a
+ * complementary, coarser guard against a target DB whose migrations simply
+ * haven't been applied yet.
  */
 async function fetchActualShapes(
 	// biome-ignore lint/suspicious/noExplicitAny: dynamically typed Database
@@ -420,26 +437,27 @@ async function main(): Promise<void> {
 		columns: getTableConfig(d.table).columns.map((c) => c.name),
 	}));
 
-	// Section C.4: was this backup produced by a schema compatible with what
-	// THIS codebase currently expects? Compared BEFORE the live-target-DB
-	// check and BEFORE any mutation. Reuses `checkSchemaCompatibility`
-	// directly (expected = current registry, actual = the backup's own
-	// decrypted schema descriptor) rather than a parallel comparison
-	// function. Works correctly even for a table with ZERO rows in the
-	// backup, since the schema descriptor captures columns independent of
-	// row presence.
-	const backupSchemaShapes = schemaDescriptorToShape(
-		payload.manifest.schema.tables,
+	// Section C.4 (Phase 18-R2 rework): was this backup produced by a schema
+	// EXACTLY identical (table set, column set, column types, nullability --
+	// everything) to what THIS codebase currently expects? Compared BEFORE
+	// the live-target-DB check and BEFORE any mutation. Builds the CURRENT
+	// application's schema descriptor using the EXACT SAME `buildManifestSchema()`
+	// function the backup itself used at backup time -- an apples-to-apples
+	// comparison rather than two independently-written comparison paths that
+	// could drift -- and requires an exact match (not merely "every expected
+	// column present", which would miss a same-named column whose type or
+	// nullability changed). Works correctly even for a table with ZERO rows
+	// in the backup, since the schema descriptor captures columns independent
+	// of row presence.
+	const currentSchema = await buildManifestSchema();
+	const schemaComparison = compareSchemaDescriptorsExact(
+		payload.manifest.schema,
+		currentSchema,
 	);
-	const backupCompatibility = checkSchemaCompatibility(
-		expectedShapes,
-		backupSchemaShapes,
-	);
-	if (!backupCompatibility.compatible) {
+	if (!schemaComparison.compatible) {
 		console.error(
-			`Backup schema is not compatible with the current application schema: ` +
-				`missing tables ${backupCompatibility.missingTables.join(", ")}; ` +
-				`missing columns ${JSON.stringify(backupCompatibility.missingColumns)}`,
+			"Backup schema is not EXACTLY compatible with the current application " +
+				`schema: ${schemaComparison.details.join("; ")}`,
 		);
 		process.exitCode = 1;
 		return;

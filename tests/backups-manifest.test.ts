@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { BackupError } from "../src/backups/errors";
 import {
+	type BackupManifestSchema,
 	buildManifest,
 	buildManifestSchema,
+	canonicalStringify,
+	compareSchemaDescriptorsExact,
 	computeTableContentHash,
 	type SchemaTableDescriptor,
 	type TableSnapshot,
@@ -343,5 +346,148 @@ describe("verifyManifestSchemaAgainstRegistry (Phase 18-R1 Section C)", () => {
 				tables,
 			}),
 		).rejects.toBeInstanceOf(BackupError);
+	});
+});
+
+describe("compareSchemaDescriptorsExact (Phase 18-R2 Section C: backup vs current application schema)", () => {
+	async function sha256Hex(text: string): Promise<string> {
+		const bytes = new TextEncoder().encode(text);
+		const digest = await crypto.subtle.digest(
+			"SHA-256",
+			bytes as unknown as BufferSource,
+		);
+		return Array.from(new Uint8Array(digest))
+			.map((b) => b.toString(16).padStart(2, "0"))
+			.join("");
+	}
+
+	async function schemaOf(
+		tables: SchemaTableDescriptor[],
+	): Promise<BackupManifestSchema> {
+		return {
+			tables,
+			schemaFingerprint: await sha256Hex(canonicalStringify(tables)),
+		};
+	}
+
+	const usersV1: SchemaTableDescriptor = {
+		tableName: "users",
+		columns: [
+			{ columnName: "id", columnType: "PgUUID", notNull: true },
+			{ columnName: "display_name", columnType: "PgText", notNull: false },
+		],
+	};
+
+	it("passes for byte-for-byte identical schema descriptors", async () => {
+		const a = await schemaOf([usersV1]);
+		const b = await schemaOf([usersV1]);
+		const result = compareSchemaDescriptorsExact(a, b);
+		expect(result.compatible).toBe(true);
+		expect(result.details).toEqual([]);
+	});
+
+	it("rejects when a column's columnType differs (same names, same notNull)", async () => {
+		const backup = await schemaOf([usersV1]);
+		const current = await schemaOf([
+			{
+				tableName: "users",
+				columns: [
+					{ columnName: "id", columnType: "PgUUID", notNull: true },
+					// display_name changed from PgText to PgUUID.
+					{ columnName: "display_name", columnType: "PgUUID", notNull: false },
+				],
+			},
+		]);
+		const result = compareSchemaDescriptorsExact(backup, current);
+		expect(result.compatible).toBe(false);
+		expect(result.details.some((d) => d.includes("type differs"))).toBe(true);
+	});
+
+	it("rejects when a column's notNull differs (same names, same types)", async () => {
+		const backup = await schemaOf([usersV1]);
+		const current = await schemaOf([
+			{
+				tableName: "users",
+				columns: [
+					{ columnName: "id", columnType: "PgUUID", notNull: true },
+					// display_name became NOT NULL.
+					{ columnName: "display_name", columnType: "PgText", notNull: true },
+				],
+			},
+		]);
+		const result = compareSchemaDescriptorsExact(backup, current);
+		expect(result.compatible).toBe(false);
+		expect(result.details.some((d) => d.includes("nullability differs"))).toBe(
+			true,
+		);
+	});
+
+	it("rejects when a table is missing from the current application schema", async () => {
+		const backup = await schemaOf([
+			usersV1,
+			{
+				tableName: "campaigns",
+				columns: [{ columnName: "id", columnType: "PgUUID", notNull: true }],
+			},
+		]);
+		const current = await schemaOf([usersV1]);
+		const result = compareSchemaDescriptorsExact(backup, current);
+		expect(result.compatible).toBe(false);
+		expect(result.details.some((d) => d.includes('table "campaigns"'))).toBe(
+			true,
+		);
+	});
+
+	it("rejects when the current application schema requires an extra table absent from the backup", async () => {
+		const backup = await schemaOf([usersV1]);
+		const current = await schemaOf([
+			usersV1,
+			{
+				tableName: "new_table",
+				columns: [{ columnName: "id", columnType: "PgUUID", notNull: true }],
+			},
+		]);
+		const result = compareSchemaDescriptorsExact(backup, current);
+		expect(result.compatible).toBe(false);
+		expect(result.details.some((d) => d.includes('table "new_table"'))).toBe(
+			true,
+		);
+	});
+
+	it("rejects when a required column is missing from the backup schema", async () => {
+		const backup = await schemaOf([
+			{
+				tableName: "users",
+				columns: [{ columnName: "id", columnType: "PgUUID", notNull: true }],
+			},
+		]);
+		const current = await schemaOf([usersV1]); // has display_name too
+		const result = compareSchemaDescriptorsExact(backup, current);
+		expect(result.compatible).toBe(false);
+		expect(
+			result.details.some((d) => d.includes('column "display_name"')),
+		).toBe(true);
+	});
+
+	it("rejects when the backup has an extra column absent from the current application schema", async () => {
+		const backup = await schemaOf([usersV1]);
+		const current = await schemaOf([
+			{
+				tableName: "users",
+				columns: [{ columnName: "id", columnType: "PgUUID", notNull: true }],
+			},
+		]);
+		const result = compareSchemaDescriptorsExact(backup, current);
+		expect(result.compatible).toBe(false);
+		expect(
+			result.details.some((d) => d.includes('column "display_name"')),
+		).toBe(true);
+	});
+
+	it("passes when comparing the REAL current application schema against itself via buildManifestSchema()", async () => {
+		const current = await buildManifestSchema();
+		const backup = await buildManifestSchema();
+		const result = compareSchemaDescriptorsExact(backup, current);
+		expect(result.compatible).toBe(true);
 	});
 });

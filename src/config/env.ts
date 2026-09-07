@@ -218,19 +218,53 @@ export function getBackupEncryptionKey(env: AppEnv): Uint8Array {
 }
 
 /**
+ * Bounded identifier charset for `BACKUP_ENCRYPTION_KEY_ID`, matching the
+ * same convention used elsewhere in this codebase for bounded identifiers
+ * (e.g. `BASE64URL_STRICT_PATTERN` above, `BASE64URL_PATTERN` in
+ * `src/auth/session-cookie.ts`/`src/notifications/calendar.ts`) and the same
+ * `MAX_KEY_ID_LENGTH` bound `src/backups/crypto.ts`'s `assertEnvelopeShape`
+ * already enforces on a decrypted envelope's `keyId`.
+ */
+const BACKUP_KEY_ID_MAX_LENGTH = 64;
+const BACKUP_KEY_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/**
  * Returns the active backup encryption key identifier. `BACKUP_ENCRYPTION_KEY_ID`
  * is OPTIONAL -- if unset it defaults to `"v1"`, since a single-operator
  * deployment starting out has exactly one key generation. Once a key is ever
  * rotated, the operator is expected to set this explicitly so newly created
  * backups carry the correct identifier (old backups keep whatever keyId they
  * were encrypted under, recorded in their own envelope header).
+ *
+ * When explicitly provided, the value is validated EAGERLY here (length
+ * 1-64, restricted to a safe bounded identifier charset) -- BEFORE it can
+ * ever reach `runDatabaseBackup`. Without this, a malformed keyId would only
+ * be caught much later, inside Phase 2's own envelope read-back
+ * verification (`assertEnvelopeShape`'s `MAX_KEY_ID_LENGTH` bound) -- after a
+ * STARTED reservation, a full snapshot/encrypt/upload cycle, and an orphaned
+ * uploaded object (Section B) had already been produced for what was really
+ * just a config error, knowable up front. `src/index.ts`'s scheduled handler
+ * already calls all `getBackupXxx(env)` functions (this one included) in a
+ * try/catch BEFORE any reservation is attempted, so throwing here
+ * automatically gets the "zero backup reservation, zero R2 call" behavior.
  */
 export function getBackupKeyId(env: AppEnv): string {
 	const raw = env.BACKUP_ENCRYPTION_KEY_ID;
 	if (!raw || raw.trim() === "") {
 		return "v1";
 	}
-	return raw.trim();
+	const trimmed = raw.trim();
+	if (trimmed.length > BACKUP_KEY_ID_MAX_LENGTH) {
+		throw new Error(
+			`BACKUP_ENCRYPTION_KEY_ID must be at most ${BACKUP_KEY_ID_MAX_LENGTH} characters`,
+		);
+	}
+	if (!BACKUP_KEY_ID_PATTERN.test(trimmed)) {
+		throw new Error(
+			"BACKUP_ENCRYPTION_KEY_ID must contain only letters, digits, underscores, or hyphens",
+		);
+	}
+	return trimmed;
 }
 
 /**

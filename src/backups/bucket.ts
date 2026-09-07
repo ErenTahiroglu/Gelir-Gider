@@ -81,7 +81,24 @@ export function toBackupBucket(bucket: R2Bucket): BackupBucket {
 			await bucket.delete(key);
 		},
 		async list(options) {
-			const listOptions: { prefix?: string; cursor?: string } = {};
+			// Phase 18-R2 Section D: retention needs each object's
+			// `customMetadata` (formatVersion/ciphertextSha256) to authoritatively
+			// verify it against the DB's `COMPLETED` records. Cloudflare R2's
+			// `list()` only populates `customMetadata` inline when explicitly
+			// requested via `include` -- by default it is omitted entirely for
+			// performance. Requesting it here trades a smaller max page size (R2
+			// caps listings at 100 objects per page, instead of 1000, when
+			// `customMetadata`/`httpMetadata` is included) for avoiding a
+			// separate `head()` call per candidate object; `listAllBackupObjects`
+			// in `retention.ts` already paginates via `cursor`, so the smaller
+			// page size only means more pages, not more total R2 operations than
+			// the head()-per-object alternative would need (which is O(n) heads
+			// on top of the list calls).
+			const listOptions: {
+				prefix?: string;
+				cursor?: string;
+				include?: ("customMetadata" | "httpMetadata")[];
+			} = { include: ["customMetadata"] };
 			if (options?.prefix !== undefined) listOptions.prefix = options.prefix;
 			if (options?.cursor !== undefined) listOptions.cursor = options.cursor;
 			const result = await bucket.list(listOptions);

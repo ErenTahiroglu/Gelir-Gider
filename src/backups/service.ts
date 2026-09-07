@@ -42,15 +42,27 @@ export function deriveBackupId(scheduledAt: Date): string {
 }
 
 /**
- * Derives the R2 object key for a backup: `gelir-gider/v1/YYYY/MM/DD/<backupId>.ggbak`,
- * derived entirely from `scheduledAt` (UTC) and `backupId` -- never a user
- * name, email, financial value, or DB host.
+ * Derives the R2 object key for a backup:
+ * `gelir-gider/v1/YYYY/MM/DD/<backupId>-<reservationEventId>.ggbak`.
+ * `backupId` (`YYYYMMDD`) stays the deterministic DAILY identity; the
+ * `reservationEventId` suffix is the UUID of the `STARTED` event this
+ * specific logical execution reserved in Phase 1 (`reservation.eventId`),
+ * making the key EXECUTION-scoped rather than merely day-scoped. This is
+ * what lets `bucket.delete(objectKey)` cleanup calls (see `runDatabaseBackup`
+ * below) safely delete only the object THIS execution itself wrote, even
+ * when a stale/racing execution for the same day is involved (Section B).
+ * Derived entirely from `scheduledAt` (UTC), `backupId`, and an opaque UUID
+ * -- never a user name, email, financial value, or DB host.
  */
-export function deriveObjectKey(scheduledAt: Date, backupId: string): string {
+export function deriveObjectKey(
+	scheduledAt: Date,
+	backupId: string,
+	reservationEventId: string,
+): string {
 	const y = scheduledAt.getUTCFullYear().toString().padStart(4, "0");
 	const m = (scheduledAt.getUTCMonth() + 1).toString().padStart(2, "0");
 	const d = scheduledAt.getUTCDate().toString().padStart(2, "0");
-	return `${BACKUP_OBJECT_KEY_PREFIX}/${y}/${m}/${d}/${backupId}.ggbak`;
+	return `${BACKUP_OBJECT_KEY_PREFIX}/${y}/${m}/${d}/${backupId}-${reservationEventId}.ggbak`;
 }
 
 export interface RunDatabaseBackupParams {
@@ -76,6 +88,45 @@ export interface BackupRunResult {
 	backupId: string;
 	objectKey: string | null;
 	safeErrorCode: string | null;
+}
+
+export interface CompletedBackupObject {
+	objectKey: string;
+	ciphertextSha256: string;
+}
+
+/**
+ * Queries every `COMPLETED` `backup_run_attempts` row that has a non-null
+ * `object_key`/`ciphertext_sha256` (the DB trigger/constraints from migration
+ * 0057 guarantee a `COMPLETED` row always has both set), returning the exact
+ * `{objectKey, ciphertextSha256}` pairs. This is the DB-authoritative source
+ * of truth `runBackupRetention` (Section D) uses to decide which R2 objects
+ * correspond to a genuine successful backup -- `retention.ts` itself stays a
+ * pure R2-plus-input-data module and never imports DB schema/query code
+ * directly; the caller (`src/index.ts`'s scheduled handler) queries this and
+ * passes the result in.
+ */
+export async function listCompletedBackupObjects(
+	db: Database,
+): Promise<CompletedBackupObject[]> {
+	const rows = await db
+		.select({
+			objectKey: backupRunAttempts.objectKey,
+			ciphertextSha256: backupRunAttempts.ciphertextSha256,
+		})
+		.from(backupRunAttempts)
+		.where(eq(backupRunAttempts.status, "COMPLETED"));
+
+	const results: CompletedBackupObject[] = [];
+	for (const row of rows) {
+		if (row.objectKey && row.ciphertextSha256) {
+			results.push({
+				objectKey: row.objectKey,
+				ciphertextSha256: row.ciphertextSha256,
+			});
+		}
+	}
+	return results;
 }
 
 async function getOrCreateAnchorRun(
@@ -312,9 +363,23 @@ async function reserveExecution(
 type Finalization = { kind: "ok" } | { kind: "conflict" };
 
 /**
- * Phase 3: a short finalization transaction. Re-locks the same `backup_runs`
- * anchor row FOR UPDATE and re-reads the latest event; only if it is EXACTLY
- * the event this invocation reserved in Phase 1 (by id) does it append the
+ * Phase 3: a short finalization transaction. Explicitly re-locks the same
+ * `backup_runs` anchor row FOR UPDATE BEFORE reading the latest event --
+ * mirroring exactly the same rationale/pattern as `reserveExecution`'s own
+ * lock above: without it, `getLatestEvent`'s read here and the subsequent
+ * `insertEvent` are two separate unlocked statements, and a concurrent
+ * process (e.g. a new invocation running its own Phase 1 stale-recovery
+ * logic against the same anchor) could interleave between them, causing this
+ * finalization to act on a stale view of "latest event" or race the other
+ * process's own insert. The INSERT trigger's own internal locking only
+ * protects the INSERT itself -- too late to protect the READ that precedes
+ * this finalization's conflict decision. Acquiring the lock FIRST serializes
+ * the read-decide-insert sequence exactly as it does in `reserveExecution`.
+ *
+ * Only if the re-read latest event is EXACTLY the event this invocation
+ * reserved in Phase 1 -- matched on `id`, `status === "STARTED"`, AND
+ * `attemptNo` (an exact-match belt-and-suspenders check: `id` should already
+ * be unique, but all three are checked defensively) -- does it append the
  * terminal COMPLETED/FAILED event. Otherwise returns `conflict` -- some
  * other process already resolved this reservation (structurally very rare
  * given the Phase 1 locking, but must still be checked defensively) -- and
@@ -326,11 +391,17 @@ async function finalizeExecution(
 	reservation: { anchorId: string; attemptNo: number; eventId: string },
 	terminal: Omit<InsertEventRow, "attemptNo">,
 ): Promise<Finalization> {
+	// Explicit lock BEFORE the decision read -- see doc comment above.
+	await tx.execute(
+		sql`SELECT id FROM backup_runs WHERE id = ${reservation.anchorId} FOR UPDATE`,
+	);
+
 	const latest = await getLatestEvent(tx, reservation.anchorId);
 	if (
 		!latest ||
 		latest.id !== reservation.eventId ||
-		latest.status !== "STARTED"
+		latest.status !== "STARTED" ||
+		latest.attemptNo !== reservation.attemptNo
 	) {
 		return { kind: "conflict" };
 	}
@@ -386,7 +457,6 @@ export async function runDatabaseBackup(
 	}
 
 	const backupId = deriveBackupId(scheduledAt);
-	const objectKey = deriveObjectKey(scheduledAt, backupId);
 
 	const reservation = await db.transaction(async (tx) =>
 		reserveExecution(tx, user.id, backupId, scheduledAt),
@@ -420,7 +490,12 @@ export async function runDatabaseBackup(
 		};
 	}
 
-	// reservation.kind === "reserved" -- proceed to Phase 2.
+	// reservation.kind === "reserved" -- proceed to Phase 2. The object key is
+	// derived ONLY NOW, from THIS execution's own reservation event id
+	// (Section B) -- never before Phase 1 -- so it is execution-scoped and
+	// cannot collide with any other logical execution's object, even for the
+	// same day (see `deriveObjectKey`'s doc comment).
+	const objectKey = deriveObjectKey(scheduledAt, backupId, reservation.eventId);
 	let uploaded = false;
 	try {
 		const snapshot = await db.transaction(
@@ -552,6 +627,10 @@ export async function runDatabaseBackup(
 			// latest event no longer matches our reservation -- do not write a
 			// COMPLETED row that could stomp on a different outcome. Best-effort
 			// clean up the object we just wrote, since it will not be recorded.
+			// `objectKey` is execution-scoped (derived from THIS execution's own
+			// reservation.eventId, Section B) -- it therefore cannot ever match
+			// any other execution's object key, even one for the same day, so
+			// this delete can never remove data belonging to another execution.
 			try {
 				await bucket.delete(objectKey);
 			} catch {
@@ -580,7 +659,15 @@ export async function runDatabaseBackup(
 		if (uploaded) {
 			// Best-effort cleanup of the exact key this run just wrote -- never
 			// delete a key not constructed by this run, and never let a delete
-			// failure mask the original failure.
+			// failure mask the original failure. `objectKey` is execution-scoped
+			// (Section B: derived from THIS execution's own reservation.eventId),
+			// so it can never collide with, and therefore can never delete,
+			// another execution's object even for the same calendar day. A
+			// crash-orphaned upload (this process dies before reaching this
+			// catch, or before Phase 3) is an ACCEPTED tradeoff -- it may remain
+			// in R2 indefinitely for manual operator cleanup; correctness
+			// (never deleting the wrong object) is prioritized over aggressive
+			// deletion.
 			try {
 				await bucket.delete(objectKey);
 			} catch {

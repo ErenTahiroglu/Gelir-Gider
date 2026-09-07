@@ -323,6 +323,22 @@ class PausableFakeBucket extends FakeBucket {
 	}
 }
 
+/** A FakeBucket whose `get` (the post-upload readback verification call,
+ * which happens AFTER upload/before Phase 3 finalization) blocks until the
+ * test explicitly releases it -- used to simulate one invocation "pausing"
+ * between a successful upload and its own finalization, so a test can
+ * directly manipulate the fake DB's row state in between (Section A). */
+class PausableOnGetFakeBucket extends FakeBucket {
+	getStarted = createDeferred<void>();
+	getGate = createDeferred<void>();
+
+	override async get(key: string): Promise<BackupBucketObjectBody | null> {
+		this.getStarted.resolve();
+		await this.getGate.promise;
+		return super.get(key);
+	}
+}
+
 /**
  * `buildManifestSchema()` (Phase 18-R1 Section C) enumerates the ENTIRE real
  * table registry, and `verifyManifestSchemaAgainstRegistry` requires the
@@ -379,7 +395,7 @@ describe("runDatabaseBackup", () => {
 
 		expect(result.status).toBe("COMPLETED");
 		expect(result.objectKey).toMatch(
-			/^gelir-gider\/v1\/2026\/09\/07\/\d+\.ggbak$/,
+			/^gelir-gider\/v1\/2026\/09\/07\/\d{8}-.+\.ggbak$/,
 		);
 		expect(bucket.calls[0]).toMatch(/^put:/);
 		expect(bucket.store.size).toBe(1);
@@ -697,5 +713,195 @@ describe("runDatabaseBackup", () => {
 		// No new reservation was made -- zero R2 work was ever attempted.
 		expect(bucket.calls).toHaveLength(0);
 		expect(attemptsRows).toHaveLength(BACKUP_MAX_EVENTS_PER_RUN);
+	});
+
+	// ==========================================================================
+	// Section A (Phase 18-R2): finalizeExecution re-locks the SAME backup_runs
+	// anchor row FOR UPDATE and re-checks id/status/attemptNo as an exact-match
+	// triple before appending a terminal event. This fake DB is
+	// single-threaded/sequential, so it cannot model REAL lock contention --
+	// instead these tests directly control the ORDER of fake DB operations
+	// (by pausing the invocation between its successful upload/readback and
+	// its own Phase 3 finalization, then mutating the fake DB's row state as
+	// if another process had already resolved the same reservation) to prove
+	// the OUTCOME stays coherent: no raw/unhandled exception escapes the
+	// service layer, and no wrong terminal event is ever recorded.
+	// ==========================================================================
+	it("Section A: a conflicting terminal event already recorded by the time finalization runs produces a graceful FAILED/conflict result, never an unhandled exception or a stomped event", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db, attemptsRows } = createFakeDatabase(USER_ID);
+		const bucket = new PausableOnGetFakeBucket();
+
+		const pending = runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+
+		// Wait until the invocation has reserved STARTED, uploaded successfully,
+		// and is now blocked inside the post-upload readback (i.e. it is about
+		// to enter Phase 3 finalization next).
+		await bucket.getStarted.promise;
+		expect(attemptsRows.map((a) => a.status)).toEqual(["STARTED"]);
+
+		// Simulate a conflicting process having ALREADY appended a terminal
+		// event for this exact reservation (attemptNo 1's STARTED event) in the
+		// gap before this invocation's own finalization transaction runs --
+		// this is exactly the class of race Section A's explicit FOR UPDATE
+		// lock (plus the id/status/attemptNo triple-check) exists to detect and
+		// handle gracefully, since the single-threaded fake cannot otherwise
+		// model true concurrent lock contention.
+		attemptsRows.push({
+			id: "conflicting-terminal-event",
+			backupRunId: attemptsRows[0]?.backupRunId as string,
+			attemptNo: 2,
+			status: "FAILED",
+			objectKey: null,
+			occurredAt: new Date(),
+			safeErrorCode: "BACKUP_OUTCOME_UNKNOWN",
+		});
+
+		bucket.getGate.resolve();
+		const result = await pending;
+
+		expect(result.status).toBe("FAILED");
+		expect(result.safeErrorCode).toBe("BACKUP_RESERVATION_CONFLICT");
+		// The conflicting event is untouched, and NO additional (stomping)
+		// terminal event was appended by this invocation.
+		expect(attemptsRows).toHaveLength(2);
+		expect(attemptsRows[1]?.id).toBe("conflicting-terminal-event");
+		expect(attemptsRows[1]?.status).toBe("FAILED");
+		// Best-effort cleanup still ran against this invocation's OWN object
+		// key -- never against anything else.
+		expect(bucket.calls.some((c) => c.startsWith("delete:"))).toBe(true);
+	});
+
+	it("Section A: an attemptNo mismatch alone (id and status otherwise matching) is caught by the added defense-in-depth check", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db, attemptsRows } = createFakeDatabase(USER_ID);
+		const bucket = new PausableOnGetFakeBucket();
+
+		const pending = runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+
+		await bucket.getStarted.promise;
+		expect(attemptsRows).toHaveLength(1);
+
+		// Tamper with the reserved event's own attemptNo in place (same id,
+		// same STARTED status) -- an artificial stand-in for "attemptNo no
+		// longer matches what was reserved", which `id`/`status` alone would
+		// NOT catch. This proves the added `attemptNo` check in
+		// `finalizeExecution` is actually load-bearing, not dead code.
+		const reservedEvent = attemptsRows[0];
+		if (reservedEvent) reservedEvent.attemptNo = 99;
+
+		bucket.getGate.resolve();
+		const result = await pending;
+
+		expect(result.status).toBe("FAILED");
+		expect(result.safeErrorCode).toBe("BACKUP_RESERVATION_CONFLICT");
+		// No terminal event was appended on top of the tampered row.
+		expect(attemptsRows).toHaveLength(1);
+		expect(attemptsRows[0]?.status).toBe("STARTED");
+	});
+
+	// ==========================================================================
+	// Section B (Phase 18-R2): the object key is now execution-scoped (derived
+	// from the reservation's own event id), so two logical executions for the
+	// SAME day never share an object key, and a cleanup delete in one
+	// execution's failure path can never reference or match the other's key.
+	// ==========================================================================
+	it("Section B: two logical executions for the same day derive two DIFFERENT execution-scoped object keys", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db } = createFakeDatabase(USER_ID);
+		const bucket = new FakeBucket();
+		bucket.failPut = true;
+
+		const first = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(first.status).toBe("FAILED");
+
+		const second = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(second.status).toBe("FAILED");
+
+		const putCalls = bucket.calls.filter((c) => c.startsWith("put:"));
+		expect(putCalls).toHaveLength(2);
+		const [firstKey, secondKey] = putCalls.map((c) => c.slice("put:".length));
+		expect(firstKey).not.toBe(secondKey);
+		// Both still belong to the same calendar day/backupId prefix.
+		expect(firstKey).toMatch(/^gelir-gider\/v1\/2026\/09\/07\/20260907-/);
+		expect(secondKey).toMatch(/^gelir-gider\/v1\/2026\/09\/07\/20260907-/);
+	});
+
+	it("Section B: a cleanup delete in one execution's failure path targets ONLY that execution's own execution-scoped key, never the other's", async () => {
+		vi.mocked(exportDatabaseSnapshot).mockResolvedValue(
+			await makeSmallSnapshot(),
+		);
+		const { db } = createFakeDatabase(USER_ID);
+		const bucket = new FakeBucket();
+		// Post-upload verification failure -- this path uploads successfully
+		// (uploaded = true) and then deletes the exact key it just wrote.
+		bucket.corruptOnGet = true;
+
+		const first = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(first.status).toBe("FAILED");
+		expect(first.safeErrorCode).toBe("BACKUP_VERIFICATION_FAILED");
+
+		const second = await runDatabaseBackup({
+			db,
+			bucket,
+			encryptionKey: ENCRYPTION_KEY,
+			keyId: "v1",
+			scheduledAt: SCHEDULED_AT,
+		});
+		expect(second.status).toBe("FAILED");
+		expect(second.safeErrorCode).toBe("BACKUP_VERIFICATION_FAILED");
+
+		const putKeys = bucket.calls
+			.filter((c) => c.startsWith("put:"))
+			.map((c) => c.slice("put:".length));
+		const deleteKeys = bucket.calls
+			.filter((c) => c.startsWith("delete:"))
+			.map((c) => c.slice("delete:".length));
+
+		expect(putKeys).toHaveLength(2);
+		expect(deleteKeys).toHaveLength(2);
+		expect(putKeys[0]).not.toBe(putKeys[1]);
+		// Each execution's delete matches ONLY its own put key, never the
+		// other's -- the exact guarantee execution-scoped keys provide.
+		expect(deleteKeys[0]).toBe(putKeys[0]);
+		expect(deleteKeys[1]).toBe(putKeys[1]);
+		expect(deleteKeys[0]).not.toBe(putKeys[1]);
+		expect(deleteKeys[1]).not.toBe(putKeys[0]);
 	});
 });

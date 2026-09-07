@@ -3,7 +3,10 @@ import { Hono } from "hono";
 import { toBackupBucket } from "./backups/bucket";
 import { BackupError } from "./backups/errors";
 import { runBackupRetention } from "./backups/retention";
-import { runDatabaseBackup } from "./backups/service";
+import {
+	listCompletedBackupObjects,
+	runDatabaseBackup,
+} from "./backups/service";
 import type { AppEnv } from "./config/env";
 import {
 	getBackupBucket,
@@ -214,18 +217,29 @@ export default {
 							loggedFailure = true;
 						}
 
-						// Retention is fully independent of backup success/failure --
-						// its own failure must never mark a completed backup failed.
-						const retention = await runBackupRetention({
-							bucket,
-							currentObjectKey: result.objectKey,
-						});
-						if (retention.status === "FAILED") {
-							logOperationalEvent({
-								level: "warn",
-								eventCode: "BACKUP_RETENTION_FAILED",
-								component: "scheduled",
+						// Retention only ever runs after a COMPLETED backup outcome
+						// (Phase 18-R2 Section D.4) -- never for IN_PROGRESS (a
+						// legitimate concurrent invocation did zero work; running
+						// retention here is pointless busywork, not a correctness
+						// issue, but is skipped for simplicity/consistency) or FAILED
+						// (retention is otherwise independent of backup
+						// success/failure, but there is no new completed backup to
+						// protect and no reason to do R2 list/delete work on every
+						// failed attempt).
+						if (result.status === "COMPLETED") {
+							const completedBackups = await listCompletedBackupObjects(db);
+							const retention = await runBackupRetention({
+								bucket,
+								currentObjectKey: result.objectKey,
+								completedBackups,
 							});
+							if (retention.status === "FAILED") {
+								logOperationalEvent({
+									level: "warn",
+									eventCode: "BACKUP_RETENTION_FAILED",
+									component: "scheduled",
+								});
+							}
 						}
 
 						if (result.status === "FAILED") {

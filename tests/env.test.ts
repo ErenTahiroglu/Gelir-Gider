@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	type AppEnv,
+	getBackupKeyId,
 	getBootstrapTokenHash,
 	getDatabaseUrl,
 	getWebAuthnConfig,
@@ -157,5 +158,51 @@ describe("Bootstrap Environment Contract", () => {
 				BOOTSTRAP_TOKEN_HASH: `  ${validHash}  \n`,
 			}),
 		).toBe(validHash);
+	});
+});
+
+describe("Backup Key ID Environment Contract (Phase 18-R2 Section E)", () => {
+	it("defaults to 'v1' when unset", () => {
+		expect(getBackupKeyId({ BACKUP_ENCRYPTION_KEY_ID: undefined })).toBe("v1");
+	});
+
+	it("defaults to 'v1' when empty or whitespace-only", () => {
+		expect(getBackupKeyId({ BACKUP_ENCRYPTION_KEY_ID: "" })).toBe("v1");
+		expect(getBackupKeyId({ BACKUP_ENCRYPTION_KEY_ID: "   " })).toBe("v1");
+	});
+
+	it("returns a trimmed valid custom keyId", () => {
+		expect(getBackupKeyId({ BACKUP_ENCRYPTION_KEY_ID: "  v2-prod  " })).toBe(
+			"v2-prod",
+		);
+	});
+
+	it("throws for an oversized keyId (>64 chars)", () => {
+		expect(() =>
+			getBackupKeyId({ BACKUP_ENCRYPTION_KEY_ID: "a".repeat(65) }),
+		).toThrow("BACKUP_ENCRYPTION_KEY_ID must be at most 64 characters");
+	});
+
+	it("accepts a keyId at exactly the 64-char boundary", () => {
+		const exact = "a".repeat(64);
+		expect(getBackupKeyId({ BACKUP_ENCRYPTION_KEY_ID: exact })).toBe(exact);
+	});
+
+	it("throws for a keyId containing unsafe characters", () => {
+		expect(() =>
+			getBackupKeyId({ BACKUP_ENCRYPTION_KEY_ID: "v1/../etc" }),
+		).toThrow(
+			"BACKUP_ENCRYPTION_KEY_ID must contain only letters, digits, underscores, or hyphens",
+		);
+		expect(() =>
+			getBackupKeyId({ BACKUP_ENCRYPTION_KEY_ID: "v1 prod" }),
+		).toThrow(
+			"BACKUP_ENCRYPTION_KEY_ID must contain only letters, digits, underscores, or hyphens",
+		);
+		expect(() =>
+			getBackupKeyId({ BACKUP_ENCRYPTION_KEY_ID: "v1;drop" }),
+		).toThrow(
+			"BACKUP_ENCRYPTION_KEY_ID must contain only letters, digits, underscores, or hyphens",
+		);
 	});
 });

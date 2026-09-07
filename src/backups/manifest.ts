@@ -383,3 +383,114 @@ export async function verifyManifestSchemaAgainstRegistry(
 		);
 	}
 }
+
+export interface SchemaComparisonResult {
+	compatible: boolean;
+	details: string[];
+}
+
+/**
+ * Compares a BACKUP's own schema descriptor (captured at backup time by
+ * `buildManifestSchema()`) against the CURRENT APPLICATION's schema
+ * descriptor (built by calling `buildManifestSchema()` again, at restore
+ * time) -- two independently-built `BackupManifestSchema` values, NOT the
+ * same value checked against itself (that's what
+ * `verifyManifestSchemaAgainstRegistry` does; it is a decryption-integrity
+ * check, not a compatibility check).
+ *
+ * V1 requires an EXACT match: same table set (no missing, no extra tables),
+ * and for every table the exact same column set with the exact same
+ * `columnType` and exact same `notNull` for every column. Since both
+ * descriptors are produced by the SAME `buildManifestSchema()` function (so
+ * there is no risk of two independently-written comparison paths drifting),
+ * this reduces to a single, provably-correct check: comparing
+ * `backup.schemaFingerprint` to `current.schemaFingerprint`. The fingerprint
+ * is a SHA-256 over the exact canonical structure of `tables` (table set,
+ * column set, `columnType`, and `notNull` all included), so equal
+ * fingerprints prove the schemas are identical in every respect a mismatch
+ * could occur, and unequal fingerprints prove some difference exists. On a
+ * mismatch, `details` is built by directly diffing the two `tables` arrays
+ * (table set first, then per-table column set/type/nullability) so the
+ * restore operator gets a human-readable diagnosis rather than just
+ * "fingerprint mismatch".
+ */
+export function compareSchemaDescriptorsExact(
+	backup: BackupManifestSchema,
+	current: BackupManifestSchema,
+): SchemaComparisonResult {
+	if (backup.schemaFingerprint === current.schemaFingerprint) {
+		return { compatible: true, details: [] };
+	}
+
+	const details: string[] = [];
+	const backupByName = new Map(backup.tables.map((t) => [t.tableName, t]));
+	const currentByName = new Map(current.tables.map((t) => [t.tableName, t]));
+
+	for (const tableName of backupByName.keys()) {
+		if (!currentByName.has(tableName)) {
+			details.push(
+				`table "${tableName}" is present in the backup schema but missing from the current application schema`,
+			);
+		}
+	}
+	for (const tableName of currentByName.keys()) {
+		if (!backupByName.has(tableName)) {
+			details.push(
+				`table "${tableName}" is required by the current application schema but missing from the backup schema`,
+			);
+		}
+	}
+
+	for (const [tableName, backupTable] of backupByName) {
+		const currentTable = currentByName.get(tableName);
+		if (!currentTable) continue;
+
+		const backupColumnsByName = new Map(
+			backupTable.columns.map((c) => [c.columnName, c]),
+		);
+		const currentColumnsByName = new Map(
+			currentTable.columns.map((c) => [c.columnName, c]),
+		);
+
+		for (const columnName of backupColumnsByName.keys()) {
+			if (!currentColumnsByName.has(columnName)) {
+				details.push(
+					`table "${tableName}" column "${columnName}" is present in the backup schema but missing from the current application schema`,
+				);
+			}
+		}
+		for (const columnName of currentColumnsByName.keys()) {
+			if (!backupColumnsByName.has(columnName)) {
+				details.push(
+					`table "${tableName}" column "${columnName}" is required by the current application schema but missing from the backup schema`,
+				);
+			}
+		}
+		for (const [columnName, backupColumn] of backupColumnsByName) {
+			const currentColumn = currentColumnsByName.get(columnName);
+			if (!currentColumn) continue;
+			if (backupColumn.columnType !== currentColumn.columnType) {
+				details.push(
+					`table "${tableName}" column "${columnName}" type differs: backup has "${backupColumn.columnType}", current application schema has "${currentColumn.columnType}"`,
+				);
+			}
+			if (backupColumn.notNull !== currentColumn.notNull) {
+				details.push(
+					`table "${tableName}" column "${columnName}" nullability differs: backup has notNull=${backupColumn.notNull}, current application schema has notNull=${currentColumn.notNull}`,
+				);
+			}
+		}
+	}
+
+	if (details.length === 0) {
+		// Fingerprints differed but no structural difference was found by this
+		// diff (should not happen given the fingerprint's canonical inputs
+		// match exactly what is compared above) -- report the raw mismatch
+		// rather than silently claiming compatibility.
+		details.push(
+			"backup schema fingerprint does not match the current application schema fingerprint",
+		);
+	}
+
+	return { compatible: false, details };
+}
