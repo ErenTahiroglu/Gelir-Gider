@@ -133,6 +133,32 @@ export function validateAndNormalizeBatchMeta(input: {
 	validParserVersion: string;
 	validObservedAt: Date;
 } {
+	if (!input || typeof input !== "object" || Array.isArray(input)) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"batch metadata input must be an object",
+		);
+	}
+
+	const allowedBatchMetaKeys = new Set([
+		"userId",
+		"provider",
+		"sourceKind",
+		"sourceContentHash",
+		"sourceFileName",
+		"parserType",
+		"parserVersion",
+		"observedAt",
+	]);
+	for (const key of Object.keys(input)) {
+		if (!allowedBatchMetaKeys.has(key)) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`Unknown property "${key}" in batch metadata`,
+			);
+		}
+	}
+
 	if (
 		!input.userId ||
 		typeof input.userId !== "string" ||
@@ -164,7 +190,7 @@ export function validateAndNormalizeBatchMeta(input: {
 	) {
 		throw new ImportError(
 			"IMPORT_INVALID_INPUT",
-			`Invalid sourceKind: "${input.sourceKind}". Must be NORMALIZED_ROWS or GENERIC_CSV_V1`,
+			`Invalid sourceKind: "${String(input.sourceKind)}". Must be NORMALIZED_ROWS or GENERIC_CSV_V1`,
 		);
 	}
 
@@ -262,10 +288,21 @@ export async function normalizeImportRow(
 		);
 	}
 
-	if (!input || typeof input !== "object") {
+	if (!input || typeof input !== "object" || Array.isArray(input)) {
 		throw new ImportError(
 			"IMPORT_INVALID_INPUT",
 			`Invalid row at ordinal ${rowOrdinal}: must be an object`,
+		);
+	}
+
+	if (
+		input.externalTransactionId !== undefined &&
+		input.externalTransactionId !== null &&
+		typeof input.externalTransactionId !== "string"
+	) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			`Row ${rowOrdinal}: externalTransactionId must be a string`,
 		);
 	}
 
@@ -277,8 +314,36 @@ export async function normalizeImportRow(
 			: null;
 
 	if (input.recordType === "CREDIT_CARD_PURCHASE") {
+		const allowedKeys = new Set([
+			"recordType",
+			"cardId",
+			"occurredAt",
+			"amount",
+			"purchaseCategory",
+			"shortTermGoalId",
+			"merchant",
+			"description",
+			"installmentCount",
+			"externalTransactionId",
+			"rawRecord",
+		]);
+		for (const key of Object.keys(input)) {
+			if (!allowedKeys.has(key)) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: unknown property "${key}" in CREDIT_CARD_PURCHASE input`,
+				);
+			}
+		}
+
 		let cardId: string | null = null;
-		if (input.cardId != null && typeof input.cardId === "string") {
+		if (input.cardId != null) {
+			if (typeof input.cardId !== "string") {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: cardId must be a string`,
+				);
+			}
 			const trimmed = input.cardId.trim();
 			if (trimmed.length > 0) {
 				if (!isValidUuid(trimmed)) {
@@ -291,6 +356,16 @@ export async function normalizeImportRow(
 			}
 		}
 
+		if (
+			!(input.occurredAt instanceof Date) &&
+			typeof input.occurredAt !== "string"
+		) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`Row ${rowOrdinal}: occurredAt must be a Date or ISO date string`,
+			);
+		}
+
 		const occurredDate =
 			input.occurredAt instanceof Date
 				? input.occurredAt
@@ -300,6 +375,13 @@ export async function normalizeImportRow(
 			throw new ImportError(
 				"IMPORT_INVALID_INPUT",
 				`Row ${rowOrdinal}: invalid occurredAt date: ${String(input.occurredAt)}`,
+			);
+		}
+
+		if (typeof input.amount !== "string") {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`Row ${rowOrdinal}: amount must be a decimal string`,
 			);
 		}
 
@@ -324,26 +406,34 @@ export async function normalizeImportRow(
 			| "UNCLASSIFIED"
 			| null = null;
 
-		if (
-			input.purchaseCategory != null &&
-			String(input.purchaseCategory).trim() !== ""
-		) {
-			const trimmedCat = String(input.purchaseCategory).trim();
-			try {
-				purchaseCategory = validatePurchaseCategory(trimmedCat);
-			} catch {
+		if (input.purchaseCategory != null) {
+			if (typeof input.purchaseCategory !== "string") {
 				throw new ImportError(
 					"IMPORT_INVALID_INPUT",
-					`Row ${rowOrdinal}: invalid purchaseCategory "${trimmedCat}". Must be MANDATORY, DISCRETIONARY, SHORT_TERM_PURCHASE, or UNCLASSIFIED`,
+					`Row ${rowOrdinal}: purchaseCategory must be a string`,
 				);
+			}
+			const trimmedCat = input.purchaseCategory.trim();
+			if (trimmedCat !== "") {
+				try {
+					purchaseCategory = validatePurchaseCategory(trimmedCat);
+				} catch {
+					throw new ImportError(
+						"IMPORT_INVALID_INPUT",
+						`Row ${rowOrdinal}: invalid purchaseCategory "${trimmedCat}". Must be MANDATORY, DISCRETIONARY, SHORT_TERM_PURCHASE, or UNCLASSIFIED`,
+					);
+				}
 			}
 		}
 
 		let shortTermGoalId: string | null = null;
-		if (
-			input.shortTermGoalId != null &&
-			typeof input.shortTermGoalId === "string"
-		) {
+		if (input.shortTermGoalId != null) {
+			if (typeof input.shortTermGoalId !== "string") {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: shortTermGoalId must be a string`,
+				);
+			}
 			const trimmed = input.shortTermGoalId.trim();
 			if (trimmed.length > 0) {
 				if (!isValidUuid(trimmed)) {
@@ -370,27 +460,56 @@ export async function normalizeImportRow(
 			);
 		}
 
-		const merchant =
-			typeof input.merchant === "string" && input.merchant.trim().length > 0
-				? input.merchant.trim().slice(0, 200)
-				: null;
+		let merchant: string | null = null;
+		if (input.merchant != null) {
+			if (typeof input.merchant !== "string") {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: merchant must be a string`,
+				);
+			}
+			const trimmed = input.merchant.trim();
+			if (trimmed.length > 200) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: merchant must not exceed 200 characters`,
+				);
+			}
+			merchant = trimmed.length > 0 ? trimmed : null;
+		}
 
-		const description =
-			typeof input.description === "string" &&
-			input.description.trim().length > 0
-				? input.description.trim().slice(0, 500)
-				: null;
+		let description: string | null = null;
+		if (input.description != null) {
+			if (typeof input.description !== "string") {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: description must be a string`,
+				);
+			}
+			const trimmed = input.description.trim();
+			if (trimmed.length > 500) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: description must not exceed 500 characters`,
+				);
+			}
+			description = trimmed.length > 0 ? trimmed : null;
+		}
 
 		let installmentCount: number | null = null;
 		if (input.installmentCount != null) {
-			const num = Number(input.installmentCount);
-			if (!Number.isInteger(num) || num < 1 || num > 36) {
+			if (
+				typeof input.installmentCount !== "number" ||
+				!Number.isInteger(input.installmentCount) ||
+				input.installmentCount < 1 ||
+				input.installmentCount > 60
+			) {
 				throw new ImportError(
 					"IMPORT_INVALID_INPUT",
-					`Row ${rowOrdinal}: installmentCount must be an integer between 1 and 36, got ${input.installmentCount}`,
+					`Row ${rowOrdinal}: installmentCount must be an integer between 1 and 60, got ${String(input.installmentCount)}`,
 				);
 			}
-			installmentCount = num;
+			installmentCount = input.installmentCount;
 		}
 
 		const payload: NormalizedCardPurchasePayload = {
@@ -430,11 +549,33 @@ export async function normalizeImportRow(
 	}
 
 	if (input.recordType === "INCOME_RECEIPT") {
+		const allowedKeys = new Set([
+			"recordType",
+			"incomeSourceId",
+			"destinationAccountId",
+			"receivedAt",
+			"amount",
+			"note",
+			"externalTransactionId",
+			"rawRecord",
+		]);
+		for (const key of Object.keys(input)) {
+			if (!allowedKeys.has(key)) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: unknown property "${key}" in INCOME_RECEIPT input`,
+				);
+			}
+		}
+
 		let incomeSourceId: string | null = null;
-		if (
-			input.incomeSourceId != null &&
-			typeof input.incomeSourceId === "string"
-		) {
+		if (input.incomeSourceId != null) {
+			if (typeof input.incomeSourceId !== "string") {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: incomeSourceId must be a string`,
+				);
+			}
 			const trimmed = input.incomeSourceId.trim();
 			if (trimmed.length > 0) {
 				if (!isValidUuid(trimmed)) {
@@ -448,10 +589,13 @@ export async function normalizeImportRow(
 		}
 
 		let destinationAccountId: string | null = null;
-		if (
-			input.destinationAccountId != null &&
-			typeof input.destinationAccountId === "string"
-		) {
+		if (input.destinationAccountId != null) {
+			if (typeof input.destinationAccountId !== "string") {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: destinationAccountId must be a string`,
+				);
+			}
 			const trimmed = input.destinationAccountId.trim();
 			if (trimmed.length > 0) {
 				if (!isValidUuid(trimmed)) {
@@ -464,6 +608,16 @@ export async function normalizeImportRow(
 			}
 		}
 
+		if (
+			!(input.receivedAt instanceof Date) &&
+			typeof input.receivedAt !== "string"
+		) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`Row ${rowOrdinal}: receivedAt must be a Date or ISO date string`,
+			);
+		}
+
 		const receivedDate =
 			input.receivedAt instanceof Date
 				? input.receivedAt
@@ -473,6 +627,13 @@ export async function normalizeImportRow(
 			throw new ImportError(
 				"IMPORT_INVALID_INPUT",
 				`Row ${rowOrdinal}: invalid receivedAt date: ${String(input.receivedAt)}`,
+			);
+		}
+
+		if (typeof input.amount !== "string") {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`Row ${rowOrdinal}: amount must be a decimal string`,
 			);
 		}
 
@@ -490,10 +651,23 @@ export async function normalizeImportRow(
 			);
 		}
 
-		const note =
-			typeof input.note === "string" && input.note.trim().length > 0
-				? input.note.trim().slice(0, 500)
-				: null;
+		let note: string | null = null;
+		if (input.note != null) {
+			if (typeof input.note !== "string") {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: note must be a string`,
+				);
+			}
+			const trimmed = input.note.trim();
+			if (trimmed.length > 500) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: note must not exceed 500 characters`,
+				);
+			}
+			note = trimmed.length > 0 ? trimmed : null;
+		}
 
 		const payload: NormalizedIncomeReceiptPayload = {
 			recordType: "INCOME_RECEIPT",
@@ -529,9 +703,42 @@ export async function normalizeImportRow(
 	}
 
 	if (input.recordType === "UNSUPPORTED") {
+		const allowedKeys = new Set([
+			"recordType",
+			"reason",
+			"externalTransactionId",
+			"rawRecord",
+		]);
+		for (const key of Object.keys(input)) {
+			if (!allowedKeys.has(key)) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: unknown property "${key}" in UNSUPPORTED input`,
+				);
+			}
+		}
+
+		let reason = "Unsupported record type";
+		if (input.reason != null) {
+			if (typeof input.reason !== "string") {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: reason must be a string`,
+				);
+			}
+			const trimmed = input.reason.trim();
+			if (trimmed.length > 500) {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Row ${rowOrdinal}: reason must not exceed 500 characters`,
+				);
+			}
+			reason = trimmed.length > 0 ? trimmed : "Unsupported record type";
+		}
+
 		const payload: NormalizedUnsupportedPayload = {
 			recordType: "UNSUPPORTED",
-			reason: (input.reason ?? "Unsupported record type").slice(0, 500),
+			reason,
 		};
 
 		const semanticFingerprint = await computeUnsupportedSemanticFingerprint({

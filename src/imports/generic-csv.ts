@@ -18,6 +18,7 @@ function getField(
  * Pure RFC 4180 compliant CSV tokenizer/parser.
  * Correctly handles commas inside quotes, escaped double quotes (""),
  * CRLF/LF line breaks, and multi-line quoted fields.
+ * Fails closed on malformed input (e.g. unquoted quotes, chars after quotes).
  */
 export function parseCsvRecords(csvContent: string): string[][] {
 	if (typeof csvContent !== "string") {
@@ -31,6 +32,7 @@ export function parseCsvRecords(csvContent: string): string[][] {
 	let currentRecord: string[] = [];
 	let currentField = "";
 	let inQuotes = false;
+	let afterClosingQuote = false;
 	let i = 0;
 	const len = csvContent.length;
 
@@ -47,11 +49,41 @@ export function parseCsvRecords(csvContent: string): string[][] {
 				}
 				// End of quoted field
 				inQuotes = false;
+				afterClosingQuote = true;
 				i++;
 				continue;
 			}
 			currentField += char;
 			i++;
+		} else if (afterClosingQuote) {
+			if (char === ",") {
+				currentRecord.push(currentField);
+				currentField = "";
+				afterClosingQuote = false;
+				i++;
+			} else if (char === "\r") {
+				if (i + 1 < len && csvContent[i + 1] === "\n") {
+					i++;
+				}
+				currentRecord.push(currentField);
+				currentField = "";
+				records.push(currentRecord);
+				currentRecord = [];
+				afterClosingQuote = false;
+				i++;
+			} else if (char === "\n") {
+				currentRecord.push(currentField);
+				currentField = "";
+				records.push(currentRecord);
+				currentRecord = [];
+				afterClosingQuote = false;
+				i++;
+			} else {
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					`Illegal character "${char}" after closing quote before delimiter`,
+				);
+			}
 		} else {
 			if (char === '"') {
 				if (currentField.length === 0) {
@@ -59,9 +91,11 @@ export function parseCsvRecords(csvContent: string): string[][] {
 					i++;
 					continue;
 				}
-				// Quote inside unquoted field
-				currentField += char;
-				i++;
+				// Illegal quote inside an unquoted field
+				throw new ImportError(
+					"IMPORT_INVALID_INPUT",
+					"Illegal unquoted quote character found in CSV field",
+				);
 			} else if (char === ",") {
 				currentRecord.push(currentField);
 				currentField = "";
@@ -96,7 +130,11 @@ export function parseCsvRecords(csvContent: string): string[][] {
 	}
 
 	// Push trailing field/record if any content exists
-	if (currentField.length > 0 || currentRecord.length > 0) {
+	if (
+		currentField.length > 0 ||
+		currentRecord.length > 0 ||
+		afterClosingQuote
+	) {
 		currentRecord.push(currentField);
 		records.push(currentRecord);
 	}
@@ -137,11 +175,31 @@ export function parseGenericCsvV1(csvContent: string): RawImportRowInput[] {
 	}
 
 	const headers = headerRow.map((h) => h.trim().toLowerCase());
+
+	// Reject duplicate normalized header names
+	const seenHeaders = new Set<string>();
+	for (const h of headers) {
+		if (seenHeaders.has(h)) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`Duplicate header "${h}" in CSV content`,
+			);
+		}
+		seenHeaders.add(h);
+	}
+
 	const rows: RawImportRowInput[] = [];
 
 	for (let i = 1; i < records.length; i++) {
 		const record = records[i];
 		if (!record || (record.length === 1 && record[0] === "")) continue;
+
+		if (record.length !== headers.length) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`Row ${i} field count (${record.length}) does not match header field count (${headers.length})`,
+			);
+		}
 
 		const rowObj: Record<string, string> = {};
 		for (let h = 0; h < headers.length; h++) {

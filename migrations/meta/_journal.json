@@ -379,6 +379,13 @@
       "when": 1788725913227,
       "tag": "0053_ordinary_ken_ellis",
       "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1788757000000,
+      "tag": "0054_harden_import_contracts_and_receipt_authority",
+      "breakpoints": true
     }
   ]
 }

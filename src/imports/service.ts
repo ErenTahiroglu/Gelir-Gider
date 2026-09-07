@@ -171,6 +171,13 @@ export async function buildImportRowReadModelForRevisionInTransaction(
 		);
 	}
 
+	if (rev.importRowId !== importRowId) {
+		throw new ImportError(
+			"IMPORT_INVALID_STATE",
+			"Revision does not belong to the requested import row",
+		);
+	}
+
 	const candidates = await tx
 		.select({
 			candidateType: importDuplicateCandidates.candidateType,
@@ -180,11 +187,29 @@ export async function buildImportRowReadModelForRevisionInTransaction(
 		.from(importDuplicateCandidates)
 		.where(eq(importDuplicateCandidates.importRowId, importRowId));
 
-	const [res] = await tx
-		.select()
-		.from(importRowResults)
-		.where(eq(importRowResults.importRowId, importRowId))
-		.limit(1);
+	const isTerminalWithResult =
+		rev.status === "APPLIED" ||
+		rev.status === "LINKED_EXISTING" ||
+		rev.status === "EXACT_DUPLICATE";
+
+	let result: ImportRowDetail["result"] = null;
+	if (isTerminalWithResult) {
+		const [res] = await tx
+			.select()
+			.from(importRowResults)
+			.where(eq(importRowResults.importRowId, importRowId))
+			.limit(1);
+
+		if (res) {
+			result = {
+				resultKind: res.resultKind as ImportResultKind,
+				targetType: res.targetType as ImportResultTargetType,
+				targetId: res.targetId,
+				canonicalTransactionId: res.canonicalTransactionId,
+				externalIdentityClaimId: res.externalIdentityClaimId,
+			};
+		}
+	}
 
 	return {
 		id: row.id,
@@ -202,15 +227,7 @@ export async function buildImportRowReadModelForRevisionInTransaction(
 			candidateId: c.candidateId,
 			reasonCode: c.reasonCode as ImportDuplicateReasonCode,
 		})),
-		result: res
-			? {
-					resultKind: res.resultKind as ImportResultKind,
-					targetType: res.targetType as ImportResultTargetType,
-					targetId: res.targetId,
-					canonicalTransactionId: res.canonicalTransactionId,
-					externalIdentityClaimId: res.externalIdentityClaimId,
-				}
-			: null,
+		result,
 	};
 }
 
@@ -368,6 +385,29 @@ export async function stageImportBatch(
 	idempotentReplay: boolean;
 }> {
 	// Strict DB-independent validation BEFORE transaction
+	if (!params || typeof params !== "object" || Array.isArray(params)) {
+		throw new ImportError("IMPORT_INVALID_INPUT", "params must be an object");
+	}
+	if (
+		params.sourceContent !== undefined &&
+		params.sourceContent !== null &&
+		typeof params.sourceContent !== "string"
+	) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"sourceContent must be a string",
+		);
+	}
+	if (
+		params.sourceContentHash !== undefined &&
+		params.sourceContentHash !== null &&
+		typeof params.sourceContentHash !== "string"
+	) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"sourceContentHash must be a string",
+		);
+	}
 	if (params.sourceContent && params.sourceContentHash) {
 		const computed = await computeSourceContentHash(params.sourceContent);
 		if (computed !== params.sourceContentHash.trim().toLowerCase()) {
@@ -668,6 +708,9 @@ export async function resolveImportRow(
 	params: ResolveImportRowParams,
 ): Promise<{ row: ImportRowDetail; idempotentReplay: boolean }> {
 	// 1. Strict validation before DB
+	if (!params || typeof params !== "object" || Array.isArray(params)) {
+		throw new ImportError("IMPORT_INVALID_INPUT", "params must be an object");
+	}
 	if (!isValidUuid(params.userId)) {
 		throw new ImportError(
 			"IMPORT_INVALID_INPUT",
@@ -694,6 +737,7 @@ export async function resolveImportRow(
 	const validKey = params.idempotencyKey.trim();
 
 	if (
+		typeof params.expectedRevisionNo !== "number" ||
 		!Number.isInteger(params.expectedRevisionNo) ||
 		params.expectedRevisionNo < 1
 	) {
@@ -709,11 +753,84 @@ export async function resolveImportRow(
 		"RESOLVE_MAPPINGS",
 		"SKIP",
 	];
-	if (!allowedActions.includes(params.action)) {
+	if (
+		typeof params.action !== "string" ||
+		!allowedActions.includes(params.action)
+	) {
 		throw new ImportError(
 			"IMPORT_INVALID_INPUT",
-			`Invalid action "${params.action}". Must be CONFIRM_IMPORT, LINK_EXISTING, RESOLVE_MAPPINGS, or SKIP`,
+			`Invalid action "${String(params.action)}". Must be CONFIRM_IMPORT, LINK_EXISTING, RESOLVE_MAPPINGS, or SKIP`,
 		);
+	}
+
+	if (params.reasonNote !== undefined && params.reasonNote !== null) {
+		if (typeof params.reasonNote !== "string") {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				"reasonNote must be a string",
+			);
+		}
+		if (params.reasonNote.trim().length > 500) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				"reasonNote must not exceed 500 characters",
+			);
+		}
+	}
+
+	if (
+		params.resolvedMappings !== undefined &&
+		params.resolvedMappings !== null
+	) {
+		if (
+			typeof params.resolvedMappings !== "object" ||
+			Array.isArray(params.resolvedMappings)
+		) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				"resolvedMappings must be an object",
+			);
+		}
+	}
+
+	if (params.action === "LINK_EXISTING") {
+		if (
+			!params.linkTarget ||
+			typeof params.linkTarget !== "object" ||
+			Array.isArray(params.linkTarget)
+		) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				"linkTarget is required for LINK_EXISTING action",
+			);
+		}
+		if (!isValidUuid(params.linkTarget.targetId)) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				"linkTarget.targetId must be a valid UUID",
+			);
+		}
+		const allowedTargetTypes = [
+			"CREDIT_CARD_TRANSACTION",
+			"CREDIT_CARD_SPLIT",
+			"INCOME",
+		];
+		if (!allowedTargetTypes.includes(params.linkTarget.targetType)) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				`linkTarget.targetType must be one of: ${allowedTargetTypes.join(", ")}`,
+			);
+		}
+	} else if (params.linkTarget !== undefined && params.linkTarget !== null) {
+		if (
+			typeof params.linkTarget !== "object" ||
+			Array.isArray(params.linkTarget)
+		) {
+			throw new ImportError(
+				"IMPORT_INVALID_INPUT",
+				"linkTarget must be an object",
+			);
+		}
 	}
 
 	const requestFingerprint = await computeResolveRequestFingerprint({
@@ -764,7 +881,7 @@ export async function resolveImportRow(
 			};
 		}
 
-		// 3. Lock row for update and retrieve latest state
+		// 3. Lock row for update
 		const [row] = await tx
 			.select()
 			.from(importRows)
@@ -779,6 +896,43 @@ export async function resolveImportRow(
 
 		if (!row) {
 			throw new ImportError("IMPORT_ROW_NOT_FOUND", "Import row not found");
+		}
+
+		// 3b. SECOND REPLAY CHECK: Check mutation idempotency receipts again after acquiring row lock
+		const [receiptAfterLock] = await tx
+			.select()
+			.from(importMutationIdempotencyReceipts)
+			.where(
+				and(
+					eq(importMutationIdempotencyReceipts.userId, params.userId),
+					eq(importMutationIdempotencyReceipts.idempotencyKey, validKey),
+				),
+			)
+			.limit(1);
+
+		if (receiptAfterLock) {
+			if (
+				receiptAfterLock.operation !== params.action ||
+				receiptAfterLock.requestFingerprint !== requestFingerprint ||
+				receiptAfterLock.importRowId !== params.importRowId
+			) {
+				throw new ImportError(
+					"IMPORT_IDEMPOTENCY_CONFLICT",
+					"Idempotency key has already been used for a different request",
+				);
+			}
+
+			const historicalDetail =
+				await buildImportRowReadModelForRevisionInTransaction(
+					tx,
+					receiptAfterLock.importRowId,
+					receiptAfterLock.importRowRevisionId,
+				);
+
+			return {
+				row: historicalDetail,
+				idempotentReplay: true,
+			};
 		}
 
 		const [currentRev] = await tx
@@ -1122,6 +1276,16 @@ export async function resolveImportRow(
 				);
 			}
 		} else if (params.action === "LINK_EXISTING") {
+			if (
+				currentRev.status !== "READY" &&
+				currentRev.status !== "POSSIBLE_DUPLICATE"
+			) {
+				throw new ImportError(
+					"IMPORT_INVALID_STATE",
+					`Cannot perform LINK_EXISTING from status ${currentRev.status} (expected READY or POSSIBLE_DUPLICATE)`,
+				);
+			}
+
 			if (!params.linkTarget?.targetId) {
 				throw new ImportError(
 					"IMPORT_INVALID_INPUT",
@@ -1137,11 +1301,15 @@ export async function resolveImportRow(
 			}
 
 			operation = "LINK";
-			nextStatus = "LINKED_EXISTING";
 			nextPayload = currentRev.payload as NormalizedImportPayload; // exact copy-forward
 
-			let targetCanonicalTxId: string;
+			let targetCanonicalTxId: string | null = null;
 			let claimIdToBind: string | null = null;
+			let finalResultKind: ImportResultKind = "LINKED_EXISTING";
+			let finalTargetType: ImportResultTargetType =
+				params.linkTarget.targetType;
+			let finalTargetId: string = params.linkTarget.targetId;
+			nextStatus = "LINKED_EXISTING";
 
 			if (params.linkTarget.targetType === "CREDIT_CARD_PURCHASE") {
 				if (row.recordType !== "CREDIT_CARD_PURCHASE") {
@@ -1214,9 +1382,9 @@ export async function resolveImportRow(
 
 				targetCanonicalTxId = cardEvent.canonicalTransactionId;
 
-				// If row has external ID hash, insert claim before linking
+				// If row has external ID hash, insert/check claim before linking
 				if (row.externalTransactionIdHash) {
-					const [newClaim] = await tx
+					await tx
 						.insert(importExternalIdentityClaims)
 						.values({
 							userId: params.userId,
@@ -1226,33 +1394,60 @@ export async function resolveImportRow(
 							externalTransactionIdHash: row.externalTransactionIdHash,
 							importRowId: row.id,
 						})
-						.onConflictDoNothing()
-						.returning({ id: importExternalIdentityClaims.id });
+						.onConflictDoNothing();
 
-					if (newClaim) {
-						claimIdToBind = newClaim.id;
-					} else {
-						const [existingClaim] = await tx
-							.select()
-							.from(importExternalIdentityClaims)
-							.where(
-								and(
-									eq(importExternalIdentityClaims.userId, params.userId),
-									eq(importExternalIdentityClaims.provider, batch.provider),
-									eq(
-										importExternalIdentityClaims.recordType,
-										"CREDIT_CARD_PURCHASE",
-									),
-									eq(importExternalIdentityClaims.scopeId, cardPayload.cardId),
-									eq(
-										importExternalIdentityClaims.externalTransactionIdHash,
-										row.externalTransactionIdHash,
-									),
+					const [claim] = await tx
+						.select()
+						.from(importExternalIdentityClaims)
+						.where(
+							and(
+								eq(importExternalIdentityClaims.userId, params.userId),
+								eq(importExternalIdentityClaims.provider, batch.provider),
+								eq(
+									importExternalIdentityClaims.recordType,
+									"CREDIT_CARD_PURCHASE",
 								),
-							)
+								eq(importExternalIdentityClaims.scopeId, cardPayload.cardId),
+								eq(
+									importExternalIdentityClaims.externalTransactionIdHash,
+									row.externalTransactionIdHash,
+								),
+							),
+						)
+						.limit(1);
+
+					if (!claim) {
+						throw new ImportError(
+							"IMPORT_DATABASE_ERROR",
+							"Failed to resolve external identity claim",
+						);
+					}
+
+					claimIdToBind = claim.id;
+
+					if (claim.importRowId === row.id) {
+						nextStatus = "LINKED_EXISTING";
+						finalResultKind = "LINKED_EXISTING";
+					} else {
+						// Strong ID belongs to another row: transition to EXACT_DUPLICATE
+						const [ownerResult] = await tx
+							.select()
+							.from(importRowResults)
+							.where(eq(importRowResults.importRowId, claim.importRowId))
 							.limit(1);
 
-						claimIdToBind = existingClaim?.id ?? null;
+						if (!ownerResult) {
+							throw new ImportError(
+								"IMPORT_INVALID_STATE",
+								"Claim owner has no authoritative result for exact duplicate",
+							);
+						}
+
+						nextStatus = "EXACT_DUPLICATE";
+						finalResultKind = "EXACT_DUPLICATE";
+						finalTargetType = ownerResult.targetType as ImportResultTargetType;
+						finalTargetId = ownerResult.targetId;
+						targetCanonicalTxId = ownerResult.canonicalTransactionId ?? null;
 					}
 				}
 			} else if (params.linkTarget.targetType === "INCOME_RECEIPT") {
@@ -1328,9 +1523,9 @@ export async function resolveImportRow(
 
 				targetCanonicalTxId = receiptRecord.canonicalTransactionId;
 
-				// If row has external ID hash, insert claim
+				// If row has external ID hash, insert/check claim
 				if (row.externalTransactionIdHash) {
-					const [newClaim] = await tx
+					await tx
 						.insert(importExternalIdentityClaims)
 						.values({
 							userId: params.userId,
@@ -1340,33 +1535,60 @@ export async function resolveImportRow(
 							externalTransactionIdHash: row.externalTransactionIdHash,
 							importRowId: row.id,
 						})
-						.onConflictDoNothing()
-						.returning({ id: importExternalIdentityClaims.id });
+						.onConflictDoNothing();
 
-					if (newClaim) {
-						claimIdToBind = newClaim.id;
-					} else {
-						const [existingClaim] = await tx
-							.select()
-							.from(importExternalIdentityClaims)
-							.where(
-								and(
-									eq(importExternalIdentityClaims.userId, params.userId),
-									eq(importExternalIdentityClaims.provider, batch.provider),
-									eq(importExternalIdentityClaims.recordType, "INCOME_RECEIPT"),
-									eq(
-										importExternalIdentityClaims.scopeId,
-										incPayload.destinationAccountId,
-									),
-									eq(
-										importExternalIdentityClaims.externalTransactionIdHash,
-										row.externalTransactionIdHash,
-									),
+					const [claim] = await tx
+						.select()
+						.from(importExternalIdentityClaims)
+						.where(
+							and(
+								eq(importExternalIdentityClaims.userId, params.userId),
+								eq(importExternalIdentityClaims.provider, batch.provider),
+								eq(importExternalIdentityClaims.recordType, "INCOME_RECEIPT"),
+								eq(
+									importExternalIdentityClaims.scopeId,
+									incPayload.destinationAccountId,
 								),
-							)
+								eq(
+									importExternalIdentityClaims.externalTransactionIdHash,
+									row.externalTransactionIdHash,
+								),
+							),
+						)
+						.limit(1);
+
+					if (!claim) {
+						throw new ImportError(
+							"IMPORT_DATABASE_ERROR",
+							"Failed to resolve external identity claim",
+						);
+					}
+
+					claimIdToBind = claim.id;
+
+					if (claim.importRowId === row.id) {
+						nextStatus = "LINKED_EXISTING";
+						finalResultKind = "LINKED_EXISTING";
+					} else {
+						// Strong ID belongs to another row: transition to EXACT_DUPLICATE
+						const [ownerResult] = await tx
+							.select()
+							.from(importRowResults)
+							.where(eq(importRowResults.importRowId, claim.importRowId))
 							.limit(1);
 
-						claimIdToBind = existingClaim?.id ?? null;
+						if (!ownerResult) {
+							throw new ImportError(
+								"IMPORT_INVALID_STATE",
+								"Claim owner has no authoritative result for exact duplicate",
+							);
+						}
+
+						nextStatus = "EXACT_DUPLICATE";
+						finalResultKind = "EXACT_DUPLICATE";
+						finalTargetType = ownerResult.targetType as ImportResultTargetType;
+						finalTargetId = ownerResult.targetId;
+						targetCanonicalTxId = ownerResult.canonicalTransactionId ?? null;
 					}
 				}
 			} else {
@@ -1381,9 +1603,9 @@ export async function resolveImportRow(
 				.values({
 					userId: params.userId,
 					importRowId: row.id,
-					resultKind: "LINKED_EXISTING",
-					targetType: params.linkTarget.targetType,
-					targetId: params.linkTarget.targetId,
+					resultKind: finalResultKind,
+					targetType: finalTargetType,
+					targetId: finalTargetId,
 					canonicalTransactionId: targetCanonicalTxId,
 					externalIdentityClaimId: claimIdToBind,
 				})
@@ -1468,6 +1690,9 @@ export async function applyImportRow(
 	params: ApplyImportRowParams,
 ): Promise<{ row: ImportRowDetail; idempotentReplay: boolean }> {
 	// Strict validation before DB
+	if (!params || typeof params !== "object" || Array.isArray(params)) {
+		throw new ImportError("IMPORT_INVALID_INPUT", "params must be an object");
+	}
 	if (!isValidUuid(params.userId)) {
 		throw new ImportError(
 			"IMPORT_INVALID_INPUT",
@@ -1494,6 +1719,7 @@ export async function applyImportRow(
 	const validKey = params.idempotencyKey.trim();
 
 	if (
+		typeof params.expectedRevisionNo !== "number" ||
 		!Number.isInteger(params.expectedRevisionNo) ||
 		params.expectedRevisionNo < 1
 	) {
@@ -1562,6 +1788,43 @@ export async function applyImportRow(
 
 		if (!row) {
 			throw new ImportError("IMPORT_ROW_NOT_FOUND", "Import row not found");
+		}
+
+		// 2b. SECOND REPLAY CHECK: Check mutation idempotency receipts again after acquiring row lock
+		const [receiptAfterLock] = await tx
+			.select()
+			.from(importMutationIdempotencyReceipts)
+			.where(
+				and(
+					eq(importMutationIdempotencyReceipts.userId, params.userId),
+					eq(importMutationIdempotencyReceipts.idempotencyKey, validKey),
+				),
+			)
+			.limit(1);
+
+		if (receiptAfterLock) {
+			if (
+				receiptAfterLock.operation !== "APPLY" ||
+				receiptAfterLock.requestFingerprint !== requestFingerprint ||
+				receiptAfterLock.importRowId !== params.importRowId
+			) {
+				throw new ImportError(
+					"IMPORT_IDEMPOTENCY_CONFLICT",
+					"Idempotency key has already been used for a different apply request",
+				);
+			}
+
+			const historicalDetail =
+				await buildImportRowReadModelForRevisionInTransaction(
+					tx,
+					receiptAfterLock.importRowId,
+					receiptAfterLock.importRowRevisionId,
+				);
+
+			return {
+				row: historicalDetail,
+				idempotentReplay: true,
+			};
 		}
 
 		const [currentRev] = await tx
@@ -1997,6 +2260,9 @@ export async function applyReadyImportRows(
 		result?: ImportRowDetail["result"];
 	}>;
 }> {
+	if (!params || typeof params !== "object" || Array.isArray(params)) {
+		throw new ImportError("IMPORT_INVALID_INPUT", "params must be an object");
+	}
 	if (!isValidUuid(params.userId)) {
 		throw new ImportError(
 			"IMPORT_INVALID_INPUT",
@@ -2090,6 +2356,29 @@ export async function previewImportBatch(
 	batchMeta: ImportBatchSummary;
 	rows: ImportRowDetail[];
 }> {
+	if (!params || typeof params !== "object" || Array.isArray(params)) {
+		throw new ImportError("IMPORT_INVALID_INPUT", "params must be an object");
+	}
+	if (
+		params.sourceContent !== undefined &&
+		params.sourceContent !== null &&
+		typeof params.sourceContent !== "string"
+	) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"sourceContent must be a string",
+		);
+	}
+	if (
+		params.sourceContentHash !== undefined &&
+		params.sourceContentHash !== null &&
+		typeof params.sourceContentHash !== "string"
+	) {
+		throw new ImportError(
+			"IMPORT_INVALID_INPUT",
+			"sourceContentHash must be a string",
+		);
+	}
 	let contentHash = params.sourceContentHash;
 	if (!contentHash && params.sourceContent) {
 		contentHash = await computeSourceContentHash(params.sourceContent);
