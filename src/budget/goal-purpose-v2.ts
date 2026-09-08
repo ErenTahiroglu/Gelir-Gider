@@ -128,6 +128,56 @@ async function assertGoalOwned(
 	}
 }
 
+/**
+ * Fail-closed reconciliation of an already-stored purpose revision found by
+ * `(userId, idempotencyKey)` against the incoming effective command. Shared by
+ * the fast pre-transaction path and the in-transaction rechecks (after the
+ * goal lock, and after an `ON CONFLICT DO NOTHING` no-op) so replay-vs-conflict
+ * is decided in exactly one place. A raw unique-violation is never surfaced.
+ */
+async function reconcileExistingRevision(
+	existing: typeof shortTermGoalBudgetV2PurposeRevisions.$inferSelect,
+	ctx: {
+		userId: string;
+		goalId: string;
+		purpose: StgBudgetV2Purpose;
+		operation: "CREATE" | "UPDATE";
+		expectedRevisionNo?: number;
+		explicitOccurredAt: Date | undefined;
+		idempotencyKey: string;
+	},
+): Promise<GoalBudgetV2PurposeResult> {
+	const candidateFp = await calculateGoalPurposeRevisionFingerprint({
+		userId: ctx.userId,
+		goalId: ctx.goalId,
+		operation: ctx.operation,
+		revisionNo: existing.revisionNo,
+		previousRevisionId: existing.previousRevisionId,
+		purpose: ctx.purpose,
+		occurredAt: ctx.explicitOccurredAt ?? existing.occurredAt,
+	});
+	const positionOk =
+		ctx.operation === "CREATE"
+			? existing.revisionNo === 1 && existing.previousRevisionId === null
+			: existing.revisionNo === (ctx.expectedRevisionNo ?? -1) + 1 &&
+				existing.previousRevisionId !== null;
+	const exact =
+		existing.userId === ctx.userId &&
+		existing.goalId === ctx.goalId &&
+		existing.operation === ctx.operation &&
+		positionOk &&
+		existing.revisionFingerprint === candidateFp;
+	if (!exact) {
+		throw new BudgetError(
+			"BUDGET_IDEMPOTENCY_CONFLICT",
+			`Idempotency key "${ctx.idempotencyKey}" was already used with different ${
+				ctx.operation === "CREATE" ? "purpose" : "re-purpose"
+			} parameters`,
+		);
+	}
+	return { purpose: toItem(existing), idempotentReplay: true };
+}
+
 async function findByIdempotencyKey(
 	db: Database,
 	userId: string,
@@ -186,38 +236,26 @@ export async function classifyGoalPurpose(
 	const idempotencyKey = requireKey(params.idempotencyKey);
 	const explicitOccurredAt = validateOptionalOccurredAt(params.occurredAt);
 
+	const reconcileCtx = {
+		userId,
+		goalId,
+		purpose,
+		operation: "CREATE" as const,
+		explicitOccurredAt,
+		idempotencyKey,
+	};
+
 	const existing = await findByIdempotencyKey(db, userId, idempotencyKey);
-	if (existing) {
-		const candidateFp = await calculateGoalPurposeRevisionFingerprint({
-			userId,
-			goalId,
-			operation: "CREATE",
-			revisionNo: existing.revisionNo,
-			previousRevisionId: existing.previousRevisionId,
-			purpose,
-			occurredAt: explicitOccurredAt ?? existing.occurredAt,
-		});
-		if (
-			existing.goalId !== goalId ||
-			existing.operation !== "CREATE" ||
-			candidateFp !== existing.revisionFingerprint
-		) {
-			throw new BudgetError(
-				"BUDGET_IDEMPOTENCY_CONFLICT",
-				`Idempotency key "${idempotencyKey}" was already used with different purpose parameters`,
-			);
-		}
-		return { purpose: toItem(existing), idempotentReplay: true };
-	}
+	if (existing) return reconcileExistingRevision(existing, reconcileCtx);
 
 	return await db.transaction(async (tx) => {
-		await assertGoalOwned(tx as unknown as Database, userId, goalId, true);
+		const txdb = tx as unknown as Database;
+		await assertGoalOwned(txdb, userId, goalId, true);
 
-		const latest = await latestRevisionForGoal(
-			tx as unknown as Database,
-			userId,
-			goalId,
-		);
+		const raced = await findByIdempotencyKey(txdb, userId, idempotencyKey);
+		if (raced) return reconcileExistingRevision(raced, reconcileCtx);
+
+		const latest = await latestRevisionForGoal(txdb, userId, goalId);
 		if (latest) {
 			throw new BudgetError(
 				"BUDGET_REVISION_CONFLICT",
@@ -249,14 +287,29 @@ export async function classifyGoalPurpose(
 				revisionFingerprint,
 				occurredAt,
 			})
+			.onConflictDoNothing({
+				target: [
+					shortTermGoalBudgetV2PurposeRevisions.userId,
+					shortTermGoalBudgetV2PurposeRevisions.idempotencyKey,
+				],
+			})
 			.returning();
-		if (!inserted) {
+		if (inserted) {
+			return { purpose: toItem(inserted), idempotentReplay: false };
+		}
+
+		const afterConflict = await findByIdempotencyKey(
+			txdb,
+			userId,
+			idempotencyKey,
+		);
+		if (!afterConflict) {
 			throw new BudgetError(
 				"BUDGET_INVALID_STATE",
-				"Failed to insert goal purpose revision",
+				"Goal purpose idempotency key conflicted but no row is visible",
 			);
 		}
-		return { purpose: toItem(inserted), idempotentReplay: false };
+		return reconcileExistingRevision(afterConflict, reconcileCtx);
 	});
 }
 
@@ -284,39 +337,27 @@ export async function reclassifyGoalPurpose(
 		);
 	}
 
+	const reconcileCtx = {
+		userId,
+		goalId,
+		purpose,
+		operation: "UPDATE" as const,
+		expectedRevisionNo,
+		explicitOccurredAt,
+		idempotencyKey,
+	};
+
 	const existing = await findByIdempotencyKey(db, userId, idempotencyKey);
-	if (existing) {
-		const candidateFp = await calculateGoalPurposeRevisionFingerprint({
-			userId,
-			goalId,
-			operation: "UPDATE",
-			revisionNo: existing.revisionNo,
-			previousRevisionId: existing.previousRevisionId,
-			purpose,
-			occurredAt: explicitOccurredAt ?? existing.occurredAt,
-		});
-		if (
-			existing.goalId !== goalId ||
-			existing.operation !== "UPDATE" ||
-			existing.revisionNo !== expectedRevisionNo + 1 ||
-			candidateFp !== existing.revisionFingerprint
-		) {
-			throw new BudgetError(
-				"BUDGET_IDEMPOTENCY_CONFLICT",
-				`Idempotency key "${idempotencyKey}" was already used with different re-purpose parameters`,
-			);
-		}
-		return { purpose: toItem(existing), idempotentReplay: true };
-	}
+	if (existing) return reconcileExistingRevision(existing, reconcileCtx);
 
 	return await db.transaction(async (tx) => {
-		await assertGoalOwned(tx as unknown as Database, userId, goalId, true);
+		const txdb = tx as unknown as Database;
+		await assertGoalOwned(txdb, userId, goalId, true);
 
-		const latest = await latestRevisionForGoal(
-			tx as unknown as Database,
-			userId,
-			goalId,
-		);
+		const raced = await findByIdempotencyKey(txdb, userId, idempotencyKey);
+		if (raced) return reconcileExistingRevision(raced, reconcileCtx);
+
+		const latest = await latestRevisionForGoal(txdb, userId, goalId);
 		if (!latest) {
 			throw new BudgetError(
 				"BUDGET_CLASSIFICATION_TARGET_NOT_FOUND",
@@ -355,14 +396,29 @@ export async function reclassifyGoalPurpose(
 				revisionFingerprint,
 				occurredAt,
 			})
+			.onConflictDoNothing({
+				target: [
+					shortTermGoalBudgetV2PurposeRevisions.userId,
+					shortTermGoalBudgetV2PurposeRevisions.idempotencyKey,
+				],
+			})
 			.returning();
-		if (!inserted) {
+		if (inserted) {
+			return { purpose: toItem(inserted), idempotentReplay: false };
+		}
+
+		const afterConflict = await findByIdempotencyKey(
+			txdb,
+			userId,
+			idempotencyKey,
+		);
+		if (!afterConflict) {
 			throw new BudgetError(
 				"BUDGET_INVALID_STATE",
-				"Failed to insert re-purpose revision",
+				"Goal re-purpose idempotency key conflicted but no row is visible",
 			);
 		}
-		return { purpose: toItem(inserted), idempotentReplay: false };
+		return reconcileExistingRevision(afterConflict, reconcileCtx);
 	});
 }
 

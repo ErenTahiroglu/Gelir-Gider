@@ -63,6 +63,47 @@ async function expectAccept(
 	}
 }
 
+/**
+ * Verify, on a live connection with all guards active, that
+ * `INSERT ... ON CONFLICT (user_id, idempotency_key) DO NOTHING RETURNING`
+ * absorbs a duplicate-key write as a 0-row no-op WITHOUT aborting the
+ * transaction (a subsequent insert in the same tx still commits). `rowA`
+ * seeds the key; `rowBConflict` reuses the key on a different target;
+ * `rowBFresh` uses a new key and must succeed to prove the tx is alive.
+ */
+async function idempotencyRaceShape(
+	db: PGlite,
+	label: string,
+	table: string,
+	cols: string,
+	rowA: string,
+	rowBConflict: string,
+	rowBFresh: string,
+) {
+	try {
+		await db.exec("BEGIN");
+		await db.query(`insert into ${table} ${cols} values ${rowA}`);
+		const clash = await db.query(
+			`insert into ${table} ${cols} values ${rowBConflict}
+			 on conflict (user_id, idempotency_key) do nothing returning id`,
+		);
+		clash.rows.length === 0
+			? ok(`${label}: duplicate (user_id,idempotency_key) absorbed as 0-row no-op`)
+			: bad(`${label}: ON CONFLICT`, "-> inserted a row, expected 0");
+		await db.query(`insert into ${table} ${cols} values ${rowBFresh}`);
+		await db.exec("COMMIT");
+		ok(`${label}: transaction NOT aborted by the no-op (follow-up write committed)`);
+	} catch (e) {
+		try {
+			await db.exec("ROLLBACK");
+		} catch {}
+		bad(
+			`${label}: idempotency race shape`,
+			`-> ${String((e as Error).message).slice(0, 120)}`,
+		);
+	}
+}
+
 async function probe(): Promise<boolean> {
 	console.log("== PHASE 1: CAPABILITY PROBE ==");
 	const db = new PGlite();
@@ -206,12 +247,24 @@ async function seed(db: PGlite) {
 			[U1, F] as never[],
 		);
 	}
-	// income receipts (one per source)
+	// income receipts: SUPPORT / REGULAR / EXTRA, plus two extra SUPPORT
+	// receipts reserved for the ON CONFLICT idempotency-key race probe.
+	{
+		const F = "f".repeat(64);
+		await db.query(
+			`insert into canonical_transactions (id,user_id,kind,creation_idempotency_key,creation_fingerprint) values
+			 ('c1000000-0000-4000-8000-00000000000d',$1,'INCOME_RECEIPT','ct-inc-4',$2),
+			 ('c1000000-0000-4000-8000-00000000000e',$1,'INCOME_RECEIPT','ct-inc-5',$2)`,
+			[U1, F] as never[],
+		);
+	}
 	await db.query(
 		`insert into income_receipts (id,user_id,source_id,canonical_transaction_id) values
 		 ('b1000000-0000-4000-8000-000000000001',$1,'a1000000-0000-4000-8000-000000000001','c1000000-0000-4000-8000-00000000000a'),
 		 ('b1000000-0000-4000-8000-000000000002',$1,'a1000000-0000-4000-8000-000000000002','c1000000-0000-4000-8000-00000000000b'),
-		 ('b1000000-0000-4000-8000-000000000003',$1,'a1000000-0000-4000-8000-000000000003','c1000000-0000-4000-8000-00000000000c')`,
+		 ('b1000000-0000-4000-8000-000000000003',$1,'a1000000-0000-4000-8000-000000000003','c1000000-0000-4000-8000-00000000000c'),
+		 ('b1000000-0000-4000-8000-000000000004',$1,'a1000000-0000-4000-8000-000000000001','c1000000-0000-4000-8000-00000000000d'),
+		 ('b1000000-0000-4000-8000-000000000005',$1,'a1000000-0000-4000-8000-000000000001','c1000000-0000-4000-8000-00000000000e')`,
 		[U1] as never[],
 	);
 	// midas chain for a short-term goal
@@ -222,13 +275,17 @@ async function seed(db: PGlite) {
 	await db.query(
 		`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values
 		 ('f1000000-0000-4000-8000-000000000001',$1,'e1000000-0000-4000-8000-000000000001','B_G1','G1 bucket','SHORT_TERM_GOAL'),
-		 ('f1000000-0000-4000-8000-000000000002',$1,'e1000000-0000-4000-8000-000000000001','B_G2','G2 bucket','SHORT_TERM_GOAL')`,
+		 ('f1000000-0000-4000-8000-000000000002',$1,'e1000000-0000-4000-8000-000000000001','B_G2','G2 bucket','SHORT_TERM_GOAL'),
+		 ('f1000000-0000-4000-8000-000000000003',$1,'e1000000-0000-4000-8000-000000000001','B_G3','G3 bucket','SHORT_TERM_GOAL'),
+		 ('f1000000-0000-4000-8000-000000000004',$1,'e1000000-0000-4000-8000-000000000001','B_G4','G4 bucket','SHORT_TERM_GOAL')`,
 		[U1] as never[],
 	);
 	await db.query(
 		`insert into short_term_goals (id,user_id,midas_account_id,midas_bucket_id) values
 		 ('99999999-0000-4000-8000-000000000001',$1,'e1000000-0000-4000-8000-000000000001','f1000000-0000-4000-8000-000000000001'),
-		 ('99999999-0000-4000-8000-000000000002',$1,'e1000000-0000-4000-8000-000000000001','f1000000-0000-4000-8000-000000000002')`,
+		 ('99999999-0000-4000-8000-000000000002',$1,'e1000000-0000-4000-8000-000000000001','f1000000-0000-4000-8000-000000000002'),
+		 ('99999999-0000-4000-8000-000000000003',$1,'e1000000-0000-4000-8000-000000000001','f1000000-0000-4000-8000-000000000003'),
+		 ('99999999-0000-4000-8000-000000000004',$1,'e1000000-0000-4000-8000-000000000001','f1000000-0000-4000-8000-000000000004')`,
 		[U1] as never[],
 	);
 	await db.exec("SET session_replication_role = origin");
@@ -388,6 +445,32 @@ async function runtime() {
 		"delete from short_term_goal_budget_v2_purpose_revisions where id='20000000-0000-4000-8000-000000000001'",
 		[],
 		"DELETE of a goal purpose row rejected (immutability)",
+	);
+
+	// ---- 0063 -- ON CONFLICT (user_id, idempotency_key) race shape ----
+	// Proves the shape the classification services rely on for a cross-target
+	// same-key race: the collision is absorbed as a no-op RETURNING 0 rows and
+	// the surrounding transaction is NOT aborted (a following write commits).
+	console.log(
+		" 0063 -- ON CONFLICT (user_id,idempotency_key) DO NOTHING idempotency race shape",
+	);
+	await idempotencyRaceShape(
+		db,
+		"support",
+		"income_receipt_budget_v2_semantic_revisions",
+		"(user_id,income_receipt_id,revision_no,operation,support_role,idempotency_key,revision_fingerprint,occurred_at)",
+		`('${U1}','b1000000-0000-4000-8000-000000000004',1,'CREATE','PLANNED_FAMILY_GIFT','race-s','${fp}',now())`,
+		`('${U1}','b1000000-0000-4000-8000-000000000005',1,'CREATE','DEFICIT_FAMILY_SUPPORT','race-s','${fp}',now())`,
+		`('${U1}','b1000000-0000-4000-8000-000000000005',1,'CREATE','DEFICIT_FAMILY_SUPPORT','race-s-2','${fp}',now())`,
+	);
+	await idempotencyRaceShape(
+		db,
+		"goal-purpose",
+		"short_term_goal_budget_v2_purpose_revisions",
+		"(user_id,goal_id,revision_no,operation,purpose,idempotency_key,revision_fingerprint,occurred_at)",
+		`('${U1}','99999999-0000-4000-8000-000000000003',1,'CREATE','OTHER','race-g','${fp}',now())`,
+		`('${U1}','99999999-0000-4000-8000-000000000004',1,'CREATE','PLANNED_DISCRETIONARY','race-g','${fp}',now())`,
+		`('${U1}','99999999-0000-4000-8000-000000000004',1,'CREATE','PLANNED_DISCRETIONARY','race-g-2','${fp}',now())`,
 	);
 
 	// ---- 0062 anchor guard ----

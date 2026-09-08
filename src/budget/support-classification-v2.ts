@@ -157,6 +157,61 @@ async function loadSupportReceiptOrThrow(
 	}
 }
 
+/**
+ * Fail-closed reconciliation of an already-stored revision found by
+ * `(userId, idempotencyKey)` against the incoming effective command. Used by
+ * BOTH the fast pre-transaction path and the in-transaction rechecks (after
+ * the target lock, and after an `ON CONFLICT DO NOTHING` no-op), so there is a
+ * single place that decides replay-vs-conflict for this domain.
+ *
+ * Exact match => idempotent replay. Any divergence (target, operation,
+ * revision position, role, or effective occurredAt -- all bound into the
+ * stored fingerprint) => BUDGET_IDEMPOTENCY_CONFLICT. A raw unique-violation
+ * is never surfaced.
+ */
+async function reconcileExistingRevision(
+	existing: typeof incomeReceiptBudgetV2SemanticRevisions.$inferSelect,
+	ctx: {
+		userId: string;
+		incomeReceiptId: string;
+		supportRole: SupportReceiptRole;
+		operation: "CREATE" | "UPDATE";
+		expectedRevisionNo?: number;
+		explicitOccurredAt: Date | undefined;
+		idempotencyKey: string;
+	},
+): Promise<SupportReceiptClassificationResult> {
+	const candidateFp = await calculateSupportSemanticRevisionFingerprint({
+		userId: ctx.userId,
+		incomeReceiptId: ctx.incomeReceiptId,
+		operation: ctx.operation,
+		revisionNo: existing.revisionNo,
+		previousRevisionId: existing.previousRevisionId,
+		supportRole: ctx.supportRole,
+		occurredAt: ctx.explicitOccurredAt ?? existing.occurredAt,
+	});
+	const positionOk =
+		ctx.operation === "CREATE"
+			? existing.revisionNo === 1 && existing.previousRevisionId === null
+			: existing.revisionNo === (ctx.expectedRevisionNo ?? -1) + 1 &&
+				existing.previousRevisionId !== null;
+	const exact =
+		existing.userId === ctx.userId &&
+		existing.incomeReceiptId === ctx.incomeReceiptId &&
+		existing.operation === ctx.operation &&
+		positionOk &&
+		existing.revisionFingerprint === candidateFp;
+	if (!exact) {
+		throw new BudgetError(
+			"BUDGET_IDEMPOTENCY_CONFLICT",
+			`Idempotency key "${ctx.idempotencyKey}" was already used with different ${
+				ctx.operation === "CREATE" ? "classification" : "reclassification"
+			} parameters`,
+		);
+	}
+	return { classification: toItem(existing), idempotentReplay: true };
+}
+
 async function findByIdempotencyKey(
 	db: Database,
 	userId: string,
@@ -221,41 +276,30 @@ export async function classifySupportReceipt(
 	const idempotencyKey = requireKey(params.idempotencyKey);
 	const explicitOccurredAt = validateOptionalOccurredAt(params.occurredAt);
 
-	// HISTORICAL IDEMPOTENCY FIRST -----------------------------------------
+	const reconcileCtx = {
+		userId,
+		incomeReceiptId,
+		supportRole,
+		operation: "CREATE" as const,
+		explicitOccurredAt,
+		idempotencyKey,
+	};
+
+	// FAST HISTORICAL IDEMPOTENCY PATH (normal retries) --------------------
 	const existing = await findByIdempotencyKey(db, userId, idempotencyKey);
-	if (existing) {
-		const candidateFp = await calculateSupportSemanticRevisionFingerprint({
-			userId,
-			incomeReceiptId,
-			operation: "CREATE",
-			revisionNo: existing.revisionNo,
-			previousRevisionId: existing.previousRevisionId,
-			supportRole,
-			occurredAt: explicitOccurredAt ?? existing.occurredAt,
-		});
-		if (
-			existing.incomeReceiptId !== incomeReceiptId ||
-			existing.operation !== "CREATE" ||
-			candidateFp !== existing.revisionFingerprint
-		) {
-			throw new BudgetError(
-				"BUDGET_IDEMPOTENCY_CONFLICT",
-				`Idempotency key "${idempotencyKey}" was already used with different classification parameters`,
-			);
-		}
-		return { classification: toItem(existing), idempotentReplay: true };
-	}
+	if (existing) return reconcileExistingRevision(existing, reconcileCtx);
 
 	return await db.transaction(async (tx) => {
-		await loadSupportReceiptOrThrow(
-			tx as unknown as Database,
-			userId,
-			incomeReceiptId,
-			true,
-		);
+		const txdb = tx as unknown as Database;
+		await loadSupportReceiptOrThrow(txdb, userId, incomeReceiptId, true);
+
+		// SECOND idempotency check -- now holding the receipt lock, a racing
+		// writer that committed after the fast path is visible here.
+		const raced = await findByIdempotencyKey(txdb, userId, idempotencyKey);
+		if (raced) return reconcileExistingRevision(raced, reconcileCtx);
 
 		const latest = await latestRevisionForReceipt(
-			tx as unknown as Database,
+			txdb,
 			userId,
 			incomeReceiptId,
 		);
@@ -278,6 +322,9 @@ export async function classifySupportReceipt(
 				occurredAt,
 			});
 
+		// Race-safe insert: a cross-target same-key writer (whose receipt lock
+		// does NOT serialize against ours) is absorbed by the idempotency
+		// unique index instead of aborting the transaction with a raw 23505.
 		const [inserted] = await tx
 			.insert(incomeReceiptBudgetV2SemanticRevisions)
 			.values({
@@ -291,14 +338,29 @@ export async function classifySupportReceipt(
 				revisionFingerprint,
 				occurredAt,
 			})
+			.onConflictDoNothing({
+				target: [
+					incomeReceiptBudgetV2SemanticRevisions.userId,
+					incomeReceiptBudgetV2SemanticRevisions.idempotencyKey,
+				],
+			})
 			.returning();
-		if (!inserted) {
+		if (inserted) {
+			return { classification: toItem(inserted), idempotentReplay: false };
+		}
+
+		const afterConflict = await findByIdempotencyKey(
+			txdb,
+			userId,
+			idempotencyKey,
+		);
+		if (!afterConflict) {
 			throw new BudgetError(
 				"BUDGET_INVALID_STATE",
-				"Failed to insert support classification revision",
+				"Support classification idempotency key conflicted but no row is visible",
 			);
 		}
-		return { classification: toItem(inserted), idempotentReplay: false };
+		return reconcileExistingRevision(afterConflict, reconcileCtx);
 	});
 }
 
@@ -329,41 +391,28 @@ export async function reclassifySupportReceipt(
 		);
 	}
 
+	const reconcileCtx = {
+		userId,
+		incomeReceiptId,
+		supportRole,
+		operation: "UPDATE" as const,
+		expectedRevisionNo,
+		explicitOccurredAt,
+		idempotencyKey,
+	};
+
 	const existing = await findByIdempotencyKey(db, userId, idempotencyKey);
-	if (existing) {
-		const candidateFp = await calculateSupportSemanticRevisionFingerprint({
-			userId,
-			incomeReceiptId,
-			operation: "UPDATE",
-			revisionNo: existing.revisionNo,
-			previousRevisionId: existing.previousRevisionId,
-			supportRole,
-			occurredAt: explicitOccurredAt ?? existing.occurredAt,
-		});
-		if (
-			existing.incomeReceiptId !== incomeReceiptId ||
-			existing.operation !== "UPDATE" ||
-			existing.revisionNo !== expectedRevisionNo + 1 ||
-			candidateFp !== existing.revisionFingerprint
-		) {
-			throw new BudgetError(
-				"BUDGET_IDEMPOTENCY_CONFLICT",
-				`Idempotency key "${idempotencyKey}" was already used with different reclassification parameters`,
-			);
-		}
-		return { classification: toItem(existing), idempotentReplay: true };
-	}
+	if (existing) return reconcileExistingRevision(existing, reconcileCtx);
 
 	return await db.transaction(async (tx) => {
-		await loadSupportReceiptOrThrow(
-			tx as unknown as Database,
-			userId,
-			incomeReceiptId,
-			true,
-		);
+		const txdb = tx as unknown as Database;
+		await loadSupportReceiptOrThrow(txdb, userId, incomeReceiptId, true);
+
+		const raced = await findByIdempotencyKey(txdb, userId, idempotencyKey);
+		if (raced) return reconcileExistingRevision(raced, reconcileCtx);
 
 		const latest = await latestRevisionForReceipt(
-			tx as unknown as Database,
+			txdb,
 			userId,
 			incomeReceiptId,
 		);
@@ -406,14 +455,29 @@ export async function reclassifySupportReceipt(
 				revisionFingerprint,
 				occurredAt,
 			})
+			.onConflictDoNothing({
+				target: [
+					incomeReceiptBudgetV2SemanticRevisions.userId,
+					incomeReceiptBudgetV2SemanticRevisions.idempotencyKey,
+				],
+			})
 			.returning();
-		if (!inserted) {
+		if (inserted) {
+			return { classification: toItem(inserted), idempotentReplay: false };
+		}
+
+		const afterConflict = await findByIdempotencyKey(
+			txdb,
+			userId,
+			idempotencyKey,
+		);
+		if (!afterConflict) {
 			throw new BudgetError(
 				"BUDGET_INVALID_STATE",
-				"Failed to insert reclassification revision",
+				"Support reclassification idempotency key conflicted but no row is visible",
 			);
 		}
-		return { classification: toItem(inserted), idempotentReplay: false };
+		return reconcileExistingRevision(afterConflict, reconcileCtx);
 	});
 }
 
