@@ -18,11 +18,10 @@ describe("Migration 0061 -- Budget Policy V2 core foundation", () => {
 			when: number;
 			tag: string;
 		}>;
-		const last = entries[entries.length - 1];
-		expect(last?.idx).toBe(61);
-		expect(last?.tag).toBe("0061_add_budget_policy_v2_foundation");
-		const prev = entries[entries.length - 2];
-		expect(last?.when).toBeGreaterThan(prev?.when ?? 0);
+		const at = entries.findIndex((e) => e.idx === 61);
+		expect(at).toBeGreaterThan(0);
+		expect(entries[at]?.tag).toBe("0061_add_budget_policy_v2_foundation");
+		expect(entries[at]?.when).toBeGreaterThan(entries[at - 1]?.when ?? 0);
 	});
 
 	// --- Separate V2 identity / revision projection --------------------

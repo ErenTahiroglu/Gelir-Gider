@@ -66,6 +66,41 @@ export function isBudgetPeriodUniqueViolation(err: unknown): boolean {
 }
 
 /**
+ * V2 analogue of `isBudgetPeriodUniqueViolation` for the
+ * `monthly_budget_v2_plans_user_period_idx` unique constraint. Kept as a
+ * separate function so the V1 detector stays a closed V1-only contract.
+ */
+export function isBudgetV2PeriodUniqueViolation(err: unknown): boolean {
+	let current: unknown = err;
+	let depth = 0;
+
+	while (current && depth < 10) {
+		const obj = current as {
+			code?: string;
+			constraint?: string;
+			detail?: string;
+			message?: string;
+			cause?: unknown;
+		};
+
+		if (obj.code === "23505") {
+			if (obj.constraint === "monthly_budget_v2_plans_user_period_idx") {
+				return true;
+			}
+			const detail = (obj.detail || obj.message || "").toLowerCase();
+			if (detail.includes("monthly_budget_v2_plans_user_period_idx")) {
+				return true;
+			}
+		}
+
+		current = obj.cause;
+		depth++;
+	}
+
+	return false;
+}
+
+/**
  * Wraps validatePeriodMonth from the income domain and maps any IncomeError
  * to BudgetError("BUDGET_INVALID_INPUT", ...) so the budget public API
  * never leaks income-domain error codes.

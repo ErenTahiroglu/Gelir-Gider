@@ -46,10 +46,11 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		}
 	}
 
-	it("audited all database functions and confirmed total count is 150", () => {
-		// 147 through migration 0060; +3 in migration 0061 (the PERSONAL_BUDGET_V2
-		// foundation adds two immutability guards and one revision insert guard).
-		expect(effectiveFunctions.size).toBe(150);
+	it("audited all database functions and confirmed total count is 151", () => {
+		// 147 through migration 0060; +3 in migration 0061 (PERSONAL_BUDGET_V2
+		// foundation: two immutability guards + one revision insert guard);
+		// +1 in migration 0062 (the V2 anchor BEFORE INSERT guard).
+		expect(effectiveFunctions.size).toBe(151);
 	});
 
 	it("migration 0061 contributes exactly the three new V2 budget guard functions", () => {
@@ -62,6 +63,13 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 				"0061_add_budget_policy_v2_foundation",
 			);
 		}
+	});
+
+	it("migration 0062 contributes exactly the V2 anchor insert guard function", () => {
+		expect(
+			effectiveFunctions.get("trg_fn_guard_monthly_budget_v2_plans_insert")
+				?.migration,
+		).toBe("0062_harden_budget_v2_anchor_insert");
 	});
 
 	it("confirms migration 0059 defines the latest active version of all 8 target functions", () => {
