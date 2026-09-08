@@ -19,6 +19,9 @@ export const MIDAS_BUCKET_TYPES = [
 	"MEDIUM_TERM_RESERVE",
 	"INCOME_BUFFER",
 	"PENDING_LONG_TERM",
+	// PERSONAL_BUDGET_V2 core emergency fund. Semantically distinct from
+	// INCOME_BUFFER (which is NOT renamed or reinterpreted). Singleton.
+	"CORE_EMERGENCY_FUND",
 ] as const;
 
 export type MidasBucketType = (typeof MIDAS_BUCKET_TYPES)[number];
@@ -27,7 +30,18 @@ export const SINGLETON_BUCKET_TYPES: readonly MidasBucketType[] = [
 	"MEDIUM_TERM_RESERVE",
 	"INCOME_BUFFER",
 	"PENDING_LONG_TERM",
+	"CORE_EMERGENCY_FUND",
 ] as const;
+
+/**
+ * SQL `IN (...)` list literal for the singleton bucket types, derived from
+ * `SINGLETON_BUCKET_TYPES` so the DB check constraint / partial unique index
+ * predicate (migration 0061) and the `ON CONFLICT` predicate in
+ * `src/midas/service.ts` stay in lockstep with the constant.
+ */
+export const SINGLETON_BUCKET_TYPES_SQL_LIST = SINGLETON_BUCKET_TYPES.map(
+	(t) => `'${t}'`,
+).join(", ");
 
 /**
  * Midas Accounts Table (Physical Liquidity Center Identity)
@@ -86,13 +100,13 @@ export const midasBuckets = pgTable(
 		uniqueIndex("midas_buckets_singleton_type_idx")
 			.on(table.midasAccountId, table.bucketType)
 			.where(
-				sql`${table.bucketType} IN ('MEDIUM_TERM_RESERVE', 'INCOME_BUFFER', 'PENDING_LONG_TERM')`,
+				sql`${table.bucketType} IN ('MEDIUM_TERM_RESERVE', 'INCOME_BUFFER', 'PENDING_LONG_TERM', 'CORE_EMERGENCY_FUND')`,
 			),
 		index("midas_buckets_account_idx").on(table.midasAccountId),
 		index("midas_buckets_user_idx").on(table.userId),
 		check(
 			"midas_buckets_type_check",
-			sql`${table.bucketType} IN ('CREDIT_CARD_RESERVE', 'SHORT_TERM_GOAL', 'MEDIUM_TERM_RESERVE', 'INCOME_BUFFER', 'PENDING_LONG_TERM')`,
+			sql`${table.bucketType} IN ('CREDIT_CARD_RESERVE', 'SHORT_TERM_GOAL', 'MEDIUM_TERM_RESERVE', 'INCOME_BUFFER', 'PENDING_LONG_TERM', 'CORE_EMERGENCY_FUND')`,
 		),
 		check(
 			"midas_buckets_code_check",

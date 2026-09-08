@@ -35,18 +35,22 @@ describe("Midas Schema Definitions (Phase 8A & 8A-R1)", () => {
 		expect(cols.bucketType.dataType).toBe("string");
 		expect(cols.createdAt.dataType).toBe("date");
 
+		// CORE_EMERGENCY_FUND appended for PERSONAL_BUDGET_V2 (migration 0061);
+		// every pre-existing type keeps its identity and order.
 		expect(MIDAS_BUCKET_TYPES).toEqual([
 			"CREDIT_CARD_RESERVE",
 			"SHORT_TERM_GOAL",
 			"MEDIUM_TERM_RESERVE",
 			"INCOME_BUFFER",
 			"PENDING_LONG_TERM",
+			"CORE_EMERGENCY_FUND",
 		]);
 
 		expect(SINGLETON_BUCKET_TYPES).toEqual([
 			"MEDIUM_TERM_RESERVE",
 			"INCOME_BUFFER",
 			"PENDING_LONG_TERM",
+			"CORE_EMERGENCY_FUND",
 		]);
 	});
 

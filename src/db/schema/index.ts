@@ -1,6 +1,7 @@
 export * from "./auth";
 export * from "./backups";
 export * from "./budget";
+export * from "./budget-v2";
 export * from "./campaigns";
 export * from "./credit-card-ledger";
 export * from "./credit-card-splits";

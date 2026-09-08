@@ -13,6 +13,7 @@ import {
 	midasAllocationTransfers,
 	midasBuckets,
 	SINGLETON_BUCKET_TYPES,
+	SINGLETON_BUCKET_TYPES_SQL_LIST,
 } from "../db/schema/midas";
 import {
 	formatSignedCentsToMoney,
@@ -1192,7 +1193,15 @@ export async function ensureMidasSingletonBucketInTransaction({
 		})
 		.onConflictDoNothing({
 			target: [midasBuckets.midasAccountId, midasBuckets.bucketType],
-			where: sql`${midasBuckets.bucketType} IN ('MEDIUM_TERM_RESERVE', 'INCOME_BUFFER', 'PENDING_LONG_TERM')`,
+			// Must match the `midas_buckets_singleton_type_idx` partial unique
+			// index predicate VERBATIM for ON CONFLICT inference to resolve it.
+			// Inlined (sql.raw) rather than parameterized so Postgres can prove
+			// the predicates equal; the list is a compile-time constant derived
+			// from SINGLETON_BUCKET_TYPES, so a new singleton type is covered
+			// automatically.
+			where: sql`${midasBuckets.bucketType} IN (${sql.raw(
+				SINGLETON_BUCKET_TYPES_SQL_LIST,
+			)})`,
 		})
 		.returning();
 

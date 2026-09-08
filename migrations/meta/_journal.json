@@ -428,6 +428,13 @@
       "when": 1788880000000,
       "tag": "0060_seal_canonical_payload_key_presence",
       "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1788900000000,
+      "tag": "0061_add_budget_policy_v2_foundation",
+      "breakpoints": true
     }
   ]
 }
