@@ -449,6 +449,20 @@
       "when": 1788940000000,
       "tag": "0063_add_budget_v2_semantic_classifications",
       "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1788960000000,
+      "tag": "0064_add_budget_basic_living_config",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1788980000000,
+      "tag": "0065_add_credit_card_statement_reconciliation",
+      "breakpoints": true
     }
   ]
 }

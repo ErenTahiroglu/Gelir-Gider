@@ -4,6 +4,8 @@ export * from "./fingerprint";
 export * from "./ledger-provisioning";
 export * from "./payments";
 export * from "./purchases";
+export * from "./reconciliation-fingerprint";
 export * from "./service";
 export * from "./split-allocation";
 export * from "./splits";
+export * from "./statement-reconciliation";

@@ -1,5 +1,7 @@
+export * from "./basic-living-config-v2";
 export * from "./errors";
 export * from "./goal-purpose-v2";
+export * from "./live-resolver-v2";
 export * from "./payload-v2";
 export * from "./policy";
 export * from "./policy-v2";

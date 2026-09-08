@@ -66,3 +66,35 @@ export function calculateGoalPurposeRevisionFingerprint(
 		params.occurredAt.toISOString(),
 	]);
 }
+
+export interface BasicLivingConfigFingerprintParams {
+	userId: string;
+	operation: "CREATE" | "UPDATE";
+	revisionNo: number;
+	previousRevisionId: string | null;
+	effectivePeriodMonth: string;
+	monthlyTargetAmount: string;
+	currency: string;
+	sourceKind: string;
+	occurredAt: Date;
+}
+
+/** Deterministic 64 lowercase-hex fingerprint for a basic-living config revision. */
+export function calculateBasicLivingConfigRevisionFingerprint(
+	params: BasicLivingConfigFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"budget-v2-basic-living-config-v1",
+		params.userId.trim().toLowerCase(),
+		params.operation,
+		params.revisionNo,
+		params.previousRevisionId
+			? params.previousRevisionId.trim().toLowerCase()
+			: null,
+		params.effectivePeriodMonth,
+		params.monthlyTargetAmount,
+		params.currency,
+		params.sourceKind,
+		params.occurredAt.toISOString(),
+	]);
+}

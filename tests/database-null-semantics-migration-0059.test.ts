@@ -46,13 +46,42 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		}
 	}
 
-	it("audited all database functions and confirmed total count is 155", () => {
+	it("audited all database functions and confirmed total count is 162", () => {
 		// 147 through migration 0060; +3 in migration 0061 (PERSONAL_BUDGET_V2
 		// foundation: two immutability guards + one revision insert guard);
 		// +1 in migration 0062 (the V2 anchor BEFORE INSERT guard);
 		// +4 in migration 0063 (two Budget V2 semantic classification domains,
-		// each with an immutability guard + a BEFORE INSERT guard).
-		expect(effectiveFunctions.size).toBe(155);
+		// each with an immutability guard + a BEFORE INSERT guard);
+		// +2 in migration 0064 (basic-living config: one immutability guard +
+		// one BEFORE INSERT chain guard);
+		// +5 in migration 0065 (credit-card statement reconciliation: one shared
+		// immutability guard + anchor / revision / component / seal insert guards).
+		expect(effectiveFunctions.size).toBe(162);
+	});
+
+	it("migration 0064 contributes exactly the two basic-living config guard functions", () => {
+		for (const fnName of [
+			"trg_fn_guard_bv2bl_revisions_immutability",
+			"trg_fn_guard_bv2bl_revisions_insert",
+		]) {
+			expect(effectiveFunctions.get(fnName)?.migration).toBe(
+				"0064_add_budget_basic_living_config",
+			);
+		}
+	});
+
+	it("migration 0065 contributes exactly the five statement-reconciliation guard functions", () => {
+		for (const fnName of [
+			"trg_fn_guard_ccsr_immutability",
+			"trg_fn_guard_ccsr_anchor_insert",
+			"trg_fn_guard_ccsrr_insert",
+			"trg_fn_guard_ccsrc_insert",
+			"trg_fn_guard_ccsr_seal_insert",
+		]) {
+			expect(effectiveFunctions.get(fnName)?.migration).toBe(
+				"0065_add_credit_card_statement_reconciliation",
+			);
+		}
 	});
 
 	it("migration 0063 contributes exactly the four Budget V2 semantic guard functions", () => {
