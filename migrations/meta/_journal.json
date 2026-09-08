@@ -442,6 +442,13 @@
       "when": 1788920000000,
       "tag": "0062_harden_budget_v2_anchor_insert",
       "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1788940000000,
+      "tag": "0063_add_budget_v2_semantic_classifications",
+      "breakpoints": true
     }
   ]
 }

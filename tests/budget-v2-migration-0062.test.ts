@@ -14,12 +14,11 @@ describe("Migration 0062 -- V2 anchor insert guard (forward hardening)", () => {
 			when: number;
 			tag: string;
 		}>;
-		const last = entries[entries.length - 1];
-		const prev = entries[entries.length - 2];
-		expect(last?.idx).toBe(62);
-		expect(last?.tag).toBe("0062_harden_budget_v2_anchor_insert");
-		expect(prev?.idx).toBe(61);
-		expect(last?.when).toBeGreaterThan(prev?.when ?? 0);
+		const at = entries.findIndex((e) => e.idx === 62);
+		expect(at).toBeGreaterThan(0);
+		expect(entries[at]?.tag).toBe("0062_harden_budget_v2_anchor_insert");
+		expect(entries[at - 1]?.idx).toBe(61);
+		expect(entries[at]?.when).toBeGreaterThan(entries[at - 1]?.when ?? 0);
 	});
 
 	it("adds ONE new BEFORE INSERT guard function + trigger on monthly_budget_v2_plans", () => {

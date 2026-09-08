@@ -87,6 +87,18 @@ export function validateBudgetV2ResolvedSnapshot(
 			"Resolved snapshot must be a non-null object",
 		);
 	}
+	// Fail-closed top-level shape: EXACTLY { inputs, evidenceSnapshot }.
+	const topKeys = Object.keys(snapshot);
+	if (
+		topKeys.length !== 2 ||
+		!Object.hasOwn(snapshot, "inputs") ||
+		!Object.hasOwn(snapshot, "evidenceSnapshot")
+	) {
+		throw new BudgetError(
+			"BUDGET_INVALID_INPUT",
+			"Resolved snapshot must contain exactly the keys: inputs, evidenceSnapshot",
+		);
+	}
 	if (!isPlainObject(snapshot.inputs)) {
 		throw new BudgetError(
 			"BUDGET_INVALID_INPUT",

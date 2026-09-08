@@ -2,6 +2,7 @@ export * from "./auth";
 export * from "./backups";
 export * from "./budget";
 export * from "./budget-v2";
+export * from "./budget-v2-semantics";
 export * from "./campaigns";
 export * from "./credit-card-ledger";
 export * from "./credit-card-splits";

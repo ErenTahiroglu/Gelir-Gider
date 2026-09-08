@@ -253,3 +253,40 @@ describe("validateBudgetV2ResolvedSnapshot", () => {
 		}
 	});
 });
+
+describe("Resolved snapshot exact top-level shape (fail-closed boundary)", () => {
+	// A
+	it("A: exactly { inputs, evidenceSnapshot } is accepted", () => {
+		const v = validateBudgetV2ResolvedSnapshot({
+			inputs: INPUTS,
+			evidenceSnapshot: EVIDENCE,
+		});
+		expect(v.policyResult.policyVersion).toBe("PERSONAL_BUDGET_V2");
+	});
+
+	// B
+	it("B: an unknown extra top-level key is rejected with BUDGET_INVALID_INPUT", () => {
+		for (const extra of [
+			{ inputs: INPUTS, evidenceSnapshot: {}, currentObligations: "1.00" },
+			{ inputs: INPUTS, evidenceSnapshot: {}, provenance: { type: "X" } },
+			{ inputs: INPUTS, evidenceSnapshot: {}, outputs: {} },
+		]) {
+			try {
+				validateBudgetV2ResolvedSnapshot(extra);
+				throw new Error("expected throw");
+			} catch (e) {
+				expect(e).toBeInstanceOf(BudgetError);
+				expect((e as BudgetError).code).toBe("BUDGET_INVALID_INPUT");
+			}
+		}
+	});
+
+	// C
+	it("C: a missing required top-level key is rejected", () => {
+		for (const missing of [{ inputs: INPUTS }, { evidenceSnapshot: {} }, {}]) {
+			expect(() => validateBudgetV2ResolvedSnapshot(missing)).toThrow(
+				BudgetError,
+			);
+		}
+	});
+});

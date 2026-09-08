@@ -6,7 +6,10 @@ export type BudgetErrorCode =
 	| "BUDGET_REVISION_CONFLICT"
 	| "BUDGET_ALREADY_VOIDED"
 	| "BUDGET_INVALID_STATE"
-	| "BUDGET_REFERENCE_INVALID_STATE";
+	| "BUDGET_REFERENCE_INVALID_STATE"
+	// Budget V2 semantic classification (support receipts / goal purpose)
+	| "BUDGET_CLASSIFICATION_TARGET_NOT_FOUND"
+	| "BUDGET_CLASSIFICATION_INVALID_TARGET";
 
 export class BudgetError extends Error {
 	readonly code: BudgetErrorCode;

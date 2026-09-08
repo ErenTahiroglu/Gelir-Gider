@@ -46,11 +46,26 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		}
 	}
 
-	it("audited all database functions and confirmed total count is 151", () => {
+	it("audited all database functions and confirmed total count is 155", () => {
 		// 147 through migration 0060; +3 in migration 0061 (PERSONAL_BUDGET_V2
 		// foundation: two immutability guards + one revision insert guard);
-		// +1 in migration 0062 (the V2 anchor BEFORE INSERT guard).
-		expect(effectiveFunctions.size).toBe(151);
+		// +1 in migration 0062 (the V2 anchor BEFORE INSERT guard);
+		// +4 in migration 0063 (two Budget V2 semantic classification domains,
+		// each with an immutability guard + a BEFORE INSERT guard).
+		expect(effectiveFunctions.size).toBe(155);
+	});
+
+	it("migration 0063 contributes exactly the four Budget V2 semantic guard functions", () => {
+		for (const fnName of [
+			"trg_fn_guard_irbv2sem_revisions_immutability",
+			"trg_fn_guard_irbv2sem_revisions_insert",
+			"trg_fn_guard_stgbv2purpose_revisions_immutability",
+			"trg_fn_guard_stgbv2purpose_revisions_insert",
+		]) {
+			expect(effectiveFunctions.get(fnName)?.migration).toBe(
+				"0063_add_budget_v2_semantic_classifications",
+			);
+		}
 	});
 
 	it("migration 0061 contributes exactly the three new V2 budget guard functions", () => {
