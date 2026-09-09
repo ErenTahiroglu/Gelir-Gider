@@ -124,6 +124,67 @@ function lastCalendarDayOfMonth(periodMonth: string): string {
 	return getIstanbulCalendarDate(new Date(next.getTime() - 86_400_000));
 }
 
+/**
+ * The one place the resolver decides "is this current-month event within the
+ * checkpoint window?". Locked semantics:
+ *
+ *   MTD live state at the current checkpoint   -> [periodStart, checkpointAt]
+ *   the current checkpoint instant is INCLUSIVE
+ *
+ * Month-end exception: `periodEnd` is the FIRST instant of the next month, so
+ *   asOf <  periodEnd  ->  occurredAt <= asOf      (checkpoint instant included)
+ *   asOf >= periodEnd  ->  occurredAt <  periodEnd (never bleed into next month)
+ *
+ * Interval membership `(previousCheckpointAt, checkpointAt]` uses the same
+ * upper bound; the previous checkpoint instant is EXCLUSIVE (or periodStart,
+ * inclusive, for the first checkpoint).
+ */
+export interface ResolverWindow {
+	periodStart: Date;
+	periodEnd: Date;
+	asOf: Date;
+	asOfInclusive: boolean;
+	intervalStart: Date;
+	intervalStartInclusive: boolean;
+	/** upper bound instant for evidence labels */
+	upperLabel: Date;
+	inMtd(occurredAt: Date): boolean;
+	inInterval(occurredAt: Date): boolean;
+}
+
+export function buildResolverWindow(
+	periodMonth: string,
+	asOf: Date,
+	previousCheckpointAt: Date | undefined,
+): ResolverWindow {
+	const periodStart = new Date(`${periodMonth}T00:00:00+03:00`);
+	const periodEnd = firstDayOfNextMonthIstanbulUtc(periodMonth);
+	const asOfInclusive = asOf < periodEnd;
+	const withinUpper = (t: Date): boolean =>
+		asOfInclusive ? t <= asOf : t < periodEnd;
+	const hasPrev =
+		previousCheckpointAt instanceof Date &&
+		!Number.isNaN(previousCheckpointAt.getTime());
+	const intervalStart = hasPrev ? (previousCheckpointAt as Date) : periodStart;
+	return {
+		periodStart,
+		periodEnd,
+		asOf,
+		asOfInclusive,
+		intervalStart,
+		intervalStartInclusive: !hasPrev,
+		upperLabel: asOfInclusive ? asOf : periodEnd,
+		inMtd(t: Date): boolean {
+			if (t < periodStart) return false;
+			return withinUpper(t);
+		},
+		inInterval(t: Date): boolean {
+			const lowerOk = hasPrev ? t > intervalStart : t >= intervalStart;
+			return lowerOk && withinUpper(t);
+		},
+	};
+}
+
 /** ceil(numeratorCents / months) in exact BigInt. */
 function ceilDivCents(numeratorCents: bigint, months: number): bigint {
 	const d = BigInt(months);
@@ -246,8 +307,7 @@ interface RealizedIncomeResult {
 async function resolveRealizedIncome(
 	db: Database,
 	userId: string,
-	windowStart: Date,
-	windowEnd: Date,
+	win: ResolverWindow,
 ): Promise<RealizedIncomeResult> {
 	const receipts = await db
 		.select({ receiptId: incomeReceipts.id, nature: incomeSources.nature })
@@ -274,7 +334,7 @@ async function resolveRealizedIncome(
 			.limit(1);
 		if (!latest || latest.operation === "VOID") continue;
 		const occurredAt = asDate(latest.occurredAt);
-		if (occurredAt < windowStart || occurredAt >= windowEnd) continue;
+		if (!win.inMtd(occurredAt)) continue;
 		const amountCents = parseAggregateMoneyString(latest.amount).cents;
 
 		if (r.nature === "REGULAR") {
@@ -533,8 +593,7 @@ async function resolveBasicLiving(
 	db: Database,
 	userId: string,
 	periodMonth: string,
-	windowStart: Date,
-	windowEnd: Date,
+	win: ResolverWindow,
 ): Promise<BasicLivingResult> {
 	const mandatoryPersonalByEvent = new Map<string, bigint>();
 	const mandatoryPeopleByObligation = new Map<string, bigint>();
@@ -596,7 +655,7 @@ async function resolveBasicLiving(
 		if (p.operation === "VOID") continue;
 		if (p.budgetCategory !== "MANDATORY_EXPENSE") continue;
 		const at = asDate(p.occurredAt);
-		if (at < windowStart || at >= windowEnd) continue;
+		if (!win.inMtd(at)) continue;
 		const grossCents = parseAggregateMoneyString(p.amount).cents;
 		const personalCents = await personalPurchaseShareCents(
 			db,
@@ -641,7 +700,7 @@ async function resolveBasicLiving(
 		if (!rev || rev.operation === "VOID") continue;
 		if (rev.budgetCategory !== "MANDATORY_EXPENSE") continue;
 		const at = asDate(rev.occurredAt);
-		if (at < windowStart || at >= windowEnd) continue;
+		if (!win.inMtd(at)) continue;
 		const cents = parseAggregateMoneyString(rev.principal).cents;
 		spend += cents;
 		mandatoryPeopleByObligation.set(
@@ -673,6 +732,9 @@ async function resolveBasicLiving(
 // Only subtract an overlap that EXACT source identity proves (never dates/amounts).
 // ============================================================================
 
+const PARTIAL_CARRY_IN_OVERLAP_REASON =
+	"PARTIAL_CARRY_IN_CATEGORY_ALLOCATION_UNRESOLVED";
+
 function computeBasicLivingOverlapCents(
 	basicLiving: BasicLivingResult,
 	obligations: CurrentObligationsResult,
@@ -684,7 +746,12 @@ function computeBasicLivingOverlapCents(
 	);
 
 	for (const st of obligations.recognizedStatements) {
+		// CASE B -- fully pre-funded by the reserve; nothing recognised in
+		// currentObligations, so no overlap.
 		if (st.burdenCents <= 0n) continue;
+
+		// Exact current-period MANDATORY overlap candidate amount, matched only by
+		// exact purchase-event identity.
 		let m = 0n;
 		const events: string[] = [];
 		for (const c of st.personalPurchaseComponents) {
@@ -695,20 +762,48 @@ function computeBasicLivingOverlapCents(
 			remainingMandatoryByEvent.set(c.purchaseEventId, mand - take);
 			events.push(c.purchaseEventId);
 		}
-		// Reserve carry-in funded `carryInFundedCents` of the personal share; only
-		// the FRESH burden (personalShare - carryIn) can overlap current income.
-		const stmtOverlap =
-			m - st.carryInFundedCents > 0n ? m - st.carryInFundedCents : 0n;
-		if (stmtOverlap > 0n) {
-			overlap += stmtOverlap;
-			detail.push({
-				statementId: st.statementId,
-				mandatoryPersonalPurchaseInStatement: formatCentsToMoney(m),
-				carryInFunded: formatCentsToMoney(st.carryInFundedCents),
-				overlapRecognized: formatCentsToMoney(stmtOverlap),
-				events,
-			});
+		// The rest of the personal share (non-mandatory purchase components,
+		// adjustments, mandatory purchases outside the MTD window, ...).
+		const nonMandatoryCents =
+			st.personalShareCents - m > 0n ? st.personalShareCents - m : 0n;
+
+		let stmtOverlap: bigint;
+		let overlapBasis: string;
+		if (st.carryInFundedCents === 0n) {
+			// CASE A -- no carry-in; the whole personal burden is fresh income, so
+			// the mandatory overlap is exactly `m`.
+			stmtOverlap = m;
+			overlapBasis = "A_NO_CARRY_IN";
+		} else if (m === 0n) {
+			// CASE D with no mandatory candidates -- exact zero.
+			stmtOverlap = 0n;
+			overlapBasis = "D_NO_MANDATORY_CANDIDATE";
+		} else if (nonMandatoryCents === 0n) {
+			// CASE D where the ENTIRE personal share is the MTD-mandatory
+			// population: however the pre-period carry-in is allocated, the fresh
+			// burden is 100% mandatory, so overlap == burden (== m - carryIn),
+			// invariant to allocation.
+			stmtOverlap = st.burdenCents;
+			overlapBasis = "D_ALL_PERSONAL_ALL_MANDATORY";
+		} else {
+			// CASE D, mandatory MIXED with other personal spend under a partial
+			// carry-in: stored truth does not prove which the carry-in funded.
+			failClosed(
+				`credit-card statement ${st.statementId}: a partial pre-period reserve carry-in of ${st.carryInFundedCents} kurus funds an all-personal statement whose personal share ${st.personalShareCents} mixes MTD-mandatory ${m} and other ${nonMandatoryCents} spend; the category allocation of the carry-in is not authoritative (${PARTIAL_CARRY_IN_OVERLAP_REASON})`,
+			);
 		}
+
+		detail.push({
+			statementId: st.statementId,
+			personalShare: formatCentsToMoney(st.personalShareCents),
+			carryInFunded: formatCentsToMoney(st.carryInFundedCents),
+			mtdMandatoryCandidate: formatCentsToMoney(m),
+			nonMandatoryOrUnmatched: formatCentsToMoney(nonMandatoryCents),
+			overlapBasis,
+			overlapRecognized: formatCentsToMoney(stmtOverlap),
+			events,
+		});
+		overlap += stmtOverlap;
 	}
 
 	for (const [
@@ -736,6 +831,8 @@ function computeBasicLivingOverlapCents(
 
 interface RecognizedStatement {
 	statementId: string;
+	/** total PERSONAL component amount of the statement (kurus). */
+	personalShareCents: bigint;
 	carryInFundedCents: bigint;
 	burdenCents: bigint;
 	personalPurchaseComponents: Array<{
@@ -791,10 +888,9 @@ async function resolveCurrentObligations(
 	db: Database,
 	userId: string,
 	periodMonth: string,
-	periodStart: Date,
-	windowStart: Date,
-	windowEnd: Date,
+	win: ResolverWindow,
 ): Promise<CurrentObligationsResult> {
+	const periodStart = win.periodStart;
 	const lastDay = lastCalendarDayOfMonth(periodMonth);
 	let total = 0n;
 	const ccEvidence: Array<Record<string, unknown>> = [];
@@ -850,7 +946,7 @@ async function resolveCurrentObligations(
 				if (paidAt < periodStart) {
 					recognisePeriod = false; // settled before this period -- history
 					recognitionBasis = "PAID_BEFORE_PERIOD";
-				} else if (paidAt < windowEnd) {
+				} else if (win.inMtd(paidAt)) {
 					recognisePeriod = true; // actual current-period cash commitment
 					recognitionBasis = "PAID_WITHIN_PERIOD";
 				} else {
@@ -929,6 +1025,7 @@ async function resolveCurrentObligations(
 				}));
 			recognizedStatements.push({
 				statementId: s.id,
+				personalShareCents: recon.personalCents,
 				carryInFundedCents: carryInFunded,
 				burdenCents: burden,
 				personalPurchaseComponents,
@@ -995,7 +1092,7 @@ async function resolveCurrentObligations(
 			const appliedCents = parseAggregateMoneyString(sr.applied).cents;
 			settledToDate += appliedCents;
 			const at = asDate(sr.occurredAt);
-			if (at >= windowStart && at < windowEnd) settledInPeriod += appliedCents;
+			if (win.inMtd(at)) settledInPeriod += appliedCents;
 		}
 		const remainingCents =
 			principalCents - settledToDate > 0n ? principalCents - settledToDate : 0n;
@@ -1077,23 +1174,39 @@ export async function resolveBudgetV2LiveSnapshot(
 			`asOf ${asOf.toISOString()} precedes the start of period ${periodMonth}`,
 		);
 	}
-	const windowStart = periodStart;
-	const windowEnd = asOf < periodEnd ? asOf : periodEnd;
 
-	const intervalStart =
-		params.previousCheckpointAt instanceof Date &&
-		!Number.isNaN(params.previousCheckpointAt.getTime())
-			? params.previousCheckpointAt
-			: periodStart;
-	const intervalEnd = windowEnd;
+	// section 3 -- validate an explicit previous checkpoint before building the
+	// window (never silently swap or clamp).
+	const prevRaw = params.previousCheckpointAt;
+	if (prevRaw instanceof Date) {
+		if (Number.isNaN(prevRaw.getTime())) {
+			throw new BudgetError(
+				"BUDGET_INVALID_INPUT",
+				"previousCheckpointAt is not a valid Date",
+			);
+		}
+		if (prevRaw >= asOf) {
+			throw new BudgetError(
+				"BUDGET_INVALID_INPUT",
+				`previousCheckpointAt ${prevRaw.toISOString()} is not before the current checkpoint ${asOf.toISOString()}`,
+			);
+		}
+		if (prevRaw >= periodEnd) {
+			throw new BudgetError(
+				"BUDGET_INVALID_INPUT",
+				`previousCheckpointAt ${prevRaw.toISOString()} is at or after the end of period ${periodMonth}; the interval would be empty`,
+			);
+		}
+	}
+
+	const win = buildResolverWindow(periodMonth, asOf, prevRaw ?? undefined);
+	const windowStart = win.periodStart;
+	const windowEnd = win.upperLabel;
+	const intervalStart = win.intervalStart;
+	const intervalEnd = win.upperLabel;
 
 	const goals = await loadGoalStates(db, userId);
-	const income = await resolveRealizedIncome(
-		db,
-		userId,
-		windowStart,
-		windowEnd,
-	);
+	const income = await resolveRealizedIncome(db, userId, win);
 	const emergency = await resolveEmergencyFund(db, userId, asOf);
 	const mobility = await resolveMobilityBalance(db, userId, goals, asOf);
 	const dateBound = await resolveDateBoundNecessary(
@@ -1103,20 +1216,12 @@ export async function resolveBudgetV2LiveSnapshot(
 		periodMonth,
 		periodStart,
 	);
-	const basicLiving = await resolveBasicLiving(
-		db,
-		userId,
-		periodMonth,
-		windowStart,
-		windowEnd,
-	);
+	const basicLiving = await resolveBasicLiving(db, userId, periodMonth, win);
 	const obligations = await resolveCurrentObligations(
 		db,
 		userId,
 		periodMonth,
-		periodStart,
-		windowStart,
-		windowEnd,
+		win,
 	);
 
 	// section 4 -- basicLivingFunding after removing the exact overlap with items

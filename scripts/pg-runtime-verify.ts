@@ -1810,12 +1810,320 @@ async function resolverRuntime4A() {
 	await pg.close();
 }
 
+// ============================================================================
+// PHASE 4A.1: PARTIAL-CARRY-IN OVERLAP AMBIGUITY + INCLUSIVE-END BOUNDARY
+// ============================================================================
+
+async function resolverRuntime4A1() {
+	console.log(
+		"\n== PHASE 4A.1: PARTIAL CARRY-IN OVERLAP + CHECKPOINT BOUNDARY ==",
+	);
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const { resolveBudgetV2LiveSnapshot, buildResolverWindow } = await import(
+		"../src/budget/live-resolver-v2.ts"
+	);
+	const { createBasicLivingTarget } = await import(
+		"../src/budget/basic-living-config-v2.ts"
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+
+	// --- pure window-boundary assertions (F..M) ------------------------------
+	const P = "2026-09-01";
+	const periodStart = new Date("2026-09-01T00:00:00+03:00");
+	const periodEnd = new Date("2026-10-01T00:00:00+03:00");
+	const asOf = new Date("2026-09-20T09:00:00+03:00");
+	const prev = new Date("2026-09-10T00:00:00+03:00");
+	const wMid = buildResolverWindow(P, asOf, prev);
+	const wMonthEnd = buildResolverWindow(
+		P,
+		new Date("2026-11-01T00:00:00+03:00"),
+		undefined,
+	);
+	const chk = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	// F: event exactly at asOf -> INCLUDED in MTD
+	chk(wMid.inMtd(asOf) === true, "F: an event exactly at checkpointAt is INCLUDED in MTD");
+	// G: PAID event exactly at checkpointAt -> INCLUDED (same rule as F)
+	chk(
+		wMid.inMtd(new Date(asOf.getTime())) === true,
+		"G: a PAID event exactly at checkpointAt is INCLUDED",
+	);
+	// H: event exactly at previousCheckpointAt -> EXCLUDED from the interval
+	chk(wMid.inInterval(prev) === false, "H: an event exactly at previousCheckpointAt is EXCLUDED from the interval");
+	// I: event 1 ms after previousCheckpointAt -> INCLUDED
+	chk(
+		wMid.inInterval(new Date(prev.getTime() + 1)) === true,
+		"I: an event 1ms after previousCheckpointAt is INCLUDED in the interval",
+	);
+	// first checkpoint: periodStart is INCLUSIVE
+	chk(
+		buildResolverWindow(P, asOf, undefined).inInterval(periodStart) === true,
+		"first checkpoint: periodStart is INCLUSIVE in the interval",
+	);
+	// J: event exactly at next-month periodEnd -> EXCLUDED from the prior month
+	chk(
+		wMonthEnd.inMtd(periodEnd) === false,
+		"J: an event exactly at next-month periodEnd is EXCLUDED from the month",
+	);
+	chk(
+		wMonthEnd.inMtd(new Date(periodEnd.getTime() - 1)) === true,
+		"J: the last instant before periodEnd is still INCLUDED",
+	);
+	// K: reserve transfer exactly at periodStart -> still NOT carry-in (exclusive)
+	//    -- covered as case O in Phase 4A; re-assert the window contract here:
+	chk(
+		wMid.asOfInclusive === true && wMonthEnd.asOfInclusive === false,
+		"asOf < periodEnd => inclusive checkpoint; asOf >= periodEnd => month cap",
+	);
+
+	// --- M: previousCheckpointAt after asOf -> rejected ---------------------
+	{
+		const pg0 = new PGlite();
+		await pg0.query("SET timezone='UTC'");
+		await applyChain(pg0, 66);
+		// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+		const db0 = drizzle(pg0 as any) as any;
+		try {
+			await resolveBudgetV2LiveSnapshot({
+				db: db0,
+				userId: U1,
+				periodMonth: P,
+				asOf,
+				previousCheckpointAt: new Date("2026-09-25T00:00:00+03:00"),
+			});
+			bad("M: previousCheckpointAt > asOf was NOT rejected");
+		} catch (e) {
+			String((e as Error).message).includes("not before the current checkpoint")
+				? ok("M: previousCheckpointAt after the current checkpoint => BUDGET_INVALID_INPUT")
+				: bad("M: previous checkpoint validation", `-> ${(e as Error).message}`);
+		}
+		await pg0.close();
+	}
+
+	// --- partial carry-in overlap (A..E) ----------------------------------
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 66);
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
+	const F = "f".repeat(64);
+	const asOfSep = new Date("2026-09-20T09:00:00+03:00");
+	await pg.exec("SET session_replication_role = replica");
+	await pg.query(
+		"insert into users (id, display_name, currency, timezone) values ($1,'U','TRY','Europe/Istanbul')",
+		[U1] as never[],
+	);
+	await pg.query(
+		`insert into ledger_accounts (id,user_id,code,name,account_type,normal_balance,currency) values ('d1000000-0000-4000-8000-000000000001',$1,'ASSET_CASH','Cash','ASSET','DEBIT','TRY')`,
+		[U1] as never[],
+	);
+	await pg.query(
+		`insert into midas_accounts (id,user_id,ledger_account_id) values ('e1000000-0000-4000-8000-000000000001',$1,'d1000000-0000-4000-8000-000000000001')`,
+		[U1] as never[],
+	);
+	await pg.query(
+		`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values
+		 ('f0000000-0000-4000-8000-000000000001',$1,'e1000000-0000-4000-8000-000000000001','CEF','E','CORE_EMERGENCY_FUND'),
+		 ('f0000000-0000-4000-8000-0000000000a1',$1,'e1000000-0000-4000-8000-000000000001','RA','A','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000b1',$1,'e1000000-0000-4000-8000-000000000001','RB','B','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000c1',$1,'e1000000-0000-4000-8000-000000000001','RC','C','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000d1',$1,'e1000000-0000-4000-8000-000000000001','RD','D','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000e1',$1,'e1000000-0000-4000-8000-000000000001','RE','E','CREDIT_CARD_RESERVE')`,
+		[U1] as never[],
+	);
+	const mk = (id: string, to: string, amt: string, when: string) =>
+		pg.query(
+			`insert into midas_allocation_transfers (id,user_id,midas_account_id,idempotency_key,transfer_fingerprint,from_bucket_id,to_bucket_id,amount,occurred_at) values ($1,$2,'e1000000-0000-4000-8000-000000000001',$3,$4,null,$5,$6,$7)`,
+			[id, U1, `mt-${id.slice(-6)}`, F, to, amt, when] as never[],
+		);
+	await mk("aa000000-0000-4000-8000-000000000001", "f0000000-0000-4000-8000-000000000001", "10000.00", "2026-08-01 00:00:00+00");
+	await mk("aa000000-0000-4000-8000-0000000000a1", "f0000000-0000-4000-8000-0000000000a1", "300.00", "2026-08-15 00:00:00+00"); // A partial
+	await mk("aa000000-0000-4000-8000-0000000000b1", "f0000000-0000-4000-8000-0000000000b1", "300.00", "2026-08-15 00:00:00+00"); // B partial
+	await mk("aa000000-0000-4000-8000-0000000000c1", "f0000000-0000-4000-8000-0000000000c1", "300.00", "2026-08-15 00:00:00+00"); // C partial
+	// D: zero carry-in
+	await mk("aa000000-0000-4000-8000-0000000000e1", "f0000000-0000-4000-8000-0000000000e1", "1000.00", "2026-08-15 00:00:00+00"); // E full
+	await pg.query(
+		`insert into credit_cards (id,user_id,code) values ('80000000-0000-4000-8000-000000000001',$1,'CARDA')`,
+		[U1] as never[],
+	);
+	await pg.query(
+		`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-0000000000a1',$1,'80000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','A','B','1','10','90000.00',now(),'ccr-1',$2)`,
+		[U1, F] as never[],
+	);
+	await pg.exec("SET session_replication_role = origin");
+	await createBasicLivingTarget({
+		db, userId: U1, effectivePeriodMonth: "2026-09-01",
+		monthlyTargetAmount: "6000.00", currency: "TRY",
+		sourceKind: "USER_APPROVED", idempotencyKey: "bl-4a1",
+	});
+
+	let seq = 0;
+	const seedStmt = async (reserveBucket: string, amount: string) => {
+		seq++;
+		const sid = `81000000-0000-4000-8000-0000000${seq.toString().padStart(5, "0")}`;
+		const r1 = `82000000-0000-4000-8000-0000000${seq.toString().padStart(5, "0")}`;
+		await pg.exec("SET session_replication_role = replica");
+		await pg.query(
+			`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ($1,$2,'80000000-0000-4000-8000-000000000001','e1000000-0000-4000-8000-000000000001',$3,$4,6)`,
+			[sid, U1, reserveBucket, 2060 + seq] as never[],
+		);
+		await pg.query(
+			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','OPEN',$4,'2026-09-01','2026-09-10','MIDAS_FUND','2026-09-01 00:00:00+00',$5,$6)`,
+			[r1, U1, sid, amount, `sr-${seq}`, F] as never[],
+		);
+		await pg.exec("SET session_replication_role = origin");
+		return { sid, r1 };
+	};
+	const seedPur = async (
+		amount: string,
+		category: string,
+		occurredAt = "2026-09-02 00:00:00+00",
+	) => {
+		seq++;
+		const eid = `83000000-0000-4000-8000-0000000${seq.toString().padStart(5, "0")}`;
+		const ct = `84000000-0000-4000-8000-0000000${seq.toString().padStart(5, "0")}`;
+		const tr = `85000000-0000-4000-8000-0000000${seq.toString().padStart(5, "0")}`;
+		const er = `86000000-0000-4000-8000-0000000${seq.toString().padStart(5, "0")}`;
+		await pg.exec("SET session_replication_role = replica");
+		await pg.query(
+			`insert into canonical_transactions (id,user_id,kind,creation_idempotency_key,creation_fingerprint) values ($1,$2,'CREDIT_CARD_PURCHASE',$3,$4)`,
+			[ct, U1, `cp-${seq}`, F] as never[],
+		);
+		await pg.query(
+			`insert into transaction_revisions (id,user_id,transaction_id,revision_no,operation,occurred_at,payload,revision_fingerprint,idempotency_key) values ($1,$2,$3,1,'CREATE',$4,'{}'::jsonb,$5,$6)`,
+			[tr, U1, ct, occurredAt, F, `cptr-${seq}`] as never[],
+		);
+		await pg.query(
+			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ($1,$2,'80000000-0000-4000-8000-000000000001','PURCHASE',$3)`,
+			[eid, U1, ct] as never[],
+		);
+		await pg.query(
+			`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,canonical_revision_id,operation,amount,budget_category,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8,$9)`,
+			[er, U1, eid, tr, amount, category, occurredAt, `cper-${seq}`, F] as never[],
+		);
+		await pg.exec("SET session_replication_role = origin");
+		return { eid };
+	};
+	let voidN = 0;
+	const voidStmt = async (sid: string, r1: string) => {
+		voidN++;
+		await pg.exec("SET session_replication_role = replica");
+		await pg.query(
+			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint)
+			 select $1,$2,statement_id,2,$3,'VOID','VOID',statement_amount,statement_date,due_date,reserve_placement,'2026-09-29 00:00:00+00',$4,revision_fingerprint from credit_card_statement_revisions where id=$3`,
+			[`8f000000-0000-4000-8000-0000000${voidN.toString().padStart(5, "0")}`, U1, r1, `vs-${voidN}`] as never[],
+		);
+		await pg.exec("SET session_replication_role = origin");
+	};
+
+	// A: partial carry-in (300), all-personal, WHOLE personal share is MTD-mandatory -> exact
+	{
+		const { sid, r1 } = await seedStmt("f0000000-0000-4000-8000-0000000000a1", "1000.00");
+		const p = await seedPur("1000.00", "MANDATORY_EXPENSE");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: `rc-a1-${seq}`,
+			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: p.eid }],
+		});
+		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: P, asOf: asOfSep });
+		const bl = (res.evidenceSnapshot as any).basicLiving;
+		const d = bl.basicLivingOverlapDetail.find((x: any) => x.statementId === sid);
+		(d?.overlapBasis === "D_ALL_PERSONAL_ALL_MANDATORY" && bl.basicLivingOverlapWithCurrentObligations === "700.00")
+			? ok("A: partial carry-in, 100% personal, 100% MTD-mandatory => EXACT overlap = burden (m - carryIn = 700)")
+			: bad("A: exact partial overlap", `-> basis=${d?.overlapBasis} overlap=${bl.basicLivingOverlapWithCurrentObligations}`);
+		await voidStmt(sid, r1);
+	}
+	// B: partial carry-in, all-personal, mandatory 400 + discretionary 600 -> FAIL CLOSED
+	{
+		const { sid, r1 } = await seedStmt("f0000000-0000-4000-8000-0000000000b1", "1000.00");
+		const pm = await seedPur("400.00", "MANDATORY_EXPENSE");
+		const pd = await seedPur("600.00", "DISCRETIONARY_SPEND");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: `rc-b1-${seq}`,
+			components: [
+				{ componentType: "PURCHASE", amount: "400.00", ownership: "PERSONAL", purchaseEventId: pm.eid },
+				{ componentType: "PURCHASE", amount: "600.00", ownership: "PERSONAL", purchaseEventId: pd.eid },
+			],
+		});
+		try {
+			await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: P, asOf: asOfSep });
+			bad("B: mandatory + discretionary under partial carry-in did NOT fail closed");
+		} catch (e) {
+			String((e as Error).message).includes("PARTIAL_CARRY_IN_CATEGORY_ALLOCATION_UNRESOLVED")
+				? ok("B: partial carry-in + mandatory/discretionary mix => FAIL CLOSED (PARTIAL_CARRY_IN_CATEGORY_ALLOCATION_UNRESOLVED)")
+				: bad("B: fail closed", `-> ${(e as Error).message}`);
+		}
+		await voidStmt(sid, r1);
+	}
+	// C: partial carry-in, all-personal, mandatory-in-window 500 + mandatory-OUT-of-window 500 -> FAIL CLOSED
+	{
+		const { sid, r1 } = await seedStmt("f0000000-0000-4000-8000-0000000000c1", "1000.00");
+		const pin = await seedPur("500.00", "MANDATORY_EXPENSE", "2026-09-03 00:00:00+00");
+		const pout = await seedPur("500.00", "MANDATORY_EXPENSE", "2026-08-20 00:00:00+00"); // before periodStart -> not MTD
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: `rc-c1-${seq}`,
+			components: [
+				{ componentType: "PURCHASE", amount: "500.00", ownership: "PERSONAL", purchaseEventId: pin.eid },
+				{ componentType: "PURCHASE", amount: "500.00", ownership: "PERSONAL", purchaseEventId: pout.eid },
+			],
+		});
+		try {
+			await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: P, asOf: asOfSep });
+			bad("C: mandatory + non-MTD component under partial carry-in did NOT fail closed");
+		} catch (e) {
+			String((e as Error).message).includes("PARTIAL_CARRY_IN_CATEGORY_ALLOCATION_UNRESOLVED")
+				? ok("C: partial carry-in + unmatched/non-MTD component => FAIL CLOSED")
+				: bad("C: fail closed", `-> ${(e as Error).message}`);
+		}
+		await voidStmt(sid, r1);
+	}
+	// D: ZERO carry-in + mixed categories -> exact overlap (CASE A, overlap = m)
+	{
+		const { sid, r1 } = await seedStmt("f0000000-0000-4000-8000-0000000000d1", "1000.00");
+		const pm = await seedPur("400.00", "MANDATORY_EXPENSE");
+		const pd = await seedPur("600.00", "DISCRETIONARY_SPEND");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: `rc-d1-${seq}`,
+			components: [
+				{ componentType: "PURCHASE", amount: "400.00", ownership: "PERSONAL", purchaseEventId: pm.eid },
+				{ componentType: "PURCHASE", amount: "600.00", ownership: "PERSONAL", purchaseEventId: pd.eid },
+			],
+		});
+		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: P, asOf: asOfSep });
+		const bl = (res.evidenceSnapshot as any).basicLiving;
+		const d = bl.basicLivingOverlapDetail.find((x: any) => x.statementId === sid);
+		(d?.overlapBasis === "A_NO_CARRY_IN" && bl.basicLivingOverlapWithCurrentObligations === "400.00")
+			? ok("D: zero carry-in + mixed categories => exact overlap = MTD-mandatory candidate (400)")
+			: bad("D: zero carry-in overlap", `-> basis=${d?.overlapBasis} overlap=${bl.basicLivingOverlapWithCurrentObligations}`);
+		await voidStmt(sid, r1);
+	}
+	// E: FULL carry-in -> burden zero -> overlap zero
+	{
+		const { sid, r1 } = await seedStmt("f0000000-0000-4000-8000-0000000000e1", "1000.00");
+		const pm = await seedPur("1000.00", "MANDATORY_EXPENSE");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: `rc-e1-${seq}`,
+			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: pm.eid }],
+		});
+		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: P, asOf: asOfSep });
+		const bl = (res.evidenceSnapshot as any).basicLiving;
+		(bl.basicLivingOverlapWithCurrentObligations === "0.00" &&
+			(res.evidenceSnapshot as any).obligations.creditCardStatements.find((x: any) => x.statementId === sid)?.recognizedPersonalBurden === "0.00")
+			? ok("E: full pre-period reserve => statement burden 0 and overlap 0")
+			: bad("E: full carry-in", `-> overlap=${bl.basicLivingOverlapWithCurrentObligations}`);
+		await voidStmt(sid, r1);
+	}
+
+	await pg.close();
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
 	await runtime();
 	await resolverRuntime();
 	await resolverRuntime4A();
+	await resolverRuntime4A1();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
