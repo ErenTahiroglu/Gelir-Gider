@@ -1506,7 +1506,7 @@ async function resolverRuntime4A() {
 		).rows;
 		await pg.query(
 			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint)
-			 select $1,$2,statement_id,$3,$4,'VOID','VOID',statement_amount,statement_date,due_date,reserve_placement,'2026-09-30 00:00:00+00',$5,revision_fingerprint
+			 select $1,$2,statement_id,$3,$4,'VOID','VOID',statement_amount,statement_date,due_date,reserve_placement,'2026-09-18 00:00:00+00',$5,revision_fingerprint
 			 from credit_card_statement_revisions where id=$4`,
 			[
 				`8f000000-0000-4000-8000-0000000${voidSeq.toString().padStart(5, "0")}`,
@@ -2011,7 +2011,7 @@ async function resolverRuntime4A1() {
 		await pg.exec("SET session_replication_role = replica");
 		await pg.query(
 			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint)
-			 select $1,$2,statement_id,2,$3,'VOID','VOID',statement_amount,statement_date,due_date,reserve_placement,'2026-09-29 00:00:00+00',$4,revision_fingerprint from credit_card_statement_revisions where id=$3`,
+			 select $1,$2,statement_id,2,$3,'VOID','VOID',statement_amount,statement_date,due_date,reserve_placement,'2026-09-18 00:00:00+00',$4,revision_fingerprint from credit_card_statement_revisions where id=$3`,
 			[`8f000000-0000-4000-8000-0000000${voidN.toString().padStart(5, "0")}`, U1, r1, `vs-${voidN}`] as never[],
 		);
 		await pg.exec("SET session_replication_role = origin");
@@ -2121,6 +2121,472 @@ async function resolverRuntime4A1() {
 // PHASE 4B: AUTHORITATIVE CHECKPOINT REPORT READ MODEL (hardened in 4B.1)
 // ============================================================================
 
+const B4_IDS = {
+	F: "f".repeat(64),
+	CASH: "d1000000-0000-4000-8000-000000000001",
+	INCOME_ACC: "d1000000-0000-4000-8000-000000000002",
+	MID: "e1000000-0000-4000-8000-000000000001",
+	CEF: "f0000000-0000-4000-8000-000000000001",
+	CARD: "80000000-0000-4000-8000-000000000001",
+	P_FAM: "9a000000-0000-4000-8000-000000000001",
+	P_FRI: "9a000000-0000-4000-8000-000000000002",
+	P_OTH: "9a000000-0000-4000-8000-000000000003",
+	REG1: "a1000000-0000-4000-8000-000000000001",
+	SUP1: "a1000000-0000-4000-8000-000000000003",
+	SUP2: "a1000000-0000-4000-8000-000000000004",
+	EXT1: "a1000000-0000-4000-8000-000000000005",
+	P: "2026-09-01",
+} as const;
+
+/**
+ * One fresh disposable PGlite DB + the shared Budget V2 checkpoint fixture
+ * (user / ledger / midas+CEF / card / people / basic-living) plus every raw
+ * seed helper. Reused by Phase 4B and Phase 4B.2.
+ */
+async function make4bScenario() {
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const { createBasicLivingTarget } = await import(
+		"../src/budget/basic-living-config-v2.ts"
+	);
+	const {
+		F,
+		CASH,
+		INCOME_ACC,
+		MID,
+		CEF,
+		CARD,
+		P_FAM,
+		P_FRI,
+		P_OTH,
+		REG1,
+		SUP1,
+		SUP2,
+		EXT1,
+		P,
+	} = B4_IDS;
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 66);
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
+
+	let n = 0;
+	const gid = () => {
+		n++;
+		return `90000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
+	};
+	const q = <T = unknown>(sql: string, params: unknown[] = []) =>
+		pg.query<T>(sql, params as never[]);
+	const replica = () => pg.exec("SET session_replication_role = replica");
+	const origin = () => pg.exec("SET session_replication_role = origin");
+
+	const mkCanon = async (kind: string, occ: string) => {
+		const ct = gid();
+		const tr = gid();
+		await q(
+			`insert into canonical_transactions (id,user_id,kind,creation_idempotency_key,creation_fingerprint) values ($1,$2,$3,$4,$5)`,
+			[ct, U1, kind, `ck-${n}`, F],
+		);
+		await q(
+			`insert into transaction_revisions (id,user_id,transaction_id,revision_no,operation,occurred_at,payload,revision_fingerprint,idempotency_key) values ($1,$2,$3,1,'CREATE',$4,'{}'::jsonb,$5,$6)`,
+			[tr, U1, ct, occ, F, `tk-${n}`],
+		);
+		return { ct, tr };
+	};
+	const mkReceipt = async (
+		rid: string,
+		src: string,
+		amount: string,
+		occ: string,
+	) => {
+		const { ct, tr } = await mkCanon("INCOME_RECEIPT", occ);
+		await q(
+			`insert into income_receipts (id,user_id,source_id,canonical_transaction_id) values ($1,$2,$3,$4)`,
+			[rid, U1, src, ct],
+		);
+		await q(
+			`insert into income_receipt_revisions (id,user_id,income_receipt_id,canonical_revision_id,revision_no,operation,occurred_at,amount,destination_account_id) values ($1,$2,$3,$4,1,'CREATE',$5,$6,$7)`,
+			[gid(), U1, rid, tr, occ, amount, CASH],
+		);
+	};
+	const mkPur = async (
+		amount: string,
+		category: string,
+		occ: string,
+		opts: { merchant?: string; installmentCount?: number } = {},
+	) => {
+		const { ct, tr } = await mkCanon("CREDIT_CARD_PURCHASE", occ);
+		const eid = gid();
+		const er = gid();
+		await q(
+			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ($1,$2,$3,'PURCHASE',$4)`,
+			[eid, U1, CARD, ct],
+		);
+		await q(
+			`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,canonical_revision_id,operation,amount,budget_category,merchant,installment_count,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8,$9,$10,$11)`,
+			[
+				er,
+				U1,
+				eid,
+				tr,
+				amount,
+				category,
+				opts.merchant ?? null,
+				opts.installmentCount ?? null,
+				occ,
+				`pk-${n}`,
+				F,
+			],
+		);
+		return { eid, er };
+	};
+	const mkPurRev = async (
+		eid: string,
+		prevEr: string,
+		revNo: number,
+		op: string,
+		amount: string,
+		category: string,
+		occ: string,
+	) => {
+		const { tr } = await mkCanon("CREDIT_CARD_PURCHASE", occ);
+		const er = gid();
+		await q(
+			`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,previous_revision_id,canonical_revision_id,operation,amount,budget_category,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			[er, U1, eid, revNo, prevEr, tr, op, amount, category, occ, `pk-${n}`, F],
+		);
+		return er;
+	};
+	const mkObligation = async (
+		oblId: string,
+		person: string,
+		dir: "RECEIVABLE" | "PAYABLE",
+		principal: string,
+		occ: string,
+	) => {
+		const { ct, tr } = await mkCanon(
+			dir === "RECEIVABLE"
+				? "PERSON_RECEIVABLE_ADVANCE"
+				: "PERSON_PAYABLE_EXPENSE",
+			occ,
+		);
+		await q(
+			`insert into person_obligations (id,user_id,person_id,direction,canonical_transaction_id) values ($1,$2,$3,$4,$5)`,
+			[oblId, U1, person, dir, ct],
+		);
+		await q(
+			`insert into person_obligation_revisions (id,user_id,obligation_id,revision_no,canonical_revision_id,operation,principal_amount,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8)`,
+			[gid(), U1, oblId, tr, principal, occ, `ok-${n}`, F],
+		);
+	};
+	const mkSettlement = async (
+		setId: string,
+		oblId: string,
+		applied: string,
+		occ: string,
+	) => {
+		const { ct, tr } = await mkCanon("PERSON_OBLIGATION_SETTLEMENT", occ);
+		await q(
+			`insert into person_settlements (id,user_id,obligation_id,canonical_transaction_id) values ($1,$2,$3,$4)`,
+			[setId, U1, oblId, ct],
+		);
+		await q(
+			`insert into person_settlement_revisions (id,user_id,settlement_id,revision_no,operation,asset_account_id,cash_amount,applied_amount,excess_amount,occurred_at,canonical_revision_id,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE',$4,$5,$5,'0.00',$6,$7,$8,$9)`,
+			[gid(), U1, setId, CASH, applied, occ, tr, `sk-${n}`, F],
+		);
+	};
+	let rbSeq = 0;
+	const nextReserve = () => {
+		rbSeq++;
+		return `f0000000-0000-4000-8000-00000000b0${rbSeq.toString().padStart(2, "0")}`;
+	};
+	const mkStmt = async (
+		sid: string,
+		amount: string,
+		cycleMonth: number,
+		reserveBucket?: string,
+	) => {
+		const rb = reserveBucket ?? nextReserve();
+		const r1 = gid();
+		await q(
+			`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,$4,'reserve','CREDIT_CARD_RESERVE')`,
+			[rb, U1, MID, `RB${rbSeq}`],
+		);
+		await q(
+			`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ($1,$2,$3,$4,$5,2026,$6)`,
+			[sid, U1, CARD, MID, rb, cycleMonth],
+		);
+		await q(
+			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','OPEN',$4,'2026-09-01','2026-09-20','MIDAS_FUND','2026-09-01 00:00:00+00',$5,$6)`,
+			[r1, U1, sid, amount, `stk-${n}`, F],
+		);
+		return r1;
+	};
+	const mkStmtRev = async (
+		sid: string,
+		prevRevId: string,
+		revNo: number,
+		op: "PAY" | "REOPEN" | "VOID",
+		status: "PAID" | "OPEN" | "VOID",
+		amount: string,
+		occ: string,
+		paymentEventId: string | null = null,
+	) => {
+		const id = gid();
+		await q(
+			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,payment_event_id,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,$8,'2026-09-01','2026-09-20','MIDAS_FUND',$9,$10,$11,$12)`,
+			[
+				id,
+				U1,
+				sid,
+				revNo,
+				prevRevId,
+				op,
+				status,
+				amount,
+				paymentEventId,
+				occ,
+				`stk-${n}`,
+				F,
+			],
+		);
+		return id;
+	};
+	const mkPayEvent = async (sid: string, amount: string, occ: string) => {
+		const { ct } = await mkCanon("CREDIT_CARD_STATEMENT_PAYMENT", occ);
+		const pe = gid();
+		await q(
+			`insert into credit_card_statement_payment_events (id,user_id,statement_id,canonical_transaction_id,payment_asset_account_id,amount,occurred_at) values ($1,$2,$3,$4,$5,$6,$7)`,
+			[pe, U1, sid, ct, CASH, amount, occ],
+		);
+		return pe;
+	};
+	const mkPay = async (
+		sid: string,
+		prevRevId: string,
+		amount: string,
+		revNo: number,
+		payAt: string,
+	) => {
+		const pe = await mkPayEvent(sid, amount, payAt);
+		const r = await mkStmtRev(
+			sid,
+			prevRevId,
+			revNo,
+			"PAY",
+			"PAID",
+			amount,
+			payAt,
+			pe,
+		);
+		return { pe, r };
+	};
+	const mkSplit = async (opts: {
+		purchaseEid: string;
+		purchaseEr: string;
+		splitId: string;
+		revNo?: number;
+		prevRevId?: string | null;
+		op?: "CREATE" | "UPDATE" | "VOID";
+		user: string;
+		ext: string;
+		gross: string;
+		occ: string;
+		sealed?: boolean;
+		personId?: string;
+		personObligationId?: string;
+		participantId?: string;
+		itemShare?: string;
+		withItem?: boolean;
+	}) => {
+		const revNo = opts.revNo ?? 1;
+		const op = opts.op ?? "CREATE";
+		const sealed = opts.sealed ?? true;
+		const withItem = opts.withItem ?? true;
+		const splitRev = gid();
+		let participantId = opts.participantId;
+		if (revNo === 1) {
+			await q(
+				`insert into credit_card_purchase_splits (id,user_id,purchase_event_id) values ($1,$2,$3)`,
+				[opts.splitId, U1, opts.purchaseEid],
+			);
+			if (opts.personId && opts.personObligationId) {
+				participantId = gid();
+				await q(
+					`insert into credit_card_purchase_split_participants (id,user_id,split_id,person_id,person_obligation_id) values ($1,$2,$3,$4,$5)`,
+					[participantId, U1, opts.splitId, opts.personId, opts.personObligationId],
+				);
+			}
+		}
+		await q(
+			`insert into credit_card_purchase_split_revisions (id,split_id,revision_no,previous_revision_id,operation,method,purchase_event_revision_id,gross_amount,user_share_amount,external_share_amount,occurred_at,revision_fingerprint) values ($1,$2,$3,$4,$5,'MANUAL',$6,$7,$8,$9,$10,$11)`,
+			[
+				splitRev,
+				opts.splitId,
+				revNo,
+				opts.prevRevId ?? null,
+				op,
+				opts.purchaseEr,
+				opts.gross,
+				opts.user,
+				opts.ext,
+				opts.occ,
+				F,
+			],
+		);
+		if (withItem && op !== "VOID" && opts.personId && participantId) {
+			await q(
+				`insert into credit_card_purchase_split_revision_items (id,split_revision_id,participant_id,person_id,share_amount) values ($1,$2,$3,$4,$5)`,
+				[gid(), splitRev, participantId, opts.personId, opts.itemShare ?? opts.ext],
+			);
+		}
+		if (sealed) {
+			await q(
+				`insert into credit_card_purchase_split_revision_seals (split_revision_id) values ($1)`,
+				[splitRev],
+			);
+		}
+		return { splitId: opts.splitId, splitRev, participantId };
+	};
+	const mkCardRev = async (
+		revNo: number,
+		prevRevId: string,
+		displayName: string,
+		issuer: string,
+		occ: string,
+	) => {
+		const id = gid();
+		await q(
+			`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,previous_revision_id,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,'UPDATE','ACTIVE',$6,$7,'1','20','90000.00',$8,$9,$10)`,
+			[id, U1, CARD, revNo, prevRevId, displayName, issuer, occ, `ccr-${n}`, F],
+		);
+		return id;
+	};
+	const mkPerson = async (
+		personId: string,
+		name: string,
+		rel: "FAMILY" | "FRIEND" | "OTHER",
+		occ: string,
+	) => {
+		await q(`insert into people (id,user_id) values ($1,$2)`, [personId, U1]);
+		const rid = gid();
+		await q(
+			`insert into person_revisions (id,user_id,person_id,revision_no,operation,status,display_name,relationship,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE',$4,$5,$6,$7,$8)`,
+			[rid, U1, personId, name, rel, occ, `pr-${personId.slice(-4)}`, F],
+		);
+		return rid;
+	};
+	const mkPersonRev = async (
+		personId: string,
+		prevRevId: string,
+		revNo: number,
+		name: string,
+		rel: "FAMILY" | "FRIEND" | "OTHER",
+		occ: string,
+	) => {
+		const id = gid();
+		await q(
+			`insert into person_revisions (id,user_id,person_id,revision_no,previous_revision_id,operation,status,display_name,relationship,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,'UPDATE','ACTIVE',$6,$7,$8,$9,$10)`,
+			[id, U1, personId, revNo, prevRevId, name, rel, occ, `pr-${n}`, F],
+		);
+		return id;
+	};
+
+	// base fixture
+	await replica();
+	await q(
+		"insert into users (id, display_name, currency, timezone) values ($1,'U','TRY','Europe/Istanbul')",
+		[U1],
+	);
+	await q(
+		`insert into ledger_accounts (id,user_id,code,name,account_type,normal_balance,currency) values
+		 ($1,$3,'ASSET_CASH','Cash','ASSET','DEBIT','TRY'),
+		 ($2,$3,'INCOME_GEN','Income','INCOME','CREDIT','TRY')`,
+		[CASH, INCOME_ACC, U1],
+	);
+	await q(
+		`insert into midas_accounts (id,user_id,ledger_account_id) values ($1,$2,$3)`,
+		[MID, U1, CASH],
+	);
+	await q(
+		`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,'CEF','Emergency','CORE_EMERGENCY_FUND')`,
+		[CEF, U1, MID],
+	);
+	await q(
+		`insert into midas_allocation_transfers (id,user_id,midas_account_id,idempotency_key,transfer_fingerprint,from_bucket_id,to_bucket_id,amount,occurred_at) values ($1,$2,$3,'mt-cef',$4,null,$5,'10000.00','2026-08-01 00:00:00+00')`,
+		[gid(), U1, MID, F, CEF],
+	);
+	await q(
+		`insert into income_sources (id,user_id,code,name,nature,reference_method,expected_monthly_amount,income_ledger_account_id,active_from) values
+		 ($1,$5,'REG1','Salary','REGULAR','FIXED_MONTHLY','20000.00',$6,'1900-01-01'),
+		 ($2,$5,'SUP1','Family A','SUPPORT','EXCLUDED',null,$6,'1900-01-01'),
+		 ($3,$5,'SUP2','Family B','SUPPORT','EXCLUDED',null,$6,'1900-01-01'),
+		 ($4,$5,'EXT1','Bonus','EXTRA','EXCLUDED',null,$6,'1900-01-01')`,
+		[REG1, SUP1, SUP2, EXT1, U1, INCOME_ACC],
+	);
+	await q(`insert into credit_cards (id,user_id,code) values ($1,$2,'CARDA')`, [
+		CARD,
+		U1,
+	]);
+	await q(
+		`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE','Akbank Axess','Akbank','1','20','90000.00','2026-07-01 00:00:00+00','ccr-1',$4)`,
+		[gid(), U1, CARD, F],
+	);
+	await mkPerson(P_FAM, "Anne", "FAMILY", "2026-07-01 00:00:00+00");
+	await mkPerson(P_FRI, "Kerem", "FRIEND", "2026-07-01 00:00:00+00");
+	await mkPerson(P_OTH, "Komsu", "OTHER", "2026-07-01 00:00:00+00");
+	await origin();
+	await createBasicLivingTarget({
+		db,
+		userId: U1,
+		effectivePeriodMonth: "2026-09-01",
+		monthlyTargetAmount: "6000.00",
+		currency: "TRY",
+		sourceKind: "USER_APPROVED",
+		idempotencyKey: "bl-4b",
+		occurredAt: new Date("2026-08-15T00:00:00Z"),
+	});
+
+	return {
+		pg,
+		db,
+		F,
+		CASH,
+		INCOME_ACC,
+		MID,
+		CEF,
+		CARD,
+		P_FAM,
+		P_FRI,
+		P_OTH,
+		REG1,
+		SUP1,
+		SUP2,
+		EXT1,
+		P,
+		gid,
+		q,
+		replica,
+		origin,
+		mkCanon,
+		mkReceipt,
+		mkPur,
+		mkPurRev,
+		mkObligation,
+		mkSettlement,
+		mkStmt,
+		mkStmtRev,
+		mkPayEvent,
+		mkPay,
+		mkSplit,
+		mkCardRev,
+		mkPerson,
+		mkPersonRev,
+		close: () => pg.close(),
+	};
+}
+
+
 function centsB(v: string): bigint {
 	const [i, f = "0"] = v.split(".");
 	return BigInt(i ?? "0") * 100n + BigInt((f + "00").slice(0, 2));
@@ -2148,20 +2614,22 @@ async function resolverRuntime4B() {
 		"../src/credit-cards/statement-reconciliation.ts"
 	);
 
-	const F = "f".repeat(64);
-	const CASH = "d1000000-0000-4000-8000-000000000001";
-	const INCOME_ACC = "d1000000-0000-4000-8000-000000000002";
-	const MID = "e1000000-0000-4000-8000-000000000001";
-	const CEF = "f0000000-0000-4000-8000-000000000001";
-	const CARD = "80000000-0000-4000-8000-000000000001";
-	const P_FAM = "9a000000-0000-4000-8000-000000000001";
-	const P_FRI = "9a000000-0000-4000-8000-000000000002";
-	const P_OTH = "9a000000-0000-4000-8000-000000000003";
-	const REG1 = "a1000000-0000-4000-8000-000000000001";
-	const SUP1 = "a1000000-0000-4000-8000-000000000003";
-	const SUP2 = "a1000000-0000-4000-8000-000000000004";
-	const EXT1 = "a1000000-0000-4000-8000-000000000005";
-	const P = "2026-09-01";
+	const {
+		F,
+		CASH,
+		INCOME_ACC,
+		MID,
+		CEF,
+		CARD,
+		P_FAM,
+		P_FRI,
+		P_OTH,
+		REG1,
+		SUP1,
+		SUP2,
+		EXT1,
+		P,
+	} = B4_IDS;
 
 	const eqB = (a: unknown, b: unknown, name: string) =>
 		a === b
@@ -2183,414 +2651,8 @@ async function resolverRuntime4B() {
 		}
 	};
 
-	// ---- one fresh disposable DB + the common fixture + raw seed helpers ----
-	const scenario = async () => {
-		const pg = new PGlite();
-		await pg.query("SET timezone='UTC'");
-		await applyChain(pg, 66);
-		// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
-		const db = drizzle(pg as any) as any;
-
-		let n = 0;
-		const gid = () => {
-			n++;
-			return `90000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
-		};
-		const q = <T = unknown>(sql: string, params: unknown[] = []) =>
-			pg.query<T>(sql, params as never[]);
-		const replica = () => pg.exec("SET session_replication_role = replica");
-		const origin = () => pg.exec("SET session_replication_role = origin");
-
-		const mkCanon = async (kind: string, occ: string) => {
-			const ct = gid();
-			const tr = gid();
-			await q(
-				`insert into canonical_transactions (id,user_id,kind,creation_idempotency_key,creation_fingerprint) values ($1,$2,$3,$4,$5)`,
-				[ct, U1, kind, `ck-${n}`, F],
-			);
-			await q(
-				`insert into transaction_revisions (id,user_id,transaction_id,revision_no,operation,occurred_at,payload,revision_fingerprint,idempotency_key) values ($1,$2,$3,1,'CREATE',$4,'{}'::jsonb,$5,$6)`,
-				[tr, U1, ct, occ, F, `tk-${n}`],
-			);
-			return { ct, tr };
-		};
-		const mkReceipt = async (
-			rid: string,
-			src: string,
-			amount: string,
-			occ: string,
-		) => {
-			const { ct, tr } = await mkCanon("INCOME_RECEIPT", occ);
-			await q(
-				`insert into income_receipts (id,user_id,source_id,canonical_transaction_id) values ($1,$2,$3,$4)`,
-				[rid, U1, src, ct],
-			);
-			await q(
-				`insert into income_receipt_revisions (id,user_id,income_receipt_id,canonical_revision_id,revision_no,operation,occurred_at,amount,destination_account_id) values ($1,$2,$3,$4,1,'CREATE',$5,$6,$7)`,
-				[gid(), U1, rid, tr, occ, amount, CASH],
-			);
-		};
-		const mkPur = async (
-			amount: string,
-			category: string,
-			occ: string,
-			opts: { merchant?: string; installmentCount?: number } = {},
-		) => {
-			const { ct, tr } = await mkCanon("CREDIT_CARD_PURCHASE", occ);
-			const eid = gid();
-			const er = gid();
-			await q(
-				`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ($1,$2,$3,'PURCHASE',$4)`,
-				[eid, U1, CARD, ct],
-			);
-			await q(
-				`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,canonical_revision_id,operation,amount,budget_category,merchant,installment_count,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8,$9,$10,$11)`,
-				[
-					er,
-					U1,
-					eid,
-					tr,
-					amount,
-					category,
-					opts.merchant ?? null,
-					opts.installmentCount ?? null,
-					occ,
-					`pk-${n}`,
-					F,
-				],
-			);
-			return { eid, er };
-		};
-		const mkPurRev = async (
-			eid: string,
-			prevEr: string,
-			revNo: number,
-			op: string,
-			amount: string,
-			category: string,
-			occ: string,
-		) => {
-			const { tr } = await mkCanon("CREDIT_CARD_PURCHASE", occ);
-			const er = gid();
-			await q(
-				`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,previous_revision_id,canonical_revision_id,operation,amount,budget_category,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-				[er, U1, eid, revNo, prevEr, tr, op, amount, category, occ, `pk-${n}`, F],
-			);
-			return er;
-		};
-		const mkObligation = async (
-			oblId: string,
-			person: string,
-			dir: "RECEIVABLE" | "PAYABLE",
-			principal: string,
-			occ: string,
-		) => {
-			const { ct, tr } = await mkCanon(
-				dir === "RECEIVABLE"
-					? "PERSON_RECEIVABLE_ADVANCE"
-					: "PERSON_PAYABLE_EXPENSE",
-				occ,
-			);
-			await q(
-				`insert into person_obligations (id,user_id,person_id,direction,canonical_transaction_id) values ($1,$2,$3,$4,$5)`,
-				[oblId, U1, person, dir, ct],
-			);
-			await q(
-				`insert into person_obligation_revisions (id,user_id,obligation_id,revision_no,canonical_revision_id,operation,principal_amount,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8)`,
-				[gid(), U1, oblId, tr, principal, occ, `ok-${n}`, F],
-			);
-		};
-		const mkSettlement = async (
-			setId: string,
-			oblId: string,
-			applied: string,
-			occ: string,
-		) => {
-			const { ct, tr } = await mkCanon("PERSON_OBLIGATION_SETTLEMENT", occ);
-			await q(
-				`insert into person_settlements (id,user_id,obligation_id,canonical_transaction_id) values ($1,$2,$3,$4)`,
-				[setId, U1, oblId, ct],
-			);
-			await q(
-				`insert into person_settlement_revisions (id,user_id,settlement_id,revision_no,operation,asset_account_id,cash_amount,applied_amount,excess_amount,occurred_at,canonical_revision_id,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE',$4,$5,$5,'0.00',$6,$7,$8,$9)`,
-				[gid(), U1, setId, CASH, applied, occ, tr, `sk-${n}`, F],
-			);
-		};
-		let rbSeq = 0;
-		const nextReserve = () => {
-			rbSeq++;
-			return `f0000000-0000-4000-8000-00000000b0${rbSeq.toString().padStart(2, "0")}`;
-		};
-		const mkStmt = async (
-			sid: string,
-			amount: string,
-			cycleMonth: number,
-			reserveBucket?: string,
-		) => {
-			const rb = reserveBucket ?? nextReserve();
-			const r1 = gid();
-			await q(
-				`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,$4,'reserve','CREDIT_CARD_RESERVE')`,
-				[rb, U1, MID, `RB${rbSeq}`],
-			);
-			await q(
-				`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ($1,$2,$3,$4,$5,2026,$6)`,
-				[sid, U1, CARD, MID, rb, cycleMonth],
-			);
-			await q(
-				`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','OPEN',$4,'2026-09-01','2026-09-20','MIDAS_FUND','2026-09-01 00:00:00+00',$5,$6)`,
-				[r1, U1, sid, amount, `stk-${n}`, F],
-			);
-			return r1;
-		};
-		const mkStmtRev = async (
-			sid: string,
-			prevRevId: string,
-			revNo: number,
-			op: "PAY" | "REOPEN" | "VOID",
-			status: "PAID" | "OPEN" | "VOID",
-			amount: string,
-			occ: string,
-			paymentEventId: string | null = null,
-		) => {
-			const id = gid();
-			await q(
-				`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,payment_event_id,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,$8,'2026-09-01','2026-09-20','MIDAS_FUND',$9,$10,$11,$12)`,
-				[
-					id,
-					U1,
-					sid,
-					revNo,
-					prevRevId,
-					op,
-					status,
-					amount,
-					paymentEventId,
-					occ,
-					`stk-${n}`,
-					F,
-				],
-			);
-			return id;
-		};
-		const mkPayEvent = async (sid: string, amount: string, occ: string) => {
-			const { ct } = await mkCanon("CREDIT_CARD_STATEMENT_PAYMENT", occ);
-			const pe = gid();
-			await q(
-				`insert into credit_card_statement_payment_events (id,user_id,statement_id,canonical_transaction_id,payment_asset_account_id,amount,occurred_at) values ($1,$2,$3,$4,$5,$6,$7)`,
-				[pe, U1, sid, ct, CASH, amount, occ],
-			);
-			return pe;
-		};
-		const mkPay = async (
-			sid: string,
-			prevRevId: string,
-			amount: string,
-			revNo: number,
-			payAt: string,
-		) => {
-			const pe = await mkPayEvent(sid, amount, payAt);
-			const r = await mkStmtRev(
-				sid,
-				prevRevId,
-				revNo,
-				"PAY",
-				"PAID",
-				amount,
-				payAt,
-				pe,
-			);
-			return { pe, r };
-		};
-		const mkSplit = async (opts: {
-			purchaseEid: string;
-			purchaseEr: string;
-			splitId: string;
-			revNo?: number;
-			prevRevId?: string | null;
-			op?: "CREATE" | "UPDATE" | "VOID";
-			user: string;
-			ext: string;
-			gross: string;
-			occ: string;
-			sealed?: boolean;
-			personId?: string;
-			personObligationId?: string;
-			participantId?: string;
-			itemShare?: string;
-			withItem?: boolean;
-		}) => {
-			const revNo = opts.revNo ?? 1;
-			const op = opts.op ?? "CREATE";
-			const sealed = opts.sealed ?? true;
-			const withItem = opts.withItem ?? true;
-			const splitRev = gid();
-			let participantId = opts.participantId;
-			if (revNo === 1) {
-				await q(
-					`insert into credit_card_purchase_splits (id,user_id,purchase_event_id) values ($1,$2,$3)`,
-					[opts.splitId, U1, opts.purchaseEid],
-				);
-				if (opts.personId && opts.personObligationId) {
-					participantId = gid();
-					await q(
-						`insert into credit_card_purchase_split_participants (id,user_id,split_id,person_id,person_obligation_id) values ($1,$2,$3,$4,$5)`,
-						[participantId, U1, opts.splitId, opts.personId, opts.personObligationId],
-					);
-				}
-			}
-			await q(
-				`insert into credit_card_purchase_split_revisions (id,split_id,revision_no,previous_revision_id,operation,method,purchase_event_revision_id,gross_amount,user_share_amount,external_share_amount,occurred_at,revision_fingerprint) values ($1,$2,$3,$4,$5,'MANUAL',$6,$7,$8,$9,$10,$11)`,
-				[
-					splitRev,
-					opts.splitId,
-					revNo,
-					opts.prevRevId ?? null,
-					op,
-					opts.purchaseEr,
-					opts.gross,
-					opts.user,
-					opts.ext,
-					opts.occ,
-					F,
-				],
-			);
-			if (withItem && op !== "VOID" && opts.personId && participantId) {
-				await q(
-					`insert into credit_card_purchase_split_revision_items (id,split_revision_id,participant_id,person_id,share_amount) values ($1,$2,$3,$4,$5)`,
-					[gid(), splitRev, participantId, opts.personId, opts.itemShare ?? opts.ext],
-				);
-			}
-			if (sealed) {
-				await q(
-					`insert into credit_card_purchase_split_revision_seals (split_revision_id) values ($1)`,
-					[splitRev],
-				);
-			}
-			return { splitId: opts.splitId, splitRev, participantId };
-		};
-		const mkCardRev = async (
-			revNo: number,
-			prevRevId: string,
-			displayName: string,
-			issuer: string,
-			occ: string,
-		) => {
-			const id = gid();
-			await q(
-				`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,previous_revision_id,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,'UPDATE','ACTIVE',$6,$7,'1','20','90000.00',$8,$9,$10)`,
-				[id, U1, CARD, revNo, prevRevId, displayName, issuer, occ, `ccr-${n}`, F],
-			);
-			return id;
-		};
-		const mkPerson = async (
-			personId: string,
-			name: string,
-			rel: "FAMILY" | "FRIEND" | "OTHER",
-			occ: string,
-		) => {
-			await q(`insert into people (id,user_id) values ($1,$2)`, [personId, U1]);
-			const rid = gid();
-			await q(
-				`insert into person_revisions (id,user_id,person_id,revision_no,operation,status,display_name,relationship,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE',$4,$5,$6,$7,$8)`,
-				[rid, U1, personId, name, rel, occ, `pr-${personId.slice(-4)}`, F],
-			);
-			return rid;
-		};
-		const mkPersonRev = async (
-			personId: string,
-			prevRevId: string,
-			revNo: number,
-			name: string,
-			rel: "FAMILY" | "FRIEND" | "OTHER",
-			occ: string,
-		) => {
-			const id = gid();
-			await q(
-				`insert into person_revisions (id,user_id,person_id,revision_no,previous_revision_id,operation,status,display_name,relationship,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,'UPDATE','ACTIVE',$6,$7,$8,$9,$10)`,
-				[id, U1, personId, revNo, prevRevId, name, rel, occ, `pr-${n}`, F],
-			);
-			return id;
-		};
-
-		// base fixture
-		await replica();
-		await q(
-			"insert into users (id, display_name, currency, timezone) values ($1,'U','TRY','Europe/Istanbul')",
-			[U1],
-		);
-		await q(
-			`insert into ledger_accounts (id,user_id,code,name,account_type,normal_balance,currency) values
-			 ($1,$3,'ASSET_CASH','Cash','ASSET','DEBIT','TRY'),
-			 ($2,$3,'INCOME_GEN','Income','INCOME','CREDIT','TRY')`,
-			[CASH, INCOME_ACC, U1],
-		);
-		await q(
-			`insert into midas_accounts (id,user_id,ledger_account_id) values ($1,$2,$3)`,
-			[MID, U1, CASH],
-		);
-		await q(
-			`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,'CEF','Emergency','CORE_EMERGENCY_FUND')`,
-			[CEF, U1, MID],
-		);
-		await q(
-			`insert into midas_allocation_transfers (id,user_id,midas_account_id,idempotency_key,transfer_fingerprint,from_bucket_id,to_bucket_id,amount,occurred_at) values ($1,$2,$3,'mt-cef',$4,null,$5,'10000.00','2026-08-01 00:00:00+00')`,
-			[gid(), U1, MID, F, CEF],
-		);
-		await q(
-			`insert into income_sources (id,user_id,code,name,nature,reference_method,expected_monthly_amount,income_ledger_account_id,active_from) values
-			 ($1,$5,'REG1','Salary','REGULAR','FIXED_MONTHLY','20000.00',$6,'1900-01-01'),
-			 ($2,$5,'SUP1','Family A','SUPPORT','EXCLUDED',null,$6,'1900-01-01'),
-			 ($3,$5,'SUP2','Family B','SUPPORT','EXCLUDED',null,$6,'1900-01-01'),
-			 ($4,$5,'EXT1','Bonus','EXTRA','EXCLUDED',null,$6,'1900-01-01')`,
-			[REG1, SUP1, SUP2, EXT1, U1, INCOME_ACC],
-		);
-		await q(`insert into credit_cards (id,user_id,code) values ($1,$2,'CARDA')`, [
-			CARD,
-			U1,
-		]);
-		await q(
-			`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE','Akbank Axess','Akbank','1','20','90000.00','2026-07-01 00:00:00+00','ccr-1',$4)`,
-			[gid(), U1, CARD, F],
-		);
-		await mkPerson(P_FAM, "Anne", "FAMILY", "2026-07-01 00:00:00+00");
-		await mkPerson(P_FRI, "Kerem", "FRIEND", "2026-07-01 00:00:00+00");
-		await mkPerson(P_OTH, "Komsu", "OTHER", "2026-07-01 00:00:00+00");
-		await origin();
-		await createBasicLivingTarget({
-			db,
-			userId: U1,
-			effectivePeriodMonth: "2026-09-01",
-			monthlyTargetAmount: "6000.00",
-			currency: "TRY",
-			sourceKind: "USER_APPROVED",
-			idempotencyKey: "bl-4b",
-		});
-
-		return {
-			pg,
-			db,
-			gid,
-			q,
-			replica,
-			origin,
-			mkCanon,
-			mkReceipt,
-			mkPur,
-			mkPurRev,
-			mkObligation,
-			mkSettlement,
-			mkStmt,
-			mkStmtRev,
-			mkPayEvent,
-			mkPay,
-			mkSplit,
-			mkCardRev,
-			mkPerson,
-			mkPersonRev,
-			close: () => pg.close(),
-		};
-	};
+	// ---- fresh disposable DB + shared fixture + seed helpers (see make4bScenario) ----
+	const scenario = make4bScenario;
 
 	// =====================================================================
 	// MAIN happy-path DB -- adapted 4B A..X + FAMILY_REIMBURSEMENT (K)
@@ -2958,6 +3020,7 @@ async function resolverRuntime4B() {
 			statementId: TS,
 			statementRevisionId: r1,
 			idempotencyKey: "rc-a",
+			occurredAt: new Date("2026-09-01T00:00:00Z"),
 			components: [
 				{ componentType: "ADJUSTMENT", amount: "1000.00", ownership: "PERSONAL", adjustmentKind: "OTHER" },
 			],
@@ -3258,8 +3321,699 @@ async function resolverRuntime4B() {
 		await s.origin();
 		await expectThrowB(
 			() => buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_O }),
-			"support-role classification effective by",
+			"no active Budget V2 semantic role effective at",
 			"4B.1/O: a SUPPORT role classified only after the checkpoint cannot classify earlier interval activity",
+		);
+		await s.close();
+	}
+}
+
+// ============================================================================
+// PHASE 4B.2: TRUE EFFECTIVE-AS-OF CLOSURE (revisioned source time safety)
+// ============================================================================
+
+async function resolverRuntime4B2() {
+	console.log(
+		"\n== PHASE 4B.2: TRUE EFFECTIVE-AS-OF CLOSURE (drizzle / PGlite) ==",
+	);
+	const { buildBudgetV2CheckpointReport } = await import(
+		"../src/budget/checkpoint-report-v2.ts"
+	);
+	const { resolveBudgetV2LiveSnapshot, resolveBudgetV2SnapshotForWrite } =
+		await import("../src/budget/live-resolver-v2.ts");
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+	const { P } = B4_IDS;
+	const RECON_AT = new Date("2026-09-01T00:00:00Z");
+	const at = (iso: string) => new Date(iso);
+
+	const eqB = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `-> got ${JSON.stringify(a)} want ${JSON.stringify(b)}`);
+	const chkB = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+	// raw helpers layered on make4bScenario (caller manages replica/origin)
+	const mkReceiptRev = async (
+		s: S,
+		rid: string,
+		revNo: number,
+		op: string,
+		amount: string,
+		occ: string,
+	) => {
+		const { tr } = await s.mkCanon("INCOME_RECEIPT", occ);
+		const prev = (
+			await s.q(
+				"select id from income_receipt_revisions where income_receipt_id=$1 and revision_no=$2",
+				[rid, revNo - 1],
+			)
+		).rows[0].id;
+		await s.q(
+			`insert into income_receipt_revisions (id,user_id,income_receipt_id,canonical_revision_id,revision_no,previous_receipt_revision_id,operation,occurred_at,amount,destination_account_id) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			[s.gid(), U1, rid, tr, revNo, prev, op, occ, amount, s.CASH],
+		);
+	};
+	const mkPurRev2 = async (
+		s: S,
+		eid: string,
+		prevEr: string,
+		revNo: number,
+		op: string,
+		amount: string,
+		category: string,
+		occ: string,
+	) => s.mkPurRev(eid, prevEr, revNo, op, amount, category, occ);
+	const mkOblRev = async (
+		s: S,
+		oblId: string,
+		revNo: number,
+		op: string,
+		principal: string,
+		dueDate: string | null,
+		occ: string,
+	) => {
+		const { tr } = await s.mkCanon("PERSON_PAYABLE_EXPENSE", occ);
+		const prev = (
+			await s.q(
+				"select id from person_obligation_revisions where obligation_id=$1 and revision_no=$2",
+				[oblId, revNo - 1],
+			)
+		).rows[0].id;
+		await s.q(
+			`insert into person_obligation_revisions (id,user_id,obligation_id,revision_no,previous_revision_id,canonical_revision_id,operation,principal_amount,due_date,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			[
+				s.gid(),
+				U1,
+				oblId,
+				revNo,
+				prev,
+				tr,
+				op,
+				principal,
+				dueDate,
+				occ,
+				`ok2-${revNo}-${oblId.slice(-4)}`,
+				s.F,
+			],
+		);
+	};
+	const mkSettlementRev = async (
+		s: S,
+		setId: string,
+		revNo: number,
+		op: string,
+		applied: string,
+		occ: string,
+	) => {
+		const { tr } = await s.mkCanon("PERSON_OBLIGATION_SETTLEMENT", occ);
+		const prev = (
+			await s.q(
+				"select id from person_settlement_revisions where settlement_id=$1 and revision_no=$2",
+				[setId, revNo - 1],
+			)
+		).rows[0].id;
+		await s.q(
+			`insert into person_settlement_revisions (id,user_id,settlement_id,revision_no,previous_revision_id,operation,asset_account_id,cash_amount,applied_amount,excess_amount,occurred_at,canonical_revision_id,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,$8,$8,'0.00',$9,$10,$11,$12)`,
+			[
+				s.gid(),
+				U1,
+				setId,
+				revNo,
+				prev,
+				op,
+				s.CASH,
+				applied,
+				occ,
+				tr,
+				`sr2-${revNo}-${setId.slice(-4)}`,
+				s.F,
+			],
+		);
+	};
+	const mkGoal = async (
+		s: S,
+		goalId: string,
+		bucketId: string,
+		fundingTarget: string,
+		targetDate: string | null,
+		occ: string,
+		purpose: string,
+	) => {
+		await s.q(
+			`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,$4,'goal bucket','SHORT_TERM_GOAL')`,
+			[bucketId, U1, s.MID, `GB${goalId.slice(-4).toUpperCase()}`],
+		);
+		await s.q(
+			`insert into short_term_goals (id,user_id,midas_account_id,midas_bucket_id) values ($1,$2,$3,$4)`,
+			[goalId, U1, s.MID, bucketId],
+		);
+		await s.q(
+			`insert into short_term_goal_revisions (id,user_id,goal_id,revision_no,operation,status,name,funding_target,target_date,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE','goal',$4,$5,$6,$7,$8)`,
+			[
+				s.gid(),
+				U1,
+				goalId,
+				fundingTarget,
+				targetDate,
+				occ,
+				`g-${goalId.slice(-4)}`,
+				s.F,
+			],
+		);
+		await s.q(
+			`insert into short_term_goal_budget_v2_purpose_revisions (id,user_id,goal_id,revision_no,operation,purpose,idempotency_key,revision_fingerprint,occurred_at) values ($1,$2,$3,1,'CREATE',$4,$5,$6,$7)`,
+			[s.gid(), U1, goalId, purpose, `gp-${goalId.slice(-4)}`, s.F, occ],
+		);
+	};
+	const mkGoalRev = async (
+		s: S,
+		goalId: string,
+		revNo: number,
+		op: string,
+		status: string,
+		fundingTarget: string,
+		targetDate: string | null,
+		occ: string,
+	) => {
+		const prev = (
+			await s.q(
+				"select id from short_term_goal_revisions where goal_id=$1 and revision_no=$2",
+				[goalId, revNo - 1],
+			)
+		).rows[0].id;
+		await s.q(
+			`insert into short_term_goal_revisions (id,user_id,goal_id,revision_no,previous_revision_id,operation,status,name,funding_target,target_date,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,'goal',$8,$9,$10,$11,$12)`,
+			[
+				s.gid(),
+				U1,
+				goalId,
+				revNo,
+				prev,
+				op,
+				status,
+				fundingTarget,
+				targetDate,
+				occ,
+				`gr-${revNo}-${goalId.slice(-4)}`,
+				s.F,
+			],
+		);
+	};
+	const mkPurposeRev = async (
+		s: S,
+		goalId: string,
+		revNo: number,
+		purpose: string,
+		occ: string,
+	) => {
+		const prev = (
+			await s.q(
+				"select id from short_term_goal_budget_v2_purpose_revisions where goal_id=$1 and revision_no=$2",
+				[goalId, revNo - 1],
+			)
+		).rows[0].id;
+		await s.q(
+			`insert into short_term_goal_budget_v2_purpose_revisions (id,user_id,goal_id,revision_no,previous_revision_id,operation,purpose,idempotency_key,revision_fingerprint,occurred_at) values ($1,$2,$3,$4,$5,'UPDATE',$6,$7,$8,$9)`,
+			[
+				s.gid(),
+				U1,
+				goalId,
+				revNo,
+				prev,
+				purpose,
+				`gpr-${revNo}-${goalId.slice(-4)}`,
+				s.F,
+				occ,
+			],
+		);
+	};
+	const mkRoleRev = async (
+		s: S,
+		rid: string,
+		revNo: number,
+		role: string,
+		occ: string,
+	) => {
+		const prev =
+			revNo === 1
+				? null
+				: (
+						await s.q(
+							"select id from income_receipt_budget_v2_semantic_revisions where income_receipt_id=$1 and revision_no=$2",
+							[rid, revNo - 1],
+						)
+					).rows[0].id;
+		await s.q(
+			`insert into income_receipt_budget_v2_semantic_revisions (id,user_id,income_receipt_id,revision_no,previous_revision_id,operation,support_role,idempotency_key,revision_fingerprint,occurred_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			[
+				s.gid(),
+				U1,
+				rid,
+				revNo,
+				prev,
+				revNo === 1 ? "CREATE" : "UPDATE",
+				role,
+				`sem-${revNo}-${rid.slice(-4)}`,
+				s.F,
+				occ,
+			],
+		);
+	};
+	// seed a PAID + reconciled (all-personal) trigger statement, return its PE id
+	const mkTrigger = async (
+		s: S,
+		amount = "400.00",
+		payAt = "2026-09-15 00:00:00+00",
+	) => {
+		await s.origin();
+		const sid = `81000000-0000-4000-8000-0000000000e1`;
+		const r1 = await (async () => {
+			await s.replica();
+			const rr = await s.mkStmt(sid, amount, 9);
+			await s.origin();
+			return rr;
+		})();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: "rc-trig",
+			occurredAt: RECON_AT,
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe } = await s.mkPay(sid, r1, amount, 2, payAt);
+		await s.origin();
+		return { sid, pe };
+	};
+
+	// ---- A / B: a future purchase UPDATE / VOID does not erase a prior MTD purchase
+	for (const variant of ["UPDATE", "VOID"] as const) {
+		const s = await make4bScenario();
+		const { pe } = await mkTrigger(s);
+		await s.replica();
+		const pur = await s.mkPur(
+			"500.00",
+			"DISCRETIONARY_SPEND",
+			"2026-09-05 00:00:00+00",
+		);
+		await mkPurRev2(
+			s,
+			pur.eid,
+			pur.er,
+			2,
+			variant,
+			variant === "VOID" ? "500.00" : "5000.00",
+			"DISCRETIONARY_SPEND",
+			"2026-09-20 00:00:00+00",
+		);
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		eqB(
+			rep.mtd.spending.byCategoryPersonalShare.DISCRETIONARY_SPEND,
+			"500.00",
+			`4B.2/${variant === "UPDATE" ? "A" : "B"}: a future purchase ${variant} does not ${variant === "UPDATE" ? "mutate" : "erase"} the Sep-15 MTD purchase (500, not ${variant === "VOID" ? "0" : "5000"})`,
+		);
+		await s.close();
+	}
+
+	// ---- C / D: a future receipt UPDATE / VOID does not replace / erase earlier asOf income
+	for (const variant of ["UPDATE", "VOID"] as const) {
+		const s = await make4bScenario();
+		const { pe } = await mkTrigger(s);
+		const rid = "b1000000-0000-4000-8000-0000000000c1";
+		const src = variant === "UPDATE" ? s.EXT1 : s.REG1;
+		await s.replica();
+		await s.mkReceipt(
+			rid,
+			src,
+			variant === "UPDATE" ? "100.00" : "20000.00",
+			"2026-09-05 00:00:00+00",
+		);
+		await mkReceiptRev(
+			s,
+			rid,
+			2,
+			variant,
+			variant === "VOID" ? "20000.00" : "9999.00",
+			"2026-09-20 00:00:00+00",
+		);
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		if (variant === "UPDATE") {
+			eqB(
+				rep.interval.income.extraReceipts,
+				"100.00",
+				"4B.2/C: a future receipt UPDATE does not replace the Sep-15 interval income (100, not 9999)",
+			);
+			eqB(
+				rep.mtd.budget.inputs.realizedIncome,
+				"100.00",
+				"4B.2/C: the MTD realizedIncome uses the Sep-15 receipt state",
+			);
+		} else {
+			eqB(
+				rep.interval.income.regularReceipts,
+				"20000.00",
+				"4B.2/D: a future receipt VOID does not erase the Sep-15 interval income",
+			);
+			eqB(
+				rep.mtd.budget.inputs.realizedIncome,
+				"20000.00",
+				"4B.2/D: the MTD realizedIncome still contains the Sep-15 receipt",
+			);
+		}
+		await s.close();
+	}
+
+	// ---- E: a SUPPORT role changed AFTER the checkpoint is not used before it
+	{
+		const s = await make4bScenario();
+		const { pe } = await mkTrigger(s);
+		const rid = "b1000000-0000-4000-8000-0000000000e2";
+		await s.replica();
+		await s.mkReceipt(rid, s.SUP1, "2000.00", "2026-09-05 00:00:00+00");
+		await mkRoleRev(s, rid, 1, "DEFICIT_FAMILY_SUPPORT", "2026-09-01 00:00:00+00");
+		await mkRoleRev(s, rid, 2, "PLANNED_FAMILY_GIFT", "2026-09-20 00:00:00+00");
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		eqB(
+			rep.interval.income.deficitFamilySupportReceipts,
+			"2000.00",
+			"4B.2/E: the SUPPORT role effective at the checkpoint (DEFICIT) is used",
+		);
+		eqB(
+			rep.interval.income.plannedFamilyGiftReceipts,
+			"0.00",
+			"4B.2/E: the later PLANNED_FAMILY_GIFT reclassification does not time-travel",
+		);
+		eqB(
+			rep.mtd.budget.inputs.realizedIncome,
+			"0.00",
+			"4B.2/E: DEFICIT support is excluded from realizedIncome at the checkpoint",
+		);
+		await s.close();
+	}
+
+	// ---- F: a goal that is ACTIVE at the checkpoint but CANCELLED afterwards
+	{
+		const s = await make4bScenario();
+		const G = "99999999-0000-4000-8000-0000000000f1";
+		const B = "f0000000-0000-4000-8000-0000000000f1";
+		await s.replica();
+		await mkGoal(s, G, B, "100000.00", null, "2026-09-01 00:00:00+00", "INTERNATIONAL_MOBILITY");
+		await mkGoalRev(s, G, 2, "CANCEL", "CANCELLED", "100000.00", null, "2026-09-20 00:00:00+00");
+		await s.q(
+			`insert into midas_allocation_transfers (id,user_id,midas_account_id,idempotency_key,transfer_fingerprint,from_bucket_id,to_bucket_id,amount,occurred_at) values ($1,$2,$3,'mt-f',$4,null,$5,'40000.00','2026-08-20 00:00:00+00')`,
+			[s.gid(), U1, s.MID, s.F, B],
+		);
+		await s.origin();
+		const res15 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-15T00:00:00Z") });
+		const res25 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-25T00:00:00Z") });
+		eqB(res15.inputs.mobilityBalance, "40000.00", "4B.2/F: at Sep-15 the goal is ACTIVE => its bucket is in mobilityBalance");
+		eqB(res25.inputs.mobilityBalance, "0.00", "4B.2/F: at Sep-25 the CANCEL is in effect => excluded");
+		await s.close();
+	}
+
+	// ---- G: a goal purpose reclassified AFTER the checkpoint is not used before it
+	{
+		const s = await make4bScenario();
+		const G = "99999999-0000-4000-8000-0000000000d1";
+		const B = "f0000000-0000-4000-8000-0000000000d5";
+		await s.replica();
+		await mkGoal(s, G, B, "100000.00", null, "2026-09-01 00:00:00+00", "OTHER");
+		await mkPurposeRev(s, G, 2, "INTERNATIONAL_MOBILITY", "2026-09-20 00:00:00+00");
+		await s.q(
+			`insert into midas_allocation_transfers (id,user_id,midas_account_id,idempotency_key,transfer_fingerprint,from_bucket_id,to_bucket_id,amount,occurred_at) values ($1,$2,$3,'mt-g',$4,null,$5,'30000.00','2026-08-20 00:00:00+00')`,
+			[s.gid(), U1, s.MID, s.F, B],
+		);
+		await s.origin();
+		const res15 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-15T00:00:00Z") });
+		const res25 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-25T00:00:00Z") });
+		eqB(res15.inputs.mobilityBalance, "0.00", "4B.2/G: at Sep-15 the purpose is OTHER => NOT mobility");
+		eqB(res25.inputs.mobilityBalance, "30000.00", "4B.2/G: at Sep-25 the INTERNATIONAL_MOBILITY reclassification is in effect");
+		await s.close();
+	}
+
+	// ---- H: OPEN -> PAY Sep 12 -> REOPEN Sep 20 : PAID at Sep-15, OPEN at Sep-25
+	{
+		const s = await make4bScenario();
+		const SID = "81000000-0000-4000-8000-00000000c1a2";
+		await s.replica();
+		const r1 = await s.mkStmt(SID, "800.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: SID, statementRevisionId: r1, idempotencyKey: "rc-h2", occurredAt: RECON_AT,
+			components: [{ componentType: "ADJUSTMENT", amount: "800.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
+		});
+		await s.replica();
+		const { r: pay } = await s.mkPay(SID, r1, "800.00", 2, "2026-09-12 00:00:00+00");
+		await s.mkStmtRev(SID, pay, 3, "REOPEN", "OPEN", "800.00", "2026-09-20 00:00:00+00");
+		await s.origin();
+		const res15 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-15T00:00:00Z") });
+		const res25 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-25T00:00:00Z") });
+		const b15 = (res15.evidenceSnapshot as any).obligations.creditCardStatements.find((x: any) => x.statementId === SID);
+		const b25 = (res25.evidenceSnapshot as any).obligations.creditCardStatements.find((x: any) => x.statementId === SID);
+		eqB(b15?.recognitionBasis, "PAID_WITHIN_PERIOD", "4B.2/H: at Sep-15 the statement lifecycle state is PAID");
+		eqB(b25?.recognitionBasis, "OPEN_DUE", "4B.2/H: the Sep-20 REOPEN does not rewrite the Sep-15 PAID state; at Sep-25 it is OPEN");
+		await s.close();
+	}
+
+	// ---- I: OPEN -> PAY#1 Sep 10 -> REOPEN Sep 13 -> PAY#2 Sep 20
+	{
+		const s = await make4bScenario();
+		const SID = "81000000-0000-4000-8000-00000000c1a3";
+		await s.replica();
+		const r1 = await s.mkStmt(SID, "600.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: SID, statementRevisionId: r1, idempotencyKey: "rc-i2", occurredAt: RECON_AT,
+			components: [{ componentType: "ADJUSTMENT", amount: "600.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
+		});
+		await s.replica();
+		const { r: pay1 } = await s.mkPay(SID, r1, "600.00", 2, "2026-09-10 00:00:00+00");
+		const reo = await s.mkStmtRev(SID, pay1, 3, "REOPEN", "OPEN", "600.00", "2026-09-13 00:00:00+00");
+		await s.mkPay(SID, reo, "600.00", 4, "2026-09-20 00:00:00+00");
+		await s.origin();
+		const basis = async (iso: string) => {
+			const r = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at(iso) });
+			return (r.evidenceSnapshot as any).obligations.creditCardStatements.find((x: any) => x.statementId === SID)?.recognitionBasis;
+		};
+		eqB(await basis("2026-09-11T00:00:00Z"), "PAID_WITHIN_PERIOD", "4B.2/I: at Sep-11 the statement is PAID by PAY#1");
+		eqB(await basis("2026-09-14T00:00:00Z"), "OPEN_DUE", "4B.2/I: at Sep-14 the REOPEN is in effect; PAY#2 (Sep-20) is NOT yet the state");
+		eqB(await basis("2026-09-25T00:00:00Z"), "PAID_WITHIN_PERIOD", "4B.2/I: at Sep-25 PAY#2 is in effect");
+		await s.close();
+	}
+
+	// ---- J: reconciliation SUPERSEDE after the checkpoint (same amount, different
+	//        ownership) does NOT rewrite the historical trigger ownership
+	{
+		const s = await make4bScenario();
+		const SID = "81000000-0000-4000-8000-00000000c1a4";
+		await s.replica();
+		const r1 = await s.mkStmt(SID, "1000.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: SID, statementRevisionId: r1, idempotencyKey: "rc-j2-1", occurredAt: RECON_AT,
+			components: [{ componentType: "ADJUSTMENT", amount: "1000.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
+		});
+		await s.replica();
+		const { pe, r: pay } = await s.mkPay(SID, r1, "1000.00", 2, "2026-09-15 00:00:00+00");
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: SID, statementRevisionId: pay, idempotencyKey: "rc-j2-2",
+			expectedRevisionNo: 1, occurredAt: at("2026-09-20T00:00:00Z"),
+			components: [
+				{ componentType: "ADJUSTMENT", amount: "500.00", ownership: "PERSONAL", adjustmentKind: "OTHER" },
+				{ componentType: "ADJUSTMENT", amount: "500.00", ownership: "EXTERNAL_PERSON", personId: s.P_FAM, adjustmentKind: "OTHER" },
+			],
+		});
+		const rep = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: pe });
+		eqB(rep.triggerPayment.ownership.personalEconomicShare, "1000.00", "4B.2/J: trigger ownership uses the reconciliation effective at Sep-15 (100% personal)");
+		eqB(rep.triggerPayment.ownership.familyExternalShare, "0.00", "4B.2/J: the Sep-20 SUPERSEDE (500 FAMILY) does not rewrite the Sep-15 trigger");
+		await s.close();
+	}
+
+	// ---- K: a non-trigger interval payment uses the reconciliation effective at
+	//        its OWN payment instant, not the report checkpoint
+	{
+		const s = await make4bScenario();
+		const trig = await mkTrigger(s, "400.00", "2026-09-15 00:00:00+00");
+		const SNT = "81000000-0000-4000-8000-00000000c1a5";
+		await s.replica();
+		const r1 = await s.mkStmt(SNT, "1000.00", 8);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: SNT, statementRevisionId: r1, idempotencyKey: "rc-k2-1", occurredAt: RECON_AT,
+			components: [{ componentType: "ADJUSTMENT", amount: "1000.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
+		});
+		await s.replica();
+		const { pe: peNt, r: payNt } = await s.mkPay(SNT, r1, "1000.00", 2, "2026-09-12 00:00:00+00");
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: SNT, statementRevisionId: payNt, idempotencyKey: "rc-k2-2",
+			expectedRevisionNo: 1, occurredAt: at("2026-09-20T00:00:00Z"),
+			components: [
+				{ componentType: "ADJUSTMENT", amount: "500.00", ownership: "PERSONAL", adjustmentKind: "OTHER" },
+				{ componentType: "ADJUSTMENT", amount: "500.00", ownership: "EXTERNAL_PERSON", personId: s.P_FAM, adjustmentKind: "OTHER" },
+			],
+		});
+		const rep = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: trig.pe });
+		const spNt = rep.interval.statementPayments.find((x) => x.paymentEventId === peNt);
+		chkB(
+			!!spNt && spNt.ownership.available === true &&
+				spNt.ownership.personalEconomicShare === "1000.00" &&
+				spNt.ownership.familyExternalShare === "0.00",
+			"4B.2/K: a non-trigger payment (Sep-12) uses the reconciliation effective at Sep-12, not the Sep-20 SUPERSEDE",
+		);
+		await s.close();
+	}
+
+	// ---- L: People PAYABLE future VOID does not rewrite old currentObligations
+	{
+		const s = await make4bScenario();
+		const OBL = "8a000000-0000-4000-8000-00000000c1a6";
+		await s.replica();
+		await s.mkObligation(OBL, s.P_FAM, "PAYABLE", "500.00", "2026-09-01 00:00:00+00");
+		await mkOblRev(s, OBL, 2, "VOID", "500.00", null, "2026-09-20 00:00:00+00");
+		await s.origin();
+		// give the obligation a dueDate this period via a raw rev1 patch is unneeded --
+		// mkObligation left dueDate NULL, which routes it to "settled only" (0). Instead
+		// assert the VOID path: rev1 has no dueDate so currentObligations is 0 either
+		// way; use a rev1 WITH a dueDate.
+		await s.replica();
+		await s.q(
+			`update person_obligation_revisions set due_date='2026-09-25' where obligation_id=$1 and revision_no=1`,
+			[OBL],
+		);
+		await s.origin();
+		const res15 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-15T00:00:00Z") });
+		const res25 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-25T00:00:00Z") });
+		eqB(res15.inputs.currentObligations, "500.00", "4B.2/L: at Sep-15 the PAYABLE (rev1) is recognised");
+		eqB(res25.inputs.currentObligations, "0.00", "4B.2/L: the Sep-20 VOID removes it only from Sep-25 onward");
+		await s.close();
+	}
+
+	// ---- M: a settlement VOIDed AFTER the checkpoint does not erase an old
+	//        FAMILY_REIMBURSEMENT
+	{
+		const s = await make4bScenario();
+		const trig = await mkTrigger(s, "400.00", "2026-09-15 00:00:00+00");
+		const OBL = "8a000000-0000-4000-8000-00000000c1a7";
+		const SET = "8b000000-0000-4000-8000-00000000c1a7";
+		const SPLIT = "87000000-0000-4000-8000-00000000c1a7";
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "SHORT_TERM_PURCHASE", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-03 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: SPLIT,
+			user: "400.00", ext: "600.00", gross: "1000.00", occ: "2026-09-03 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL,
+		});
+		await s.mkSettlement(SET, OBL, "600.00", "2026-09-10 00:00:00+00");
+		await mkSettlementRev(s, SET, 2, "VOID", "600.00", "2026-09-20 00:00:00+00");
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: trig.pe });
+		chkB(
+			rep.interval.peopleFamily.familyReimbursements.length === 1 &&
+				rep.interval.peopleFamily.familyReimbursements[0]?.obligationId === OBL,
+			"4B.2/M: a settlement VOIDed on Sep-20 does not erase the Sep-15 FAMILY_REIMBURSEMENT",
+		);
+		await s.close();
+	}
+
+	// ---- N: a future basic-living purchase UPDATE does not rewrite the old MTD amount
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "MANDATORY_EXPENSE", "2026-09-05 00:00:00+00");
+		await mkPurRev2(s, pur.eid, pur.er, 2, "UPDATE", "200.00", "MANDATORY_EXPENSE", "2026-09-20 00:00:00+00");
+		await s.origin();
+		const res15 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-15T00:00:00Z") });
+		const res25 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-25T00:00:00Z") });
+		eqB((res15.evidenceSnapshot as any).basicLiving.actualPersonalMandatorySpendMTD, "1000.00", "4B.2/N: at Sep-15 the mandatory purchase spend is the Sep-5 amount (1000)");
+		eqB(res15.inputs.basicLivingFunding, "6000.00", "4B.2/N: basicLivingFunding = max(6000,1000) - 0");
+		eqB((res25.evidenceSnapshot as any).basicLiving.actualPersonalMandatorySpendMTD, "200.00", "4B.2/N: the Sep-20 correction applies only from Sep-25 onward");
+		await s.close();
+	}
+
+	// ---- P: a stored Budget V2 lifecycle result is REPLAYED before any live read
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const { ct } = await s.mkCanon("MONTHLY_BUDGET_PLAN_V2", "2026-09-01 00:00:00+00");
+		await s.q(
+			`update canonical_transactions set creation_idempotency_key='p-key' where id=$1`,
+			[ct],
+		);
+		const planId = s.gid();
+		await s.q(
+			`insert into monthly_budget_v2_plans (id,user_id,period_month,canonical_transaction_id) values ($1,$2,$3,$4)`,
+			[planId, U1, P, ct],
+		);
+		const [{ id: canonRev }] = (
+			await s.q<{ id: string }>(
+				`select id from transaction_revisions where transaction_id=$1 and revision_no=1`,
+				[ct],
+			)
+		).rows;
+		await s.q(
+			`insert into monthly_budget_v2_plan_revisions
+			 (id,user_id,budget_plan_id,canonical_revision_id,revision_no,previous_budget_revision_id,operation,policy_version,currency,
+			  realized_income_amount,current_obligations_amount,basic_living_funding_amount,date_bound_necessary_purchase_funding_amount,
+			  core_emergency_fund_balance_amount,mobility_balance_amount,emergency_catch_up_amount,deficit_amount,true_surplus_amount,
+			  mobility_allocation_amount,long_term_investment_amount,discretionary_allocation_amount,evidence_snapshot)
+			 values ($1,$2,$3,$4,1,null,'CREATE','PERSONAL_BUDGET_V2','TRY',
+			  '77777.00','0.00','6000.00','0.00','10000.00','0.00','0.00','0.00','1234.00','0.00','0.00','1234.00','{"stored":true}'::jsonb)`,
+			[s.gid(), U1, planId, canonRev],
+		);
+		// a live source that would change a fresh resolve
+		await s.mkReceipt(
+			"b1000000-0000-4000-8000-0000000000a1",
+			s.REG1,
+			"55555.00",
+			"2026-09-05 00:00:00+00",
+		);
+		await s.origin();
+		const r = await resolveBudgetV2SnapshotForWrite({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			idempotencyKey: "p-key",
+			asOf: at("2026-09-15T00:00:00Z"),
+		});
+		eqB(r.source, "REPLAY", "4B.2/P: a stored V2 lifecycle result is replayed (source=REPLAY)");
+		eqB(
+			r.snapshot.inputs.realizedIncome,
+			"77777.00",
+			"4B.2/P: replay returns the STORED snapshot, never a live-source recompute",
 		);
 		await s.close();
 	}
@@ -3274,6 +4028,7 @@ if (probed) {
 	await resolverRuntime4A();
 	await resolverRuntime4A1();
 	await resolverRuntime4B();
+	await resolverRuntime4B2();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

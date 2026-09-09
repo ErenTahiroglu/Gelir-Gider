@@ -1,5 +1,6 @@
 import { and, desc, eq } from "drizzle-orm";
 import type { Database } from "../db/client";
+import { effectiveRevisionAsOf } from "../db/effective-revision";
 import { creditCardLiabilityEventRevisions } from "../db/schema/credit-card-ledger";
 import {
 	creditCardPurchaseSplitRevisionItems,
@@ -597,6 +598,134 @@ async function purchaseComponentStaleReason(
 }
 
 // ============================================================================
+// AS-OF (business-effective) read path -- for historical payment-event reports
+// ============================================================================
+
+/** The split effective for a purchase AT `asOf` (its split anchor's highest
+ * revisionNo with occurredAt <= asOf). Null when unsplit / VOID at that instant. */
+async function splitForPurchaseAsOf(
+	db: Database,
+	purchaseEventId: string,
+	asOf: Date,
+): Promise<ActiveSplitInfo | null> {
+	const [split] = await db
+		.select({ id: creditCardPurchaseSplits.id })
+		.from(creditCardPurchaseSplits)
+		.where(eq(creditCardPurchaseSplits.purchaseEventId, purchaseEventId))
+		.limit(1);
+	if (!split) return null;
+	const revs = await db
+		.select({
+			id: creditCardPurchaseSplitRevisions.id,
+			revisionNo: creditCardPurchaseSplitRevisions.revisionNo,
+			operation: creditCardPurchaseSplitRevisions.operation,
+			userShare: creditCardPurchaseSplitRevisions.userShareAmount,
+			occurredAt: creditCardPurchaseSplitRevisions.occurredAt,
+		})
+		.from(creditCardPurchaseSplitRevisions)
+		.where(eq(creditCardPurchaseSplitRevisions.splitId, split.id));
+	const rev = effectiveRevisionAsOf(revs, asOf);
+	if (!rev || rev.operation === "VOID") return null;
+	const [seal] = await db
+		.select({ id: creditCardPurchaseSplitRevisionSeals.splitRevisionId })
+		.from(creditCardPurchaseSplitRevisionSeals)
+		.where(eq(creditCardPurchaseSplitRevisionSeals.splitRevisionId, rev.id))
+		.limit(1);
+	const items = await db
+		.select({ personId: creditCardPurchaseSplitRevisionItems.personId })
+		.from(creditCardPurchaseSplitRevisionItems)
+		.where(eq(creditCardPurchaseSplitRevisionItems.splitRevisionId, rev.id));
+	return {
+		splitRevisionId: rev.id,
+		userShareCents: parseAggregateMoneyString(rev.userShare).cents,
+		sealed: Boolean(seal),
+		participantPersonIds: new Set(items.map((i) => i.personId)),
+	};
+}
+
+/** Why a stored PURCHASE component was not trustworthy AT `asOf` (a future VOID /
+ * supersede must NOT retroactively stale a historical reconciliation). */
+async function purchaseComponentStaleReasonAsOf(
+	db: Database,
+	item: ReconciliationComponentItem,
+	asOf: Date,
+): Promise<string | null> {
+	if (item.componentType !== "PURCHASE" || !item.purchaseEventId) return null;
+	const evRevs = await db
+		.select({
+			revisionNo: creditCardLiabilityEventRevisions.revisionNo,
+			operation: creditCardLiabilityEventRevisions.operation,
+			occurredAt: creditCardLiabilityEventRevisions.occurredAt,
+		})
+		.from(creditCardLiabilityEventRevisions)
+		.where(eq(creditCardLiabilityEventRevisions.eventId, item.purchaseEventId));
+	const ev = effectiveRevisionAsOf(evRevs, asOf);
+	if (!ev) {
+		return `purchase event ${item.purchaseEventId} had no revision effective at ${asOf.toISOString()}`;
+	}
+	if (ev.operation === "VOID") {
+		return `purchase event ${item.purchaseEventId} was VOID as of ${asOf.toISOString()}`;
+	}
+	const active = await splitForPurchaseAsOf(db, item.purchaseEventId, asOf);
+	if (!active) {
+		if (item.purchaseSplitRevisionId) {
+			return `purchase ${item.purchaseEventId} had no active split as of the checkpoint`;
+		}
+		if (item.ownership !== "PERSONAL") {
+			return `purchase ${item.purchaseEventId} was unsplit as of the checkpoint; ownership ${item.ownership} incompatible`;
+		}
+		return null;
+	}
+	if (item.purchaseSplitRevisionId !== active.splitRevisionId) {
+		return `purchase ${item.purchaseEventId} split evidence not effective as of the checkpoint (${item.purchaseSplitRevisionId} -> ${active.splitRevisionId})`;
+	}
+	if (!active.sealed) {
+		return `split revision ${active.splitRevisionId} was not sealed as of the checkpoint`;
+	}
+	if (
+		item.ownership === "EXTERNAL_PERSON" &&
+		(!item.personId || !active.participantPersonIds.has(item.personId))
+	) {
+		return `personId ${item.personId} was not a participant of split ${active.splitRevisionId} as of the checkpoint`;
+	}
+	if (item.ownership === "PERSONAL" && active.userShareCents <= 0n) {
+		return `split ${active.splitRevisionId} user share was zero as of the checkpoint`;
+	}
+	return null;
+}
+
+async function reconRevisionAsOf(
+	db: Database,
+	reconciliationId: string,
+	asOf: Date,
+): Promise<
+	typeof creditCardStatementReconciliationRevisions.$inferSelect | undefined
+> {
+	const rows = await db
+		.select()
+		.from(creditCardStatementReconciliationRevisions)
+		.where(
+			eq(
+				creditCardStatementReconciliationRevisions.reconciliationId,
+				reconciliationId,
+			),
+		);
+	return effectiveRevisionAsOf(rows, asOf);
+}
+
+async function statementRevisionAsOf(
+	db: Database,
+	statementId: string,
+	asOf: Date,
+): Promise<typeof creditCardStatementRevisions.$inferSelect | undefined> {
+	const rows = await db
+		.select()
+		.from(creditCardStatementRevisions)
+		.where(eq(creditCardStatementRevisions.statementId, statementId));
+	return effectiveRevisionAsOf(rows, asOf);
+}
+
+// ============================================================================
 // Race-safe idempotency replay (section 5)
 // ============================================================================
 
@@ -1148,6 +1277,132 @@ export async function getStatementReconciliation(params: {
 	// old components -- report STALE.
 	for (const c of components) {
 		const reason = await purchaseComponentStaleReason(db, c);
+		if (reason) {
+			return { ...base, status: "STALE", staleReason: reason };
+		}
+	}
+
+	let personalCents = 0n;
+	const externalByPerson = new Map<string, bigint>();
+	for (const c of components) {
+		const cents = parsePositiveMoneyString(c.amount).cents;
+		if (c.ownership === "PERSONAL") {
+			personalCents += cents;
+		} else if (c.personId) {
+			externalByPerson.set(
+				c.personId,
+				(externalByPerson.get(c.personId) ?? 0n) + cents,
+			);
+		}
+	}
+
+	return {
+		...base,
+		status: "RECONCILED",
+		components,
+		personalCents,
+		externalByPerson,
+	};
+}
+
+/**
+ * AS-OF twin of `getStatementReconciliation`: the reconciliation STATE that was
+ * business-effective at `asOf` (highest revisionNo with occurredAt <= asOf).
+ *
+ * Never uses the current/latest reconciliation merely because the amount is
+ * unchanged; a SUPERSEDE / VOID authored after `asOf` cannot rewrite a
+ * historical checkpoint. The statement amount is validated against the
+ * statement revision effective at `asOf`, and referenced purchase / split
+ * evidence is checked as it stood at `asOf`. Returns the same NONE / VOIDED /
+ * UNSEALED / STALE / STATEMENT_VOID / RECONCILED view. Does not mutate history.
+ */
+export async function getStatementReconciliationAsOf(params: {
+	db: Database;
+	userId: string;
+	statementId: string;
+	asOf: Date;
+}): Promise<StatementReconciliationView> {
+	const userId = validateCcCanonicalUuid(params.userId, "userId");
+	const statementId = validateCcCanonicalUuid(
+		params.statementId,
+		"statementId",
+	);
+	const { db } = params;
+	if (!(params.asOf instanceof Date) || Number.isNaN(params.asOf.getTime())) {
+		throw new CreditCardError(
+			"CREDIT_CARD_INVALID_INPUT",
+			"asOf must be a valid Date object",
+		);
+	}
+	const asOf = params.asOf;
+
+	const base: StatementReconciliationView = {
+		statementId,
+		status: "NONE",
+		revisionNo: null,
+		statementRevisionId: null,
+		reconciledStatementAmount: null,
+		staleReason: null,
+		components: [],
+		personalCents: 0n,
+		externalByPerson: new Map(),
+	};
+
+	const [anchor] = await db
+		.select()
+		.from(creditCardStatementReconciliations)
+		.where(
+			and(
+				eq(creditCardStatementReconciliations.statementId, statementId),
+				eq(creditCardStatementReconciliations.userId, userId),
+			),
+		)
+		.limit(1);
+	if (!anchor) return base;
+
+	const rev = await reconRevisionAsOf(db, anchor.id, asOf);
+	if (!rev) return base; // no reconciliation was effective yet at asOf
+
+	base.revisionNo = rev.revisionNo;
+	base.statementRevisionId = rev.statementRevisionId;
+	base.reconciledStatementAmount = rev.reconciledStatementAmount;
+
+	if (rev.operation === "VOID") {
+		return { ...base, status: "VOIDED" };
+	}
+	if (!(await isSealed(db, rev.id))) {
+		return { ...base, status: "UNSEALED" };
+	}
+
+	const stmtRev = await statementRevisionAsOf(db, statementId, asOf);
+	if (!stmtRev) {
+		return {
+			...base,
+			status: "STALE",
+			staleReason: "statement had no revision effective at the checkpoint",
+		};
+	}
+	if (stmtRev.status === "VOID") {
+		return {
+			...base,
+			status: "STATEMENT_VOID",
+			staleReason: "the statement was VOID as of the checkpoint",
+		};
+	}
+	if (
+		parsePositiveMoneyString(stmtRev.statementAmount).cents !==
+		parsePositiveMoneyString(rev.reconciledStatementAmount).cents
+	) {
+		return {
+			...base,
+			status: "STALE",
+			staleReason: `statement amount as of the checkpoint (${stmtRev.statementAmount}) does not match the reconciled amount (${rev.reconciledStatementAmount})`,
+		};
+	}
+
+	const components = await componentsFor(db, rev.id);
+	for (const c of components) {
+		const reason = await purchaseComponentStaleReasonAsOf(db, c, asOf);
 		if (reason) {
 			return { ...base, status: "STALE", staleReason: reason };
 		}

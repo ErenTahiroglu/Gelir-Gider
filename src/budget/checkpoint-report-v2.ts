@@ -1,9 +1,10 @@
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import {
-	getStatementReconciliation,
+	getStatementReconciliationAsOf,
 	type StatementReconciliationStatus,
 } from "../credit-cards/statement-reconciliation";
 import type { Database } from "../db/client";
+import { effectiveRevisionAsOf } from "../db/effective-revision";
 import { incomeReceiptBudgetV2SemanticRevisions } from "../db/schema/budget-v2-semantics";
 import {
 	creditCardLiabilityEventRevisions,
@@ -456,12 +457,8 @@ async function personAt(
 				eq(personRevisions.personId, personId),
 				eq(personRevisions.userId, userId),
 			),
-		)
-		.orderBy(asc(personRevisions.revisionNo));
-	let chosen: (typeof revs)[number] | undefined;
-	for (const r of revs) {
-		if (asDate(r.occurredAt) <= at) chosen = r;
-	}
+		);
+	const chosen = effectiveRevisionAsOf(revs, at);
 	if (!chosen) {
 		reportFailClosed(
 			`person ${personId} has no revision effective at or before ${at.toISOString()}; a later revision must not be used to classify it`,
@@ -507,12 +504,8 @@ async function cardMetaAsOf(
 			revisionNo: creditCardRevisions.revisionNo,
 		})
 		.from(creditCardRevisions)
-		.where(eq(creditCardRevisions.creditCardId, cardId))
-		.orderBy(asc(creditCardRevisions.revisionNo));
-	let chosen: (typeof revs)[number] | undefined;
-	for (const r of revs) {
-		if (asDate(r.occurredAt) <= at) chosen = r;
-	}
+		.where(eq(creditCardRevisions.creditCardId, cardId));
+	const chosen = effectiveRevisionAsOf(revs, at);
 	if (!chosen) {
 		reportFailClosed(
 			`credit card ${cardId} has no configuration revision effective at or before ${at.toISOString()}`,
@@ -607,12 +600,8 @@ async function resolveSealedSplitAsOf(
 			occurredAt: creditCardPurchaseSplitRevisions.occurredAt,
 		})
 		.from(creditCardPurchaseSplitRevisions)
-		.where(eq(creditCardPurchaseSplitRevisions.splitId, split.id))
-		.orderBy(asc(creditCardPurchaseSplitRevisions.revisionNo));
-	let eff: (typeof revs)[number] | undefined;
-	for (const r of revs) {
-		if (asDate(r.occurredAt) <= at) eff = r;
-	}
+		.where(eq(creditCardPurchaseSplitRevisions.splitId, split.id));
+	const eff = effectiveRevisionAsOf(revs, at);
 	if (!eff) return { kind: "NO_SPLIT" };
 	if (eff.operation === "VOID") {
 		return { kind: "VOID_SPLIT", splitRevisionId: eff.id };
@@ -785,7 +774,7 @@ interface TriggerContext {
 }
 
 function decomposeOwnership(
-	recon: Awaited<ReturnType<typeof getStatementReconciliation>>,
+	recon: Awaited<ReturnType<typeof getStatementReconciliationAsOf>>,
 	whoByPerson: Map<
 		string,
 		{ displayName: string; relationship: PersonRelationship }
@@ -950,14 +939,16 @@ async function resolveTrigger(
 		);
 	}
 
-	// 9. reconciliation is authoritative for the PAY revision statement amount.
-	// If the statement was later REOPENED / repaid at a different amount, its
-	// reconciliation is no longer RECONCILED (or no longer matches) and we fail
-	// closed rather than switching to the newer PAY.
-	const recon = await getStatementReconciliation({
+	// 9. reconciliation is authoritative for the PAY revision statement amount --
+	// read AS OF the checkpoint, so a SUPERSEDE / VOID authored after this payment
+	// event cannot rewrite the historical trigger ownership. If the statement was
+	// later REOPENED / repaid at a different amount, the as-of reconciliation is
+	// no longer RECONCILED / matching and we fail closed rather than switching.
+	const recon = await getStatementReconciliationAsOf({
 		db,
 		userId,
 		statementId: stmt.id,
+		asOf: checkpointAt,
 	});
 	if (recon.status !== "RECONCILED") {
 		triggerInvalid(
@@ -1048,8 +1039,7 @@ async function buildIntervalIncome(
 				amount: incomeReceiptRevisions.amount,
 			})
 			.from(incomeReceiptRevisions)
-			.where(eq(incomeReceiptRevisions.incomeReceiptId, r.receiptId))
-			.orderBy(asc(incomeReceiptRevisions.revisionNo));
+			.where(eq(incomeReceiptRevisions.incomeReceiptId, r.receiptId));
 		if (revs.length === 0) continue;
 
 		// SUPPORT role effective AT the checkpoint (never a later reclassification).
@@ -1067,16 +1057,15 @@ async function buildIntervalIncome(
 						incomeReceiptBudgetV2SemanticRevisions.incomeReceiptId,
 						r.receiptId,
 					),
-				)
-				.orderBy(asc(incomeReceiptBudgetV2SemanticRevisions.revisionNo));
-			let eff: (typeof roleRevs)[number] | undefined;
-			for (const rr of roleRevs) {
-				if (asDate(rr.occurredAt) <= checkpointAt) eff = rr;
-			}
-			supportRole = (eff?.role as SupportRole | undefined) ?? null;
+				);
+			supportRole =
+				(effectiveRevisionAsOf(roleRevs, checkpointAt)?.role as
+					| SupportRole
+					| undefined) ?? null;
 		}
 
-		for (const rev of revs) {
+		// The activity list is revision-activity based within the interval.
+		for (const rev of [...revs].sort((a, b) => a.revisionNo - b.revisionNo)) {
 			const at = asDate(rev.occurredAt);
 			if (!win.inInterval(at)) continue;
 			activity.push({
@@ -1090,11 +1079,13 @@ async function buildIntervalIncome(
 			});
 		}
 
-		const latest = revs[revs.length - 1];
-		if (!latest || latest.operation === "VOID") continue;
-		const latestAt = asDate(latest.occurredAt);
-		if (!win.inInterval(latestAt)) continue;
-		const cents = centsOf(latest.amount);
+		// The SUMMARY uses the receipt STATE effective at the checkpoint -- a
+		// later UPDATE/VOID must not replace or erase the older summary figure.
+		const eff = effectiveRevisionAsOf(revs, checkpointAt);
+		if (!eff || eff.operation === "VOID") continue;
+		const effAt = asDate(eff.occurredAt);
+		if (!win.inInterval(effAt)) continue;
+		const cents = centsOf(eff.amount);
 		if (nature === "REGULAR") regular += cents;
 		else if (nature === "EXTRA") extra += cents;
 		else if (supportRole === "PLANNED_FAMILY_GIFT") gift += cents;
@@ -1271,13 +1262,16 @@ async function buildMtdSpending(
 				occurredAt: creditCardLiabilityEventRevisions.occurredAt,
 			})
 			.from(creditCardLiabilityEventRevisions)
-			.where(eq(creditCardLiabilityEventRevisions.eventId, ev.eventId))
-			.orderBy(desc(creditCardLiabilityEventRevisions.revisionNo));
-		const latest = revs[0];
-		if (!latest || latest.operation === "VOID") continue;
-		const at = asDate(latest.occurredAt);
+			.where(eq(creditCardLiabilityEventRevisions.eventId, ev.eventId));
+		// The purchase revision STATE effective at the checkpoint -- a later
+		// UPDATE/VOID (or a CREATE after the checkpoint) must NOT erase or mutate
+		// this MTD purchase. Never "latest, then test its occurredAt".
+		const eff = effectiveRevisionAsOf(revs, checkpointAt);
+		if (!eff) continue; // purchase did not exist yet at the checkpoint
+		if (eff.operation === "VOID") continue;
+		const at = asDate(eff.occurredAt);
 		if (!win.inMtd(at)) continue;
-		const grossCents = centsOf(latest.amount);
+		const grossCents = centsOf(eff.amount);
 		const shares = await purchaseSharesAsOf(
 			db,
 			userId,
@@ -1290,7 +1284,7 @@ async function buildMtdSpending(
 				`MTD purchase ${ev.eventId}: ownership cannot be authoritatively resolved as of the checkpoint (${shares.reason})`,
 			);
 		}
-		const cat = normalizeCategory(latest.budgetCategory);
+		const cat = normalizeCategory(eff.budgetCategory);
 		byCategory[cat] += shares.personalCents;
 		gross += grossCents;
 		personal += shares.personalCents;
@@ -1298,12 +1292,12 @@ async function buildMtdSpending(
 		for (const p of shares.participants) {
 			byRelationship[p.relationship] += p.shareCents;
 		}
-		if (latest.installmentCount != null) {
+		if (eff.installmentCount != null) {
 			installmentPurchases.push({
 				eventId: ev.eventId,
 				grossAmount: formatCentsToMoney(grossCents),
 				personalShare: formatCentsToMoney(shares.personalCents),
-				installmentCount: latest.installmentCount,
+				installmentCount: eff.installmentCount,
 			});
 		}
 	}
@@ -1424,9 +1418,10 @@ async function buildPeopleFamily(
 					occurredAt: personSettlementRevisions.occurredAt,
 				})
 				.from(personSettlementRevisions)
-				.where(eq(personSettlementRevisions.settlementId, s.id))
-				.orderBy(asc(personSettlementRevisions.revisionNo));
-			for (const rev of sRevs) {
+				.where(eq(personSettlementRevisions.settlementId, s.id));
+			for (const rev of [...sRevs].sort(
+				(a, b) => a.revisionNo - b.revisionNo,
+			)) {
 				const at = asDate(rev.occurredAt);
 				if (!win.inInterval(at)) continue;
 				settlementActivity.push({
@@ -1448,8 +1443,9 @@ async function buildPeopleFamily(
 			// checkpoint that is ACTIVE + SEALED -> exact revision item references
 			// the participant -> participant anchor personObligationId == this
 			// obligation -> direction RECEIVABLE -> relationship at checkpoint FAMILY
-			// -> settlement latest op CREATE, in the interval.
-			const latest = sRevs[sRevs.length - 1];
+			// -> settlement STATE effective at the checkpoint is CREATE, in the
+			// interval. A VOID authored after the checkpoint does not erase it.
+			const latest = effectiveRevisionAsOf(sRevs, checkpointAt);
 			if (latest?.operation !== "CREATE") continue;
 			const at = asDate(latest.occurredAt);
 			if (!win.inInterval(at)) continue;
@@ -1533,7 +1529,6 @@ async function buildStatementPayments(
 	db: Database,
 	userId: string,
 	win: ResolverWindow,
-	checkpointAt: Date,
 	triggerPaymentEventId: string,
 	cardMetaOf: (cardId: string) => Promise<CardMeta>,
 ): Promise<StatementPaymentItem[]> {
@@ -1564,10 +1559,14 @@ async function buildStatementPayments(
 			);
 		}
 		const meta = await cardMetaOf(stmt.creditCardId);
-		const recon = await getStatementReconciliation({
+		// Section 9 -- ownership for EACH interval payment is based on the
+		// reconciliation truth effective at THAT payment event's own instant,
+		// never the report checkpoint's current/latest reconciliation.
+		const recon = await getStatementReconciliationAsOf({
 			db,
 			userId,
 			statementId: e.statementId,
+			asOf: at,
 		});
 		let ownership: OwnershipDecomposition | OwnershipUnavailable;
 		if (recon.status === "RECONCILED") {
@@ -1576,10 +1575,7 @@ async function buildStatementPayments(
 				{ displayName: string; relationship: PersonRelationship }
 			>();
 			for (const personId of recon.externalByPerson.keys()) {
-				whoByPerson.set(
-					personId,
-					await personAt(db, userId, personId, checkpointAt),
-				);
+				whoByPerson.set(personId, await personAt(db, userId, personId, at));
 			}
 			ownership = decomposeOwnership(recon, whoByPerson);
 		} else {
@@ -1768,7 +1764,6 @@ export async function buildBudgetV2CheckpointReport(
 		db,
 		userId,
 		win,
-		checkpointAt,
 		triggerPaymentEventId,
 		cardMetaOf,
 	);

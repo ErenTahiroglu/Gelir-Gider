@@ -1,6 +1,7 @@
-import { and, desc, eq, lt, lte, or, sql } from "drizzle-orm";
-import { getStatementReconciliation } from "../credit-cards/statement-reconciliation";
+import { and, eq, lt, lte, or, sql } from "drizzle-orm";
+import { getStatementReconciliationAsOf } from "../credit-cards/statement-reconciliation";
 import type { Database } from "../db/client";
+import { effectiveRevisionAsOf } from "../db/effective-revision";
 import { budgetV2BasicLivingConfigRevisions } from "../db/schema/budget-basic-living";
 import {
 	monthlyBudgetV2PlanRevisions,
@@ -250,6 +251,7 @@ interface LatestGoalState {
 async function loadGoalStates(
 	db: Database,
 	userId: string,
+	asOf: Date,
 ): Promise<LatestGoalState[]> {
 	const goals = await db
 		.select({ id: shortTermGoals.id, bucketId: shortTermGoals.midasBucketId })
@@ -269,32 +271,38 @@ async function loadGoalStates(
 			.where(eq(shortTermGoalRevisions.goalId, g.id))
 			.orderBy(shortTermGoalRevisions.revisionNo);
 		if (revs.length === 0) continue;
-		const latest = revs[revs.length - 1];
+		// The lifecycle STATE effective at asOf -- a later ARCHIVE/UPDATE must not
+		// rewrite the state a historical checkpoint observed.
+		const eff = effectiveRevisionAsOf(revs, asOf);
+		if (!eff) continue; // goal did not exist yet at asOf
 		const first = revs[0];
-		if (!latest || !first) continue;
+		if (!first) continue;
 		out.push({
 			goalId: g.id,
 			midasBucketId: g.bucketId,
-			status: latest.status,
-			fundingTargetCents: parseAggregateMoneyString(latest.fundingTarget).cents,
-			targetDate: latest.targetDate,
+			status: eff.status,
+			fundingTargetCents: parseAggregateMoneyString(eff.fundingTarget).cents,
+			targetDate: eff.targetDate,
 			activationAt: asDate(first.occurredAt),
 		});
 	}
 	return out;
 }
 
-async function latestGoalPurpose(
+async function goalPurposeAsOf(
 	db: Database,
 	goalId: string,
+	asOf: Date,
 ): Promise<string | null> {
-	const [row] = await db
-		.select({ purpose: shortTermGoalBudgetV2PurposeRevisions.purpose })
+	const revs = await db
+		.select({
+			revisionNo: shortTermGoalBudgetV2PurposeRevisions.revisionNo,
+			purpose: shortTermGoalBudgetV2PurposeRevisions.purpose,
+			occurredAt: shortTermGoalBudgetV2PurposeRevisions.occurredAt,
+		})
 		.from(shortTermGoalBudgetV2PurposeRevisions)
-		.where(eq(shortTermGoalBudgetV2PurposeRevisions.goalId, goalId))
-		.orderBy(desc(shortTermGoalBudgetV2PurposeRevisions.revisionNo))
-		.limit(1);
-	return row?.purpose ?? null;
+		.where(eq(shortTermGoalBudgetV2PurposeRevisions.goalId, goalId));
+	return effectiveRevisionAsOf(revs, asOf)?.purpose ?? null;
 }
 
 // ============================================================================
@@ -328,27 +336,29 @@ async function resolveRealizedIncome(
 	const receiptEvidence: Array<Record<string, unknown>> = [];
 
 	for (const r of receipts) {
-		const [latest] = await db
+		// The receipt STATE effective at asOf -- a later UPDATE/VOID must not
+		// replace (or erase) the state a historical checkpoint observed.
+		const revs = await db
 			.select({
+				revisionNo: incomeReceiptRevisions.revisionNo,
 				operation: incomeReceiptRevisions.operation,
 				occurredAt: incomeReceiptRevisions.occurredAt,
 				amount: incomeReceiptRevisions.amount,
 			})
 			.from(incomeReceiptRevisions)
-			.where(eq(incomeReceiptRevisions.incomeReceiptId, r.receiptId))
-			.orderBy(desc(incomeReceiptRevisions.revisionNo))
-			.limit(1);
-		if (!latest || latest.operation === "VOID") continue;
-		const occurredAt = asDate(latest.occurredAt);
+			.where(eq(incomeReceiptRevisions.incomeReceiptId, r.receiptId));
+		const eff = effectiveRevisionAsOf(revs, win.asOf);
+		if (!eff || eff.operation === "VOID") continue;
+		const occurredAt = asDate(eff.occurredAt);
 		if (!win.inMtd(occurredAt)) continue;
-		const amountCents = parseAggregateMoneyString(latest.amount).cents;
+		const amountCents = parseAggregateMoneyString(eff.amount).cents;
 
 		if (r.nature === "REGULAR") {
 			regular += amountCents;
 			receiptEvidence.push({
 				receiptId: r.receiptId,
 				nature: r.nature,
-				amount: latest.amount,
+				amount: eff.amount,
 				includedIn: "realizedIncome",
 			});
 		} else if (r.nature === "EXTRA") {
@@ -356,33 +366,36 @@ async function resolveRealizedIncome(
 			receiptEvidence.push({
 				receiptId: r.receiptId,
 				nature: r.nature,
-				amount: latest.amount,
+				amount: eff.amount,
 				includedIn: "realizedIncome",
 			});
 		} else if (r.nature === "SUPPORT") {
-			const [roleRow] = await db
-				.select({ role: incomeReceiptBudgetV2SemanticRevisions.supportRole })
+			const roleRevs = await db
+				.select({
+					revisionNo: incomeReceiptBudgetV2SemanticRevisions.revisionNo,
+					role: incomeReceiptBudgetV2SemanticRevisions.supportRole,
+					occurredAt: incomeReceiptBudgetV2SemanticRevisions.occurredAt,
+				})
 				.from(incomeReceiptBudgetV2SemanticRevisions)
 				.where(
 					eq(
 						incomeReceiptBudgetV2SemanticRevisions.incomeReceiptId,
 						r.receiptId,
 					),
-				)
-				.orderBy(desc(incomeReceiptBudgetV2SemanticRevisions.revisionNo))
-				.limit(1);
-			if (!roleRow) {
+				);
+			const roleEff = effectiveRevisionAsOf(roleRevs, win.asOf);
+			if (!roleEff) {
 				failClosed(
-					`SUPPORT income receipt ${r.receiptId} has no active Budget V2 semantic role; classify it before resolving`,
+					`SUPPORT income receipt ${r.receiptId} has no active Budget V2 semantic role effective at ${win.asOf.toISOString()}; classify it before resolving`,
 				);
 			}
-			if (roleRow.role === "PLANNED_FAMILY_GIFT") {
+			if (roleEff.role === "PLANNED_FAMILY_GIFT") {
 				gift += amountCents;
 				receiptEvidence.push({
 					receiptId: r.receiptId,
 					nature: r.nature,
-					supportRole: roleRow.role,
-					amount: latest.amount,
+					supportRole: roleEff.role,
+					amount: eff.amount,
 					includedIn: "realizedIncome",
 				});
 			} else {
@@ -390,8 +403,8 @@ async function resolveRealizedIncome(
 				receiptEvidence.push({
 					receiptId: r.receiptId,
 					nature: r.nature,
-					supportRole: roleRow.role,
-					amount: latest.amount,
+					supportRole: roleEff.role,
+					amount: eff.amount,
 					includedIn: "deficitFundingOnly",
 				});
 			}
@@ -455,7 +468,9 @@ async function resolveMobilityBalance(
 	const goalEvidence: Array<Record<string, unknown>> = [];
 	for (const g of goals) {
 		if (g.status !== "ACTIVE") continue;
-		if ((await latestGoalPurpose(db, g.goalId)) !== "INTERNATIONAL_MOBILITY") {
+		if (
+			(await goalPurposeAsOf(db, g.goalId, asOf)) !== "INTERNATIONAL_MOBILITY"
+		) {
 			continue;
 		}
 		const bal = await bucketNetCents(db, userId, g.midasBucketId, asOf);
@@ -494,6 +509,7 @@ async function resolveDateBoundNecessary(
 	goals: LatestGoalState[],
 	periodMonth: string,
 	periodStart: Date,
+	asOf: Date,
 ): Promise<{
 	cents: bigint;
 	perGoal: Array<Record<string, unknown>>;
@@ -505,7 +521,7 @@ async function resolveDateBoundNecessary(
 	for (const g of goals) {
 		if (g.status !== "ACTIVE") continue;
 		if (
-			(await latestGoalPurpose(db, g.goalId)) !==
+			(await goalPurposeAsOf(db, g.goalId, asOf)) !==
 			"DATE_BOUND_NECESSARY_PURCHASE"
 		) {
 			continue;
@@ -561,26 +577,28 @@ async function resolveDateBoundNecessary(
 // INPUT: basicLivingFunding (section 4)
 // ============================================================================
 
-async function personalPurchaseShareCents(
+async function personalPurchaseShareCentsAsOf(
 	db: Database,
 	purchaseEventId: string,
 	grossCents: bigint,
+	asOf: Date,
 ): Promise<bigint> {
-	const [split] = await db
+	const revs = await db
 		.select({
+			revisionNo: creditCardPurchaseSplitRevisions.revisionNo,
 			userShare: creditCardPurchaseSplitRevisions.userShareAmount,
 			operation: creditCardPurchaseSplitRevisions.operation,
+			occurredAt: creditCardPurchaseSplitRevisions.occurredAt,
 		})
 		.from(creditCardPurchaseSplitRevisions)
 		.innerJoin(
 			creditCardPurchaseSplits,
 			eq(creditCardPurchaseSplits.id, creditCardPurchaseSplitRevisions.splitId),
 		)
-		.where(eq(creditCardPurchaseSplits.purchaseEventId, purchaseEventId))
-		.orderBy(desc(creditCardPurchaseSplitRevisions.revisionNo))
-		.limit(1);
-	if (!split || split.operation === "VOID") return grossCents;
-	return parseAggregateMoneyString(split.userShare).cents;
+		.where(eq(creditCardPurchaseSplits.purchaseEventId, purchaseEventId));
+	const eff = effectiveRevisionAsOf(revs, asOf);
+	if (!eff || eff.operation === "VOID") return grossCents;
+	return parseAggregateMoneyString(eff.userShare).cents;
 }
 
 interface BasicLivingResult {
@@ -603,7 +621,10 @@ async function resolveBasicLiving(
 ): Promise<BasicLivingResult> {
 	const mandatoryPersonalByEvent = new Map<string, bigint>();
 	const mandatoryPeopleByObligation = new Map<string, bigint>();
-	const [cfg] = await db
+	// Among config revisions that target this period (effectivePeriodMonth <=
+	// periodMonth), take the one whose STATE was effective at asOf -- a config
+	// revision authored after the checkpoint must not apply retroactively.
+	const cfgRows = await db
 		.select()
 		.from(budgetV2BasicLivingConfigRevisions)
 		.where(
@@ -614,9 +635,8 @@ async function resolveBasicLiving(
 					periodMonth,
 				),
 			),
-		)
-		.orderBy(desc(budgetV2BasicLivingConfigRevisions.revisionNo))
-		.limit(1);
+		);
+	const cfg = effectiveRevisionAsOf(cfgRows, win.asOf);
 	if (!cfg) {
 		failClosed(
 			`no user-approved basic-living config is effective for period ${periodMonth}`,
@@ -627,7 +647,9 @@ async function resolveBasicLiving(
 	let spend = 0n;
 	const spendComponents: Array<Record<string, unknown>> = [];
 
-	// (a) credit-card purchases categorised MANDATORY_EXPENSE (personal share)
+	// (a) credit-card purchases categorised MANDATORY_EXPENSE (personal share).
+	// Use the purchase revision STATE effective at asOf -- a later UPDATE/VOID
+	// must not mutate or erase a prior checkpoint's basic-living actual spend.
 	const purchaseRevs = await db
 		.select({
 			eventId: creditCardLiabilityEventRevisions.eventId,
@@ -650,32 +672,34 @@ async function resolveBasicLiving(
 				eq(creditCardLiabilityEvents.userId, userId),
 				eq(creditCardLiabilityEvents.eventType, "PURCHASE"),
 			),
-		)
-		.orderBy(
-			creditCardLiabilityEventRevisions.eventId,
-			creditCardLiabilityEventRevisions.revisionNo,
 		);
-	const latestByEvent = new Map<string, (typeof purchaseRevs)[number]>();
-	for (const p of purchaseRevs) latestByEvent.set(p.eventId, p);
-	for (const p of latestByEvent.values()) {
-		if (p.operation === "VOID") continue;
+	const revsByEvent = new Map<string, (typeof purchaseRevs)[number][]>();
+	for (const p of purchaseRevs) {
+		const list = revsByEvent.get(p.eventId);
+		if (list) list.push(p);
+		else revsByEvent.set(p.eventId, [p]);
+	}
+	for (const [eventId, evRevs] of revsByEvent) {
+		const p = effectiveRevisionAsOf(evRevs, win.asOf);
+		if (!p || p.operation === "VOID") continue;
 		if (p.budgetCategory !== "MANDATORY_EXPENSE") continue;
 		const at = asDate(p.occurredAt);
 		if (!win.inMtd(at)) continue;
 		const grossCents = parseAggregateMoneyString(p.amount).cents;
-		const personalCents = await personalPurchaseShareCents(
+		const personalCents = await personalPurchaseShareCentsAsOf(
 			db,
-			p.eventId,
+			eventId,
 			grossCents,
+			win.asOf,
 		);
 		spend += personalCents;
 		mandatoryPersonalByEvent.set(
-			p.eventId,
-			(mandatoryPersonalByEvent.get(p.eventId) ?? 0n) + personalCents,
+			eventId,
+			(mandatoryPersonalByEvent.get(eventId) ?? 0n) + personalCents,
 		);
 		spendComponents.push({
 			source: "CREDIT_CARD_PURCHASE",
-			eventId: p.eventId,
+			eventId,
 			personalShare: formatCentsToMoney(personalCents),
 			occurredAt: at.toISOString(),
 		});
@@ -692,17 +716,17 @@ async function resolveBasicLiving(
 			),
 		);
 	for (const o of payables) {
-		const [rev] = await db
+		const oblRevs = await db
 			.select({
+				revisionNo: personObligationRevisions.revisionNo,
 				operation: personObligationRevisions.operation,
 				principal: personObligationRevisions.principalAmount,
 				budgetCategory: personObligationRevisions.budgetCategory,
 				occurredAt: personObligationRevisions.occurredAt,
 			})
 			.from(personObligationRevisions)
-			.where(eq(personObligationRevisions.obligationId, o.id))
-			.orderBy(desc(personObligationRevisions.revisionNo))
-			.limit(1);
+			.where(eq(personObligationRevisions.obligationId, o.id));
+		const rev = effectiveRevisionAsOf(oblRevs, win.asOf);
 		if (!rev || rev.operation === "VOID") continue;
 		if (rev.budgetCategory !== "MANDATORY_EXPENSE") continue;
 		const at = asDate(rev.occurredAt);
@@ -863,9 +887,11 @@ interface CurrentObligationsResult {
 async function statementPaidInstant(
 	db: Database,
 	statementId: string,
+	asOf: Date,
 ): Promise<Date | null> {
-	const [payRev] = await db
+	const payRevs = await db
 		.select({
+			revisionNo: creditCardStatementRevisions.revisionNo,
 			occurredAt: creditCardStatementRevisions.occurredAt,
 			paymentEventId: creditCardStatementRevisions.paymentEventId,
 		})
@@ -875,9 +901,10 @@ async function statementPaidInstant(
 				eq(creditCardStatementRevisions.statementId, statementId),
 				eq(creditCardStatementRevisions.operation, "PAY"),
 			),
-		)
-		.orderBy(desc(creditCardStatementRevisions.revisionNo))
-		.limit(1);
+		);
+	// The PAY revision effective at asOf -- with PAY -> REOPEN -> PAY, each asOf
+	// observes only the PAY event that had happened by that instant.
+	const payRev = effectiveRevisionAsOf(payRevs, asOf);
 	if (!payRev) return null;
 	if (payRev.paymentEventId) {
 		const [pe] = await db
@@ -924,16 +951,19 @@ async function resolveCurrentObligations(
 				),
 			);
 		for (const s of stmts) {
-			const [rev] = await db
+			// The statement lifecycle STATE effective at asOf -- e.g. OPEN -> PAY
+			// Sep 10 -> REOPEN Sep 20 is PAID at asOf Sep 15 and OPEN at asOf Sep 25.
+			const stmtRevs = await db
 				.select({
+					revisionNo: creditCardStatementRevisions.revisionNo,
 					status: creditCardStatementRevisions.status,
 					statementAmount: creditCardStatementRevisions.statementAmount,
 					dueDate: creditCardStatementRevisions.dueDate,
+					occurredAt: creditCardStatementRevisions.occurredAt,
 				})
 				.from(creditCardStatementRevisions)
-				.where(eq(creditCardStatementRevisions.statementId, s.id))
-				.orderBy(desc(creditCardStatementRevisions.revisionNo))
-				.limit(1);
+				.where(eq(creditCardStatementRevisions.statementId, s.id));
+			const rev = effectiveRevisionAsOf(stmtRevs, win.asOf);
 			if (!rev || rev.status === "VOID") continue;
 
 			// Period recognition -- the defect was recognising every non-VOID
@@ -943,7 +973,7 @@ async function resolveCurrentObligations(
 			let recognisePeriod: boolean;
 			let recognitionBasis: string;
 			if (rev.status === "PAID") {
-				const paidAt = await statementPaidInstant(db, s.id);
+				const paidAt = await statementPaidInstant(db, s.id, win.asOf);
 				if (!paidAt) {
 					failClosed(
 						`credit-card statement ${s.id} latest status is PAID but has no authoritative PAY revision / payment event`,
@@ -967,10 +997,11 @@ async function resolveCurrentObligations(
 			}
 			if (!recognisePeriod) continue;
 
-			const recon = await getStatementReconciliation({
+			const recon = await getStatementReconciliationAsOf({
 				db,
 				userId,
 				statementId: s.id,
+				asOf: win.asOf,
 			});
 			if (recon.status !== "RECONCILED") {
 				failClosed(
@@ -1064,16 +1095,19 @@ async function resolveCurrentObligations(
 			),
 		);
 	for (const o of payables) {
-		const [rev] = await db
+		// Obligation STATE effective at asOf -- a later UPDATE/VOID must not
+		// rewrite a prior checkpoint's currentObligations.
+		const oblRevs = await db
 			.select({
+				revisionNo: personObligationRevisions.revisionNo,
 				operation: personObligationRevisions.operation,
 				principal: personObligationRevisions.principalAmount,
 				dueDate: personObligationRevisions.dueDate,
+				occurredAt: personObligationRevisions.occurredAt,
 			})
 			.from(personObligationRevisions)
-			.where(eq(personObligationRevisions.obligationId, o.id))
-			.orderBy(desc(personObligationRevisions.revisionNo))
-			.limit(1);
+			.where(eq(personObligationRevisions.obligationId, o.id));
+		const rev = effectiveRevisionAsOf(oblRevs, win.asOf);
 		if (!rev || rev.operation === "VOID") continue;
 		const principalCents = parseAggregateMoneyString(rev.principal).cents;
 
@@ -1084,16 +1118,16 @@ async function resolveCurrentObligations(
 		let settledToDate = 0n;
 		let settledInPeriod = 0n;
 		for (const st of settlements) {
-			const [sr] = await db
+			const srRevs = await db
 				.select({
+					revisionNo: personSettlementRevisions.revisionNo,
 					operation: personSettlementRevisions.operation,
 					applied: personSettlementRevisions.appliedAmount,
 					occurredAt: personSettlementRevisions.occurredAt,
 				})
 				.from(personSettlementRevisions)
-				.where(eq(personSettlementRevisions.settlementId, st.id))
-				.orderBy(desc(personSettlementRevisions.revisionNo))
-				.limit(1);
+				.where(eq(personSettlementRevisions.settlementId, st.id));
+			const sr = effectiveRevisionAsOf(srRevs, win.asOf);
 			if (!sr || sr.operation === "VOID") continue;
 			const appliedCents = parseAggregateMoneyString(sr.applied).cents;
 			settledToDate += appliedCents;
@@ -1211,7 +1245,7 @@ export async function resolveBudgetV2LiveSnapshot(
 	const intervalStart = win.intervalStart;
 	const intervalEnd = win.upperLabel;
 
-	const goals = await loadGoalStates(db, userId);
+	const goals = await loadGoalStates(db, userId, asOf);
 	const income = await resolveRealizedIncome(db, userId, win);
 	const emergency = await resolveEmergencyFund(db, userId, asOf);
 	const mobility = await resolveMobilityBalance(db, userId, goals, asOf);
@@ -1221,6 +1255,7 @@ export async function resolveBudgetV2LiveSnapshot(
 		goals,
 		periodMonth,
 		periodStart,
+		asOf,
 	);
 	const basicLiving = await resolveBasicLiving(db, userId, periodMonth, win);
 	const obligations = await resolveCurrentObligations(
