@@ -56,6 +56,8 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		// one BEFORE INSERT chain guard);
 		// +5 in migration 0065 (credit-card statement reconciliation: one shared
 		// immutability guard + anchor / revision / component / seal insert guards).
+		// 0066 CREATE OR REPLACEs an existing function (trg_fn_guard_ccsrc_insert)
+		// -- no new function name, so the count is unchanged.
 		expect(effectiveFunctions.size).toBe(162);
 	});
 
@@ -70,18 +72,26 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		}
 	});
 
-	it("migration 0065 contributes exactly the five statement-reconciliation guard functions", () => {
+	it("migration 0065 defines the statement-reconciliation guard functions (component guard later hardened by 0066)", () => {
 		for (const fnName of [
 			"trg_fn_guard_ccsr_immutability",
 			"trg_fn_guard_ccsr_anchor_insert",
 			"trg_fn_guard_ccsrr_insert",
-			"trg_fn_guard_ccsrc_insert",
 			"trg_fn_guard_ccsr_seal_insert",
 		]) {
 			expect(effectiveFunctions.get(fnName)?.migration).toBe(
 				"0065_add_credit_card_statement_reconciliation",
 			);
 		}
+	});
+
+	it("migration 0066 provides the effective version of trg_fn_guard_ccsrc_insert (split-consistency hardening)", () => {
+		const fn = effectiveFunctions.get("trg_fn_guard_ccsrc_insert");
+		expect(fn?.migration).toBe(
+			"0066_harden_statement_reconciliation_split_consistency",
+		);
+		expect(fn?.body).toContain("has no active split");
+		expect(fn?.body).toContain("is not a participant of split revision");
 	});
 
 	it("migration 0063 contributes exactly the four Budget V2 semantic guard functions", () => {

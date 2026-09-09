@@ -1,5 +1,12 @@
 import { and, desc, eq } from "drizzle-orm";
 import type { Database } from "../db/client";
+import { creditCardLiabilityEventRevisions } from "../db/schema/credit-card-ledger";
+import {
+	creditCardPurchaseSplitRevisionItems,
+	creditCardPurchaseSplitRevisionSeals,
+	creditCardPurchaseSplitRevisions,
+	creditCardPurchaseSplits,
+} from "../db/schema/credit-card-splits";
 import {
 	CC_STATEMENT_RECON_ADJUSTMENT_KINDS,
 	CC_STATEMENT_RECON_COMPONENT_TYPES,
@@ -16,7 +23,10 @@ import {
 	creditCardStatementRevisions,
 	creditCardStatements,
 } from "../db/schema/credit-cards";
-import { parsePositiveMoneyString } from "../ledger/money";
+import {
+	parseAggregateMoneyString,
+	parsePositiveMoneyString,
+} from "../ledger/money";
 import { validateCcCanonicalUuid } from "./calendar";
 import { CreditCardError } from "./errors";
 import {
@@ -56,11 +66,14 @@ export interface ReconcileStatementParams {
 	db: Database;
 	userId: string;
 	statementId: string;
-	/** MUST be the statement's current latest revision id. */
+	/** MUST be the statement's current latest (non-VOID) revision id. */
 	statementRevisionId: string;
 	components: ReconciliationComponentInput[];
 	idempotencyKey: string;
-	/** Required when superseding: the current latest reconciliation revision no. */
+	/**
+	 * OCC. Omit for the first reconciliation (CREATE); REQUIRED to supersede an
+	 * existing one and must equal the current latest reconciliation revision no.
+	 */
 	expectedRevisionNo?: number | undefined;
 	occurredAt?: Date | undefined;
 }
@@ -107,8 +120,10 @@ export interface ReconcileStatementResult {
 export type StatementReconciliationStatus =
 	| "NONE" // no reconciliation ever created
 	| "UNSEALED" // latest revision has no seal (incomplete)
-	| "VOIDED" // latest revision is a terminal VOID
-	| "STALE" // sealed, but the statement was revised / re-amounted since
+	| "VOIDED" // latest reconciliation revision is a terminal VOID
+	| "STATEMENT_VOID" // the statement itself is VOID -- not usable
+	| "STALE" // sealed, but the statement amount changed, or the referenced
+	// purchase/split evidence has since become VOID / superseded / incompatible
 	| "RECONCILED"; // sealed and current
 
 export interface StatementReconciliationView {
@@ -117,6 +132,8 @@ export interface StatementReconciliationView {
 	revisionNo: number | null;
 	statementRevisionId: string | null;
 	reconciledStatementAmount: string | null;
+	/** Set when status is STALE / STATEMENT_VOID -- why it is not usable. */
+	staleReason: string | null;
 	/** Present only when status is RECONCILED. */
 	components: ReconciliationComponentItem[];
 	/** kurus */
@@ -433,6 +450,204 @@ function fpComponents(
 }
 
 // ============================================================================
+// Purchase / split integrity (section 6)
+// ============================================================================
+
+interface ActiveSplitInfo {
+	splitRevisionId: string;
+	userShareCents: bigint;
+	sealed: boolean;
+	participantPersonIds: Set<string>;
+}
+
+/**
+ * The authoritative ACTIVE split for a purchase = its split anchor's latest
+ * non-VOID revision. Returns null when the purchase has no split, or its latest
+ * split revision is VOID (i.e. the purchase is currently unsplit / 100% user).
+ */
+async function activeSplitForPurchase(
+	db: Database,
+	purchaseEventId: string,
+): Promise<ActiveSplitInfo | null> {
+	const [split] = await db
+		.select({ id: creditCardPurchaseSplits.id })
+		.from(creditCardPurchaseSplits)
+		.where(eq(creditCardPurchaseSplits.purchaseEventId, purchaseEventId))
+		.limit(1);
+	if (!split) return null;
+	const [rev] = await db
+		.select({
+			id: creditCardPurchaseSplitRevisions.id,
+			operation: creditCardPurchaseSplitRevisions.operation,
+			userShare: creditCardPurchaseSplitRevisions.userShareAmount,
+		})
+		.from(creditCardPurchaseSplitRevisions)
+		.where(eq(creditCardPurchaseSplitRevisions.splitId, split.id))
+		.orderBy(desc(creditCardPurchaseSplitRevisions.revisionNo))
+		.limit(1);
+	if (!rev || rev.operation === "VOID") return null;
+	const [seal] = await db
+		.select({
+			id: creditCardPurchaseSplitRevisionSeals.splitRevisionId,
+		})
+		.from(creditCardPurchaseSplitRevisionSeals)
+		.where(eq(creditCardPurchaseSplitRevisionSeals.splitRevisionId, rev.id))
+		.limit(1);
+	const items = await db
+		.select({ personId: creditCardPurchaseSplitRevisionItems.personId })
+		.from(creditCardPurchaseSplitRevisionItems)
+		.where(eq(creditCardPurchaseSplitRevisionItems.splitRevisionId, rev.id));
+	return {
+		splitRevisionId: rev.id,
+		userShareCents: parseAggregateMoneyString(rev.userShare).cents,
+		sealed: Boolean(seal),
+		participantPersonIds: new Set(items.map((i) => i.personId)),
+	};
+}
+
+/** Write-time: a new PURCHASE component must not contradict split truth. */
+async function assertPurchaseComponentSplitConsistency(
+	db: Database,
+	c: NormalizedComponent,
+): Promise<void> {
+	if (c.componentType !== "PURCHASE" || !c.purchaseEventId) return;
+	const active = await activeSplitForPurchase(db, c.purchaseEventId);
+	const fail = (msg: string): never => {
+		throw new CreditCardError(
+			"CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT",
+			`component ${c.componentNo}: ${msg}`,
+		);
+	};
+	if (!active) {
+		if (c.ownership !== "PERSONAL") {
+			fail(
+				`purchase ${c.purchaseEventId} has no active split; PURCHASE component ownership must be PERSONAL`,
+			);
+		}
+		if (c.purchaseSplitRevisionId) {
+			fail(
+				`purchase ${c.purchaseEventId} has no active split; purchaseSplitRevisionId must be null`,
+			);
+		}
+		return;
+	}
+	if (c.purchaseSplitRevisionId !== active.splitRevisionId) {
+		fail(
+			`purchaseSplitRevisionId must be the active split revision "${active.splitRevisionId}" for purchase ${c.purchaseEventId}`,
+		);
+	}
+	if (!active.sealed) {
+		fail(`active split revision "${active.splitRevisionId}" is not sealed`);
+	}
+	if (c.ownership === "EXTERNAL_PERSON") {
+		if (!c.personId || !active.participantPersonIds.has(c.personId)) {
+			fail(
+				`personId ${c.personId} is not a participant of split revision "${active.splitRevisionId}"`,
+			);
+		}
+	} else if (active.userShareCents <= 0n) {
+		fail(
+			`split revision "${active.splitRevisionId}" has zero user share; PERSONAL ownership is incompatible`,
+		);
+	}
+}
+
+/** Read-time freshness: why a stored PURCHASE component is no longer trustworthy. */
+async function purchaseComponentStaleReason(
+	db: Database,
+	item: ReconciliationComponentItem,
+): Promise<string | null> {
+	if (item.componentType !== "PURCHASE" || !item.purchaseEventId) return null;
+	const [ev] = await db
+		.select({ operation: creditCardLiabilityEventRevisions.operation })
+		.from(creditCardLiabilityEventRevisions)
+		.where(eq(creditCardLiabilityEventRevisions.eventId, item.purchaseEventId))
+		.orderBy(desc(creditCardLiabilityEventRevisions.revisionNo))
+		.limit(1);
+	if (!ev) return `purchase event ${item.purchaseEventId} has no revisions`;
+	if (ev.operation === "VOID") {
+		return `purchase event ${item.purchaseEventId} is now VOID`;
+	}
+	const active = await activeSplitForPurchase(db, item.purchaseEventId);
+	if (!active) {
+		if (item.purchaseSplitRevisionId) {
+			return `purchase ${item.purchaseEventId} no longer has an active split`;
+		}
+		if (item.ownership !== "PERSONAL") {
+			return `purchase ${item.purchaseEventId} is now unsplit; ownership ${item.ownership} incompatible`;
+		}
+		return null;
+	}
+	if (item.purchaseSplitRevisionId !== active.splitRevisionId) {
+		return `purchase ${item.purchaseEventId} split evidence superseded (${item.purchaseSplitRevisionId} -> ${active.splitRevisionId})`;
+	}
+	if (!active.sealed) {
+		return `active split revision ${active.splitRevisionId} is not sealed`;
+	}
+	if (
+		item.ownership === "EXTERNAL_PERSON" &&
+		(!item.personId || !active.participantPersonIds.has(item.personId))
+	) {
+		return `personId ${item.personId} is no longer a participant of split ${active.splitRevisionId}`;
+	}
+	if (item.ownership === "PERSONAL" && active.userShareCents <= 0n) {
+		return `split ${active.splitRevisionId} user share is now zero; PERSONAL ownership incompatible`;
+	}
+	return null;
+}
+
+// ============================================================================
+// Race-safe idempotency replay (section 5)
+// ============================================================================
+
+interface ReplayCtx {
+	userId: string;
+	statementId: string;
+	fingerprintComponents: ReconciliationComponentFingerprintInput[];
+	explicitOccurredAt: Date | undefined;
+	idempotencyKey: string;
+}
+
+/**
+ * Fail-closed replay of an already-stored reconciliation revision found by
+ * `(userId, idempotencyKey)`. The candidate fingerprint is rebuilt from the
+ * STORED positional fields (so a PAY lifecycle transition can never turn an
+ * exact retry into a false conflict) plus the incoming components and the
+ * effective occurredAt (STORED occurredAt when the caller omitted it).
+ */
+async function replayReconcile(
+	db: Database,
+	existing: typeof creditCardStatementReconciliationRevisions.$inferSelect,
+	ctx: ReplayCtx,
+): Promise<ReconcileStatementResult> {
+	const candidateFp = await calculateStatementReconciliationRevisionFingerprint(
+		{
+			userId: ctx.userId,
+			statementId: ctx.statementId,
+			operation: existing.operation as "CREATE" | "SUPERSEDE" | "VOID",
+			revisionNo: existing.revisionNo,
+			previousRevisionId: existing.previousRevisionId,
+			statementRevisionId: existing.statementRevisionId,
+			reconciledStatementAmount: existing.reconciledStatementAmount,
+			occurredAt: ctx.explicitOccurredAt ?? existing.occurredAt,
+			components: ctx.fingerprintComponents,
+		},
+	);
+	if (candidateFp !== existing.reconciliationFingerprint) {
+		throw new CreditCardError(
+			"CREDIT_CARD_STATEMENT_RECONCILIATION_IDEMPOTENCY_CONFLICT",
+			`idempotency key "${ctx.idempotencyKey}" was already used with a different reconciliation`,
+		);
+	}
+	const sealed = await isSealed(db, existing.id);
+	return {
+		revision: toRevisionItem(existing, sealed),
+		components: await componentsFor(db, existing.id),
+		idempotentReplay: true,
+	};
+}
+
+// ============================================================================
 // reconcileStatement
 // ============================================================================
 
@@ -453,6 +668,7 @@ export async function reconcileStatement(
 	const explicitOccurredAt = validateOptionalOccurredAt(params.occurredAt);
 	const comps = normalizeComponents(params.components);
 	const sumCents = comps.reduce((acc, c) => acc + c.amountCents, 0n);
+	const fpComps = fpComponents(comps);
 	if (
 		params.expectedRevisionNo !== undefined &&
 		(!Number.isInteger(params.expectedRevisionNo) ||
@@ -463,6 +679,24 @@ export async function reconcileStatement(
 			"expectedRevisionNo must be a positive integer",
 		);
 	}
+
+	const replayCtx: ReplayCtx = {
+		userId,
+		statementId,
+		fingerprintComponents: fpComps,
+		explicitOccurredAt,
+		idempotencyKey,
+	};
+
+	// FAST historical idempotency -- BEFORE any mutable latest-state validation,
+	// so an exact retry (incl. after a PAY lifecycle transition, and with
+	// occurredAt omitted) is a replay, never a false conflict.
+	const fast = await findReconRevisionByIdempotencyKey(
+		db,
+		userId,
+		idempotencyKey,
+	);
+	if (fast) return replayReconcile(db, fast, replayCtx);
 
 	return await db.transaction(async (txRaw) => {
 		const tx = txRaw as unknown as Database;
@@ -484,6 +718,15 @@ export async function reconcileStatement(
 				`statement "${statementId}" not found`,
 			);
 		}
+
+		// SECOND idempotency lookup, now holding the statement lock -- a racer
+		// that committed after the fast path is visible here.
+		const raced = await findReconRevisionByIdempotencyKey(
+			tx,
+			userId,
+			idempotencyKey,
+		);
+		if (raced) return replayReconcile(tx, raced, replayCtx);
 
 		const stmtRev = await latestStatementRevision(tx, statementId);
 		if (!stmtRev) {
@@ -510,6 +753,11 @@ export async function reconcileStatement(
 				"CREDIT_CARD_STATEMENT_RECONCILIATION_NOT_BALANCED",
 				`reconciliation component sum ${sumCents} kurus does not equal statement_amount ${stmtAmount.cents} kurus`,
 			);
+		}
+
+		// section 6 -- PURCHASE components must agree with authoritative split truth.
+		for (const c of comps) {
+			await assertPurchaseComponentSplitConsistency(tx, c);
 		}
 
 		// Anchor (find-or-create; unique on statement_id).
@@ -549,32 +797,34 @@ export async function reconcileStatement(
 			);
 		}
 
-		// Historical idempotency.
-		const existing = await findReconRevisionByIdempotencyKey(
-			tx,
-			userId,
-			idempotencyKey,
-		);
 		const latestRev = await latestReconRevision(tx, anchor.id);
 
 		let operation: "CREATE" | "SUPERSEDE";
 		let previousRevisionId: string | null;
 		let revisionNo: number;
 		if (!latestRev) {
+			if (params.expectedRevisionNo !== undefined) {
+				throw new CreditCardError(
+					"CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT",
+					`statement "${statementId}" has no reconciliation to supersede`,
+				);
+			}
 			operation = "CREATE";
 			previousRevisionId = null;
 			revisionNo = 1;
+		} else if (latestRev.operation === "VOID") {
+			throw new CreditCardError(
+				"CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT",
+				`statement "${statementId}" reconciliation is VOIDED (terminal); cannot supersede`,
+			);
 		} else {
-			if (latestRev.operation === "VOID") {
+			if (params.expectedRevisionNo === undefined) {
 				throw new CreditCardError(
 					"CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT",
-					`statement "${statementId}" reconciliation is VOIDED (terminal); cannot supersede`,
+					`statement "${statementId}" is already reconciled (revision ${latestRev.revisionNo}); pass expectedRevisionNo to supersede`,
 				);
 			}
-			if (
-				params.expectedRevisionNo !== undefined &&
-				params.expectedRevisionNo !== latestRev.revisionNo
-			) {
+			if (params.expectedRevisionNo !== latestRev.revisionNo) {
 				throw new CreditCardError(
 					"CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT",
 					`expected reconciliation revision ${params.expectedRevisionNo}, latest is ${latestRev.revisionNo}`,
@@ -596,24 +846,11 @@ export async function reconcileStatement(
 				statementRevisionId,
 				reconciledStatementAmount: stmtAmount.normalized,
 				occurredAt,
-				components: fpComponents(comps),
+				components: fpComps,
 			});
 
-		if (existing) {
-			if (existing.reconciliationFingerprint !== fingerprint) {
-				throw new CreditCardError(
-					"CREDIT_CARD_STATEMENT_RECONCILIATION_IDEMPOTENCY_CONFLICT",
-					`idempotency key "${idempotencyKey}" was already used with a different reconciliation`,
-				);
-			}
-			const sealed = await isSealed(tx, existing.id);
-			return {
-				revision: toRevisionItem(existing, sealed),
-				components: await componentsFor(tx, existing.id),
-				idempotentReplay: true,
-			};
-		}
-
+		// Race-safe insert: a cross-statement same-key writer is absorbed by the
+		// (user_id, idempotency_key) unique index, never a raw 23505.
 		const [revRow] = await tx
 			.insert(creditCardStatementReconciliationRevisions)
 			.values({
@@ -629,12 +866,26 @@ export async function reconcileStatement(
 				reconciliationFingerprint: fingerprint,
 				occurredAt,
 			})
+			.onConflictDoNothing({
+				target: [
+					creditCardStatementReconciliationRevisions.userId,
+					creditCardStatementReconciliationRevisions.idempotencyKey,
+				],
+			})
 			.returning();
 		if (!revRow) {
-			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_STATE",
-				"failed to insert reconciliation revision",
+			const afterConflict = await findReconRevisionByIdempotencyKey(
+				tx,
+				userId,
+				idempotencyKey,
 			);
+			if (!afterConflict) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					"reconciliation idempotency key conflicted but no row is visible",
+				);
+			}
+			return replayReconcile(tx, afterConflict, replayCtx);
 		}
 
 		for (const c of comps) {
@@ -686,6 +937,21 @@ export async function voidStatementReconciliation(
 		);
 	}
 
+	const replayCtx: ReplayCtx = {
+		userId,
+		statementId,
+		fingerprintComponents: [],
+		explicitOccurredAt,
+		idempotencyKey,
+	};
+
+	const fast = await findReconRevisionByIdempotencyKey(
+		db,
+		userId,
+		idempotencyKey,
+	);
+	if (fast) return replayReconcile(db, fast, replayCtx);
+
 	return await db.transaction(async (txRaw) => {
 		const tx = txRaw as unknown as Database;
 		const [anchor] = await tx
@@ -705,6 +971,14 @@ export async function voidStatementReconciliation(
 				`statement "${statementId}" has no reconciliation to void`,
 			);
 		}
+
+		const raced = await findReconRevisionByIdempotencyKey(
+			tx,
+			userId,
+			idempotencyKey,
+		);
+		if (raced) return replayReconcile(tx, raced, replayCtx);
+
 		const latestRev = await latestReconRevision(tx, anchor.id);
 		if (!latestRev) {
 			throw new CreditCardError(
@@ -712,12 +986,19 @@ export async function voidStatementReconciliation(
 				`statement "${statementId}" has no reconciliation revisions`,
 			);
 		}
+		if (latestRev.operation === "VOID") {
+			throw new CreditCardError(
+				"CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT",
+				`statement "${statementId}" reconciliation is already VOIDED`,
+			);
+		}
+		if (latestRev.revisionNo !== expectedRevisionNo) {
+			throw new CreditCardError(
+				"CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT",
+				`expected reconciliation revision ${expectedRevisionNo}, latest is ${latestRev.revisionNo}`,
+			);
+		}
 
-		const existing = await findReconRevisionByIdempotencyKey(
-			tx,
-			userId,
-			idempotencyKey,
-		);
 		const occurredAt = explicitOccurredAt ?? new Date();
 		const fingerprint =
 			await calculateStatementReconciliationRevisionFingerprint({
@@ -731,32 +1012,6 @@ export async function voidStatementReconciliation(
 				occurredAt,
 				components: [],
 			});
-		if (existing) {
-			if (existing.reconciliationFingerprint !== fingerprint) {
-				throw new CreditCardError(
-					"CREDIT_CARD_STATEMENT_RECONCILIATION_IDEMPOTENCY_CONFLICT",
-					`idempotency key "${idempotencyKey}" was already used with a different reconciliation`,
-				);
-			}
-			return {
-				revision: toRevisionItem(existing, false),
-				components: [],
-				idempotentReplay: true,
-			};
-		}
-
-		if (latestRev.operation === "VOID") {
-			throw new CreditCardError(
-				"CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT",
-				`statement "${statementId}" reconciliation is already VOIDED`,
-			);
-		}
-		if (latestRev.revisionNo !== expectedRevisionNo) {
-			throw new CreditCardError(
-				"CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT",
-				`expected reconciliation revision ${expectedRevisionNo}, latest is ${latestRev.revisionNo}`,
-			);
-		}
 
 		const [revRow] = await tx
 			.insert(creditCardStatementReconciliationRevisions)
@@ -773,12 +1028,26 @@ export async function voidStatementReconciliation(
 				reconciliationFingerprint: fingerprint,
 				occurredAt,
 			})
+			.onConflictDoNothing({
+				target: [
+					creditCardStatementReconciliationRevisions.userId,
+					creditCardStatementReconciliationRevisions.idempotencyKey,
+				],
+			})
 			.returning();
 		if (!revRow) {
-			throw new CreditCardError(
-				"CREDIT_CARD_INVALID_STATE",
-				"failed to insert VOID reconciliation revision",
+			const afterConflict = await findReconRevisionByIdempotencyKey(
+				tx,
+				userId,
+				idempotencyKey,
 			);
+			if (!afterConflict) {
+				throw new CreditCardError(
+					"CREDIT_CARD_INVALID_STATE",
+					"reconciliation idempotency key conflicted but no row is visible",
+				);
+			}
+			return replayReconcile(tx, afterConflict, replayCtx);
 		}
 		return {
 			revision: toRevisionItem(revRow, false),
@@ -810,6 +1079,7 @@ export async function getStatementReconciliation(params: {
 		revisionNo: null,
 		statementRevisionId: null,
 		reconciledStatementAmount: null,
+		staleReason: null,
 		components: [],
 		personalCents: 0n,
 		externalByPerson: new Map(),
@@ -841,19 +1111,48 @@ export async function getStatementReconciliation(params: {
 		return { ...base, status: "UNSEALED" };
 	}
 
-	// Freshness: the sealed reconciliation must match the statement's CURRENT
-	// latest revision id AND amount.
+	// Freshness (section 1): a status-only lifecycle change (PAY / compatible
+	// REOPEN) creates a new statement revision but MUST NOT stale the
+	// reconciliation. Staleness = the statement is VOID, or the economic
+	// statement amount it decomposes has changed.
 	const stmtRev = await latestStatementRevision(db, statementId);
+	if (!stmtRev) {
+		return {
+			...base,
+			status: "STALE",
+			staleReason: "statement has no revisions",
+		};
+	}
+	if (stmtRev.status === "VOID") {
+		return {
+			...base,
+			status: "STATEMENT_VOID",
+			staleReason: "the statement itself is VOID",
+		};
+	}
 	if (
-		!stmtRev ||
-		stmtRev.id !== latestRev.statementRevisionId ||
 		parsePositiveMoneyString(stmtRev.statementAmount).cents !==
-			parsePositiveMoneyString(latestRev.reconciledStatementAmount).cents
+		parsePositiveMoneyString(latestRev.reconciledStatementAmount).cents
 	) {
-		return { ...base, status: "STALE" };
+		return {
+			...base,
+			status: "STALE",
+			staleReason: `statement amount changed (${latestRev.reconciledStatementAmount} -> ${stmtRev.statementAmount}); supersede the reconciliation`,
+		};
 	}
 
 	const components = await componentsFor(db, latestRev.id);
+
+	// Read-time evidence freshness (section 6): if a referenced purchase/split
+	// has since become VOID / superseded / incompatible, do NOT keep summing the
+	// old components -- report STALE.
+	for (const c of components) {
+		const reason = await purchaseComponentStaleReason(db, c);
+		if (reason) {
+			return { ...base, status: "STALE", staleReason: reason };
+		}
+	}
+
 	let personalCents = 0n;
 	const externalByPerson = new Map<string, bigint>();
 	for (const c of components) {

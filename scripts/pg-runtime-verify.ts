@@ -310,12 +310,12 @@ function v2Payload(inputs: Record<string, string>, evidence: Record<string, unkn
 }
 
 async function runtime() {
-	console.log("\n== PHASE 2: APPLY MIGRATION CHAIN 0000..0065 (empty disposable DB) ==");
+	console.log("\n== PHASE 2: APPLY MIGRATION CHAIN 0000..0066 (empty disposable DB) ==");
 	const db = new PGlite();
 	await db.query("SET timezone='UTC'");
 	try {
-		await applyChain(db, 65);
-		ok("migration chain 0000..0065 applied to an empty PostgreSQL database");
+		await applyChain(db, 66);
+		ok("migration chain 0000..0066 applied to an empty PostgreSQL database");
 	} catch (e) {
 		bad("migration chain apply", "\n" + (e as Error).message);
 		await db.close();
@@ -761,7 +761,7 @@ async function runtime() {
 		 values ($1,'50000000-0000-4000-8000-000000000001','40000000-0000-4000-8000-0000000000f1',1,null,'CREATE','PERSONAL_BUDGET_V1','TRY',
 		  '10000.00','6500.00','500.00','1000.00','1000.00','1000.00',$2)`,
 		[U1, JSON.stringify(v1Payload.referenceSnapshot)],
-		"PERSONAL_BUDGET_V1 revision #1 (65/5/10/10/10) still accepted after 0065",
+		"PERSONAL_BUDGET_V1 revision #1 (65/5/10/10/10) still accepted after 0066",
 	);
 
 	// ---- 0064 -- basic-living config append-only chain ----
@@ -991,7 +991,7 @@ async function resolverRuntime() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 65);
+	await applyChain(pg, 66);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -1057,7 +1057,10 @@ async function resolverRuntime() {
 		`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values
 		 ('f1000000-0000-4000-8000-000000000001',$1,'e1000000-0000-4000-8000-000000000001','CEF','Emergency','CORE_EMERGENCY_FUND'),
 		 ('f1000000-0000-4000-8000-000000000002',$1,'e1000000-0000-4000-8000-000000000001','G_MOB','Mobility goal','SHORT_TERM_GOAL'),
-		 ('f1000000-0000-4000-8000-000000000003',$1,'e1000000-0000-4000-8000-000000000001','G_DBN','Necessary goal','SHORT_TERM_GOAL')`,
+		 ('f1000000-0000-4000-8000-000000000003',$1,'e1000000-0000-4000-8000-000000000001','G_DBN','Necessary goal','SHORT_TERM_GOAL'),
+		 ('f1000000-0000-4000-8000-000000000005',$1,'e1000000-0000-4000-8000-000000000001','CCR_A','Statement 521 reserve','CREDIT_CARD_RESERVE'),
+		 ('f1000000-0000-4000-8000-000000000006',$1,'e1000000-0000-4000-8000-000000000001','CCR_B','Statement 821 reserve','CREDIT_CARD_RESERVE'),
+		 ('f1000000-0000-4000-8000-000000000007',$1,'e1000000-0000-4000-8000-000000000001','CCR_C','Carry-in case reserve','CREDIT_CARD_RESERVE')`,
 		[U1] as never[],
 	);
 	// transfers: 8,630 into CEF pre-period; 40,000 into mobility bucket pre-period; 500 into DBN bucket pre-period
@@ -1092,7 +1095,7 @@ async function resolverRuntime() {
 		[U1, F] as never[],
 	);
 	await pg.query(
-		`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ('80000000-0000-4000-8000-000000000521',$1,'80000000-0000-4000-8000-000000000001','e1000000-0000-4000-8000-000000000001','f1000000-0000-4000-8000-000000000003',2026,9)`,
+		`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ('80000000-0000-4000-8000-000000000521',$1,'80000000-0000-4000-8000-000000000001','e1000000-0000-4000-8000-000000000001','f1000000-0000-4000-8000-000000000005',2026,9)`,
 		[U1] as never[],
 	);
 	await pg.query(
@@ -1224,7 +1227,7 @@ async function resolverRuntime() {
 	// B (fail-closed): an unreconciled but due statement -> resolver fails closed.
 	await pg.exec("SET session_replication_role = replica");
 	await pg.query(
-		`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ('80000000-0000-4000-8000-000000000821',$1,'80000000-0000-4000-8000-000000000001','e1000000-0000-4000-8000-000000000001','f1000000-0000-4000-8000-000000000002',2026,8)`,
+		`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ('80000000-0000-4000-8000-000000000821',$1,'80000000-0000-4000-8000-000000000001','e1000000-0000-4000-8000-000000000001','f1000000-0000-4000-8000-000000000006',2026,8)`,
 		[U1] as never[],
 	);
 	await pg.query(
@@ -1350,6 +1353,460 @@ async function resolverRuntime() {
 	});
 	eq2(freshResolve.source, "LIVE", "G: a fresh idempotency key runs the LIVE resolver");
 
+	// P. replay key stored for one period, requested for another -> conflict.
+	try {
+		await resolveBudgetV2SnapshotForWrite({
+			db,
+			userId: U1,
+			periodMonth: "2026-10-01",
+			idempotencyKey: "plan-key-1",
+			asOf: new Date("2026-10-05T09:00:00+03:00"),
+		});
+		bad("P: replay key + different periodMonth -> did NOT conflict");
+	} catch (e) {
+		String((e as Error).message).includes("stored for period")
+			? ok("P: replay idempotency key + different periodMonth => BUDGET_IDEMPOTENCY_CONFLICT")
+			: bad("P: replay periodMonth conflict", `-> ${(e as Error).message}`);
+	}
+
+	await pg.close();
+}
+
+// ============================================================================
+// PHASE 4A: CHECKPOINT-4A CORRECTNESS REPAIR REGRESSIONS
+// ============================================================================
+
+async function resolverRuntime4A() {
+	console.log(
+		"\n== PHASE 4A: LIVE RESOLVER CORRECTNESS REPAIR (drizzle / PGlite) ==",
+	);
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const { resolveBudgetV2LiveSnapshot } = await import(
+		"../src/budget/live-resolver-v2.ts"
+	);
+	const { createBasicLivingTarget } = await import(
+		"../src/budget/basic-living-config-v2.ts"
+	);
+	const { reconcileStatement, getStatementReconciliation } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 66);
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
+	const F = "f".repeat(64);
+	const asOfSep = new Date("2026-09-20T09:00:00+03:00");
+	const eqA = (a: unknown, b: unknown, name: string) =>
+		a === b ? ok(name) : bad(name, `-> got ${JSON.stringify(a)} want ${JSON.stringify(b)}`);
+
+	await pg.exec("SET session_replication_role = replica");
+	await pg.query(
+		"insert into users (id, display_name, currency, timezone) values ($1,'U','TRY','Europe/Istanbul')",
+		[U1] as never[],
+	);
+	await pg.query(
+		`insert into ledger_accounts (id,user_id,code,name,account_type,normal_balance,currency) values
+		 ('d1000000-0000-4000-8000-000000000001',$1,'ASSET_CASH','Cash','ASSET','DEBIT','TRY')`,
+		[U1] as never[],
+	);
+	await pg.query(
+		`insert into midas_accounts (id,user_id,ledger_account_id) values ('e1000000-0000-4000-8000-000000000001',$1,'d1000000-0000-4000-8000-000000000001')`,
+		[U1] as never[],
+	);
+	await pg.query(
+		`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values
+		 ('f0000000-0000-4000-8000-000000000001',$1,'e1000000-0000-4000-8000-000000000001','CEF','E','CORE_EMERGENCY_FUND'),
+		 ('f0000000-0000-4000-8000-0000000000d0',$1,'e1000000-0000-4000-8000-000000000001','RSVD','full pre-fund','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000e0',$1,'e1000000-0000-4000-8000-000000000001','RSVE','partial personal','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000f0',$1,'e1000000-0000-4000-8000-000000000001','RSVF','partial mixed','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000a1',$1,'e1000000-0000-4000-8000-000000000001','RSVG','strict boundary','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000b0',$1,'e1000000-0000-4000-8000-000000000001','RSVB','old paid','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000c3',$1,'e1000000-0000-4000-8000-000000000001','RSVH','overlap','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000c1',$1,'e1000000-0000-4000-8000-000000000001','RSVK','retry after pay','CREDIT_CARD_RESERVE'),
+		 ('f0000000-0000-4000-8000-0000000000c2',$1,'e1000000-0000-4000-8000-000000000001','RSVN','void evidence','CREDIT_CARD_RESERVE')`,
+		[U1] as never[],
+	);
+	const T = (id: string, to: string, amt: string, when: string) =>
+		pg.query(
+			`insert into midas_allocation_transfers (id,user_id,midas_account_id,idempotency_key,transfer_fingerprint,from_bucket_id,to_bucket_id,amount,occurred_at) values ($1,$2,'e1000000-0000-4000-8000-000000000001',$3,$4,null,$5,$6,$7)`,
+			[id, U1, `mt-${id.slice(-6)}`, F, to, amt, when] as never[],
+		);
+	// CEF 10,000 so there is no emergency-gap noise in the waterfall
+	await T("a0000000-0000-4000-8000-000000000001", "f0000000-0000-4000-8000-000000000001", "10000.00", "2026-08-01 00:00:00+00");
+	// D: full pre-period fund of a 1,000 statement
+	await T("a0000000-0000-4000-8000-0000000000d1", "f0000000-0000-4000-8000-0000000000d0", "1000.00", "2026-08-15 00:00:00+00");
+	// E: partial (400) pre-period fund of a 1,000 all-personal statement
+	await T("a0000000-0000-4000-8000-0000000000e1", "f0000000-0000-4000-8000-0000000000e0", "400.00", "2026-08-15 00:00:00+00");
+	// F: partial (400) pre-period fund of a mixed 1,000 statement
+	await T("a0000000-0000-4000-8000-0000000000f1", "f0000000-0000-4000-8000-0000000000f0", "400.00", "2026-08-15 00:00:00+00");
+	// G: a transfer EXACTLY at periodStart must NOT reduce the burden (strict <)
+	await T("a0000000-0000-4000-8000-0000000000a2", "f0000000-0000-4000-8000-0000000000a1", "300.00", "2026-08-31 21:00:00+00");
+
+	await pg.query(
+		`insert into credit_cards (id,user_id,code) values ('80000000-0000-4000-8000-000000000001',$1,'CARDA')`,
+		[U1] as never[],
+	);
+	await pg.query(
+		`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-0000000000a1',$1,'80000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','A','B','1','10','90000.00',now(),'ccr-1',$2)`,
+		[U1, F] as never[],
+	);
+	// people P1 (family) for the mixed-ownership / split cases
+	await pg.query(
+		`insert into people (id,user_id) values ('9a000000-0000-4000-8000-000000000001',$1)`,
+		[U1] as never[],
+	);
+	await pg.query(
+		`insert into person_revisions (id,user_id,person_id,revision_no,operation,status,display_name,relationship,occurred_at,idempotency_key,revision_fingerprint) values ('9a000000-0000-4000-8000-0000000000a1',$1,'9a000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','Fam','FAMILY',now(),'pr-1',$2)`,
+		[U1, F] as never[],
+	);
+
+	let stmtSeq = 0;
+	const seedStatement = async (
+		reserveBucket: string,
+		amount: string,
+		dueDate: string,
+		status: "OPEN" | "PAID" = "OPEN",
+		payAt?: string,
+	) => {
+		stmtSeq++;
+		const sid = `81000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		const r1 = `82000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		await pg.exec("SET session_replication_role = replica");
+		await pg.query(
+			`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ($1,$2,'80000000-0000-4000-8000-000000000001','e1000000-0000-4000-8000-000000000001',$3,$4,6)`,
+			[sid, U1, reserveBucket, 2050 + stmtSeq] as never[],
+		);
+		await pg.query(
+			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','OPEN',$4,'2026-09-01',$5,'MIDAS_FUND','2026-09-01 00:00:00+00',$6,$7)`,
+			[r1, U1, sid, amount, dueDate, `sr-${sid.slice(-6)}-1`, F] as never[],
+		);
+		let latestRevId = r1;
+		if (status === "PAID") {
+			const r2 = `82000000-0000-4000-8000-0000000${(stmtSeq + 50).toString().padStart(5, "0")}`;
+			await pg.query(
+				`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,2,$4,'PAY','PAID',$5,'2026-09-01',$6,'MIDAS_FUND',$7,$8,$9)`,
+				[r2, U1, sid, r1, amount, dueDate, payAt ?? "2026-09-15 00:00:00+00", `sr-${sid.slice(-6)}-2`, F] as never[],
+			);
+			latestRevId = r2;
+		}
+		await pg.exec("SET session_replication_role = origin");
+		return { sid, r1, latestRevId };
+	};
+	let voidSeq = 0;
+	const voidStmt = async (sid: string, latestRevId: string) => {
+		voidSeq++;
+		await pg.exec("SET session_replication_role = replica");
+		const [{ n }] = (
+			await pg.query<{ n: number }>(
+				`select coalesce(max(revision_no),0)+1 n from credit_card_statement_revisions where statement_id=$1`,
+				[sid] as never[],
+			)
+		).rows;
+		await pg.query(
+			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint)
+			 select $1,$2,statement_id,$3,$4,'VOID','VOID',statement_amount,statement_date,due_date,reserve_placement,'2026-09-30 00:00:00+00',$5,revision_fingerprint
+			 from credit_card_statement_revisions where id=$4`,
+			[
+				`8f000000-0000-4000-8000-0000000${voidSeq.toString().padStart(5, "0")}`,
+				U1,
+				n,
+				latestRevId,
+				`vs-${voidSeq}`,
+			] as never[],
+		);
+		await pg.exec("SET session_replication_role = origin");
+	};
+
+	const seedPurchase = async (amount: string, category: string) => {
+		stmtSeq++;
+		const eid = `83000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		const ctid = `84000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		const trid = `85000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		const erid = `86000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		await pg.exec("SET session_replication_role = replica");
+		await pg.query(
+			`insert into canonical_transactions (id,user_id,kind,creation_idempotency_key,creation_fingerprint) values ($1,$2,'CREDIT_CARD_PURCHASE',$3,$4)`,
+			[ctid, U1, `cp-${eid.slice(-6)}`, F] as never[],
+		);
+		await pg.query(
+			`insert into transaction_revisions (id,user_id,transaction_id,revision_no,operation,occurred_at,payload,revision_fingerprint,idempotency_key) values ($1,$2,$3,1,'CREATE','2026-09-02 00:00:00+00','{}'::jsonb,$4,$5)`,
+			[trid, U1, ctid, F, `cptr-${eid.slice(-6)}`] as never[],
+		);
+		await pg.query(
+			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ($1,$2,'80000000-0000-4000-8000-000000000001','PURCHASE',$3)`,
+			[eid, U1, ctid] as never[],
+		);
+		await pg.query(
+			`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,canonical_revision_id,operation,amount,budget_category,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,'2026-09-02 00:00:00+00',$7,$8)`,
+			[erid, U1, eid, trid, amount, category, `cper-${eid.slice(-6)}`, F] as never[],
+		);
+		await pg.exec("SET session_replication_role = origin");
+		return { eid, trid };
+	};
+
+	await createBasicLivingTarget({
+		db,
+		userId: U1,
+		effectivePeriodMonth: "2026-09-01",
+		monthlyTargetAmount: "6000.00",
+		currency: "TRY",
+		sourceKind: "USER_APPROVED",
+		idempotencyKey: "bl-4a",
+	});
+
+	// ---- D: full pre-period reserve => zero burden ----
+	{
+		const { sid, r1, latestRevId } = await seedStatement("f0000000-0000-4000-8000-0000000000d0", "1000.00", "2026-09-10");
+		const pur = await seedPurchase("1000.00", "DISCRETIONARY_SPEND");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1,
+			idempotencyKey: `rc-d-${sid.slice(-6)}`,
+			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
+		});
+		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
+		eqA(res.inputs.currentObligations, "0.00", "D: full pre-period reserve carry-in => zero current-period burden");
+		await voidStmt(sid, latestRevId);
+	}
+	// ---- E: partial (400) pre-period reserve, all-personal => net burden 600 ----
+	{
+		const { sid, r1, latestRevId } = await seedStatement("f0000000-0000-4000-8000-0000000000e0", "1000.00", "2026-09-10");
+		const pur = await seedPurchase("1000.00", "DISCRETIONARY_SPEND");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1,
+			idempotencyKey: `rc-e-${sid.slice(-6)}`,
+			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
+		});
+		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
+		eqA(res.inputs.currentObligations, "600.00", "E: partial pre-period reserve + all-personal => personalShare - carryIn");
+		await voidStmt(sid, latestRevId);
+	}
+	// ---- F: partial carry-in + MIXED ownership => fail closed ----
+	{
+		const { sid, r1, latestRevId } = await seedStatement("f0000000-0000-4000-8000-0000000000f0", "1000.00", "2026-09-10");
+		const pur = await seedPurchase("1000.00", "DISCRETIONARY_SPEND");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1,
+			idempotencyKey: `rc-f-${sid.slice(-6)}`,
+			components: [
+				{ componentType: "PURCHASE", amount: "700.00", ownership: "PERSONAL", purchaseEventId: pur.eid },
+				{ componentType: "ADJUSTMENT", amount: "300.00", ownership: "EXTERNAL_PERSON", personId: "9a000000-0000-4000-8000-000000000001", adjustmentKind: "OTHER" },
+			],
+		});
+		try {
+			await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
+			bad("F: partial carry-in + mixed ownership did NOT fail closed");
+		} catch (e) {
+			String((e as Error).message).includes("mixed PERSONAL/EXTERNAL")
+				? ok("F: partial carry-in + mixed ownership => resolver fails closed")
+				: bad("F: fail-closed", `-> ${(e as Error).message}`);
+		}
+		await voidStmt(sid, latestRevId);
+	}
+	// ---- G: transfer EXACTLY at periodStart does NOT reduce the burden ----
+	{
+		const { sid, r1, latestRevId } = await seedStatement("f0000000-0000-4000-8000-0000000000a1", "1000.00", "2026-09-10");
+		const pur = await seedPurchase("1000.00", "DISCRETIONARY_SPEND");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1,
+			idempotencyKey: `rc-g-${sid.slice(-6)}`,
+			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
+		});
+		// reserve bucket G has a 300 transfer at exactly periodStart -> strict < excludes it.
+		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
+		eqA(res.inputs.currentObligations, "1000.00", "G/O: a transfer exactly at periodStart is NOT counted as carry-in (strict <)");
+		await voidStmt(sid, latestRevId);
+	}
+	// ---- B: an old PAID statement does not recur next month ----
+	{
+		const { sid, latestRevId } = await seedStatement("f0000000-0000-4000-8000-0000000000b0", "500.00", "2026-09-10", "PAID", "2026-09-15 00:00:00+00");
+		const pur = await seedPurchase("500.00", "DISCRETIONARY_SPEND");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: latestRevId,
+			idempotencyKey: `rc-b-${sid.slice(-6)}`,
+			components: [{ componentType: "PURCHASE", amount: "500.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
+		});
+		const sep = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
+		const oct = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-10-01", asOf: new Date("2026-10-20T09:00:00+03:00") });
+		const sepStmt = (sep.evidenceSnapshot as any).obligations.creditCardStatements.find((x: any) => x.statementId === sid);
+		const octStmt = (oct.evidenceSnapshot as any).obligations.creditCardStatements.find((x: any) => x.statementId === sid);
+		eqA(sepStmt?.recognizedPersonalBurden, "500.00", "C: PAID-within-period statement recognised exactly once in its period");
+		eqA(octStmt, undefined, "B: an August/September PAID statement does NOT reappear as an October obligation");
+		await voidStmt(sid, latestRevId);
+	}
+	// ---- H / I: basic-living <-> currentObligations overlap prevents double count ----
+	{
+		const { sid, r1, latestRevId } = await seedStatement("f0000000-0000-4000-8000-0000000000c3", "1000.00", "2026-09-10");
+		const pur = await seedPurchase("1000.00", "MANDATORY_EXPENSE");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1,
+			idempotencyKey: `rc-h-${sid.slice(-6)}`,
+			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
+		});
+		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
+		const bl = (res.evidenceSnapshot as any).basicLiving;
+		eqA(bl.actualPersonalMandatorySpendMTD, "1000.00", "H: actual personal mandatory spend MTD recorded");
+		eqA(bl.basicLivingOverlapWithCurrentObligations, "1000.00", "H: exact-identity overlap with currentObligations detected");
+		eqA(res.inputs.basicLivingFunding, "5000.00", "H: basicLivingFunding = max(6000,1000) - overlap 1000 = 5000 (not 6000+1000)");
+		eqA(res.inputs.currentObligations, "1000.00", "H: the mandatory 1000 is counted once, in currentObligations");
+		await voidStmt(sid, latestRevId);
+	}
+	// ---- I: basic-living with NO overlap is unchanged ----
+	{
+		await seedPurchase("900.00", "MANDATORY_EXPENSE"); // MANDATORY personal spend, NOT on any due reconciled statement
+		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
+		const bl = (res.evidenceSnapshot as any).basicLiving;
+		eqA(bl.basicLivingOverlapWithCurrentObligations, "0.00", "I: mandatory spend not recognised in currentObligations => no overlap reduction");
+		eqA(res.inputs.basicLivingFunding, "6000.00", "I: basicLivingFunding = max(6000, 900) - 0 = 6000 (unchanged)");
+	}
+	// ---- N: VOID purchase evidence is not silently trusted (read-time STALE) ----
+	{
+		const { sid, r1 } = await seedStatement("f0000000-0000-4000-8000-0000000000c2", "400.00", "2026-09-10");
+		const pur = await seedPurchase("400.00", "DISCRETIONARY_SPEND");
+		await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1,
+			idempotencyKey: `rc-n-${sid.slice(-6)}`,
+			components: [{ componentType: "PURCHASE", amount: "400.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
+		});
+		// now VOID the purchase liability event
+		await pg.exec("SET session_replication_role = replica");
+		await pg.query(
+			`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,previous_revision_id,canonical_revision_id,operation,amount,budget_category,occurred_at,idempotency_key,revision_fingerprint)
+			 values ($1,$2,$3,2,$4,$5,'VOID','400.00','DISCRETIONARY_SPEND','2026-09-06 00:00:00+00',$6,$7)`,
+			[
+				`86000000-0000-4000-8000-00000009${sid.slice(-4)}`,
+				U1, pur.eid,
+				`86000000-0000-4000-8000-0000000${(stmtSeq).toString().padStart(5, "0")}`,
+				pur.trid, `cper-void-${sid.slice(-6)}`, F,
+			] as never[],
+		);
+		await pg.exec("SET session_replication_role = origin");
+		const view = await getStatementReconciliation({ db, userId: U1, statementId: sid });
+		String(view.status) === "STALE"
+			? ok("N: a now-VOID referenced purchase makes the reconciliation STALE (evidence not silently trusted)")
+			: bad("N: stale evidence", `-> status=${view.status}`);
+		try {
+			await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
+			bad("N: resolver did NOT fail closed on stale purchase evidence");
+		} catch (e) {
+			String((e as Error).message).includes("not reconciled")
+				? ok("N: resolver fails closed when a due statement's purchase evidence is stale")
+				: bad("N: fail-closed", `-> ${(e as Error).message}`);
+		}
+		// void the reserve/undo so it does not block final checks -- simply void the statement
+		await pg.exec("SET session_replication_role = replica");
+		await pg.query(
+			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,2,$4,'VOID','VOID','400.00','2026-09-01','2026-09-10','MIDAS_FUND','2026-09-07 00:00:00+00',$5,$6)`,
+			[`82000000-0000-4000-8000-00000009${sid.slice(-4)}`, U1, sid, r1, `sr-void-${sid.slice(-6)}`, F] as never[],
+		);
+		await pg.exec("SET session_replication_role = origin");
+	}
+	// ---- K: reconcile retry AFTER a PAY lifecycle transition is idempotent ----
+	{
+		const { sid, r1 } = await seedStatement("f0000000-0000-4000-8000-0000000000c1", "250.00", "2026-09-10");
+		const pur = await seedPurchase("250.00", "DISCRETIONARY_SPEND");
+		const first = await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1,
+			idempotencyKey: "rc-k-1",
+			components: [{ componentType: "PURCHASE", amount: "250.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
+		});
+		// a PAY revision creates a NEW statement revision id
+		await pg.exec("SET session_replication_role = replica");
+		await pg.query(
+			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,2,$4,'PAY','PAID','250.00','2026-09-01','2026-09-10','MIDAS_FUND','2026-09-12 00:00:00+00',$5,$6)`,
+			[`82000000-0000-4000-8000-000000091${sid.slice(-3)}`, U1, sid, r1, `sr-k-pay-${sid.slice(-6)}`, F] as never[],
+		);
+		await pg.exec("SET session_replication_role = origin");
+		// retry: SAME key, SAME (now stale) statementRevisionId, occurredAt omitted
+		const retry = await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1,
+			idempotencyKey: "rc-k-1",
+			components: [{ componentType: "PURCHASE", amount: "250.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
+		});
+		(retry.idempotentReplay && retry.revision.revisionId === first.revision.revisionId)
+			? ok("J/K: reconcile retry (no occurredAt) after a PAY transition is an idempotent replay")
+			: bad("J/K: retry after PAY", `-> replay=${retry.idempotentReplay}`);
+		// and the reconciliation is still RECONCILED across the PAY (section 1)
+		const view = await getStatementReconciliation({ db, userId: U1, statementId: sid });
+		String(view.status) === "RECONCILED"
+			? ok("1: a sealed reconciliation stays RECONCILED across a same-amount PAY transition")
+			: bad("1: PAID freshness", `-> status=${view.status}`);
+	}
+	// ---- L: same idempotency key on a DIFFERENT statement => typed conflict, no 23505 ----
+	{
+		const a = await seedStatement("f0000000-0000-4000-8000-0000000000c4", "111.00", "2026-09-10");
+		const b = await seedStatement("f0000000-0000-4000-8000-0000000000c5", "222.00", "2026-09-10");
+		const pa = await seedPurchase("111.00", "DISCRETIONARY_SPEND");
+		const pb = await seedPurchase("222.00", "DISCRETIONARY_SPEND");
+		await reconcileStatement({
+			db, userId: U1, statementId: a.sid, statementRevisionId: a.r1,
+			idempotencyKey: "rc-shared-key",
+			components: [{ componentType: "PURCHASE", amount: "111.00", ownership: "PERSONAL", purchaseEventId: pa.eid }],
+		});
+		const err = await reconcileStatement({
+			db, userId: U1, statementId: b.sid, statementRevisionId: b.r1,
+			idempotencyKey: "rc-shared-key",
+			components: [{ componentType: "PURCHASE", amount: "222.00", ownership: "PERSONAL", purchaseEventId: pb.eid }],
+		}).catch((e) => e);
+		((err as Error)?.constructor?.name === "CreditCardError" &&
+			!/23505|duplicate key|unique constraint/i.test(String((err as Error).message)))
+			? ok("L: same idempotency key on a different statement => typed IDEMPOTENCY conflict, no raw 23505")
+			: bad("L: cross-statement key", `-> ${(err as Error)?.message}`);
+	}
+	// ---- M: PURCHASE component incompatible with active split truth => rejected ----
+	{
+		const { sid, r1 } = await seedStatement("f0000000-0000-4000-8000-0000000000c6", "600.00", "2026-09-10");
+		const pur = await seedPurchase("600.00", "DISCRETIONARY_SPEND");
+		// give the purchase an ACTIVE, SEALED split: user 200 / external 400 to P1
+		await pg.exec("SET session_replication_role = replica");
+		const splitId = `87000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		const splitRev = `88000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		const part = `89000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		const oblId = `8a000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		const oblCt = `8b000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`;
+		await pg.query(
+			`insert into credit_card_purchase_splits (id,user_id,purchase_event_id) values ($1,$2,$3)`,
+			[splitId, U1, pur.eid] as never[],
+		);
+		await pg.query(
+			`insert into credit_card_purchase_split_revisions (id,split_id,revision_no,operation,method,purchase_event_revision_id,gross_amount,user_share_amount,external_share_amount,occurred_at,revision_fingerprint)
+			 values ($1,$2,1,'CREATE','MANUAL',(select id from credit_card_liability_event_revisions where event_id=$3 order by revision_no desc limit 1),'600.00','200.00','400.00','2026-09-02 00:00:00+00',$4)`,
+			[splitRev, splitId, pur.eid, F] as never[],
+		);
+		await pg.query(
+			`insert into canonical_transactions (id,user_id,kind,creation_idempotency_key,creation_fingerprint) values ($1,$2,'PERSON_OBLIGATION',$3,$4)`,
+			[oblCt, U1, `obl-${sid.slice(-6)}`, F] as never[],
+		);
+		await pg.query(
+			`insert into person_obligations (id,user_id,person_id,direction,canonical_transaction_id) values ($1,$2,'9a000000-0000-4000-8000-000000000001','RECEIVABLE',$3)`,
+			[oblId, U1, oblCt] as never[],
+		);
+		await pg.query(
+			`insert into credit_card_purchase_split_participants (id,user_id,split_id,person_id,person_obligation_id) values ($1,$2,$3,'9a000000-0000-4000-8000-000000000001',$4)`,
+			[part, U1, splitId, oblId] as never[],
+		);
+		await pg.query(
+			`insert into credit_card_purchase_split_revision_items (id,split_revision_id,participant_id,person_id,share_amount) values ($1,$2,$3,'9a000000-0000-4000-8000-000000000001','400.00')`,
+			[`8c000000-0000-4000-8000-0000000${stmtSeq.toString().padStart(5, "0")}`, splitRev, part] as never[],
+		);
+		await pg.query(
+			`insert into credit_card_purchase_split_revision_seals (split_revision_id) values ($1)`,
+			[splitRev] as never[],
+		);
+		await pg.exec("SET session_replication_role = origin");
+		// a PURCHASE component claiming PERSONAL for the full 600 contradicts the split
+		const err = await reconcileStatement({
+			db, userId: U1, statementId: sid, statementRevisionId: r1,
+			idempotencyKey: `rc-m-${sid.slice(-6)}`,
+			components: [{ componentType: "PURCHASE", amount: "600.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
+		}).catch((e) => e);
+		((err as Error)?.constructor?.name === "CreditCardError" &&
+			/active split revision/.test(String((err as Error).message)))
+			? ok("M: PURCHASE component that ignores the authoritative active split is rejected")
+			: bad("M: split integrity", `-> ${(err as Error)?.message}`);
+	}
+
 	await pg.close();
 }
 
@@ -1358,6 +1815,7 @@ console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)
 if (probed) {
 	await runtime();
 	await resolverRuntime();
+	await resolverRuntime4A();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

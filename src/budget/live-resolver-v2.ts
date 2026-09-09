@@ -1,4 +1,4 @@
-import { and, desc, eq, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, lt, lte, or, sql } from "drizzle-orm";
 import { getStatementReconciliation } from "../credit-cards/statement-reconciliation";
 import type { Database } from "../db/client";
 import { budgetV2BasicLivingConfigRevisions } from "../db/schema/budget-basic-living";
@@ -13,6 +13,7 @@ import {
 import {
 	creditCardLiabilityEventRevisions,
 	creditCardLiabilityEvents,
+	creditCardStatementPaymentEvents,
 } from "../db/schema/credit-card-ledger";
 import {
 	creditCardPurchaseSplitRevisions,
@@ -134,13 +135,24 @@ function asDate(v: unknown): Date {
 	return v instanceof Date ? v : new Date(v as string);
 }
 
-/** Net kurus balance of a Midas bucket as of `at` (inclusive). */
+/**
+ * Net kurus balance of a Midas bucket at `at`.
+ *  - "inclusive" (default): transfers with occurredAt <= at  -- current balance.
+ *  - "exclusive": transfers with occurredAt <  at  -- STRICT recognition basis
+ *    (reserve carry-in before periodStart / date-bound recognition basis). A
+ *    transfer exactly at `at` does NOT count.
+ */
 async function bucketNetCents(
 	db: Database,
 	userId: string,
 	bucketId: string,
 	at: Date,
+	boundary: "inclusive" | "exclusive" = "inclusive",
 ): Promise<bigint> {
+	const timeCond =
+		boundary === "exclusive"
+			? lt(midasAllocationTransfers.occurredAt, at)
+			: lte(midasAllocationTransfers.occurredAt, at);
 	const [row] = await db
 		.select({
 			net: sql<string>`COALESCE(SUM(CASE WHEN ${midasAllocationTransfers.toBucketId} = ${bucketId} THEN ${midasAllocationTransfers.amount} WHEN ${midasAllocationTransfers.fromBucketId} = ${bucketId} THEN -${midasAllocationTransfers.amount} ELSE 0 END), 0)::text`,
@@ -149,7 +161,7 @@ async function bucketNetCents(
 		.where(
 			and(
 				eq(midasAllocationTransfers.userId, userId),
-				lte(midasAllocationTransfers.occurredAt, at),
+				timeCond,
 				or(
 					eq(midasAllocationTransfers.fromBucketId, bucketId),
 					eq(midasAllocationTransfers.toBucketId, bucketId),
@@ -439,11 +451,14 @@ async function resolveDateBoundNecessary(
 		}
 		const recognitionBasisAt =
 			g.activationAt > periodStart ? g.activationAt : periodStart;
+		// Locked rule: transfers occurredAt < max(periodStart, goalActivation).
+		// A transfer exactly at the recognition basis must NOT shrink the gap.
 		const bucketAtBasis = await bucketNetCents(
 			db,
 			userId,
 			g.midasBucketId,
 			recognitionBasisAt,
+			"exclusive",
 		);
 		if (bucketAtBasis < 0n) {
 			failClosed(
@@ -506,7 +521,10 @@ interface BasicLivingResult {
 	targetCents: bigint;
 	targetRevisionId: string;
 	actualSpendMtdCents: bigint;
-	fundingCents: bigint;
+	/** MANDATORY personal credit-card purchase spend this window, by purchase event. */
+	mandatoryPersonalByEvent: Map<string, bigint>;
+	/** MANDATORY People PAYABLE principal this window, by obligation. */
+	mandatoryPeopleByObligation: Map<string, bigint>;
 	spendComponents: Array<Record<string, unknown>>;
 	currency: string;
 }
@@ -518,6 +536,8 @@ async function resolveBasicLiving(
 	windowStart: Date,
 	windowEnd: Date,
 ): Promise<BasicLivingResult> {
+	const mandatoryPersonalByEvent = new Map<string, bigint>();
+	const mandatoryPeopleByObligation = new Map<string, bigint>();
 	const [cfg] = await db
 		.select()
 		.from(budgetV2BasicLivingConfigRevisions)
@@ -584,6 +604,10 @@ async function resolveBasicLiving(
 			grossCents,
 		);
 		spend += personalCents;
+		mandatoryPersonalByEvent.set(
+			p.eventId,
+			(mandatoryPersonalByEvent.get(p.eventId) ?? 0n) + personalCents,
+		);
 		spendComponents.push({
 			source: "CREDIT_CARD_PURCHASE",
 			eventId: p.eventId,
@@ -620,6 +644,10 @@ async function resolveBasicLiving(
 		if (at < windowStart || at >= windowEnd) continue;
 		const cents = parseAggregateMoneyString(rev.principal).cents;
 		spend += cents;
+		mandatoryPeopleByObligation.set(
+			o.id,
+			(mandatoryPeopleByObligation.get(o.id) ?? 0n) + cents,
+		);
 		spendComponents.push({
 			source: "PEOPLE_PAYABLE",
 			obligationId: o.id,
@@ -628,26 +656,135 @@ async function resolveBasicLiving(
 		});
 	}
 
-	const fundingCents = spend > targetCents ? spend : targetCents;
 	return {
 		targetCents,
 		targetRevisionId: cfg.id,
 		actualSpendMtdCents: spend,
-		fundingCents,
+		mandatoryPersonalByEvent,
+		mandatoryPeopleByObligation,
 		spendComponents,
 		currency: cfg.currency,
 	};
 }
 
 // ============================================================================
+// Cross-waterfall overlap (section 4) -- the same MANDATORY economic item must
+// NEVER be recognised in BOTH currentObligations and basicLivingFunding.
+// Only subtract an overlap that EXACT source identity proves (never dates/amounts).
+// ============================================================================
+
+function computeBasicLivingOverlapCents(
+	basicLiving: BasicLivingResult,
+	obligations: CurrentObligationsResult,
+): { overlapCents: bigint; detail: Array<Record<string, unknown>> } {
+	let overlap = 0n;
+	const detail: Array<Record<string, unknown>> = [];
+	const remainingMandatoryByEvent = new Map(
+		basicLiving.mandatoryPersonalByEvent,
+	);
+
+	for (const st of obligations.recognizedStatements) {
+		if (st.burdenCents <= 0n) continue;
+		let m = 0n;
+		const events: string[] = [];
+		for (const c of st.personalPurchaseComponents) {
+			const mand = remainingMandatoryByEvent.get(c.purchaseEventId) ?? 0n;
+			if (mand <= 0n) continue;
+			const take = c.personalCents < mand ? c.personalCents : mand;
+			m += take;
+			remainingMandatoryByEvent.set(c.purchaseEventId, mand - take);
+			events.push(c.purchaseEventId);
+		}
+		// Reserve carry-in funded `carryInFundedCents` of the personal share; only
+		// the FRESH burden (personalShare - carryIn) can overlap current income.
+		const stmtOverlap =
+			m - st.carryInFundedCents > 0n ? m - st.carryInFundedCents : 0n;
+		if (stmtOverlap > 0n) {
+			overlap += stmtOverlap;
+			detail.push({
+				statementId: st.statementId,
+				mandatoryPersonalPurchaseInStatement: formatCentsToMoney(m),
+				carryInFunded: formatCentsToMoney(st.carryInFundedCents),
+				overlapRecognized: formatCentsToMoney(stmtOverlap),
+				events,
+			});
+		}
+	}
+
+	for (const [
+		oblId,
+		contribCents,
+	] of obligations.recognizedPeopleByObligation) {
+		const mand = basicLiving.mandatoryPeopleByObligation.get(oblId) ?? 0n;
+		if (mand <= 0n || contribCents <= 0n) continue;
+		const o = mand < contribCents ? mand : contribCents;
+		overlap += o;
+		detail.push({
+			obligationId: oblId,
+			mandatoryPrincipal: formatCentsToMoney(mand),
+			recognizedInCurrentObligations: formatCentsToMoney(contribCents),
+			overlapRecognized: formatCentsToMoney(o),
+		});
+	}
+
+	return { overlapCents: overlap, detail };
+}
+
+// ============================================================================
 // INPUT: currentObligations (section 3) -- ONE-COUNT
 // ============================================================================
+
+interface RecognizedStatement {
+	statementId: string;
+	carryInFundedCents: bigint;
+	burdenCents: bigint;
+	personalPurchaseComponents: Array<{
+		purchaseEventId: string;
+		personalCents: bigint;
+	}>;
+}
 
 interface CurrentObligationsResult {
 	cents: bigint;
 	creditCardStatements: Array<Record<string, unknown>>;
 	peoplePayable: Array<Record<string, unknown>>;
 	unresolvedPayables: Array<Record<string, unknown>>;
+	recognizedStatements: RecognizedStatement[];
+	recognizedPeopleByObligation: Map<string, bigint>;
+}
+
+/**
+ * Authoritative instant a statement became PAID -- from the append-only PAY
+ * statement revision (preferring its linked payment event). Never inferred.
+ */
+async function statementPaidInstant(
+	db: Database,
+	statementId: string,
+): Promise<Date | null> {
+	const [payRev] = await db
+		.select({
+			occurredAt: creditCardStatementRevisions.occurredAt,
+			paymentEventId: creditCardStatementRevisions.paymentEventId,
+		})
+		.from(creditCardStatementRevisions)
+		.where(
+			and(
+				eq(creditCardStatementRevisions.statementId, statementId),
+				eq(creditCardStatementRevisions.operation, "PAY"),
+			),
+		)
+		.orderBy(desc(creditCardStatementRevisions.revisionNo))
+		.limit(1);
+	if (!payRev) return null;
+	if (payRev.paymentEventId) {
+		const [pe] = await db
+			.select({ occurredAt: creditCardStatementPaymentEvents.occurredAt })
+			.from(creditCardStatementPaymentEvents)
+			.where(eq(creditCardStatementPaymentEvents.id, payRev.paymentEventId))
+			.limit(1);
+		if (pe) return asDate(pe.occurredAt);
+	}
+	return asDate(payRev.occurredAt);
 }
 
 async function resolveCurrentObligations(
@@ -663,8 +800,10 @@ async function resolveCurrentObligations(
 	const ccEvidence: Array<Record<string, unknown>> = [];
 	const peopleEvidence: Array<Record<string, unknown>> = [];
 	const unresolved: Array<Record<string, unknown>> = [];
+	const recognizedStatements: RecognizedStatement[] = [];
+	const recognizedPeopleByObligation = new Map<string, bigint>();
 
-	// ---- A. Credit-card personal current/due/overdue burden (one-count) ----
+	// ---- A. Credit-card personal current/due/overdue burden (TRUE one-count) ----
 	const cards = await db
 		.select({ id: creditCards.id })
 		.from(creditCards)
@@ -694,7 +833,37 @@ async function resolveCurrentObligations(
 				.orderBy(desc(creditCardStatementRevisions.revisionNo))
 				.limit(1);
 			if (!rev || rev.status === "VOID") continue;
-			if (!rev.dueDate || rev.dueDate > lastDay) continue;
+
+			// Period recognition -- the defect was recognising every non-VOID
+			// statement whose dueDate <= period end, so an old PAID statement
+			// reappeared every later month.
+			const dueThisPeriod = !!rev.dueDate && rev.dueDate <= lastDay;
+			let recognisePeriod: boolean;
+			let recognitionBasis: string;
+			if (rev.status === "PAID") {
+				const paidAt = await statementPaidInstant(db, s.id);
+				if (!paidAt) {
+					failClosed(
+						`credit-card statement ${s.id} latest status is PAID but has no authoritative PAY revision / payment event`,
+					);
+				}
+				if (paidAt < periodStart) {
+					recognisePeriod = false; // settled before this period -- history
+					recognitionBasis = "PAID_BEFORE_PERIOD";
+				} else if (paidAt < windowEnd) {
+					recognisePeriod = true; // actual current-period cash commitment
+					recognitionBasis = "PAID_WITHIN_PERIOD";
+				} else {
+					// paid after asOf -> as of this period it was still an unpaid due
+					recognisePeriod = dueThisPeriod;
+					recognitionBasis = "OPEN_DUE";
+				}
+			} else {
+				// OPEN (incl. after REOPEN) -- deterministic on latest status.
+				recognisePeriod = dueThisPeriod;
+				recognitionBasis = "OPEN_DUE";
+			}
+			if (!recognisePeriod) continue;
 
 			const recon = await getStatementReconciliation({
 				db,
@@ -703,35 +872,78 @@ async function resolveCurrentObligations(
 			});
 			if (recon.status !== "RECONCILED") {
 				failClosed(
-					`credit-card statement ${s.id} is not reconciled (status=${recon.status}); its personal share cannot be authoritatively decomposed`,
+					`credit-card statement ${s.id} is not reconciled (status=${recon.status}${recon.staleReason ? `: ${recon.staleReason}` : ""}); its personal share cannot be authoritatively decomposed`,
 				);
 			}
 			const stmtAmountCents = parseAggregateMoneyString(
 				rev.statementAmount,
 			).cents;
+			// STRICT: reserve carry-in = transfers occurredAt < periodStart.
 			const carryInFunded = await bucketNetCents(
 				db,
 				userId,
 				s.reserveBucketId,
 				periodStart,
+				"exclusive",
 			);
 			if (carryInFunded < 0n) {
 				failClosed(
 					`credit-card statement ${s.id} reserve bucket has a negative net balance; invariant violated`,
 				);
 			}
-			const fullyPreFunded = carryInFunded >= stmtAmountCents;
-			const burden = fullyPreFunded ? 0n : recon.personalCents;
+			let externalCents = 0n;
+			for (const v of recon.externalByPerson.values()) externalCents += v;
+			const isAllPersonal = externalCents === 0n;
+
+			let burden: bigint;
+			let carryInCase: string;
+			if (carryInFunded === 0n) {
+				burden = recon.personalCents;
+				carryInCase = "A_NO_CARRY_IN";
+			} else if (carryInFunded >= stmtAmountCents) {
+				burden = 0n;
+				carryInCase = "B_FULLY_PREFUNDED";
+			} else if (isAllPersonal) {
+				burden =
+					recon.personalCents - carryInFunded > 0n
+						? recon.personalCents - carryInFunded
+						: 0n;
+				carryInCase = "C_PARTIAL_ALL_PERSONAL";
+			} else {
+				failClosed(
+					`credit-card statement ${s.id}: pre-period reserve carry-in ${carryInFunded} kurus partially funds a statement with mixed PERSONAL/EXTERNAL ownership; the ownership allocation of an old reserve is not authoritative`,
+				);
+			}
 			total += burden;
+
+			const personalPurchaseComponents = recon.components
+				.filter(
+					(c) =>
+						c.componentType === "PURCHASE" &&
+						c.ownership === "PERSONAL" &&
+						!!c.purchaseEventId,
+				)
+				.map((c) => ({
+					purchaseEventId: c.purchaseEventId as string,
+					personalCents: parseAggregateMoneyString(c.amount).cents,
+				}));
+			recognizedStatements.push({
+				statementId: s.id,
+				carryInFundedCents: carryInFunded,
+				burdenCents: burden,
+				personalPurchaseComponents,
+			});
 			ccEvidence.push({
 				statementId: s.id,
 				cardId: card.id,
 				dueDate: rev.dueDate,
-				status: rev.status,
+				statementStatus: rev.status,
+				recognitionBasis,
 				statementAmount: rev.statementAmount,
 				personalShare: formatCentsToMoney(recon.personalCents),
+				externalShare: formatCentsToMoney(externalCents),
 				reserveCarryInFundedBeforePeriod: formatCentsToMoney(carryInFunded),
-				fullyPreFunded,
+				carryInCase,
 				recognizedPersonalBurden: formatCentsToMoney(burden),
 				reconciliationRevisionNo: recon.revisionNo,
 			});
@@ -799,6 +1011,7 @@ async function resolveCurrentObligations(
 			}
 			total += settledInPeriod;
 			if (settledInPeriod > 0n) {
+				recognizedPeopleByObligation.set(o.id, settledInPeriod);
 				peopleEvidence.push({
 					obligationId: o.id,
 					personId: o.personId,
@@ -816,6 +1029,7 @@ async function resolveCurrentObligations(
 			: settledInPeriod;
 		total += contribution;
 		if (contribution > 0n) {
+			recognizedPeopleByObligation.set(o.id, contribution);
 			peopleEvidence.push({
 				obligationId: o.id,
 				personId: o.personId,
@@ -836,6 +1050,8 @@ async function resolveCurrentObligations(
 		creditCardStatements: ccEvidence,
 		peoplePayable: peopleEvidence,
 		unresolvedPayables: unresolved,
+		recognizedStatements,
+		recognizedPeopleByObligation,
 	};
 }
 
@@ -903,10 +1119,25 @@ export async function resolveBudgetV2LiveSnapshot(
 		windowEnd,
 	);
 
+	// section 4 -- basicLivingFunding after removing the exact overlap with items
+	// already recognised in currentObligations (one-count across the waterfall).
+	const grossBasicLivingNeedCents =
+		basicLiving.actualSpendMtdCents > basicLiving.targetCents
+			? basicLiving.actualSpendMtdCents
+			: basicLiving.targetCents;
+	const {
+		overlapCents: basicLivingOverlapCents,
+		detail: basicLivingOverlapDetail,
+	} = computeBasicLivingOverlapCents(basicLiving, obligations);
+	const basicLivingFundingCents =
+		grossBasicLivingNeedCents - basicLivingOverlapCents > 0n
+			? grossBasicLivingNeedCents - basicLivingOverlapCents
+			: 0n;
+
 	const inputs: PersonalBudgetV2Inputs = {
 		realizedIncome: formatCentsToMoney(income.cents),
 		currentObligations: formatCentsToMoney(obligations.cents),
-		basicLivingFunding: formatCentsToMoney(basicLiving.fundingCents),
+		basicLivingFunding: formatCentsToMoney(basicLivingFundingCents),
 		dateBoundNecessaryPurchaseFunding: formatCentsToMoney(dateBound.cents),
 		coreEmergencyFundBalance: formatCentsToMoney(emergency.balanceCents),
 		mobilityBalance: formatCentsToMoney(mobility.cents),
@@ -938,11 +1169,17 @@ export async function resolveBudgetV2LiveSnapshot(
 		basicLiving: {
 			basicLivingTarget: formatCentsToMoney(basicLiving.targetCents),
 			basicLivingTargetRevisionId: basicLiving.targetRevisionId,
-			actualBasicLivingSpendMTD: formatCentsToMoney(
+			actualPersonalMandatorySpendMTD: formatCentsToMoney(
 				basicLiving.actualSpendMtdCents,
 			),
+			grossBasicLivingNeed: formatCentsToMoney(grossBasicLivingNeedCents),
+			basicLivingOverlapWithCurrentObligations: formatCentsToMoney(
+				basicLivingOverlapCents,
+			),
+			basicLivingOverlapDetail,
 			basicLivingFunding: inputs.basicLivingFunding,
-			formula: "max(approvedTarget, actualPersonalMandatorySpendMTD)",
+			formula:
+				"max(max(approvedTarget, actualPersonalMandatorySpendMTD) - basicLivingOverlapWithCurrentObligations, 0)",
 			spendComponents: basicLiving.spendComponents,
 		},
 		necessaryPurchases: {
@@ -987,7 +1224,7 @@ export async function resolveBudgetV2LiveSnapshot(
 			currentDueOrOverdueStatements: obligations.creditCardStatements,
 		},
 		spending: {
-			actualBasicLivingSpendMTD: formatCentsToMoney(
+			actualPersonalMandatorySpendMTD: formatCentsToMoney(
 				basicLiving.actualSpendMtdCents,
 			),
 			basicLivingSpendComponents: basicLiving.spendComponents,
@@ -999,8 +1236,12 @@ export async function resolveBudgetV2LiveSnapshot(
 		},
 		budgetInputs: {
 			basicLivingTarget: formatCentsToMoney(basicLiving.targetCents),
-			actualBasicLivingSpendMTD: formatCentsToMoney(
+			actualPersonalMandatorySpendMTD: formatCentsToMoney(
 				basicLiving.actualSpendMtdCents,
+			),
+			grossBasicLivingNeed: formatCentsToMoney(grossBasicLivingNeedCents),
+			basicLivingOverlapWithCurrentObligations: formatCentsToMoney(
+				basicLivingOverlapCents,
 			),
 			basicLivingFunding: inputs.basicLivingFunding,
 			dateBoundNecessaryPurchaseFunding:
@@ -1125,6 +1366,12 @@ export async function resolveBudgetV2SnapshotForWrite(params: {
 				"stored V2 creation exists but plan/revision #1 is missing",
 			);
 		}
+		if (plan.periodMonth !== periodMonth) {
+			throw new BudgetError(
+				"BUDGET_IDEMPOTENCY_CONFLICT",
+				`idempotency key "${idempotencyKey}" is stored for period "${plan.periodMonth}", not the requested "${periodMonth}"`,
+			);
+		}
 		return {
 			source: "REPLAY",
 			periodMonth: plan.periodMonth,
@@ -1135,12 +1382,14 @@ export async function resolveBudgetV2SnapshotForWrite(params: {
 		};
 	}
 
-	// 2. Stored REFRESH (UPDATE) revision by this key -> replay.
+	// 2. Stored REFRESH (UPDATE) revision by this key -> replay. The DB
+	// idempotency uniqueness is user-scoped, so scope the lookup by userId.
 	const [canonRev] = await db
 		.select()
 		.from(transactionRevisions)
 		.where(
 			and(
+				eq(transactionRevisions.userId, userId),
 				eq(transactionRevisions.idempotencyKey, idempotencyKey),
 				eq(transactionRevisions.operation, "UPDATE"),
 			),
@@ -1163,6 +1412,12 @@ export async function resolveBudgetV2SnapshotForWrite(params: {
 				.from(monthlyBudgetV2Plans)
 				.where(eq(monthlyBudgetV2Plans.id, planRev.budgetPlanId))
 				.limit(1);
+			if (plan && plan.periodMonth !== periodMonth) {
+				throw new BudgetError(
+					"BUDGET_IDEMPOTENCY_CONFLICT",
+					`refresh idempotency key "${idempotencyKey}" is stored for period "${plan.periodMonth}", not the requested "${periodMonth}"`,
+				);
+			}
 			return {
 				source: "REPLAY",
 				periodMonth: plan?.periodMonth ?? periodMonth,
