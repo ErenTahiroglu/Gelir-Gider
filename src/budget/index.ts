@@ -1,4 +1,5 @@
 export * from "./basic-living-config-v2";
+export * from "./behavior-profile-v2";
 export * from "./checkpoint-canonical-v2";
 export * from "./checkpoint-processor-v2";
 export * from "./checkpoint-report-v2";

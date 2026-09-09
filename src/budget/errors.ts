@@ -59,7 +59,13 @@ export type BudgetErrorCode =
 	// The attribution's bound source is inactive as of the attribution instant
 	// (purchase VOID, People PAYABLE VOID, Midas transfer reversed, Long-Term
 	// task CANCELLED) so it cannot open a surplus-use attribution.
-	| "BUDGET_SURPLUS_USE_SOURCE_INACTIVE";
+	| "BUDGET_SURPLUS_USE_SOURCE_INACTIVE"
+	// Budget V2 Behavior Engine (Checkpoint 6A). The historical behavior profile
+	// could not be assembled from authoritative persisted checkpoint snapshots:
+	// the target payment event has no successfully persisted checkpoint, or the
+	// persisted history violates a Checkpoint 5 invariant (two distinct payment
+	// events sharing the exact checkpointAt). Never a silently dropped row.
+	| "BUDGET_BEHAVIOR_PROFILE_FAIL_CLOSED";
 
 export class BudgetError extends Error {
 	readonly code: BudgetErrorCode;

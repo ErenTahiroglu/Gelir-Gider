@@ -2876,12 +2876,24 @@ export async function buildBudgetV2CheckpointReportByStatement(params: {
 }
 
 // ============================================================================
-// Behavior-Engine observation contract (Checkpoint 5B.1, section 9)
+// Behavior-Engine observation contract (Checkpoint 5B.1 section 9 / 6A section 5)
 // ============================================================================
 
 /**
+ * The Behavior Engine observation contract version. This is SEPARATE from
+ * `BUDGET_V2_CHECKPOINT_REPORT_SCHEMA_VERSION`: two persisted reports may share
+ * the same report schemaVersion yet a report frozen before a later additive
+ * phase can be missing a field this projection now reads. The Behavior Engine
+ * classifies such a snapshot as incompatible for the affected feature -- it
+ * never fills a missing field with a plausible zero and never rewrites the
+ * stored historical report.
+ */
+export const BUDGET_V2_BEHAVIOR_OBSERVATION_CONTRACT_VERSION =
+	"budget-v2-behavior-observation-v1";
+
+/**
  * The deterministic, machine-readable slice of ONE checkpoint report that the
- * (future) Behavior Engine is allowed to consume.
+ * Behavior Engine (Checkpoint 6A) is allowed to consume.
  *
  * AUTHORITY BOUNDARY -- the Behavior Engine's observation source is the
  * PERSISTED Budget V2 checkpoint report (`budget_v2_checkpoint_snapshots`,
@@ -2889,14 +2901,60 @@ export async function buildBudgetV2CheckpointReportByStatement(params: {
  * `resolveBudgetV2LiveSnapshot(...).availableToAllocateNow` and never a
  * recomputation from mutable live sources. `extract...` is a pure projection
  * of an already-built (typically frozen) report object -- it performs no I/O
- * and adds no new math.
+ * and adds no new financial math. A field that the report does not carry is
+ * surfaced as `null` here (never `"0.00"`); the profile builder decides
+ * whether that makes a feature or the whole observation incompatible.
  */
 export interface BehaviorEngineCheckpointObservation {
+	observationContractVersion: string;
 	paymentEventId: string;
 	checkpointAt: string;
 	periodMonth: string;
 	previousCheckpointAt: string | null;
-	trueSurplus: string;
+	/** budget waterfall figures (verbatim strings from the persisted report). */
+	budget: {
+		realizedIncome: string | null;
+		currentObligations: string | null;
+		basicLivingFunding: string | null;
+		actualPersonalMandatorySpendMTD: string | null;
+		deficit: string | null;
+		emergencyCatchUp: string | null;
+		trueSurplus: string | null;
+	};
+	emergency: {
+		currentBalance: string | null;
+		target: string | null;
+		gap: string | null;
+	};
+	mobility: { currentTotal: string | null };
+	spending: {
+		personalCardSpendMTD: string | null;
+		mandatoryExpensePersonalSpend: string | null;
+		discretionarySpendPersonalSpend: string | null;
+		shortTermPurchasePersonalSpend: string | null;
+	};
+	surplusUse: {
+		coverageComplete: boolean;
+		candidateCount: number;
+		attributedCount: number;
+		unattributedCount: number;
+		staleCount: number;
+		overlapUnresolvedCount: number;
+		/** authoritative only -- null when availableToAllocateNow.available === false */
+		totalAttributedCurrentSurplusUse: string | null;
+		availableAmount: string | null;
+		oversubscribedBy: string | null;
+		lanes: Record<SurplusUseLaneName, SurplusUseLaneAccounting> | null;
+	};
+	food: {
+		available: boolean;
+		reason: string | null;
+		foodTotal: string | null;
+		foodOutside: string | null;
+		foodHomeMarket: string | null;
+	};
+	/** legacy top-level fields retained for existing consumers. */
+	trueSurplus: string | null;
 	coverageComplete: boolean;
 	candidateCount: number;
 	attributedCount: number;
@@ -2910,23 +2968,123 @@ export interface BehaviorEngineCheckpointObservation {
 	lanes: Record<SurplusUseLaneName, SurplusUseLaneAccounting> | null;
 }
 
+function obsMoneyOrNull(v: unknown): string | null {
+	if (typeof v !== "string") return null;
+	try {
+		parseAggregateMoneyString(v);
+		return v;
+	} catch {
+		return null;
+	}
+}
+
 export function extractBehaviorEngineCheckpointObservation(
 	report: BudgetV2CheckpointReport,
 ): BehaviorEngineCheckpointObservation {
-	const su = report.mtd.surplusUseAttribution;
+	const mtd = (report.mtd ?? {}) as Partial<MtdSection>;
+	const budget = (mtd.budget ?? {}) as Partial<MtdBudgetSection>;
+	const policyOutput = (budget.policyOutput ?? {}) as Record<string, unknown>;
+	const basicLiving = (budget.basicLiving ?? {}) as Record<string, unknown>;
+	const inputs = (budget.inputs ?? {}) as Record<string, unknown>;
+	const emergencyFund = (mtd.emergencyFund ?? {}) as Record<string, unknown>;
+	const mobility = (mtd.mobility ?? {}) as Record<string, unknown>;
+	const spending = (mtd.spending ?? {}) as Partial<MtdSpendingSection>;
+	const byCategory = (spending.byCategoryPersonalShare ?? {}) as Record<
+		string,
+		unknown
+	>;
+	const su = (mtd.surplusUseAttribution ??
+		{}) as Partial<SurplusUseAttributionSection>;
 	const atn = report.availableToAllocateNow;
+	const food = report.foodAnalytics as Partial<FoodAnalyticsAvailable> &
+		Partial<FoodAnalyticsIncomplete>;
+	const foodAvailable = food?.available === true;
+
 	return {
+		observationContractVersion: BUDGET_V2_BEHAVIOR_OBSERVATION_CONTRACT_VERSION,
 		paymentEventId: report.checkpoint.paymentEventId,
 		checkpointAt: report.checkpoint.checkpointAt,
 		periodMonth: report.checkpoint.periodMonth,
-		previousCheckpointAt: report.checkpoint.previousCheckpointAt,
-		trueSurplus: report.mtd.budget.policyOutput.trueSurplus,
-		coverageComplete: su.coverageComplete,
-		candidateCount: su.candidateCount,
-		attributedCount: su.attributedCount,
-		unattributedSubjectIds: su.unattributedSubjectIds,
-		staleSubjectIds: su.staleSubjectIds,
-		overlapUnresolvedSubjectIds: su.overlapUnresolvedSubjectIds,
+		previousCheckpointAt: report.checkpoint.previousCheckpointAt ?? null,
+		budget: {
+			realizedIncome: obsMoneyOrNull(inputs.realizedIncome),
+			currentObligations: obsMoneyOrNull(inputs.currentObligations),
+			basicLivingFunding: obsMoneyOrNull(basicLiving.basicLivingFunding),
+			actualPersonalMandatorySpendMTD: obsMoneyOrNull(
+				basicLiving.actualPersonalMandatorySpendMTD,
+			),
+			deficit: obsMoneyOrNull(policyOutput.deficit),
+			emergencyCatchUp: obsMoneyOrNull(policyOutput.emergencyCatchUp),
+			trueSurplus: obsMoneyOrNull(policyOutput.trueSurplus),
+		},
+		emergency: {
+			currentBalance: obsMoneyOrNull(emergencyFund.currentBalance),
+			target: obsMoneyOrNull(emergencyFund.target),
+			gap: obsMoneyOrNull(emergencyFund.gap),
+		},
+		mobility: { currentTotal: obsMoneyOrNull(mobility.currentTotal) },
+		spending: {
+			personalCardSpendMTD: obsMoneyOrNull(spending.personalCardSpendMTD),
+			mandatoryExpensePersonalSpend: obsMoneyOrNull(
+				byCategory.MANDATORY_EXPENSE,
+			),
+			discretionarySpendPersonalSpend: obsMoneyOrNull(
+				byCategory.DISCRETIONARY_SPEND,
+			),
+			shortTermPurchasePersonalSpend: obsMoneyOrNull(
+				byCategory.SHORT_TERM_PURCHASE,
+			),
+		},
+		surplusUse: {
+			coverageComplete: su.coverageComplete === true,
+			candidateCount:
+				typeof su.candidateCount === "number" ? su.candidateCount : 0,
+			attributedCount:
+				typeof su.attributedCount === "number" ? su.attributedCount : 0,
+			unattributedCount: Array.isArray(su.unattributedSubjectIds)
+				? su.unattributedSubjectIds.length
+				: 0,
+			staleCount: Array.isArray(su.staleSubjectIds)
+				? su.staleSubjectIds.length
+				: 0,
+			overlapUnresolvedCount: Array.isArray(su.overlapUnresolvedSubjectIds)
+				? su.overlapUnresolvedSubjectIds.length
+				: 0,
+			totalAttributedCurrentSurplusUse: atn.available
+				? atn.totalAttributedCurrentSurplusUse
+				: null,
+			availableAmount: atn.available ? atn.amount : null,
+			oversubscribedBy: atn.available ? atn.oversubscribedBy : null,
+			lanes: atn.available ? atn.lanes : null,
+		},
+		food: {
+			available: foodAvailable,
+			reason: foodAvailable
+				? null
+				: typeof food?.reason === "string"
+					? food.reason
+					: "FOOD_ANALYTICS_UNAVAILABLE",
+			foodTotal: foodAvailable ? obsMoneyOrNull(food.foodTotal) : null,
+			foodOutside: foodAvailable ? obsMoneyOrNull(food.foodOutside) : null,
+			foodHomeMarket: foodAvailable
+				? obsMoneyOrNull(food.foodHomeMarket)
+				: null,
+		},
+		trueSurplus: obsMoneyOrNull(policyOutput.trueSurplus),
+		coverageComplete: su.coverageComplete === true,
+		candidateCount:
+			typeof su.candidateCount === "number" ? su.candidateCount : 0,
+		attributedCount:
+			typeof su.attributedCount === "number" ? su.attributedCount : 0,
+		unattributedSubjectIds: Array.isArray(su.unattributedSubjectIds)
+			? su.unattributedSubjectIds
+			: [],
+		staleSubjectIds: Array.isArray(su.staleSubjectIds)
+			? su.staleSubjectIds
+			: [],
+		overlapUnresolvedSubjectIds: Array.isArray(su.overlapUnresolvedSubjectIds)
+			? su.overlapUnresolvedSubjectIds
+			: [],
 		availableToAllocateNow: atn,
 		availableAmount: atn.available ? atn.amount : null,
 		oversubscribedBy: atn.available ? atn.oversubscribedBy : null,

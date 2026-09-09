@@ -8446,6 +8446,207 @@ async function resolverRuntime5B1() {
 	}
 }
 
+async function resolverRuntime6A() {
+	console.log(
+		"\n== PHASE 6A: BEHAVIOR ENGINE FOUNDATION -- persisted-checkpoint authority ==",
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+	const { maybeEnqueueBudgetV2CheckpointRequest } = await import(
+		"../src/budget/checkpoint-request-v2.ts"
+	);
+	const {
+		processPendingBudgetV2CheckpointRequests,
+	} = await import("../src/budget/checkpoint-processor-v2.ts");
+	const { createCheckpointTriggerCard } = await import(
+		"../src/budget/checkpoint-trigger-card-v2.ts"
+	);
+	const { buildBudgetV2BehaviorProfile } = await import(
+		"../src/budget/behavior-profile-v2.ts"
+	);
+	const { canonicalJsonStringify } = await import(
+		"../src/budget/checkpoint-canonical-v2.ts"
+	);
+
+	const RECON = new Date("2026-09-01T00:00:00Z");
+	const at = (iso: string) => new Date(iso);
+	const SEP5 = "2026-09-05 00:00:00+00";
+	const eqB = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `-> got ${JSON.stringify(a)} want ${JSON.stringify(b)}`);
+	const chkB = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+
+	// a PAID + reconciled trigger on its own statement -> {pe, sid, payRev},
+	// then durably enqueue + process so it becomes an immutable snapshot.
+	let seq = 0;
+	const persistCheckpoint = async (s: S, payIso: string) => {
+		seq++;
+		const sid = `86a00000-0000-4000-8000-0000000006a${seq}`;
+		const amount = "400.00";
+		await s.replica();
+		const r1 = await s.mkStmt(sid, amount, 3 + seq);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: `rc-6a-${seq}`,
+			occurredAt: RECON,
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe, r } = await s.mkPay(sid, r1, amount, 2, payIso);
+		await s.origin();
+		await s.db.transaction((tx: S) =>
+			maybeEnqueueBudgetV2CheckpointRequest({
+				tx,
+				userId: U1,
+				statementId: sid,
+				creditCardId: s.CARD,
+				paymentEventId: pe,
+				payRevisionId: r,
+				occurredAt: at(payIso.replace(" ", "T").replace("+00", "Z")),
+			}),
+		);
+		await processPendingBudgetV2CheckpointRequests({ db: s.db });
+		return { pe, sid };
+	};
+
+	// ---------------------------------------------------------------- A + C + regime
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-6a",
+			occurredAt: at("2026-08-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		await s.origin();
+
+		const a = await persistCheckpoint(s, "2026-09-08 00:00:00+00");
+		const b = await persistCheckpoint(s, "2026-09-15 00:00:00+00");
+		await persistCheckpoint(s, "2026-09-22 00:00:00+00"); // FUTURE vs target b
+
+		const p1 = await buildBudgetV2BehaviorProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		eqB(
+			p1.through.paymentEventId,
+			b.pe,
+			"6A/A: profile is anchored on the target persisted checkpoint",
+		);
+		eqB(
+			p1.dataQuality.compatibleSnapshotCount,
+			2,
+			"6A/A+C: only persisted snapshots at or before the target are used (the Sep 22 checkpoint is excluded as future)",
+		);
+		eqB(
+			p1.windows.DAYS_90.observationCount,
+			2,
+			"6A/C: the trailing 90-day window excludes the future checkpoint",
+		);
+		chkB(
+			p1.currentObservation !== null &&
+				p1.currentNormalizedFeatures !== null &&
+				p1.observationContractVersion === "budget-v2-behavior-observation-v1",
+			"6A/A: the target observation + normalized features project from the frozen report",
+		);
+		eqB(
+			p1.confidence.level,
+			"LOW",
+			"6A: a ~7-day / 2-checkpoint history is LOW confidence (cold start)",
+		);
+		eqB(
+			p1.regime.current,
+			"SURPLUS_AVAILABLE",
+			"6A: deterministic regime from the frozen checkpoint = SURPLUS_AVAILABLE",
+		);
+		eqB(
+			p1.regime.changed,
+			false,
+			"6A: identical consecutive regimes -> no baseline-reset review",
+		);
+
+		// ------------------------------------------------ B + AA: live mutation immunity
+		const fp1 = canonicalJsonStringify(p1);
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "500000.00", SEP5); // would swing a LIVE trueSurplus
+		await s.q(
+			`update credit_card_liability_event_revisions set amount = '9999.00' where user_id = $1`,
+			[U1],
+		);
+		await s.origin();
+		const p2 = await buildBudgetV2BehaviorProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		eqB(
+			canonicalJsonStringify(p2),
+			fp1,
+			"6A/B+AA: the historical profile is byte-identical after a large live-source mutation (no live resolver / no report rebuild)",
+		);
+
+		// ------------------------------------------------ Z: determinism
+		const p3 = await buildBudgetV2BehaviorProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		eqB(
+			canonicalJsonStringify(p3),
+			fp1,
+			"6A/Z: the same target checkpoint yields a deterministically identical behavior profile",
+		);
+
+		// ------------------------------------------------ D: corrupt snapshot -> fail closed
+		await s.replica();
+		await s.q(
+			`update budget_v2_checkpoint_snapshots
+			   set report_json = jsonb_set(report_json, '{mtd,budget,policyOutput,trueSurplus}', '"424242.00"'::jsonb)
+			 where payment_event_id = $1`,
+			[a.pe],
+		);
+		await s.origin();
+		let threw = "";
+		try {
+			await buildBudgetV2BehaviorProfile({
+				db: s.db,
+				userId: U1,
+				throughPaymentEventId: b.pe,
+			});
+		} catch (e) {
+			threw = (e as { code?: string }).code ?? String((e as Error).message);
+		}
+		eqB(
+			threw,
+			"BUDGET_CHECKPOINT_SNAPSHOT_CORRUPT",
+			"6A/D: a tampered historical snapshot fails the whole profile closed (never a silent drop)",
+		);
+		await s.close();
+	}
+}
+
 
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
@@ -8462,6 +8663,7 @@ if (probed) {
 	await resolverRuntime5A();
 	await resolverRuntime5B();
 	await resolverRuntime5B1();
+	await resolverRuntime6A();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
