@@ -1,4 +1,5 @@
 export * from "./basic-living-config-v2";
+export * from "./checkpoint-report-v2";
 export * from "./errors";
 export * from "./goal-purpose-v2";
 export * from "./live-resolver-v2";

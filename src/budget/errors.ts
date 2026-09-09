@@ -15,7 +15,12 @@ export type BudgetErrorCode =
 	// Budget V2 authoritative live-source resolver -- fail-closed guard.
 	// The resolver refuses to produce an input it cannot prove from stored,
 	// authoritative domain truth (never an estimate).
-	| "BUDGET_RESOLVER_FAIL_CLOSED";
+	| "BUDGET_RESOLVER_FAIL_CLOSED"
+	// Budget V2 checkpoint report -- the authoritative PAID-statement trigger
+	// context (latest status PAID, an authoritative PAY revision, a resolvable
+	// linked payment event, an agreeing payment amount, a RECONCILED non-stale
+	// statement reconciliation) could not be established from stored truth.
+	| "BUDGET_CHECKPOINT_TRIGGER_INVALID";
 
 export class BudgetError extends Error {
 	readonly code: BudgetErrorCode;

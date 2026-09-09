@@ -86,6 +86,12 @@ export interface BudgetV2LiveResolution {
 	inputs: PersonalBudgetV2Inputs;
 	policyResult: PersonalBudgetV2Result;
 	evidenceSnapshot: Record<string, unknown>;
+	/**
+	 * Resolver-level checkpoint EVIDENCE only -- a lightweight interval/MTD digest
+	 * kept for the live lifecycle contract. The authoritative checkpoint-report
+	 * read model is `buildBudgetV2CheckpointReport` (checkpoint-report-v2.ts);
+	 * do not build a second source of truth on top of this field.
+	 */
 	checkpointAnalysis: Record<string, unknown>;
 	availableToAllocateNow: {
 		available: false;
