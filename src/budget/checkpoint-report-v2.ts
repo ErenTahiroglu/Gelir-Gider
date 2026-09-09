@@ -13,6 +13,7 @@ import {
 import {
 	creditCardPurchaseSplitParticipants,
 	creditCardPurchaseSplitRevisionItems,
+	creditCardPurchaseSplitRevisionSeals,
 	creditCardPurchaseSplitRevisions,
 	creditCardPurchaseSplits,
 } from "../db/schema/credit-card-splits";
@@ -46,25 +47,37 @@ import {
 import { normalizeUuid, validateBudgetPeriodMonth } from "./utils";
 
 /**
- * PERSONAL_BUDGET_V2 -- AUTHORITATIVE CHECKPOINT REPORT READ MODEL (checkpoint 4B)
+ * PERSONAL_BUDGET_V2 -- AUTHORITATIVE CHECKPOINT REPORT READ MODEL
+ * (checkpoint 4B, hardened in 4B.1)
  *
- * A READ-ONLY, zero-inference report built when a credit-card statement is PAID.
- * The authoritative checkpoint instant is derived ONLY from that statement's PAY
- * lifecycle (its append-only PAY revision + linked payment event); a caller may
- * not supply an arbitrary checkpoint amount / status. Any trigger precondition
- * it cannot prove from stored truth fails the report closed.
+ * A READ-ONLY, zero-inference, zero-silent-fallback report.
  *
- * Two clearly separated layers:
- *   interval  -- append-only ACTIVITY strictly since the previous checkpoint,
- *                `(previousCheckpointAt, checkpointAt]` (first checkpoint:
- *                `[periodStart, checkpointAt]`), via `buildResolverWindow`.
- *   mtd       -- current MONTH-TO-DATE financial state at `checkpointAt`, taken
- *                verbatim from `resolveBudgetV2LiveSnapshot` (no re-implemented
- *                waterfall math).
+ * TRIGGER IDENTITY = PAYMENT EVENT, not statement. The credit-card domain
+ * supports PAID -> REOPEN -> PAY, so one statement can carry several distinct
+ * PAY / payment events; each is a separate checkpoint identity. The canonical
+ * API takes `triggerPaymentEventId` and derives
+ *   paymentEvent -> statement -> the exact PAY revision that references it.
+ * `buildBudgetV2CheckpointReportByStatement` is a compatibility wrapper only --
+ * it resolves solely when exactly one eligible PAY event is unambiguous and
+ * otherwise raises BUDGET_CHECKPOINT_TRIGGER_AMBIGUOUS.
  *
- * Food semantic analytics and forward installment schedules are explicitly
- * UNSUPPORTED here (not stored); they are never inferred from merchant / amount
- * / time / behaviour. No persistence, no trigger wiring, no learning.
+ * TEMPORAL SAFETY. Every historical fact is read AS OF `checkpointAt`:
+ *   - person relationship: highest person_revisions row with occurredAt <= at;
+ *     no row => fail closed (never borrow a later state);
+ *   - purchase split ownership: the effective split revision as of `at`, which
+ *     MUST be sealed and internally consistent, else fail closed / mark the
+ *     activity row ownership unavailable (never trust an unsealed or future
+ *     revision, never infer ownership from amounts or names);
+ *   - card displayName / issuer: the card revision effective at `checkpointAt`;
+ *   - SUPPORT income role: the classification revision effective at
+ *     `checkpointAt` (a later reclassification never rewrites the report).
+ *
+ * MTD state comes verbatim from `resolveBudgetV2LiveSnapshot` (no re-derived
+ * waterfall math); required evidence fields are typed-asserted, never coerced
+ * into a plausible "0.00". Food semantics and forward installment schedules are
+ * not stored and are never inferred. No persistence, no trigger wiring, no
+ * learning -- future persisted checkpoint snapshots (keyed by paymentEventId)
+ * will be the historical replay source.
  */
 
 export const BUDGET_V2_CHECKPOINT_REPORT_SCHEMA_VERSION =
@@ -80,7 +93,8 @@ export interface CheckpointReportParams {
 	db: Database;
 	userId: string;
 	periodMonth: string;
-	triggerStatementId: string;
+	/** Canonical trigger identity -- a credit_card_statement_payment_events id. */
+	triggerPaymentEventId: string;
 	previousCheckpointAt?: Date | undefined;
 }
 
@@ -109,6 +123,8 @@ export interface OwnershipUnavailable {
 }
 
 export interface TriggerPaymentSection {
+	paymentEventId: string;
+	payRevisionId: string;
 	statementId: string;
 	cardId: string;
 	cardCode: string;
@@ -128,6 +144,9 @@ export interface TriggerPaymentSection {
 export interface CheckpointSection {
 	schemaVersion: string;
 	periodMonth: string;
+	paymentEventId: string;
+	payRevisionId: string;
+	statementId: string;
 	checkpointAt: string;
 	previousCheckpointAt: string | null;
 	isFirstCheckpoint: boolean;
@@ -148,6 +167,7 @@ export interface IntervalIncomeActivityItem {
 	amount: string;
 	occurredAt: string;
 	sourceNature: IncomeSourceNature;
+	/** Role effective AT the checkpoint instant (never a later reclassification). */
 	supportRole: SupportRole | null;
 }
 
@@ -173,6 +193,16 @@ export interface PurchaseParticipant {
 	shareAmount: string;
 }
 
+export type PurchaseOwnership =
+	| {
+			available: true;
+			personalShare: string;
+			externalShare: string;
+			externalParticipants: PurchaseParticipant[];
+			basis: "SEALED_SPLIT_AS_OF" | "NO_SPLIT" | "VOID_SPLIT";
+	  }
+	| { available: false; reason: string };
+
 export interface IntervalPurchaseActivityItem {
 	eventId: string;
 	revisionNo: number;
@@ -186,10 +216,8 @@ export interface IntervalPurchaseActivityItem {
 	description: string | null;
 	installmentCount: number | null;
 	occurredAt: string;
-	personalShare: string;
-	externalShare: string;
-	externalParticipants: PurchaseParticipant[];
-	ownershipBasis: "CURRENT_ACTIVE_SPLIT";
+	/** Ownership effective at THIS activity instant; unavailable if unprovable. */
+	ownership: PurchaseOwnership;
 }
 
 export interface IntervalPurchaseSection {
@@ -233,6 +261,7 @@ export interface FamilyReimbursementItem {
 	displayName: string;
 	obligationId: string;
 	purchaseEventId: string;
+	splitRevisionId: string;
 	settlementAmount: string;
 	occurredAt: string;
 }
@@ -255,6 +284,7 @@ export interface PeopleFamilySection {
 }
 
 export interface StatementPaymentItem {
+	paymentEventId: string;
 	statementId: string;
 	cardId: string;
 	cardCode: string;
@@ -351,12 +381,42 @@ function triggerInvalid(reason: string): never {
 	throw new BudgetError("BUDGET_CHECKPOINT_TRIGGER_INVALID", reason);
 }
 
+function reportFailClosed(reason: string): never {
+	throw new BudgetError("BUDGET_CHECKPOINT_REPORT_FAIL_CLOSED", reason);
+}
+
 function asDate(v: unknown): Date {
 	return v instanceof Date ? v : new Date(v as string);
 }
 
 function centsOf(v: string): bigint {
 	return parseAggregateMoneyString(v).cents;
+}
+
+function pick(obj: unknown, key: string): unknown {
+	return obj && typeof obj === "object"
+		? (obj as Record<string, unknown>)[key]
+		: undefined;
+}
+
+/**
+ * Required resolver-evidence extractor -- fails the report closed rather than
+ * converting a missing / malformed field into a plausible financial zero.
+ */
+function reqMoney(v: unknown, path: string): string {
+	if (typeof v !== "string") {
+		reportFailClosed(
+			`required resolver evidence "${path}" is missing or not a string`,
+		);
+	}
+	try {
+		parseAggregateMoneyString(v);
+	} catch {
+		reportFailClosed(
+			`required resolver evidence "${path}" is not a canonical money string`,
+		);
+	}
+	return v;
 }
 
 const PURCHASE_CATEGORIES: PurchaseBudgetCategory[] = [
@@ -373,10 +433,9 @@ function normalizeCategory(v: string | null): PurchaseBudgetCategory {
 }
 
 /**
- * Authoritative person identity (displayName + relationship) effective at a
- * point in time: the greatest-revision person_revisions row whose occurredAt is
- * at or before `at`; if none precede it, the earliest revision. Never inferred
- * from names.
+ * Person identity (displayName + relationship) effective AT `at`: the highest
+ * person_revisions row whose occurredAt <= at. If none exists, fail closed --
+ * a later revision must never be used to classify a historical checkpoint.
  */
 async function personAt(
 	db: Database,
@@ -399,88 +458,18 @@ async function personAt(
 			),
 		)
 		.orderBy(asc(personRevisions.revisionNo));
-	if (revs.length === 0) {
-		triggerInvalid(
-			`person ${personId} has no revisions; its relationship cannot be authoritatively resolved`,
-		);
-	}
-	let chosen = revs[0];
+	let chosen: (typeof revs)[number] | undefined;
 	for (const r of revs) {
 		if (asDate(r.occurredAt) <= at) chosen = r;
 	}
-	if (!chosen) chosen = revs[0];
-	return {
-		displayName: (chosen as (typeof revs)[number]).displayName,
-		relationship: (chosen as (typeof revs)[number])
-			.relationship as PersonRelationship,
-	};
-}
-
-interface PurchaseShares {
-	personalCents: bigint;
-	externalCents: bigint;
-	participants: Array<{
-		personId: string;
-		shareCents: bigint;
-		displayName: string;
-		relationship: PersonRelationship;
-	}>;
-}
-
-/**
- * Current authoritative economic split of a purchase event: its split anchor's
- * latest non-VOID revision. No active / VOID split => 100% personal.
- */
-async function currentPurchaseShares(
-	db: Database,
-	userId: string,
-	purchaseEventId: string,
-	grossCents: bigint,
-	at: Date,
-): Promise<PurchaseShares> {
-	const [split] = await db
-		.select({ id: creditCardPurchaseSplits.id })
-		.from(creditCardPurchaseSplits)
-		.where(eq(creditCardPurchaseSplits.purchaseEventId, purchaseEventId))
-		.limit(1);
-	if (!split) {
-		return { personalCents: grossCents, externalCents: 0n, participants: [] };
-	}
-	const [rev] = await db
-		.select({
-			id: creditCardPurchaseSplitRevisions.id,
-			operation: creditCardPurchaseSplitRevisions.operation,
-			userShare: creditCardPurchaseSplitRevisions.userShareAmount,
-			externalShare: creditCardPurchaseSplitRevisions.externalShareAmount,
-		})
-		.from(creditCardPurchaseSplitRevisions)
-		.where(eq(creditCardPurchaseSplitRevisions.splitId, split.id))
-		.orderBy(desc(creditCardPurchaseSplitRevisions.revisionNo))
-		.limit(1);
-	if (!rev || rev.operation === "VOID") {
-		return { personalCents: grossCents, externalCents: 0n, participants: [] };
-	}
-	const items = await db
-		.select({
-			personId: creditCardPurchaseSplitRevisionItems.personId,
-			shareAmount: creditCardPurchaseSplitRevisionItems.shareAmount,
-		})
-		.from(creditCardPurchaseSplitRevisionItems)
-		.where(eq(creditCardPurchaseSplitRevisionItems.splitRevisionId, rev.id));
-	const participants: PurchaseShares["participants"] = [];
-	for (const it of items) {
-		const who = await personAt(db, userId, it.personId, at);
-		participants.push({
-			personId: it.personId,
-			shareCents: centsOf(it.shareAmount),
-			displayName: who.displayName,
-			relationship: who.relationship,
-		});
+	if (!chosen) {
+		reportFailClosed(
+			`person ${personId} has no revision effective at or before ${at.toISOString()}; a later revision must not be used to classify it`,
+		);
 	}
 	return {
-		personalCents: centsOf(rev.userShare),
-		externalCents: centsOf(rev.externalShare),
-		participants,
+		displayName: chosen.displayName,
+		relationship: chosen.relationship as PersonRelationship,
 	};
 }
 
@@ -491,33 +480,296 @@ interface CardMeta {
 	issuer: string;
 }
 
-async function loadCardMeta(
+/**
+ * Card displayName / issuer as of `at` -- a rename / config edit performed
+ * after the checkpoint must not rewrite the historical report label. Card code
+ * comes from the immutable anchor.
+ */
+async function cardMetaAsOf(
 	db: Database,
 	userId: string,
-): Promise<Map<string, CardMeta>> {
-	const cards = await db
+	cardId: string,
+	at: Date,
+): Promise<CardMeta> {
+	const [card] = await db
 		.select({ id: creditCards.id, code: creditCards.code })
 		.from(creditCards)
-		.where(eq(creditCards.userId, userId));
-	const out = new Map<string, CardMeta>();
-	for (const c of cards) {
-		const [rev] = await db
-			.select({
-				displayName: creditCardRevisions.displayName,
-				issuer: creditCardRevisions.issuer,
-			})
-			.from(creditCardRevisions)
-			.where(eq(creditCardRevisions.creditCardId, c.id))
-			.orderBy(desc(creditCardRevisions.revisionNo))
-			.limit(1);
-		out.set(c.id, {
-			cardId: c.id,
-			code: c.code,
-			displayName: rev?.displayName ?? c.code,
-			issuer: rev?.issuer ?? "",
+		.where(and(eq(creditCards.id, cardId), eq(creditCards.userId, userId)))
+		.limit(1);
+	if (!card) {
+		reportFailClosed(`credit card ${cardId} not found for this user`);
+	}
+	const revs = await db
+		.select({
+			displayName: creditCardRevisions.displayName,
+			issuer: creditCardRevisions.issuer,
+			occurredAt: creditCardRevisions.occurredAt,
+			revisionNo: creditCardRevisions.revisionNo,
+		})
+		.from(creditCardRevisions)
+		.where(eq(creditCardRevisions.creditCardId, cardId))
+		.orderBy(asc(creditCardRevisions.revisionNo));
+	let chosen: (typeof revs)[number] | undefined;
+	for (const r of revs) {
+		if (asDate(r.occurredAt) <= at) chosen = r;
+	}
+	if (!chosen) {
+		reportFailClosed(
+			`credit card ${cardId} has no configuration revision effective at or before ${at.toISOString()}`,
+		);
+	}
+	return {
+		cardId,
+		code: card.code,
+		displayName: chosen.displayName,
+		issuer: chosen.issuer,
+	};
+}
+
+function makeCardMetaAsOf(
+	db: Database,
+	userId: string,
+	at: Date,
+): (cardId: string) => Promise<CardMeta> {
+	const cache = new Map<string, CardMeta>();
+	return async (cardId: string) => {
+		const hit = cache.get(cardId);
+		if (hit) return hit;
+		const v = await cardMetaAsOf(db, userId, cardId, at);
+		cache.set(cardId, v);
+		return v;
+	};
+}
+
+// ============================================================================
+// Sealed split truth (strict), effective AS OF a point in time
+// ============================================================================
+
+type SealedSplitResolution =
+	| { kind: "NO_SPLIT" }
+	| { kind: "VOID_SPLIT"; splitRevisionId: string }
+	| {
+			kind: "ACTIVE";
+			splitRevisionId: string;
+			grossCents: bigint;
+			userShareCents: bigint;
+			externalShareCents: bigint;
+			participants: Array<{
+				personId: string;
+				shareCents: bigint;
+				personObligationId: string;
+			}>;
+	  }
+	| { kind: "UNRESOLVED"; reason: string; inconsistent: boolean };
+
+/**
+ * The authoritative economic split of a purchase, effective at `at`:
+ *  - no split anchor, or no split revision with occurredAt <= at -> NO_SPLIT
+ *  - effective revision is VOID -> VOID_SPLIT (100% personal)
+ *  - effective revision is non-VOID -> ACTIVE only when it is SEALED and
+ *    internally consistent (user + external == gross, item shares sum to the
+ *    external share, every item person has a participant anchor); otherwise
+ *    UNRESOLVED (`inconsistent` distinguishes "not yet authoritative" from
+ *    "internally corrupt").
+ * Never trusts an unsealed or future revision; never infers by amount / name.
+ */
+async function resolveSealedSplitAsOf(
+	db: Database,
+	userId: string,
+	purchaseEventId: string,
+	at: Date,
+): Promise<SealedSplitResolution> {
+	const [split] = await db
+		.select({
+			id: creditCardPurchaseSplits.id,
+			userId: creditCardPurchaseSplits.userId,
+		})
+		.from(creditCardPurchaseSplits)
+		.where(eq(creditCardPurchaseSplits.purchaseEventId, purchaseEventId))
+		.limit(1);
+	if (!split) return { kind: "NO_SPLIT" };
+	if (split.userId !== userId) {
+		return {
+			kind: "UNRESOLVED",
+			reason: `split for purchase ${purchaseEventId} is not owned by this user`,
+			inconsistent: true,
+		};
+	}
+
+	const revs = await db
+		.select({
+			id: creditCardPurchaseSplitRevisions.id,
+			revisionNo: creditCardPurchaseSplitRevisions.revisionNo,
+			operation: creditCardPurchaseSplitRevisions.operation,
+			gross: creditCardPurchaseSplitRevisions.grossAmount,
+			userShare: creditCardPurchaseSplitRevisions.userShareAmount,
+			externalShare: creditCardPurchaseSplitRevisions.externalShareAmount,
+			occurredAt: creditCardPurchaseSplitRevisions.occurredAt,
+		})
+		.from(creditCardPurchaseSplitRevisions)
+		.where(eq(creditCardPurchaseSplitRevisions.splitId, split.id))
+		.orderBy(asc(creditCardPurchaseSplitRevisions.revisionNo));
+	let eff: (typeof revs)[number] | undefined;
+	for (const r of revs) {
+		if (asDate(r.occurredAt) <= at) eff = r;
+	}
+	if (!eff) return { kind: "NO_SPLIT" };
+	if (eff.operation === "VOID") {
+		return { kind: "VOID_SPLIT", splitRevisionId: eff.id };
+	}
+
+	const [seal] = await db
+		.select({ id: creditCardPurchaseSplitRevisionSeals.splitRevisionId })
+		.from(creditCardPurchaseSplitRevisionSeals)
+		.where(eq(creditCardPurchaseSplitRevisionSeals.splitRevisionId, eff.id))
+		.limit(1);
+	if (!seal) {
+		return {
+			kind: "UNRESOLVED",
+			reason: `active split revision ${eff.id} for purchase ${purchaseEventId} is not sealed`,
+			inconsistent: false,
+		};
+	}
+
+	const grossCents = centsOf(eff.gross);
+	const userShareCents = centsOf(eff.userShare);
+	const externalShareCents = centsOf(eff.externalShare);
+	if (userShareCents + externalShareCents !== grossCents) {
+		return {
+			kind: "UNRESOLVED",
+			reason: `split revision ${eff.id}: user ${userShareCents} + external ${externalShareCents} != gross ${grossCents}`,
+			inconsistent: true,
+		};
+	}
+
+	const items = await db
+		.select({
+			personId: creditCardPurchaseSplitRevisionItems.personId,
+			shareAmount: creditCardPurchaseSplitRevisionItems.shareAmount,
+		})
+		.from(creditCardPurchaseSplitRevisionItems)
+		.where(eq(creditCardPurchaseSplitRevisionItems.splitRevisionId, eff.id));
+	const anchors = await db
+		.select({
+			personId: creditCardPurchaseSplitParticipants.personId,
+			personObligationId:
+				creditCardPurchaseSplitParticipants.personObligationId,
+		})
+		.from(creditCardPurchaseSplitParticipants)
+		.where(eq(creditCardPurchaseSplitParticipants.splitId, split.id));
+	const anchorByPerson = new Map(
+		anchors.map((a) => [a.personId, a.personObligationId]),
+	);
+
+	let itemsSum = 0n;
+	const participants: {
+		personId: string;
+		shareCents: bigint;
+		personObligationId: string;
+	}[] = [];
+	for (const it of items) {
+		const sc = centsOf(it.shareAmount);
+		itemsSum += sc;
+		const obl = anchorByPerson.get(it.personId);
+		if (!obl) {
+			return {
+				kind: "UNRESOLVED",
+				reason: `split revision ${eff.id} item person ${it.personId} has no participant anchor`,
+				inconsistent: true,
+			};
+		}
+		participants.push({
+			personId: it.personId,
+			shareCents: sc,
+			personObligationId: obl,
 		});
 	}
-	return out;
+	if (itemsSum !== externalShareCents) {
+		return {
+			kind: "UNRESOLVED",
+			reason: `split revision ${eff.id}: item share sum ${itemsSum} != external share ${externalShareCents}`,
+			inconsistent: true,
+		};
+	}
+
+	return {
+		kind: "ACTIVE",
+		splitRevisionId: eff.id,
+		grossCents,
+		userShareCents,
+		externalShareCents,
+		participants,
+	};
+}
+
+interface PurchaseSharesAvailable {
+	available: true;
+	personalCents: bigint;
+	externalCents: bigint;
+	participants: Array<{
+		personId: string;
+		shareCents: bigint;
+		displayName: string;
+		relationship: PersonRelationship;
+	}>;
+	basis: "SEALED_SPLIT_AS_OF" | "NO_SPLIT" | "VOID_SPLIT";
+}
+type PurchaseSharesResult =
+	| PurchaseSharesAvailable
+	| { available: false; reason: string };
+
+async function purchaseSharesAsOf(
+	db: Database,
+	userId: string,
+	purchaseEventId: string,
+	grossCents: bigint,
+	at: Date,
+): Promise<PurchaseSharesResult> {
+	const res = await resolveSealedSplitAsOf(db, userId, purchaseEventId, at);
+	if (res.kind === "NO_SPLIT") {
+		return {
+			available: true,
+			personalCents: grossCents,
+			externalCents: 0n,
+			participants: [],
+			basis: "NO_SPLIT",
+		};
+	}
+	if (res.kind === "VOID_SPLIT") {
+		return {
+			available: true,
+			personalCents: grossCents,
+			externalCents: 0n,
+			participants: [],
+			basis: "VOID_SPLIT",
+		};
+	}
+	if (res.kind === "UNRESOLVED") {
+		return { available: false, reason: res.reason };
+	}
+	if (res.grossCents !== grossCents) {
+		return {
+			available: false,
+			reason: `sealed split gross ${res.grossCents} does not match the purchase amount ${grossCents} being reported`,
+		};
+	}
+	const participants: PurchaseSharesAvailable["participants"] = [];
+	for (const p of res.participants) {
+		const who = await personAt(db, userId, p.personId, at);
+		participants.push({
+			personId: p.personId,
+			shareCents: p.shareCents,
+			displayName: who.displayName,
+			relationship: who.relationship,
+		});
+	}
+	return {
+		available: true,
+		personalCents: res.userShareCents,
+		externalCents: res.externalShareCents,
+		participants,
+		basis: "SEALED_SPLIT_AS_OF",
+	};
 }
 
 // ============================================================================
@@ -527,6 +779,9 @@ async function loadCardMeta(
 interface TriggerContext {
 	section: TriggerPaymentSection;
 	checkpointAt: Date;
+	paymentEventId: string;
+	payRevisionId: string;
+	statementId: string;
 }
 
 function decomposeOwnership(
@@ -547,8 +802,8 @@ function decomposeOwnership(
 		externalTotal += cents;
 		const who = whoByPerson.get(personId);
 		if (!who) {
-			triggerInvalid(
-				`reconciliation references person ${personId} with no resolvable relationship`,
+			reportFailClosed(
+				`reconciliation references person ${personId} with no resolvable relationship at the checkpoint`,
 			);
 		}
 		if (who.relationship === "FAMILY") family += cents;
@@ -562,12 +817,12 @@ function decomposeOwnership(
 		});
 	}
 	if (personalCents + externalTotal !== grossCents) {
-		triggerInvalid(
+		reportFailClosed(
 			`sealed reconciliation does not partition exactly: personal ${personalCents} + external ${externalTotal} != reconciled ${grossCents}`,
 		);
 	}
 	if (family + friend + other !== externalTotal) {
-		triggerInvalid(
+		reportFailClosed(
 			`external share does not partition by relationship exactly (family ${family} + friend ${friend} + other ${other} != ${externalTotal})`,
 		);
 	}
@@ -586,75 +841,10 @@ function decomposeOwnership(
 async function resolveTrigger(
 	db: Database,
 	userId: string,
-	triggerStatementId: string,
+	triggerPaymentEventId: string,
 	periodMonth: string,
-	cardMeta: Map<string, CardMeta>,
 ): Promise<TriggerContext> {
-	const [stmt] = await db
-		.select({
-			id: creditCardStatements.id,
-			creditCardId: creditCardStatements.creditCardId,
-			cycleYear: creditCardStatements.cycleYear,
-			cycleMonth: creditCardStatements.cycleMonth,
-		})
-		.from(creditCardStatements)
-		.where(
-			and(
-				eq(creditCardStatements.id, triggerStatementId),
-				eq(creditCardStatements.userId, userId),
-			),
-		)
-		.limit(1);
-	if (!stmt) {
-		triggerInvalid(
-			`statement ${triggerStatementId} does not exist for this user`,
-		);
-	}
-
-	const [latestRev] = await db
-		.select({
-			status: creditCardStatementRevisions.status,
-			statementAmount: creditCardStatementRevisions.statementAmount,
-			reservePlacement: creditCardStatementRevisions.reservePlacement,
-		})
-		.from(creditCardStatementRevisions)
-		.where(eq(creditCardStatementRevisions.statementId, stmt.id))
-		.orderBy(desc(creditCardStatementRevisions.revisionNo))
-		.limit(1);
-	if (!latestRev) {
-		triggerInvalid(`statement ${stmt.id} has no revisions`);
-	}
-	if (latestRev.status !== "PAID") {
-		triggerInvalid(
-			`statement ${stmt.id} latest revision status is ${latestRev.status}, not PAID; there is no checkpoint to report`,
-		);
-	}
-
-	const [payRev] = await db
-		.select({
-			occurredAt: creditCardStatementRevisions.occurredAt,
-			paymentEventId: creditCardStatementRevisions.paymentEventId,
-			statementAmount: creditCardStatementRevisions.statementAmount,
-		})
-		.from(creditCardStatementRevisions)
-		.where(
-			and(
-				eq(creditCardStatementRevisions.statementId, stmt.id),
-				eq(creditCardStatementRevisions.operation, "PAY"),
-			),
-		)
-		.orderBy(desc(creditCardStatementRevisions.revisionNo))
-		.limit(1);
-	if (!payRev) {
-		triggerInvalid(
-			`statement ${stmt.id} is PAID but has no authoritative PAY revision`,
-		);
-	}
-	if (!payRev.paymentEventId) {
-		triggerInvalid(
-			`the PAY revision of statement ${stmt.id} has no linked payment event; the checkpoint instant is not authoritative`,
-		);
-	}
+	// 1. payment event belongs to the user.
 	const [payEvent] = await db
 		.select({
 			id: creditCardStatementPaymentEvents.id,
@@ -667,36 +857,91 @@ async function resolveTrigger(
 		.from(creditCardStatementPaymentEvents)
 		.where(
 			and(
-				eq(creditCardStatementPaymentEvents.id, payRev.paymentEventId),
+				eq(creditCardStatementPaymentEvents.id, triggerPaymentEventId),
 				eq(creditCardStatementPaymentEvents.userId, userId),
 			),
 		)
 		.limit(1);
 	if (!payEvent) {
 		triggerInvalid(
-			`the PAY revision of statement ${stmt.id} claims payment event ${payRev.paymentEventId} which cannot be resolved`,
-		);
-	}
-	if (payEvent.statementId !== stmt.id) {
-		triggerInvalid(
-			`payment event ${payEvent.id} belongs to a different statement`,
+			`payment event ${triggerPaymentEventId} does not exist for this user`,
 		);
 	}
 
+	// 2. referenced statement belongs to the user.
+	const [stmt] = await db
+		.select({
+			id: creditCardStatements.id,
+			creditCardId: creditCardStatements.creditCardId,
+			cycleYear: creditCardStatements.cycleYear,
+			cycleMonth: creditCardStatements.cycleMonth,
+		})
+		.from(creditCardStatements)
+		.where(
+			and(
+				eq(creditCardStatements.id, payEvent.statementId),
+				eq(creditCardStatements.userId, userId),
+			),
+		)
+		.limit(1);
+	if (!stmt) {
+		triggerInvalid(
+			`payment event ${triggerPaymentEventId} references statement ${payEvent.statementId} which does not exist for this user`,
+		);
+	}
+
+	// 3. exactly one PAY statement revision references this payment event.
+	const payRevs = await db
+		.select({
+			id: creditCardStatementRevisions.id,
+			status: creditCardStatementRevisions.status,
+			statementAmount: creditCardStatementRevisions.statementAmount,
+			reservePlacement: creditCardStatementRevisions.reservePlacement,
+			statementId: creditCardStatementRevisions.statementId,
+		})
+		.from(creditCardStatementRevisions)
+		.where(
+			and(
+				eq(creditCardStatementRevisions.statementId, stmt.id),
+				eq(creditCardStatementRevisions.operation, "PAY"),
+				eq(creditCardStatementRevisions.paymentEventId, triggerPaymentEventId),
+			),
+		);
+	if (payRevs.length === 0) {
+		triggerInvalid(
+			`no PAY statement revision references payment event ${triggerPaymentEventId}`,
+		);
+	}
+	if (payRevs.length > 1) {
+		triggerInvalid(
+			`payment event ${triggerPaymentEventId} is referenced by ${payRevs.length} PAY revisions; the trigger identity is ambiguous`,
+		);
+	}
+	const payRev = payRevs[0] as (typeof payRevs)[number];
+
+	// 4. PAY revision status is PAID. 5. statement identity agrees.
+	if (payRev.status !== "PAID") {
+		triggerInvalid(
+			`the PAY revision for payment event ${triggerPaymentEventId} has status ${payRev.status}, not PAID`,
+		);
+	}
+	if (payRev.statementId !== payEvent.statementId) {
+		triggerInvalid(
+			`PAY revision ${payRev.id} statement ${payRev.statementId} does not match payment event statement ${payEvent.statementId}`,
+		);
+	}
+
+	// 6. payment amount == PAY revision statement amount.
 	const payEventCents = centsOf(payEvent.amount);
-	const latestAmtCents = centsOf(latestRev.statementAmount);
-	const payRevAmtCents = centsOf(payRev.statementAmount);
-	if (payEventCents !== latestAmtCents || payRevAmtCents !== latestAmtCents) {
+	const payRevCents = centsOf(payRev.statementAmount);
+	if (payEventCents !== payRevCents) {
 		triggerInvalid(
-			`payment amount does not agree with the statement lifecycle (payment event ${payEventCents}, PAY revision ${payRevAmtCents}, latest statement ${latestAmtCents} kurus)`,
+			`payment amount ${payEventCents} does not equal the PAY revision statement amount ${payRevCents} kurus`,
 		);
 	}
 
+	// 7. checkpointAt = paymentEvent.occurredAt. 8. it belongs to the period.
 	const checkpointAt = asDate(payEvent.occurredAt);
-
-	// Section 4 / case W -- the trigger payment MUST fall inside the requested
-	// period (checked before any further work). `previousCheckpointAt` is
-	// validated by the caller.
 	const w = buildResolverWindow(periodMonth, checkpointAt, undefined);
 	if (checkpointAt < w.periodStart || checkpointAt >= w.periodEnd) {
 		throw new BudgetError(
@@ -705,6 +950,10 @@ async function resolveTrigger(
 		);
 	}
 
+	// 9. reconciliation is authoritative for the PAY revision statement amount.
+	// If the statement was later REOPENED / repaid at a different amount, its
+	// reconciliation is no longer RECONCILED (or no longer matches) and we fail
+	// closed rather than switching to the newer PAY.
 	const recon = await getStatementReconciliation({
 		db,
 		userId,
@@ -712,11 +961,23 @@ async function resolveTrigger(
 	});
 	if (recon.status !== "RECONCILED") {
 		triggerInvalid(
-			`trigger statement ${stmt.id} reconciliation is ${recon.status}${
+			`statement ${stmt.id} reconciliation is ${recon.status}${
 				recon.staleReason ? ` (${recon.staleReason})` : ""
-			}; ownership cannot be authoritatively decomposed`,
+			}; this checkpoint can no longer be safely reported`,
 		);
 	}
+	if (centsOf(recon.reconciledStatementAmount ?? "0.00") !== payRevCents) {
+		triggerInvalid(
+			`statement ${stmt.id} reconciliation amount ${recon.reconciledStatementAmount} does not match the PAY revision amount ${payRevCents} kurus; the statement was likely reopened / repaid`,
+		);
+	}
+	if (recon.revisionNo == null) {
+		triggerInvalid(
+			`statement ${stmt.id} reconciliation has no revision number`,
+		);
+	}
+
+	const meta = await cardMetaAsOf(db, userId, stmt.creditCardId, checkpointAt);
 
 	const whoByPerson = new Map<
 		string,
@@ -729,29 +990,27 @@ async function resolveTrigger(
 		);
 	}
 
-	const meta = cardMeta.get(stmt.creditCardId);
-	if (!meta) {
-		triggerInvalid(
-			`credit card ${stmt.creditCardId} for statement ${stmt.id} has no configuration`,
-		);
-	}
-
 	return {
 		checkpointAt,
+		paymentEventId: payEvent.id,
+		payRevisionId: payRev.id,
+		statementId: stmt.id,
 		section: {
+			paymentEventId: payEvent.id,
+			payRevisionId: payRev.id,
 			statementId: stmt.id,
 			cardId: stmt.creditCardId,
 			cardCode: meta.code,
 			displayName: meta.displayName,
 			issuer: meta.issuer,
 			statementCycle: { year: stmt.cycleYear, month: stmt.cycleMonth },
-			statementAmount: formatCentsToMoney(latestAmtCents),
+			statementAmount: formatCentsToMoney(payRevCents),
 			paymentAmount: formatCentsToMoney(payEventCents),
 			checkpointAt: checkpointAt.toISOString(),
 			paidAt: checkpointAt.toISOString(),
-			reservePlacement: latestRev.reservePlacement,
+			reservePlacement: payRev.reservePlacement,
 			paymentAssetAccountId: payEvent.paymentAssetAccountId,
-			reconciliationRevisionNo: recon.revisionNo ?? 0,
+			reconciliationRevisionNo: recon.revisionNo,
 			ownership: decomposeOwnership(recon, whoByPerson),
 		},
 	};
@@ -765,6 +1024,7 @@ async function buildIntervalIncome(
 	db: Database,
 	userId: string,
 	win: ResolverWindow,
+	checkpointAt: Date,
 ): Promise<IntervalIncomeSection> {
 	const receipts = await db
 		.select({ receiptId: incomeReceipts.id, nature: incomeSources.nature })
@@ -792,10 +1052,15 @@ async function buildIntervalIncome(
 			.orderBy(asc(incomeReceiptRevisions.revisionNo));
 		if (revs.length === 0) continue;
 
+		// SUPPORT role effective AT the checkpoint (never a later reclassification).
 		let supportRole: SupportRole | null = null;
 		if (nature === "SUPPORT") {
-			const [roleRow] = await db
-				.select({ role: incomeReceiptBudgetV2SemanticRevisions.supportRole })
+			const roleRevs = await db
+				.select({
+					role: incomeReceiptBudgetV2SemanticRevisions.supportRole,
+					revisionNo: incomeReceiptBudgetV2SemanticRevisions.revisionNo,
+					occurredAt: incomeReceiptBudgetV2SemanticRevisions.occurredAt,
+				})
 				.from(incomeReceiptBudgetV2SemanticRevisions)
 				.where(
 					eq(
@@ -803,9 +1068,12 @@ async function buildIntervalIncome(
 						r.receiptId,
 					),
 				)
-				.orderBy(desc(incomeReceiptBudgetV2SemanticRevisions.revisionNo))
-				.limit(1);
-			supportRole = (roleRow?.role as SupportRole | undefined) ?? null;
+				.orderBy(asc(incomeReceiptBudgetV2SemanticRevisions.revisionNo));
+			let eff: (typeof roleRevs)[number] | undefined;
+			for (const rr of roleRevs) {
+				if (asDate(rr.occurredAt) <= checkpointAt) eff = rr;
+			}
+			supportRole = (eff?.role as SupportRole | undefined) ?? null;
 		}
 
 		for (const rev of revs) {
@@ -832,8 +1100,8 @@ async function buildIntervalIncome(
 		else if (supportRole === "PLANNED_FAMILY_GIFT") gift += cents;
 		else if (supportRole === "DEFICIT_FAMILY_SUPPORT") deficit += cents;
 		else {
-			triggerInvalid(
-				`SUPPORT income receipt ${r.receiptId} active in the checkpoint interval has no Budget V2 support-role classification`,
+			reportFailClosed(
+				`SUPPORT income receipt ${r.receiptId} active in the checkpoint interval has no Budget V2 support-role classification effective by ${checkpointAt.toISOString()}`,
 			);
 		}
 	}
@@ -844,7 +1112,7 @@ async function buildIntervalIncome(
 		extraReceipts: formatCentsToMoney(extra),
 		plannedFamilyGiftReceipts: formatCentsToMoney(gift),
 		deficitFamilySupportReceipts: formatCentsToMoney(deficit),
-		note: "PLANNED_FAMILY_GIFT is real support but not baseline income; DEFICIT_FAMILY_SUPPORT is a post-deficit funding source, not realizedIncome; People receivable repayments are never income.",
+		note: "PLANNED_FAMILY_GIFT is real support but not baseline income; DEFICIT_FAMILY_SUPPORT is a post-deficit funding source, not realizedIncome; People receivable repayments are never income. Support role is resolved as of the checkpoint instant.",
 	};
 }
 
@@ -880,9 +1148,8 @@ async function buildIntervalPurchases(
 	db: Database,
 	userId: string,
 	win: ResolverWindow,
-	checkpointAt: Date,
 	events: PurchaseEventRow[],
-	cardMeta: Map<string, CardMeta>,
+	cardMetaOf: (cardId: string) => Promise<CardMeta>,
 ): Promise<IntervalPurchaseSection> {
 	const activity: IntervalPurchaseActivityItem[] = [];
 	const newlyPosted: string[] = [];
@@ -909,37 +1176,44 @@ async function buildIntervalPurchases(
 			const at = asDate(rev.occurredAt);
 			if (!win.inInterval(at)) continue;
 			const grossCents = centsOf(rev.amount);
-			const shares = await currentPurchaseShares(
+			// Ownership effective at THIS activity instant -- never current / future.
+			const shares = await purchaseSharesAsOf(
 				db,
 				userId,
 				ev.eventId,
 				grossCents,
-				checkpointAt,
+				at,
 			);
-			const meta = cardMeta.get(ev.creditCardId);
+			const meta = await cardMetaOf(ev.creditCardId);
 			const op = rev.operation as "CREATE" | "UPDATE" | "VOID";
+			const ownership: PurchaseOwnership = shares.available
+				? {
+						available: true,
+						personalShare: formatCentsToMoney(shares.personalCents),
+						externalShare: formatCentsToMoney(shares.externalCents),
+						externalParticipants: shares.participants.map((p) => ({
+							personId: p.personId,
+							displayName: p.displayName,
+							relationship: p.relationship,
+							shareAmount: formatCentsToMoney(p.shareCents),
+						})),
+						basis: shares.basis,
+					}
+				: { available: false, reason: shares.reason };
 			activity.push({
 				eventId: ev.eventId,
 				revisionNo: rev.revisionNo,
 				operation: op,
 				cardId: ev.creditCardId,
-				cardCode: meta?.code ?? "",
-				displayName: meta?.displayName ?? "",
+				cardCode: meta.code,
+				displayName: meta.displayName,
 				grossAmount: formatCentsToMoney(grossCents),
 				budgetCategory: normalizeCategory(rev.budgetCategory),
 				merchant: rev.merchant,
 				description: rev.description,
 				installmentCount: rev.installmentCount,
 				occurredAt: at.toISOString(),
-				personalShare: formatCentsToMoney(shares.personalCents),
-				externalShare: formatCentsToMoney(shares.externalCents),
-				externalParticipants: shares.participants.map((p) => ({
-					personId: p.personId,
-					displayName: p.displayName,
-					relationship: p.relationship,
-					shareAmount: formatCentsToMoney(p.shareCents),
-				})),
-				ownershipBasis: "CURRENT_ACTIVE_SPLIT",
+				ownership,
 			});
 			if (op === "CREATE") newlyPosted.push(ev.eventId);
 			else if (op === "UPDATE") corrected.push(ev.eventId);
@@ -952,12 +1226,12 @@ async function buildIntervalPurchases(
 		newlyPostedPurchases: newlyPosted,
 		correctedPurchases: corrected,
 		voidedPurchases: voided,
-		note: "revision-level activity only; an UPDATE is a correction, never a second expense. No heuristic interval net-spend delta is produced -- current MTD totals are authoritative (see mtd.spending).",
+		note: "revision-level activity only; an UPDATE is a correction, never a second expense. Ownership is resolved as of each activity instant and reported unavailable when it cannot be proved. No heuristic interval net-spend delta is produced -- current MTD totals are authoritative (see mtd.spending).",
 	};
 }
 
 // ============================================================================
-// Section 8 -- current MTD personal spending
+// Section 8 -- current MTD personal spending (must remain exact)
 // ============================================================================
 
 async function buildMtdSpending(
@@ -1004,13 +1278,18 @@ async function buildMtdSpending(
 		const at = asDate(latest.occurredAt);
 		if (!win.inMtd(at)) continue;
 		const grossCents = centsOf(latest.amount);
-		const shares = await currentPurchaseShares(
+		const shares = await purchaseSharesAsOf(
 			db,
 			userId,
 			ev.eventId,
 			grossCents,
 			checkpointAt,
 		);
+		if (!shares.available) {
+			reportFailClosed(
+				`MTD purchase ${ev.eventId}: ownership cannot be authoritatively resolved as of the checkpoint (${shares.reason})`,
+			);
+		}
 		const cat = normalizeCategory(latest.budgetCategory);
 		byCategory[cat] += shares.personalCents;
 		gross += grossCents;
@@ -1078,9 +1357,6 @@ async function buildPeopleFamily(
 		})
 		.from(creditCardPurchaseSplitParticipants)
 		.where(eq(creditCardPurchaseSplitParticipants.userId, userId));
-	const splitObligationIds = new Set(
-		participants.map((p) => p.personObligationId),
-	);
 
 	const obligationActivity: PeopleObligationActivityItem[] = [];
 	const settlementActivity: PeopleSettlementActivityItem[] = [];
@@ -1167,39 +1443,20 @@ async function buildPeopleFamily(
 				});
 			}
 
-			// Section 10 -- FAMILY_REIMBURSEMENT requires the full authoritative
-			// chain: cc purchase -> sealed split participant -> FAMILY relationship
-			// -> split-generated RECEIVABLE obligation -> non-VOID settlement.
+			// Section 10 -- FAMILY_REIMBURSEMENT requires the FULL authoritative
+			// chain: cc PURCHASE -> split anchor -> split revision effective at the
+			// checkpoint that is ACTIVE + SEALED -> exact revision item references
+			// the participant -> participant anchor personObligationId == this
+			// obligation -> direction RECEIVABLE -> relationship at checkpoint FAMILY
+			// -> settlement latest op CREATE, in the interval.
 			const latest = sRevs[sRevs.length - 1];
 			if (latest?.operation !== "CREATE") continue;
 			const at = asDate(latest.occurredAt);
 			if (!win.inInterval(at)) continue;
-			const isSplitLinked = splitObligationIds.has(o.id);
-			if (direction === "RECEIVABLE" && isSplitLinked) {
-				if (info.relationship === "FAMILY") {
-					const link = participants.find((p) => p.personObligationId === o.id);
-					const [split] = link
-						? await db
-								.select({
-									purchaseEventId: creditCardPurchaseSplits.purchaseEventId,
-								})
-								.from(creditCardPurchaseSplits)
-								.where(eq(creditCardPurchaseSplits.id, link.splitId))
-								.limit(1)
-						: [];
-					if (split) {
-						familyReimbursements.push({
-							personId: o.personId,
-							displayName: info.displayName,
-							obligationId: o.id,
-							purchaseEventId: split.purchaseEventId,
-							settlementAmount: parseAggregateMoneyString(latest.applied)
-								.normalized,
-							occurredAt: at.toISOString(),
-						});
-					}
-				}
-			} else if (direction === "RECEIVABLE" && !isSplitLinked) {
+			if (direction !== "RECEIVABLE") continue;
+
+			const link = participants.find((p) => p.personObligationId === o.id);
+			if (!link) {
 				standaloneReceivableSettlements.push({
 					personId: o.personId,
 					displayName: info.displayName,
@@ -1209,7 +1466,53 @@ async function buildPeopleFamily(
 						.normalized,
 					occurredAt: at.toISOString(),
 				});
+				continue;
 			}
+
+			const [split] = await db
+				.select({
+					purchaseEventId: creditCardPurchaseSplits.purchaseEventId,
+				})
+				.from(creditCardPurchaseSplits)
+				.where(eq(creditCardPurchaseSplits.id, link.splitId))
+				.limit(1);
+			if (!split) {
+				reportFailClosed(
+					`split participant for obligation ${o.id} references a missing split anchor ${link.splitId}`,
+				);
+			}
+			const sres = await resolveSealedSplitAsOf(
+				db,
+				userId,
+				split.purchaseEventId,
+				checkpointAt,
+			);
+			if (sres.kind === "ACTIVE") {
+				const inRevision = sres.participants.some(
+					(pp) =>
+						pp.personId === link.personId && pp.personObligationId === o.id,
+				);
+				if (inRevision && info.relationship === "FAMILY") {
+					familyReimbursements.push({
+						personId: o.personId,
+						displayName: info.displayName,
+						obligationId: o.id,
+						purchaseEventId: split.purchaseEventId,
+						splitRevisionId: sres.splitRevisionId,
+						settlementAmount: parseAggregateMoneyString(latest.applied)
+							.normalized,
+						occurredAt: at.toISOString(),
+					});
+				}
+				// else: not FAMILY, or the participant is absent from the exact
+				// active revision -> ordinary settlement activity only.
+			} else if (sres.kind === "UNRESOLVED" && sres.inconsistent) {
+				reportFailClosed(
+					`FAMILY_REIMBURSEMENT chain for obligation ${o.id} is internally inconsistent: ${sres.reason}`,
+				);
+			}
+			// VOID_SPLIT / not-yet / unsealed -> not a reimbursement; the
+			// settlement is still present in settlementActivity above.
 		}
 	}
 
@@ -1218,7 +1521,7 @@ async function buildPeopleFamily(
 		settlementActivity,
 		familyReimbursements,
 		standaloneReceivableSettlements,
-		note: "FAMILY_REIMBURSEMENT is economically neutral -- never income, never PLANNED_FAMILY_GIFT / DEFICIT_FAMILY_SUPPORT. A standalone family RECEIVABLE repayment (no split-generated obligation) is reported separately and never auto-labelled a reimbursement.",
+		note: "FAMILY_REIMBURSEMENT requires an ACTIVE, SEALED split revision (effective at the checkpoint) whose exact item references the participant, whose participant anchor obligation is this RECEIVABLE, and a FAMILY relationship at the checkpoint. A VOID / unsealed / participant-missing chain is never labelled a reimbursement; a standalone family RECEIVABLE repayment is reported separately.",
 	};
 }
 
@@ -1231,11 +1534,12 @@ async function buildStatementPayments(
 	userId: string,
 	win: ResolverWindow,
 	checkpointAt: Date,
-	triggerStatementId: string,
-	cardMeta: Map<string, CardMeta>,
+	triggerPaymentEventId: string,
+	cardMetaOf: (cardId: string) => Promise<CardMeta>,
 ): Promise<StatementPaymentItem[]> {
 	const events = await db
 		.select({
+			id: creditCardStatementPaymentEvents.id,
 			statementId: creditCardStatementPaymentEvents.statementId,
 			amount: creditCardStatementPaymentEvents.amount,
 			occurredAt: creditCardStatementPaymentEvents.occurredAt,
@@ -1254,7 +1558,12 @@ async function buildStatementPayments(
 			.from(creditCardStatements)
 			.where(eq(creditCardStatements.id, e.statementId))
 			.limit(1);
-		const meta = stmt ? cardMeta.get(stmt.creditCardId) : undefined;
+		if (!stmt) {
+			reportFailClosed(
+				`payment event ${e.id} references a missing statement ${e.statementId}`,
+			);
+		}
+		const meta = await cardMetaOf(stmt.creditCardId);
 		const recon = await getStatementReconciliation({
 			db,
 			userId,
@@ -1281,14 +1590,15 @@ async function buildStatementPayments(
 			};
 		}
 		out.push({
+			paymentEventId: e.id,
 			statementId: e.statementId,
-			cardId: stmt?.creditCardId ?? "",
-			cardCode: meta?.code ?? "",
-			displayName: meta?.displayName ?? "",
+			cardId: stmt.creditCardId,
+			cardCode: meta.code,
+			displayName: meta.displayName,
 			amount: parseAggregateMoneyString(e.amount).normalized,
 			occurredAt: at.toISOString(),
 			paymentAssetAccountId: e.paymentAssetAccountId,
-			isTrigger: e.statementId === triggerStatementId,
+			isTrigger: e.id === triggerPaymentEventId,
 			ownership,
 		});
 	}
@@ -1299,61 +1609,64 @@ async function buildStatementPayments(
 // Section 12 -- current MTD Budget V2 state (verbatim from the live resolver)
 // ============================================================================
 
-function pick(obj: unknown, key: string): unknown {
-	return obj && typeof obj === "object"
-		? (obj as Record<string, unknown>)[key]
-		: undefined;
-}
-
-function str(v: unknown): string {
-	return typeof v === "string" ? v : "0.00";
-}
-
-function buildMtdBudget(resolution: BudgetV2LiveResolution): MtdBudgetSection {
+/**
+ * Pure assembly of the non-spending MTD sections from an authoritative live
+ * resolution. Required money fields are typed-asserted (never coerced to
+ * "0.00"); policy outputs come from the strongly-typed resolver contract.
+ */
+export function assembleMtdNonSpending(
+	resolution: BudgetV2LiveResolution,
+): Omit<MtdSection, "spending"> {
 	const ev = resolution.evidenceSnapshot;
 	const bl = pick(ev, "basicLiving");
-	const out = resolution.policyResult.outputs;
-	return {
-		inputs: resolution.inputs,
-		policyOutput: {
-			deficit: out.deficit.amount,
-			emergencyCatchUp: out.emergencyCatchUp.amount,
-			trueSurplus: out.trueSurplus.amount,
-			mobilityAllocation: out.mobilityAllocation.amount,
-			longTermInvestment: out.longTermInvestment.amount,
-			discretionaryAllocation: out.discretionaryAllocation.amount,
-		},
-		basicLiving: {
-			approvedTarget: str(pick(bl, "basicLivingTarget")),
-			actualPersonalMandatorySpendMTD: str(
-				pick(bl, "actualPersonalMandatorySpendMTD"),
-			),
-			grossBasicLivingNeed: str(pick(bl, "grossBasicLivingNeed")),
-			overlapWithCurrentObligations: str(
-				pick(bl, "basicLivingOverlapWithCurrentObligations"),
-			),
-			basicLivingFunding: str(pick(bl, "basicLivingFunding")),
-		},
-	};
-}
-
-function buildMtdTail(resolution: BudgetV2LiveResolution): {
-	emergencyFund: MtdSection["emergencyFund"];
-	mobility: MtdSection["mobility"];
-	necessaryPurchases: MtdSection["necessaryPurchases"];
-} {
-	const ev = resolution.evidenceSnapshot;
 	const emergency = pick(ev, "emergencyFund");
 	const mobility = pick(ev, "mobility");
 	const necessary = pick(ev, "necessaryPurchases");
+	const out = resolution.policyResult.outputs;
 	const mobilityGoals = pick(mobility, "goals");
 	const perGoal = pick(necessary, "perGoal");
 	const overdue = pick(necessary, "overdueGoalIds");
 	return {
+		budget: {
+			inputs: resolution.inputs,
+			policyOutput: {
+				deficit: out.deficit.amount,
+				emergencyCatchUp: out.emergencyCatchUp.amount,
+				trueSurplus: out.trueSurplus.amount,
+				mobilityAllocation: out.mobilityAllocation.amount,
+				longTermInvestment: out.longTermInvestment.amount,
+				discretionaryAllocation: out.discretionaryAllocation.amount,
+			},
+			basicLiving: {
+				approvedTarget: reqMoney(
+					pick(bl, "basicLivingTarget"),
+					"basicLiving.basicLivingTarget",
+				),
+				actualPersonalMandatorySpendMTD: reqMoney(
+					pick(bl, "actualPersonalMandatorySpendMTD"),
+					"basicLiving.actualPersonalMandatorySpendMTD",
+				),
+				grossBasicLivingNeed: reqMoney(
+					pick(bl, "grossBasicLivingNeed"),
+					"basicLiving.grossBasicLivingNeed",
+				),
+				overlapWithCurrentObligations: reqMoney(
+					pick(bl, "basicLivingOverlapWithCurrentObligations"),
+					"basicLiving.basicLivingOverlapWithCurrentObligations",
+				),
+				basicLivingFunding: reqMoney(
+					pick(bl, "basicLivingFunding"),
+					"basicLiving.basicLivingFunding",
+				),
+			},
+		},
 		emergencyFund: {
-			currentBalance: str(pick(emergency, "balance")),
-			target: str(pick(emergency, "target")),
-			gap: str(pick(emergency, "gap")),
+			currentBalance: reqMoney(
+				pick(emergency, "balance"),
+				"emergencyFund.balance",
+			),
+			target: reqMoney(pick(emergency, "target"), "emergencyFund.target"),
+			gap: reqMoney(pick(emergency, "gap"), "emergencyFund.gap"),
 		},
 		mobility: {
 			currentTotal: resolution.inputs.mobilityBalance,
@@ -1378,18 +1691,16 @@ export async function buildBudgetV2CheckpointReport(
 	const { db } = params;
 	const userId = normalizeUuid(params.userId, "userId");
 	const periodMonth = validateBudgetPeriodMonth(params.periodMonth);
-	const triggerStatementId = normalizeUuid(
-		params.triggerStatementId,
-		"triggerStatementId",
+	const triggerPaymentEventId = normalizeUuid(
+		params.triggerPaymentEventId,
+		"triggerPaymentEventId",
 	);
 
-	const cardMeta = await loadCardMeta(db, userId);
 	const trigger = await resolveTrigger(
 		db,
 		userId,
-		triggerStatementId,
+		triggerPaymentEventId,
 		periodMonth,
-		cardMeta,
 	);
 	const checkpointAt = trigger.checkpointAt;
 
@@ -1441,16 +1752,16 @@ export async function buildBudgetV2CheckpointReport(
 		previousCheckpointAt: prevRaw ?? undefined,
 	});
 
+	const cardMetaOf = makeCardMetaAsOf(db, userId, checkpointAt);
 	const purchaseEvents = await loadPurchaseEvents(db, userId);
 
-	const income = await buildIntervalIncome(db, userId, win);
+	const income = await buildIntervalIncome(db, userId, win, checkpointAt);
 	const purchases = await buildIntervalPurchases(
 		db,
 		userId,
 		win,
-		checkpointAt,
 		purchaseEvents,
-		cardMeta,
+		cardMetaOf,
 	);
 	const peopleFamily = await buildPeopleFamily(db, userId, win, checkpointAt);
 	const statementPayments = await buildStatementPayments(
@@ -1458,8 +1769,8 @@ export async function buildBudgetV2CheckpointReport(
 		userId,
 		win,
 		checkpointAt,
-		triggerStatementId,
-		cardMeta,
+		triggerPaymentEventId,
+		cardMetaOf,
 	);
 	const { spending, installmentPurchases } = await buildMtdSpending(
 		db,
@@ -1469,13 +1780,16 @@ export async function buildBudgetV2CheckpointReport(
 		purchaseEvents,
 	);
 
-	const tail = buildMtdTail(resolution);
+	const nonSpending = assembleMtdNonSpending(resolution);
 
 	return {
 		schemaVersion: BUDGET_V2_CHECKPOINT_REPORT_SCHEMA_VERSION,
 		checkpoint: {
 			schemaVersion: BUDGET_V2_CHECKPOINT_REPORT_SCHEMA_VERSION,
 			periodMonth,
+			paymentEventId: trigger.paymentEventId,
+			payRevisionId: trigger.payRevisionId,
+			statementId: trigger.statementId,
 			checkpointAt: checkpointAt.toISOString(),
 			previousCheckpointAt: prevRaw ? prevRaw.toISOString() : null,
 			isFirstCheckpoint: !prevRaw,
@@ -1494,10 +1808,10 @@ export async function buildBudgetV2CheckpointReport(
 		},
 		mtd: {
 			spending,
-			budget: buildMtdBudget(resolution),
-			emergencyFund: tail.emergencyFund,
-			mobility: tail.mobility,
-			necessaryPurchases: tail.necessaryPurchases,
+			budget: nonSpending.budget,
+			emergencyFund: nonSpending.emergencyFund,
+			mobility: nonSpending.mobility,
+			necessaryPurchases: nonSpending.necessaryPurchases,
 		},
 		foodAnalytics: {
 			available: false,
@@ -1514,4 +1828,84 @@ export async function buildBudgetV2CheckpointReport(
 		},
 		availableToAllocateNow: resolution.availableToAllocateNow,
 	};
+}
+
+// ============================================================================
+// Compatibility wrapper -- statementId -> single unambiguous payment event
+// ============================================================================
+
+/**
+ * Resolve the one eligible trigger payment event id for a statement. Rejects
+ * with BUDGET_CHECKPOINT_TRIGGER_AMBIGUOUS when 0 or >1 distinct payment events
+ * exist (e.g. after PAY -> REOPEN -> PAY). NOT the canonical trigger API.
+ */
+export async function resolveTriggerPaymentEventIdForStatement(params: {
+	db: Database;
+	userId: string;
+	statementId: string;
+}): Promise<string> {
+	const userId = normalizeUuid(params.userId, "userId");
+	const statementId = normalizeUuid(params.statementId, "statementId");
+	const [stmt] = await params.db
+		.select({ id: creditCardStatements.id })
+		.from(creditCardStatements)
+		.where(
+			and(
+				eq(creditCardStatements.id, statementId),
+				eq(creditCardStatements.userId, userId),
+			),
+		)
+		.limit(1);
+	if (!stmt) {
+		triggerInvalid(`statement ${statementId} does not exist for this user`);
+	}
+	const payRevs = await params.db
+		.select({ paymentEventId: creditCardStatementRevisions.paymentEventId })
+		.from(creditCardStatementRevisions)
+		.where(
+			and(
+				eq(creditCardStatementRevisions.statementId, statementId),
+				eq(creditCardStatementRevisions.operation, "PAY"),
+			),
+		);
+	const ids = [
+		...new Set(
+			payRevs
+				.map((r) => r.paymentEventId)
+				.filter((x): x is string => typeof x === "string" && x.length > 0),
+		),
+	];
+	if (ids.length === 0) {
+		triggerInvalid(
+			`statement ${statementId} has no PAY revision with a linked payment event`,
+		);
+	}
+	if (ids.length > 1) {
+		throw new BudgetError(
+			"BUDGET_CHECKPOINT_TRIGGER_AMBIGUOUS",
+			`statement ${statementId} has ${ids.length} distinct trigger payment events; call buildBudgetV2CheckpointReport with an explicit triggerPaymentEventId`,
+		);
+	}
+	return ids[0] as string;
+}
+
+export async function buildBudgetV2CheckpointReportByStatement(params: {
+	db: Database;
+	userId: string;
+	periodMonth: string;
+	triggerStatementId: string;
+	previousCheckpointAt?: Date | undefined;
+}): Promise<BudgetV2CheckpointReport> {
+	const triggerPaymentEventId = await resolveTriggerPaymentEventIdForStatement({
+		db: params.db,
+		userId: params.userId,
+		statementId: params.triggerStatementId,
+	});
+	return buildBudgetV2CheckpointReport({
+		db: params.db,
+		userId: params.userId,
+		periodMonth: params.periodMonth,
+		triggerPaymentEventId,
+		previousCheckpointAt: params.previousCheckpointAt,
+	});
 }

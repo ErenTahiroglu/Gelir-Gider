@@ -2118,17 +2118,23 @@ async function resolverRuntime4A1() {
 }
 
 // ============================================================================
-// PHASE 4B: AUTHORITATIVE CHECKPOINT REPORT READ MODEL
+// PHASE 4B: AUTHORITATIVE CHECKPOINT REPORT READ MODEL (hardened in 4B.1)
 // ============================================================================
+
+function centsB(v: string): bigint {
+	const [i, f = "0"] = v.split(".");
+	return BigInt(i ?? "0") * 100n + BigInt((f + "00").slice(0, 2));
+}
 
 async function resolverRuntime4B() {
 	console.log(
 		"\n== PHASE 4B: BUDGET V2 CHECKPOINT REPORT READ MODEL (drizzle / PGlite) ==",
 	);
 	const { drizzle } = await import("drizzle-orm/pglite");
-	const { buildBudgetV2CheckpointReport } = await import(
-		"../src/budget/checkpoint-report-v2.ts"
-	);
+	const {
+		buildBudgetV2CheckpointReport,
+		buildBudgetV2CheckpointReportByStatement,
+	} = await import("../src/budget/checkpoint-report-v2.ts");
 	const { resolveBudgetV2LiveSnapshot } = await import(
 		"../src/budget/live-resolver-v2.ts"
 	);
@@ -2147,9 +2153,6 @@ async function resolverRuntime4B() {
 	const INCOME_ACC = "d1000000-0000-4000-8000-000000000002";
 	const MID = "e1000000-0000-4000-8000-000000000001";
 	const CEF = "f0000000-0000-4000-8000-000000000001";
-	const R1 = "f0000000-0000-4000-8000-000000000a01";
-	const R2 = "f0000000-0000-4000-8000-000000000a02";
-	const R3 = "f0000000-0000-4000-8000-000000000a03";
 	const CARD = "80000000-0000-4000-8000-000000000001";
 	const P_FAM = "9a000000-0000-4000-8000-000000000001";
 	const P_FRI = "9a000000-0000-4000-8000-000000000002";
@@ -2158,22 +2161,18 @@ async function resolverRuntime4B() {
 	const SUP1 = "a1000000-0000-4000-8000-000000000003";
 	const SUP2 = "a1000000-0000-4000-8000-000000000004";
 	const EXT1 = "a1000000-0000-4000-8000-000000000005";
-	const TS1 = "81000000-0000-4000-8000-000000000001";
-	const TS2 = "81000000-0000-4000-8000-000000000002";
-	const TS3 = "81000000-0000-4000-8000-000000000003";
-	const OBL_FAM_R = "8a000000-0000-4000-8000-000000000001";
-	const OBL_FAM_STD = "8a000000-0000-4000-8000-000000000002";
-	const SET_FAM = "8b000000-0000-4000-8000-000000000001";
-	const SET_STD = "8b000000-0000-4000-8000-000000000002";
 	const P = "2026-09-01";
-	const CHECKPOINT_ISO = "2026-09-15T00:00:00.000Z";
 
 	const eqB = (a: unknown, b: unknown, name: string) =>
 		a === b
 			? ok(name)
 			: bad(name, `-> got ${JSON.stringify(a)} want ${JSON.stringify(b)}`);
 	const chkB = (c: boolean, name: string) => (c ? ok(name) : bad(name));
-	const expectThrowB = async (fn: () => Promise<unknown>, needle: string, name: string) => {
+	const expectThrowB = async (
+		fn: () => Promise<unknown>,
+		needle: string,
+		name: string,
+	) => {
 		try {
 			await fn();
 			bad(name, "-> did not throw");
@@ -2184,873 +2183,1088 @@ async function resolverRuntime4B() {
 		}
 	};
 
-	// -------------------------------------------------------------------------
-	// Main happy-path database
-	// -------------------------------------------------------------------------
-	const pg = new PGlite();
-	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 66);
-	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
-	const db = drizzle(pg as any) as any;
-
-	let n = 0;
-	const gid = () => {
-		n++;
-		return `90000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
-	};
-	const mkCanon = async (kind: string, occ: string) => {
-		const ct = gid();
-		const tr = gid();
-		await pg.query(
-			`insert into canonical_transactions (id,user_id,kind,creation_idempotency_key,creation_fingerprint) values ($1,$2,$3,$4,$5)`,
-			[ct, U1, kind, `ck-${n}`, F] as never[],
-		);
-		await pg.query(
-			`insert into transaction_revisions (id,user_id,transaction_id,revision_no,operation,occurred_at,payload,revision_fingerprint,idempotency_key) values ($1,$2,$3,1,'CREATE',$4,'{}'::jsonb,$5,$6)`,
-			[tr, U1, ct, occ, F, `tk-${n}`] as never[],
-		);
-		return { ct, tr };
-	};
-	const mkReceipt = async (
-		rid: string,
-		src: string,
-		amount: string,
-		occ: string,
-	) => {
-		const { ct, tr } = await mkCanon("INCOME_RECEIPT", occ);
-		await pg.query(
-			`insert into income_receipts (id,user_id,source_id,canonical_transaction_id) values ($1,$2,$3,$4)`,
-			[rid, U1, src, ct] as never[],
-		);
-		await pg.query(
-			`insert into income_receipt_revisions (id,user_id,income_receipt_id,canonical_revision_id,revision_no,operation,occurred_at,amount,destination_account_id) values ($1,$2,$3,$4,1,'CREATE',$5,$6,$7)`,
-			[gid(), U1, rid, tr, occ, amount, CASH] as never[],
-		);
-	};
-	const mkPur = async (
-		amount: string,
-		category: string,
-		occ: string,
-		opts: { merchant?: string; installmentCount?: number } = {},
-	) => {
-		const { ct, tr } = await mkCanon("CREDIT_CARD_PURCHASE", occ);
-		const eid = gid();
-		const er = gid();
-		await pg.query(
-			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ($1,$2,$3,'PURCHASE',$4)`,
-			[eid, U1, CARD, ct] as never[],
-		);
-		await pg.query(
-			`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,canonical_revision_id,operation,amount,budget_category,merchant,installment_count,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8,$9,$10,$11)`,
-			[
-				er,
-				U1,
-				eid,
-				tr,
-				amount,
-				category,
-				opts.merchant ?? null,
-				opts.installmentCount ?? null,
-				occ,
-				`pk-${n}`,
-				F,
-			] as never[],
-		);
-		return { eid, er };
-	};
-	const mkPurRev = async (
-		eid: string,
-		prevEr: string,
-		revNo: number,
-		op: string,
-		amount: string,
-		category: string,
-		occ: string,
-	) => {
-		const { tr } = await mkCanon("CREDIT_CARD_PURCHASE", occ);
-		const er = gid();
-		await pg.query(
-			`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,previous_revision_id,canonical_revision_id,operation,amount,budget_category,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-			[er, U1, eid, revNo, prevEr, tr, op, amount, category, occ, `pk-${n}`, F] as never[],
-		);
-		return er;
-	};
-	const mkObligation = async (
-		oblId: string,
-		person: string,
-		dir: "RECEIVABLE" | "PAYABLE",
-		principal: string,
-		occ: string,
-	) => {
-		const { ct, tr } = await mkCanon(
-			dir === "RECEIVABLE" ? "PERSON_RECEIVABLE_ADVANCE" : "PERSON_PAYABLE_EXPENSE",
-			occ,
-		);
-		await pg.query(
-			`insert into person_obligations (id,user_id,person_id,direction,canonical_transaction_id) values ($1,$2,$3,$4,$5)`,
-			[oblId, U1, person, dir, ct] as never[],
-		);
-		await pg.query(
-			`insert into person_obligation_revisions (id,user_id,obligation_id,revision_no,canonical_revision_id,operation,principal_amount,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8)`,
-			[gid(), U1, oblId, tr, principal, occ, `ok-${n}`, F] as never[],
-		);
-	};
-	const mkSettlement = async (
-		setId: string,
-		oblId: string,
-		applied: string,
-		occ: string,
-	) => {
-		const { ct, tr } = await mkCanon("PERSON_OBLIGATION_SETTLEMENT", occ);
-		await pg.query(
-			`insert into person_settlements (id,user_id,obligation_id,canonical_transaction_id) values ($1,$2,$3,$4)`,
-			[setId, U1, oblId, ct] as never[],
-		);
-		await pg.query(
-			`insert into person_settlement_revisions (id,user_id,settlement_id,revision_no,operation,asset_account_id,cash_amount,applied_amount,excess_amount,occurred_at,canonical_revision_id,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE',$4,$5,$5,'0.00',$6,$7,$8,$9)`,
-			[gid(), U1, setId, CASH, applied, occ, tr, `sk-${n}`, F] as never[],
-		);
-	};
-	const mkStmt = async (
-		sid: string,
-		reserveBucket: string,
-		amount: string,
-		cycleMonth: number,
-	) => {
-		const r1 = gid();
-		await pg.query(
-			`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ($1,$2,$3,$4,$5,2026,$6)`,
-			[sid, U1, CARD, MID, reserveBucket, cycleMonth] as never[],
-		);
-		await pg.query(
-			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','OPEN',$4,'2026-09-01','2026-09-20','MIDAS_FUND','2026-09-01 00:00:00+00',$5,$6)`,
-			[r1, U1, sid, amount, `stk-${n}-${sid.slice(-4)}`, F] as never[],
-		);
-		return r1;
-	};
-	const mkPay = async (
-		sid: string,
-		r1: string,
-		amount: string,
-		payAt: string,
-	) => {
-		const { ct } = await mkCanon("CREDIT_CARD_STATEMENT_PAYMENT", payAt);
-		const pe = gid();
-		const r2 = gid();
-		await pg.query(
-			`insert into credit_card_statement_payment_events (id,user_id,statement_id,canonical_transaction_id,payment_asset_account_id,amount,occurred_at) values ($1,$2,$3,$4,$5,$6,$7)`,
-			[pe, U1, sid, ct, CASH, amount, payAt] as never[],
-		);
-		await pg.query(
-			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,payment_event_id,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,2,$4,'PAY','PAID',$5,'2026-09-01','2026-09-20','MIDAS_FUND',$6,$7,$8,$9)`,
-			[r2, U1, sid, r1, amount, pe, payAt, `stk-${n}-${sid.slice(-4)}p`, F] as never[],
-		);
-		return { pe, r2 };
-	};
-
-	await pg.exec("SET session_replication_role = replica");
-	await pg.query(
-		"insert into users (id, display_name, currency, timezone) values ($1,'U','TRY','Europe/Istanbul')",
-		[U1] as never[],
-	);
-	await pg.query(
-		`insert into ledger_accounts (id,user_id,code,name,account_type,normal_balance,currency) values
-		 ($1,$3,'ASSET_CASH','Cash','ASSET','DEBIT','TRY'),
-		 ($2,$3,'INCOME_GEN','Income','INCOME','CREDIT','TRY')`,
-		[CASH, INCOME_ACC, U1] as never[],
-	);
-	await pg.query(
-		`insert into midas_accounts (id,user_id,ledger_account_id) values ($1,$2,$3)`,
-		[MID, U1, CASH] as never[],
-	);
-	await pg.query(
-		`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values
-		 ($1,$5,$6,'CEF','Emergency','CORE_EMERGENCY_FUND'),
-		 ($2,$5,$6,'R1','TS1 reserve','CREDIT_CARD_RESERVE'),
-		 ($3,$5,$6,'R2','TS2 reserve','CREDIT_CARD_RESERVE'),
-		 ($4,$5,$6,'R3','TS3 reserve','CREDIT_CARD_RESERVE')`,
-		[CEF, R1, R2, R3, U1, MID] as never[],
-	);
-	await pg.query(
-		`insert into midas_allocation_transfers (id,user_id,midas_account_id,idempotency_key,transfer_fingerprint,from_bucket_id,to_bucket_id,amount,occurred_at) values ($1,$2,$3,'mt-cef',$4,null,$5,'10000.00','2026-08-01 00:00:00+00')`,
-		[gid(), U1, MID, F, CEF] as never[],
-	);
-	await pg.query(
-		`insert into income_sources (id,user_id,code,name,nature,reference_method,expected_monthly_amount,income_ledger_account_id,active_from) values
-		 ($1,$5,'REG1','Salary','REGULAR','FIXED_MONTHLY','20000.00',$6,'1900-01-01'),
-		 ($2,$5,'SUP1','Family A','SUPPORT','EXCLUDED',null,$6,'1900-01-01'),
-		 ($3,$5,'SUP2','Family B','SUPPORT','EXCLUDED',null,$6,'1900-01-01'),
-		 ($4,$5,'EXT1','Bonus','EXTRA','EXCLUDED',null,$6,'1900-01-01')`,
-		[REG1, SUP1, SUP2, EXT1, U1, INCOME_ACC] as never[],
-	);
-	await pg.query(
-		`insert into credit_cards (id,user_id,code) values ($1,$2,'CARDA')`,
-		[CARD, U1] as never[],
-	);
-	await pg.query(
-		`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE','Akbank Axess','Akbank','1','20','90000.00',now(),'ccr-1',$4)`,
-		[gid(), U1, CARD, F] as never[],
-	);
-	for (const [pid, name, rel, sfx] of [
-		[P_FAM, "Anne", "FAMILY", "a1"],
-		[P_FRI, "Kerem", "FRIEND", "a2"],
-		[P_OTH, "Komsu", "OTHER", "a3"],
-	] as const) {
-		await pg.query(`insert into people (id,user_id) values ($1,$2)`, [
-			pid,
-			U1,
-		] as never[]);
-		await pg.query(
-			`insert into person_revisions (id,user_id,person_id,revision_no,operation,status,display_name,relationship,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE',$4,$5,'2026-07-01 00:00:00+00',$6,$7)`,
-			[
-				`9a000000-0000-4000-8000-0000000000${sfx}`,
-				U1,
-				pid,
-				name,
-				rel,
-				`pr-${sfx}`,
-				F,
-			] as never[],
-		);
-	}
-
-	// income receipts
-	await mkReceipt(
-		"b1000000-0000-4000-8000-000000000001",
-		REG1,
-		"20000.00",
-		"2026-09-01 00:00:00+03",
-	); // RC_REG at exactly periodStart (case H)
-	await mkReceipt(
-		"b1000000-0000-4000-8000-000000000003",
-		SUP1,
-		"2000.00",
-		"2026-09-04 00:00:00+00",
-	); // RC_GIFT
-	await mkReceipt(
-		"b1000000-0000-4000-8000-000000000004",
-		SUP2,
-		"1500.00",
-		"2026-09-05 00:00:00+00",
-	); // RC_DEF
-	await mkReceipt(
-		"b1000000-0000-4000-8000-000000000005",
-		EXT1,
-		"111.00",
-		"2026-09-10 12:00:00+03",
-	); // RC_F at exactly previousCheckpointAt (case F)
-	await mkReceipt(
-		"b1000000-0000-4000-8000-000000000006",
-		EXT1,
-		"222.00",
-		"2026-09-10 09:00:00.001+00",
-	); // RC_G at previousCheckpointAt + 1ms (case G)
-
-	// purchases
-	const purA = await mkPur("600.00", "MANDATORY_EXPENSE", "2026-09-03 00:00:00+00");
-	const purI = await mkPur("1200.00", "DISCRETIONARY_SPEND", "2026-09-05 00:00:00+00", {
-		merchant: "RESTORAN MARKET",
-		installmentCount: 6,
-	});
-	const purS = await mkPur("1000.00", "SHORT_TERM_PURCHASE", "2026-09-06 00:00:00+00");
-	const purV = await mkPur("200.00", "DISCRETIONARY_SPEND", "2026-09-07 00:00:00+00");
-	await mkPurRev(
-		purV.eid,
-		purV.er,
-		2,
-		"VOID",
-		"200.00",
-		"DISCRETIONARY_SPEND",
-		"2026-09-08 00:00:00+00",
-	);
-	const purQ = await mkPur("300.00", "DISCRETIONARY_SPEND", "2026-09-08 00:00:00+00");
-	await mkPurRev(
-		purQ.eid,
-		purQ.er,
-		2,
-		"UPDATE",
-		"300.00",
-		"DISCRETIONARY_SPEND",
-		"2026-09-13 00:00:00+00",
-	);
-
-	// PUR_S sealed active split: user 400 / external 600 to P_FAM (split-generated
-	// RECEIVABLE obligation OBL_FAM_R) -- the FAMILY_REIMBURSEMENT chain.
-	await mkObligation(OBL_FAM_R, P_FAM, "RECEIVABLE", "600.00", "2026-09-06 00:00:00+00");
-	{
-		const splitId = gid();
-		const splitRev = gid();
-		const part = gid();
-		await pg.query(
-			`insert into credit_card_purchase_splits (id,user_id,purchase_event_id) values ($1,$2,$3)`,
-			[splitId, U1, purS.eid] as never[],
-		);
-		await pg.query(
-			`insert into credit_card_purchase_split_revisions (id,split_id,revision_no,operation,method,purchase_event_revision_id,gross_amount,user_share_amount,external_share_amount,occurred_at,revision_fingerprint) values ($1,$2,1,'CREATE','MANUAL',$3,'1000.00','400.00','600.00','2026-09-06 00:00:00+00',$4)`,
-			[splitRev, splitId, purS.er, F] as never[],
-		);
-		await pg.query(
-			`insert into credit_card_purchase_split_participants (id,user_id,split_id,person_id,person_obligation_id) values ($1,$2,$3,$4,$5)`,
-			[part, U1, splitId, P_FAM, OBL_FAM_R] as never[],
-		);
-		await pg.query(
-			`insert into credit_card_purchase_split_revision_items (id,split_revision_id,participant_id,person_id,share_amount) values ($1,$2,$3,$4,'600.00')`,
-			[gid(), splitRev, part, P_FAM] as never[],
-		);
-		await pg.query(
-			`insert into credit_card_purchase_split_revision_seals (split_revision_id) values ($1)`,
-			[splitRev] as never[],
-		);
-	}
-	// standalone FAMILY receivable (NOT split-linked) -- case M
-	await mkObligation(
-		OBL_FAM_STD,
-		P_FAM,
-		"RECEIVABLE",
-		"250.00",
-		"2026-09-06 00:00:00+00",
-	);
-	await mkSettlement(SET_FAM, OBL_FAM_R, "600.00", "2026-09-10 00:00:00+00");
-	await mkSettlement(SET_STD, OBL_FAM_STD, "250.00", "2026-09-11 00:00:00+00");
-
-	// statements
-	const ts1r1 = await mkStmt(TS1, R1, "1000.00", 9);
-	const ts2r1 = await mkStmt(TS2, R2, "500.00", 8);
-	const ts3r1 = await mkStmt(TS3, R3, "400.00", 7);
-	await pg.exec("SET session_replication_role = origin");
-
-	await createBasicLivingTarget({
-		db,
-		userId: U1,
-		effectivePeriodMonth: "2026-09-01",
-		monthlyTargetAmount: "6000.00",
-		currency: "TRY",
-		sourceKind: "USER_APPROVED",
-		idempotencyKey: "bl-4b",
-	});
-	await classifySupportReceipt({
-		db,
-		userId: U1,
-		incomeReceiptId: "b1000000-0000-4000-8000-000000000003",
-		supportRole: "PLANNED_FAMILY_GIFT",
-		idempotencyKey: "sup-gift-4b",
-	});
-	await classifySupportReceipt({
-		db,
-		userId: U1,
-		incomeReceiptId: "b1000000-0000-4000-8000-000000000004",
-		supportRole: "DEFICIT_FAMILY_SUPPORT",
-		idempotencyKey: "sup-def-4b",
-	});
-	await reconcileStatement({
-		db,
-		userId: U1,
-		statementId: TS1,
-		statementRevisionId: ts1r1,
-		idempotencyKey: "rc-ts1",
-		components: [
-			{
-				componentType: "PURCHASE",
-				amount: "600.00",
-				ownership: "PERSONAL",
-				purchaseEventId: purA.eid,
-			},
-			{
-				componentType: "ADJUSTMENT",
-				amount: "300.00",
-				ownership: "EXTERNAL_PERSON",
-				personId: P_FAM,
-				adjustmentKind: "OTHER",
-			},
-			{
-				componentType: "ADJUSTMENT",
-				amount: "100.00",
-				ownership: "EXTERNAL_PERSON",
-				personId: P_FRI,
-				adjustmentKind: "OTHER",
-			},
-		],
-	});
-	await reconcileStatement({
-		db,
-		userId: U1,
-		statementId: TS2,
-		statementRevisionId: ts2r1,
-		idempotencyKey: "rc-ts2",
-		components: [
-			{
-				componentType: "ADJUSTMENT",
-				amount: "500.00",
-				ownership: "PERSONAL",
-				adjustmentKind: "OTHER",
-			},
-		],
-	});
-
-	await pg.exec("SET session_replication_role = replica");
-	await mkPay(TS1, ts1r1, "1000.00", "2026-09-15 00:00:00+00");
-	await mkPay(TS2, ts2r1, "500.00", "2026-09-12 00:00:00+00");
-	// TS3: a payment event in the interval but the statement is later VOIDed and
-	// never reconciled -> ownership decomposition is explicitly UNAVAILABLE.
-	{
-		const { ct } = await mkCanon(
-			"CREDIT_CARD_STATEMENT_PAYMENT",
-			"2026-09-13 00:00:00+00",
-		);
-		await pg.query(
-			`insert into credit_card_statement_payment_events (id,user_id,statement_id,canonical_transaction_id,payment_asset_account_id,amount,occurred_at) values ($1,$2,$3,$4,$5,'400.00','2026-09-13 00:00:00+00')`,
-			[gid(), U1, TS3, ct, CASH] as never[],
-		);
-		await pg.query(
-			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,2,$4,'VOID','VOID','400.00','2026-09-01','2026-09-20','MIDAS_FUND','2026-09-14 00:00:00+00',$5,$6)`,
-			[gid(), U1, TS3, ts3r1, "st-ts3-void", F] as never[],
-		);
-	}
-	await pg.exec("SET session_replication_role = origin");
-
-	// ---- report 1: first checkpoint (no previousCheckpointAt) ----
-	const rep = await buildBudgetV2CheckpointReport({
-		db,
-		userId: U1,
-		periodMonth: P,
-		triggerStatementId: TS1,
-	});
-
-	// A / trigger derivation
-	eqB(
-		rep.triggerPayment.checkpointAt,
-		CHECKPOINT_ISO,
-		"A: report builds; checkpointAt derived from the authoritative payment event",
-	);
-	eqB(rep.triggerPayment.statementAmount, "1000.00", "A: trigger statement amount");
-	eqB(rep.triggerPayment.paymentAmount, "1000.00", "A: trigger payment amount agrees");
-	eqB(rep.triggerPayment.reconciliationRevisionNo, 1, "A: reconciliation revision no");
-	eqB(
-		rep.triggerPayment.paymentAssetAccountId,
-		CASH,
-		"A: authoritative paymentAssetAccountId surfaced",
-	);
-	// H: first checkpoint interval starts inclusive at period start
-	eqB(
-		rep.checkpoint.intervalStart,
-		new Date(`${P}T00:00:00+03:00`).toISOString(),
-		"H: first-checkpoint interval starts at period start (Istanbul midnight)",
-	);
-	chkB(
-		rep.checkpoint.intervalStartInclusive === true && rep.checkpoint.isFirstCheckpoint === true,
-		"H: first-checkpoint interval start is INCLUSIVE",
-	);
-	chkB(
-		rep.interval.income.activity.some(
-			(x) => x.receiptId === "b1000000-0000-4000-8000-000000000001",
-		),
-		"H: an income receipt exactly at period start is INCLUDED in the interval",
-	);
-
-	// I / J: exact ownership decomposition 600 personal + 300 FAMILY + 100 FRIEND
-	const own = rep.triggerPayment.ownership;
-	eqB(own.grossStatementAmount, "1000.00", "I: gross reconciled statement amount");
-	eqB(own.personalEconomicShare, "600.00", "I: personal economic share");
-	eqB(own.familyExternalShare, "300.00", "I: FAMILY external share");
-	eqB(own.friendExternalShare, "100.00", "I: FRIEND external share");
-	eqB(own.otherExternalShare, "0.00", "I: OTHER external share");
-	eqB(own.externalShareTotal, "400.00", "I: external share total");
-	chkB(
-		centsB(own.personalEconomicShare) +
-			centsB(own.familyExternalShare) +
-			centsB(own.friendExternalShare) +
-			centsB(own.otherExternalShare) ===
-			centsB(own.grossStatementAmount),
-		"J: personal + family + friend + other == reconciled statement amount",
-	);
-
-	// N / O: PLANNED_FAMILY_GIFT and DEFICIT_FAMILY_SUPPORT stay separate
-	eqB(
-		rep.interval.income.regularReceipts,
-		"20000.00",
-		"income: REGULAR interval total",
-	);
-	eqB(rep.interval.income.extraReceipts, "333.00", "income: EXTRA interval total");
-	eqB(
-		rep.interval.income.plannedFamilyGiftReceipts,
-		"2000.00",
-		"N: PLANNED_FAMILY_GIFT reported separately",
-	);
-	eqB(
-		rep.interval.income.deficitFamilySupportReceipts,
-		"1500.00",
-		"O: DEFICIT_FAMILY_SUPPORT reported separately (never merged with the gift)",
-	);
-
-	// P / Q / R: purchase CREATE / UPDATE / VOID activity classification
-	chkB(
-		rep.interval.purchases.newlyPostedPurchases.includes(purA.eid),
-		"P: a purchase CREATE in the interval is a newly-posted purchase",
-	);
-	chkB(
-		rep.interval.purchases.correctedPurchases.includes(purQ.eid),
-		"Q: a purchase UPDATE in the interval is a correction",
-	);
-	chkB(
-		rep.interval.purchases.voidedPurchases.includes(purV.eid),
-		"R: a purchase VOID in the interval is void activity",
-	);
-
-	// K / L / M: family reimbursement vs standalone receivable settlement
-	const famReim = rep.interval.peopleFamily.familyReimbursements;
-	chkB(
-		famReim.length === 1 &&
-			famReim[0]?.obligationId === OBL_FAM_R &&
-			famReim[0]?.purchaseEventId === purS.eid &&
-			famReim[0]?.settlementAmount === "600.00",
-		"K: split-generated FAMILY receivable settlement => FAMILY_REIMBURSEMENT (with its purchase link)",
-	);
-	chkB(
-		!famReim.some((x) => x.obligationId === OBL_FAM_STD),
-		"M: a standalone FAMILY receivable settlement is NOT auto-labelled a reimbursement",
-	);
-	chkB(
-		rep.interval.peopleFamily.standaloneReceivableSettlements.some(
-			(x) => x.obligationId === OBL_FAM_STD && x.settlementAmount === "250.00",
-		),
-		"M: the standalone FAMILY receivable settlement is reported separately",
-	);
-	chkB(
-		!(
-			rep.interval.income.regularReceipts === "20600.00" ||
-			rep.interval.income.extraReceipts === "600.00" ||
-			rep.interval.income.plannedFamilyGiftReceipts === "2600.00"
-		),
-		"L: FAMILY_REIMBURSEMENT (600) never leaks into any interval income total",
-	);
-
-	// section 11: statement payments in the interval, with ownership availability
-	const sp = rep.interval.statementPayments;
-	eqB(sp.length, 3, "11: all three interval statement payments listed");
-	const spTrigger = sp.find((x) => x.statementId === TS1);
-	const spTs2 = sp.find((x) => x.statementId === TS2);
-	const spTs3 = sp.find((x) => x.statementId === TS3);
-	chkB(
-		!!spTrigger && spTrigger.isTrigger === true && spTrigger.ownership.available === true,
-		"11/E: the trigger payment (exactly at checkpointAt) is INCLUDED with an authoritative decomposition",
-	);
-	chkB(
-		!!spTs2 &&
-			spTs2.isTrigger === false &&
-			spTs2.ownership.available === true &&
-			spTs2.ownership.personalEconomicShare === "500.00",
-		"11: a reconciled non-trigger statement payment carries an ownership decomposition",
-	);
-	chkB(
-		!!spTs3 &&
-			spTs3.ownership.available === false &&
-			spTs3.ownership.reason === "RECONCILIATION_UNAVAILABLE",
-		"11: a non-reconciled statement payment reports ownership UNAVAILABLE (no invented shares)",
-	);
-
-	// S / T: MTD personal spend by category (personal share, not gross charge)
-	const spendMtd = rep.mtd.spending;
-	eqB(
-		spendMtd.byCategoryPersonalShare.MANDATORY_EXPENSE,
-		"600.00",
-		"T: MTD MANDATORY_EXPENSE personal share",
-	);
-	eqB(
-		spendMtd.byCategoryPersonalShare.DISCRETIONARY_SPEND,
-		"1500.00",
-		"T: MTD DISCRETIONARY_SPEND personal share (installment 1200 + corrected 300)",
-	);
-	eqB(
-		spendMtd.byCategoryPersonalShare.SHORT_TERM_PURCHASE,
-		"400.00",
-		"S/T: MTD SHORT_TERM_PURCHASE uses the 400 personal share, not the 1000 gross",
-	);
-	eqB(
-		spendMtd.byCategoryPersonalShare.UNCLASSIFIED,
-		"0.00",
-		"T: MTD UNCLASSIFIED personal share",
-	);
-	eqB(spendMtd.grossCardPurchasesMTD, "3100.00", "S: gross card purchases MTD");
-	eqB(spendMtd.personalCardSpendMTD, "2500.00", "S: personal card spend MTD < gross");
-	eqB(spendMtd.externalCardSpendMTD, "600.00", "S: external card spend MTD");
-	eqB(
-		spendMtd.externalCardSpendByRelationship.FAMILY,
-		"600.00",
-		"S: external card spend MTD attributed to FAMILY by exact split truth",
-	);
-
-	// U: food analytics stays unsupported despite a market-like merchant
-	chkB(
-		rep.foodAnalytics.available === false &&
-			rep.foodAnalytics.reason === "FOOD_SEMANTIC_CLASSIFICATION_NOT_STORED" &&
-			rep.foodAnalytics.merchantInferenceUsed === false,
-		"U: a market/restaurant merchant name does NOT trigger any food inference",
-	);
-	// V: installment metadata visible, no synthetic schedule
-	const inst = rep.installmentAnalytics;
-	chkB(
-		inst.purchases.some(
-			(x) => x.eventId === purI.eid && x.installmentCount === 6 && x.grossAmount === "1200.00",
-		) && inst.futureInstallmentProjection.available === false,
-		"V: installmentCount=6 is visible metadata; forward installment projection is unavailable",
-	);
-	// section 15: availableToAllocateNow preserved as unavailable
-	chkB(
-		rep.availableToAllocateNow.available === false,
-		"15: availableToAllocateNow preserved (SURPLUS_USE_ATTRIBUTION_UNSUPPORTED)",
-	);
-
-	// X: every MTD Budget V2 number equals the live resolver at checkpointAt
-	const live = await resolveBudgetV2LiveSnapshot({
-		db,
-		userId: U1,
-		periodMonth: P,
-		asOf: new Date(CHECKPOINT_ISO),
-	});
-	eqB(
-		JSON.stringify(rep.mtd.budget.inputs),
-		JSON.stringify(live.inputs),
-		"X: mtd.budget.inputs === live resolver inputs",
-	);
-	eqB(
-		rep.mtd.budget.policyOutput.trueSurplus,
-		live.policyResult.outputs.trueSurplus.amount,
-		"X: mtd.budget.policyOutput.trueSurplus === live resolver output",
-	);
-	eqB(
-		rep.mtd.budget.policyOutput.deficit,
-		live.policyResult.outputs.deficit.amount,
-		"X: mtd.budget.policyOutput.deficit === live resolver output",
-	);
-	eqB(
-		rep.mtd.budget.basicLiving.basicLivingFunding,
-		(live.evidenceSnapshot as { basicLiving: { basicLivingFunding: string } })
-			.basicLiving.basicLivingFunding,
-		"X: mtd.budget.basicLiving.basicLivingFunding === live resolver",
-	);
-	eqB(
-		rep.mtd.emergencyFund.currentBalance,
-		"10000.00",
-		"X: mtd.emergencyFund.currentBalance === live bucket net",
-	);
-	eqB(rep.mtd.emergencyFund.gap, "0.00", "X: mtd.emergencyFund.gap");
-
-	// ---- report 2: subsequent checkpoint (previousCheckpointAt set) ----
-	const prev = new Date("2026-09-10T09:00:00.000Z"); // == RC_F occurredAt
-	const rep2 = await buildBudgetV2CheckpointReport({
-		db,
-		userId: U1,
-		periodMonth: P,
-		triggerStatementId: TS1,
-		previousCheckpointAt: prev,
-	});
-	eqB(
-		rep2.checkpoint.intervalStart,
-		prev.toISOString(),
-		"interval: subsequent checkpoint interval starts at previousCheckpointAt",
-	);
-	chkB(
-		rep2.checkpoint.intervalStartInclusive === false &&
-			rep2.checkpoint.isFirstCheckpoint === false,
-		"interval: previousCheckpointAt is EXCLUSIVE",
-	);
-	chkB(
-		!rep2.interval.income.activity.some(
-			(x) => x.receiptId === "b1000000-0000-4000-8000-000000000005",
-		),
-		"F: activity exactly at previousCheckpointAt is EXCLUDED from the interval",
-	);
-	chkB(
-		rep2.interval.income.activity.some(
-			(x) => x.receiptId === "b1000000-0000-4000-8000-000000000006",
-		),
-		"G: activity 1ms after previousCheckpointAt is INCLUDED in the interval",
-	);
-	chkB(
-		rep2.interval.purchases.correctedPurchases.includes(purQ.eid) &&
-			!rep2.interval.purchases.newlyPostedPurchases.includes(purQ.eid),
-		"Q: a purchase whose CREATE precedes the interval but whose UPDATE lands in it is a correction only",
-	);
-
-	await pg.close();
-
-	// -------------------------------------------------------------------------
-	// Isolated trigger-rejection databases (B / C / D / W)
-	// -------------------------------------------------------------------------
-	const mini = async (opts: {
-		pay: boolean;
-		pe?: "linked" | "none" | "missing";
-		reconcile?: boolean;
-		payAt?: string;
-	}) => {
-		const mpg = new PGlite();
-		await mpg.query("SET timezone='UTC'");
-		await applyChain(mpg, 66);
+	// ---- one fresh disposable DB + the common fixture + raw seed helpers ----
+	const scenario = async () => {
+		const pg = new PGlite();
+		await pg.query("SET timezone='UTC'");
+		await applyChain(pg, 66);
 		// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
-		const mdb = drizzle(mpg as any) as any;
-		const SID = "81000000-0000-4000-8000-0000000000f1";
-		const RB = "f0000000-0000-4000-8000-0000000000f1";
-		const CT_P = "c0000000-0000-4000-8000-0000000000f1";
-		const TR_P = "c0000000-0000-4000-8000-0000000000f2";
-		const EID = "c0000000-0000-4000-8000-0000000000f3";
-		const ER = "c0000000-0000-4000-8000-0000000000f4";
-		const CT_PE = "c0000000-0000-4000-8000-0000000000f5";
-		const PE = "c0000000-0000-4000-8000-0000000000f6";
-		const R1x = "82000000-0000-4000-8000-0000000000f1";
-		await mpg.exec("SET session_replication_role = replica");
-		await mpg.query(
+		const db = drizzle(pg as any) as any;
+
+		let n = 0;
+		const gid = () => {
+			n++;
+			return `90000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
+		};
+		const q = <T = unknown>(sql: string, params: unknown[] = []) =>
+			pg.query<T>(sql, params as never[]);
+		const replica = () => pg.exec("SET session_replication_role = replica");
+		const origin = () => pg.exec("SET session_replication_role = origin");
+
+		const mkCanon = async (kind: string, occ: string) => {
+			const ct = gid();
+			const tr = gid();
+			await q(
+				`insert into canonical_transactions (id,user_id,kind,creation_idempotency_key,creation_fingerprint) values ($1,$2,$3,$4,$5)`,
+				[ct, U1, kind, `ck-${n}`, F],
+			);
+			await q(
+				`insert into transaction_revisions (id,user_id,transaction_id,revision_no,operation,occurred_at,payload,revision_fingerprint,idempotency_key) values ($1,$2,$3,1,'CREATE',$4,'{}'::jsonb,$5,$6)`,
+				[tr, U1, ct, occ, F, `tk-${n}`],
+			);
+			return { ct, tr };
+		};
+		const mkReceipt = async (
+			rid: string,
+			src: string,
+			amount: string,
+			occ: string,
+		) => {
+			const { ct, tr } = await mkCanon("INCOME_RECEIPT", occ);
+			await q(
+				`insert into income_receipts (id,user_id,source_id,canonical_transaction_id) values ($1,$2,$3,$4)`,
+				[rid, U1, src, ct],
+			);
+			await q(
+				`insert into income_receipt_revisions (id,user_id,income_receipt_id,canonical_revision_id,revision_no,operation,occurred_at,amount,destination_account_id) values ($1,$2,$3,$4,1,'CREATE',$5,$6,$7)`,
+				[gid(), U1, rid, tr, occ, amount, CASH],
+			);
+		};
+		const mkPur = async (
+			amount: string,
+			category: string,
+			occ: string,
+			opts: { merchant?: string; installmentCount?: number } = {},
+		) => {
+			const { ct, tr } = await mkCanon("CREDIT_CARD_PURCHASE", occ);
+			const eid = gid();
+			const er = gid();
+			await q(
+				`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ($1,$2,$3,'PURCHASE',$4)`,
+				[eid, U1, CARD, ct],
+			);
+			await q(
+				`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,canonical_revision_id,operation,amount,budget_category,merchant,installment_count,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8,$9,$10,$11)`,
+				[
+					er,
+					U1,
+					eid,
+					tr,
+					amount,
+					category,
+					opts.merchant ?? null,
+					opts.installmentCount ?? null,
+					occ,
+					`pk-${n}`,
+					F,
+				],
+			);
+			return { eid, er };
+		};
+		const mkPurRev = async (
+			eid: string,
+			prevEr: string,
+			revNo: number,
+			op: string,
+			amount: string,
+			category: string,
+			occ: string,
+		) => {
+			const { tr } = await mkCanon("CREDIT_CARD_PURCHASE", occ);
+			const er = gid();
+			await q(
+				`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,previous_revision_id,canonical_revision_id,operation,amount,budget_category,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+				[er, U1, eid, revNo, prevEr, tr, op, amount, category, occ, `pk-${n}`, F],
+			);
+			return er;
+		};
+		const mkObligation = async (
+			oblId: string,
+			person: string,
+			dir: "RECEIVABLE" | "PAYABLE",
+			principal: string,
+			occ: string,
+		) => {
+			const { ct, tr } = await mkCanon(
+				dir === "RECEIVABLE"
+					? "PERSON_RECEIVABLE_ADVANCE"
+					: "PERSON_PAYABLE_EXPENSE",
+				occ,
+			);
+			await q(
+				`insert into person_obligations (id,user_id,person_id,direction,canonical_transaction_id) values ($1,$2,$3,$4,$5)`,
+				[oblId, U1, person, dir, ct],
+			);
+			await q(
+				`insert into person_obligation_revisions (id,user_id,obligation_id,revision_no,canonical_revision_id,operation,principal_amount,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8)`,
+				[gid(), U1, oblId, tr, principal, occ, `ok-${n}`, F],
+			);
+		};
+		const mkSettlement = async (
+			setId: string,
+			oblId: string,
+			applied: string,
+			occ: string,
+		) => {
+			const { ct, tr } = await mkCanon("PERSON_OBLIGATION_SETTLEMENT", occ);
+			await q(
+				`insert into person_settlements (id,user_id,obligation_id,canonical_transaction_id) values ($1,$2,$3,$4)`,
+				[setId, U1, oblId, ct],
+			);
+			await q(
+				`insert into person_settlement_revisions (id,user_id,settlement_id,revision_no,operation,asset_account_id,cash_amount,applied_amount,excess_amount,occurred_at,canonical_revision_id,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE',$4,$5,$5,'0.00',$6,$7,$8,$9)`,
+				[gid(), U1, setId, CASH, applied, occ, tr, `sk-${n}`, F],
+			);
+		};
+		let rbSeq = 0;
+		const nextReserve = () => {
+			rbSeq++;
+			return `f0000000-0000-4000-8000-00000000b0${rbSeq.toString().padStart(2, "0")}`;
+		};
+		const mkStmt = async (
+			sid: string,
+			amount: string,
+			cycleMonth: number,
+			reserveBucket?: string,
+		) => {
+			const rb = reserveBucket ?? nextReserve();
+			const r1 = gid();
+			await q(
+				`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,$4,'reserve','CREDIT_CARD_RESERVE')`,
+				[rb, U1, MID, `RB${rbSeq}`],
+			);
+			await q(
+				`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ($1,$2,$3,$4,$5,2026,$6)`,
+				[sid, U1, CARD, MID, rb, cycleMonth],
+			);
+			await q(
+				`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','OPEN',$4,'2026-09-01','2026-09-20','MIDAS_FUND','2026-09-01 00:00:00+00',$5,$6)`,
+				[r1, U1, sid, amount, `stk-${n}`, F],
+			);
+			return r1;
+		};
+		const mkStmtRev = async (
+			sid: string,
+			prevRevId: string,
+			revNo: number,
+			op: "PAY" | "REOPEN" | "VOID",
+			status: "PAID" | "OPEN" | "VOID",
+			amount: string,
+			occ: string,
+			paymentEventId: string | null = null,
+		) => {
+			const id = gid();
+			await q(
+				`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,payment_event_id,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,$8,'2026-09-01','2026-09-20','MIDAS_FUND',$9,$10,$11,$12)`,
+				[
+					id,
+					U1,
+					sid,
+					revNo,
+					prevRevId,
+					op,
+					status,
+					amount,
+					paymentEventId,
+					occ,
+					`stk-${n}`,
+					F,
+				],
+			);
+			return id;
+		};
+		const mkPayEvent = async (sid: string, amount: string, occ: string) => {
+			const { ct } = await mkCanon("CREDIT_CARD_STATEMENT_PAYMENT", occ);
+			const pe = gid();
+			await q(
+				`insert into credit_card_statement_payment_events (id,user_id,statement_id,canonical_transaction_id,payment_asset_account_id,amount,occurred_at) values ($1,$2,$3,$4,$5,$6,$7)`,
+				[pe, U1, sid, ct, CASH, amount, occ],
+			);
+			return pe;
+		};
+		const mkPay = async (
+			sid: string,
+			prevRevId: string,
+			amount: string,
+			revNo: number,
+			payAt: string,
+		) => {
+			const pe = await mkPayEvent(sid, amount, payAt);
+			const r = await mkStmtRev(
+				sid,
+				prevRevId,
+				revNo,
+				"PAY",
+				"PAID",
+				amount,
+				payAt,
+				pe,
+			);
+			return { pe, r };
+		};
+		const mkSplit = async (opts: {
+			purchaseEid: string;
+			purchaseEr: string;
+			splitId: string;
+			revNo?: number;
+			prevRevId?: string | null;
+			op?: "CREATE" | "UPDATE" | "VOID";
+			user: string;
+			ext: string;
+			gross: string;
+			occ: string;
+			sealed?: boolean;
+			personId?: string;
+			personObligationId?: string;
+			participantId?: string;
+			itemShare?: string;
+			withItem?: boolean;
+		}) => {
+			const revNo = opts.revNo ?? 1;
+			const op = opts.op ?? "CREATE";
+			const sealed = opts.sealed ?? true;
+			const withItem = opts.withItem ?? true;
+			const splitRev = gid();
+			let participantId = opts.participantId;
+			if (revNo === 1) {
+				await q(
+					`insert into credit_card_purchase_splits (id,user_id,purchase_event_id) values ($1,$2,$3)`,
+					[opts.splitId, U1, opts.purchaseEid],
+				);
+				if (opts.personId && opts.personObligationId) {
+					participantId = gid();
+					await q(
+						`insert into credit_card_purchase_split_participants (id,user_id,split_id,person_id,person_obligation_id) values ($1,$2,$3,$4,$5)`,
+						[participantId, U1, opts.splitId, opts.personId, opts.personObligationId],
+					);
+				}
+			}
+			await q(
+				`insert into credit_card_purchase_split_revisions (id,split_id,revision_no,previous_revision_id,operation,method,purchase_event_revision_id,gross_amount,user_share_amount,external_share_amount,occurred_at,revision_fingerprint) values ($1,$2,$3,$4,$5,'MANUAL',$6,$7,$8,$9,$10,$11)`,
+				[
+					splitRev,
+					opts.splitId,
+					revNo,
+					opts.prevRevId ?? null,
+					op,
+					opts.purchaseEr,
+					opts.gross,
+					opts.user,
+					opts.ext,
+					opts.occ,
+					F,
+				],
+			);
+			if (withItem && op !== "VOID" && opts.personId && participantId) {
+				await q(
+					`insert into credit_card_purchase_split_revision_items (id,split_revision_id,participant_id,person_id,share_amount) values ($1,$2,$3,$4,$5)`,
+					[gid(), splitRev, participantId, opts.personId, opts.itemShare ?? opts.ext],
+				);
+			}
+			if (sealed) {
+				await q(
+					`insert into credit_card_purchase_split_revision_seals (split_revision_id) values ($1)`,
+					[splitRev],
+				);
+			}
+			return { splitId: opts.splitId, splitRev, participantId };
+		};
+		const mkCardRev = async (
+			revNo: number,
+			prevRevId: string,
+			displayName: string,
+			issuer: string,
+			occ: string,
+		) => {
+			const id = gid();
+			await q(
+				`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,previous_revision_id,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,'UPDATE','ACTIVE',$6,$7,'1','20','90000.00',$8,$9,$10)`,
+				[id, U1, CARD, revNo, prevRevId, displayName, issuer, occ, `ccr-${n}`, F],
+			);
+			return id;
+		};
+		const mkPerson = async (
+			personId: string,
+			name: string,
+			rel: "FAMILY" | "FRIEND" | "OTHER",
+			occ: string,
+		) => {
+			await q(`insert into people (id,user_id) values ($1,$2)`, [personId, U1]);
+			const rid = gid();
+			await q(
+				`insert into person_revisions (id,user_id,person_id,revision_no,operation,status,display_name,relationship,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE',$4,$5,$6,$7,$8)`,
+				[rid, U1, personId, name, rel, occ, `pr-${personId.slice(-4)}`, F],
+			);
+			return rid;
+		};
+		const mkPersonRev = async (
+			personId: string,
+			prevRevId: string,
+			revNo: number,
+			name: string,
+			rel: "FAMILY" | "FRIEND" | "OTHER",
+			occ: string,
+		) => {
+			const id = gid();
+			await q(
+				`insert into person_revisions (id,user_id,person_id,revision_no,previous_revision_id,operation,status,display_name,relationship,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,'UPDATE','ACTIVE',$6,$7,$8,$9,$10)`,
+				[id, U1, personId, revNo, prevRevId, name, rel, occ, `pr-${n}`, F],
+			);
+			return id;
+		};
+
+		// base fixture
+		await replica();
+		await q(
 			"insert into users (id, display_name, currency, timezone) values ($1,'U','TRY','Europe/Istanbul')",
-			[U1] as never[],
+			[U1],
 		);
-		await mpg.query(
-			`insert into ledger_accounts (id,user_id,code,name,account_type,normal_balance,currency) values ($1,$2,'ASSET_CASH','Cash','ASSET','DEBIT','TRY')`,
-			[CASH, U1] as never[],
+		await q(
+			`insert into ledger_accounts (id,user_id,code,name,account_type,normal_balance,currency) values
+			 ($1,$3,'ASSET_CASH','Cash','ASSET','DEBIT','TRY'),
+			 ($2,$3,'INCOME_GEN','Income','INCOME','CREDIT','TRY')`,
+			[CASH, INCOME_ACC, U1],
 		);
-		await mpg.query(
+		await q(
 			`insert into midas_accounts (id,user_id,ledger_account_id) values ($1,$2,$3)`,
-			[MID, U1, CASH] as never[],
+			[MID, U1, CASH],
 		);
-		await mpg.query(
-			`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,'RB','r','CREDIT_CARD_RESERVE')`,
-			[RB, U1, MID] as never[],
+		await q(
+			`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,'CEF','Emergency','CORE_EMERGENCY_FUND')`,
+			[CEF, U1, MID],
 		);
-		await mpg.query(`insert into credit_cards (id,user_id,code) values ($1,$2,'CARDA')`, [
+		await q(
+			`insert into midas_allocation_transfers (id,user_id,midas_account_id,idempotency_key,transfer_fingerprint,from_bucket_id,to_bucket_id,amount,occurred_at) values ($1,$2,$3,'mt-cef',$4,null,$5,'10000.00','2026-08-01 00:00:00+00')`,
+			[gid(), U1, MID, F, CEF],
+		);
+		await q(
+			`insert into income_sources (id,user_id,code,name,nature,reference_method,expected_monthly_amount,income_ledger_account_id,active_from) values
+			 ($1,$5,'REG1','Salary','REGULAR','FIXED_MONTHLY','20000.00',$6,'1900-01-01'),
+			 ($2,$5,'SUP1','Family A','SUPPORT','EXCLUDED',null,$6,'1900-01-01'),
+			 ($3,$5,'SUP2','Family B','SUPPORT','EXCLUDED',null,$6,'1900-01-01'),
+			 ($4,$5,'EXT1','Bonus','EXTRA','EXCLUDED',null,$6,'1900-01-01')`,
+			[REG1, SUP1, SUP2, EXT1, U1, INCOME_ACC],
+		);
+		await q(`insert into credit_cards (id,user_id,code) values ($1,$2,'CARDA')`, [
 			CARD,
 			U1,
-		] as never[]);
-		await mpg.query(
-			`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE','C','Bank','1','20','90000.00',now(),'cr',$4)`,
-			["90000000-0000-4000-8000-0000000000f0", U1, CARD, F] as never[],
+		]);
+		await q(
+			`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE','Akbank Axess','Akbank','1','20','90000.00','2026-07-01 00:00:00+00','ccr-1',$4)`,
+			[gid(), U1, CARD, F],
 		);
-		await mpg.query(
-			`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ($1,$2,$3,$4,$5,2026,9)`,
-			[SID, U1, CARD, MID, RB] as never[],
-		);
-		await mpg.query(
-			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','OPEN','500.00','2026-09-01','2026-09-20','MIDAS_FUND','2026-09-01 00:00:00+00','sr1',$4)`,
-			[R1x, U1, SID, F] as never[],
-		);
-		await mpg.query(
-			`insert into canonical_transactions (id,user_id,kind,creation_idempotency_key,creation_fingerprint) values ($1,$2,'CREDIT_CARD_PURCHASE','cp',$3)`,
-			[CT_P, U1, F] as never[],
-		);
-		await mpg.query(
-			`insert into transaction_revisions (id,user_id,transaction_id,revision_no,operation,occurred_at,payload,revision_fingerprint,idempotency_key) values ($1,$2,$3,1,'CREATE','2026-09-02 00:00:00+00','{}'::jsonb,$4,'ctr')`,
-			[TR_P, U1, CT_P, F] as never[],
-		);
-		await mpg.query(
-			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ($1,$2,$3,'PURCHASE',$4)`,
-			[EID, U1, CARD, CT_P] as never[],
-		);
-		await mpg.query(
-			`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,canonical_revision_id,operation,amount,budget_category,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE','500.00','MANDATORY_EXPENSE','2026-09-02 00:00:00+00','cer',$5)`,
-			[ER, U1, EID, TR_P, F] as never[],
-		);
-		await mpg.exec("SET session_replication_role = origin");
-		if (opts.reconcile) {
-			await reconcileStatement({
-				db: mdb,
-				userId: U1,
-				statementId: SID,
-				statementRevisionId: R1x,
-				idempotencyKey: "rc-mini",
-				components: [
-					{
-						componentType: "PURCHASE",
-						amount: "500.00",
-						ownership: "PERSONAL",
-						purchaseEventId: EID,
-					},
-				],
-			});
-		}
-		if (opts.pay) {
-			await mpg.exec("SET session_replication_role = replica");
-			const payAt = opts.payAt ?? "2026-09-15 00:00:00+00";
-			let peId: string | null = null;
-			if (opts.pe === "linked") {
-				peId = PE;
-				await mpg.query(
-					`insert into canonical_transactions (id,user_id,kind,creation_idempotency_key,creation_fingerprint) values ($1,$2,'CREDIT_CARD_STATEMENT_PAYMENT','cpe',$3)`,
-					[CT_PE, U1, F] as never[],
-				);
-				await mpg.query(
-					`insert into credit_card_statement_payment_events (id,user_id,statement_id,canonical_transaction_id,payment_asset_account_id,amount,occurred_at) values ($1,$2,$3,$4,$5,'500.00',$6)`,
-					[PE, U1, SID, CT_PE, CASH, payAt] as never[],
-				);
-			} else if (opts.pe === "missing") {
-				peId = "c0000000-0000-4000-8000-0000000000ff";
-			}
-			await mpg.query(
-				`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,previous_revision_id,operation,status,statement_amount,statement_date,due_date,reserve_placement,payment_event_id,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,2,$4,'PAY','PAID','500.00','2026-09-01','2026-09-20','MIDAS_FUND',$5,$6,'sr2',$7)`,
-				["82000000-0000-4000-8000-0000000000f2", U1, SID, R1x, peId, payAt, F] as never[],
-			);
-			await mpg.exec("SET session_replication_role = origin");
-		}
+		await mkPerson(P_FAM, "Anne", "FAMILY", "2026-07-01 00:00:00+00");
+		await mkPerson(P_FRI, "Kerem", "FRIEND", "2026-07-01 00:00:00+00");
+		await mkPerson(P_OTH, "Komsu", "OTHER", "2026-07-01 00:00:00+00");
+		await origin();
+		await createBasicLivingTarget({
+			db,
+			userId: U1,
+			effectivePeriodMonth: "2026-09-01",
+			monthlyTargetAmount: "6000.00",
+			currency: "TRY",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "bl-4b",
+		});
+
 		return {
-			run: () =>
-				buildBudgetV2CheckpointReport({
-					db: mdb,
-					userId: U1,
-					periodMonth: P,
-					triggerStatementId: SID,
-				}),
-			close: () => mpg.close(),
+			pg,
+			db,
+			gid,
+			q,
+			replica,
+			origin,
+			mkCanon,
+			mkReceipt,
+			mkPur,
+			mkPurRev,
+			mkObligation,
+			mkSettlement,
+			mkStmt,
+			mkStmtRev,
+			mkPayEvent,
+			mkPay,
+			mkSplit,
+			mkCardRev,
+			mkPerson,
+			mkPersonRev,
+			close: () => pg.close(),
 		};
 	};
 
+	// =====================================================================
+	// MAIN happy-path DB -- adapted 4B A..X + FAMILY_REIMBURSEMENT (K)
+	// =====================================================================
 	{
-		const m = await mini({ pay: false });
-		await expectThrowB(m.run, "not PAID", "B: an OPEN trigger statement is rejected");
-		await m.close();
-	}
-	{
-		const m = await mini({ pay: true, pe: "none" });
-		await expectThrowB(
-			m.run,
-			"no linked payment event",
-			"C: a PAID statement whose PAY revision has no linked payment event is rejected",
+		const s = await scenario();
+		const OBL_FAM_R = "8a000000-0000-4000-8000-000000000001";
+		const OBL_FAM_STD = "8a000000-0000-4000-8000-000000000002";
+
+		await s.replica();
+		await s.mkReceipt(
+			"b1000000-0000-4000-8000-000000000001",
+			REG1,
+			"20000.00",
+			"2026-09-01 00:00:00+03",
 		);
-		await m.close();
-	}
-	{
-		const m = await mini({ pay: true, pe: "missing" });
-		await expectThrowB(
-			m.run,
-			"cannot be resolved",
-			"C: a PAY revision claiming an unresolvable payment event is rejected",
+		await s.mkReceipt(
+			"b1000000-0000-4000-8000-000000000003",
+			SUP1,
+			"2000.00",
+			"2026-09-04 00:00:00+00",
 		);
-		await m.close();
-	}
-	{
-		const m = await mini({ pay: true, pe: "linked", reconcile: false });
-		await expectThrowB(
-			m.run,
-			"reconciliation is NONE",
-			"D: a trigger statement with no sealed reconciliation is rejected (fail closed)",
+		await s.mkReceipt(
+			"b1000000-0000-4000-8000-000000000004",
+			SUP2,
+			"1500.00",
+			"2026-09-05 00:00:00+00",
 		);
-		await m.close();
-	}
-	{
-		const m = await mini({
-			pay: true,
-			pe: "linked",
-			reconcile: true,
-			payAt: "2026-10-05 00:00:00+00",
+		await s.mkReceipt(
+			"b1000000-0000-4000-8000-000000000005",
+			EXT1,
+			"111.00",
+			"2026-09-10 09:00:00+00",
+		);
+		await s.mkReceipt(
+			"b1000000-0000-4000-8000-000000000006",
+			EXT1,
+			"222.00",
+			"2026-09-10 09:00:00.001+00",
+		);
+		const purA = await s.mkPur(
+			"600.00",
+			"MANDATORY_EXPENSE",
+			"2026-09-03 00:00:00+00",
+		);
+		const purI = await s.mkPur(
+			"1200.00",
+			"DISCRETIONARY_SPEND",
+			"2026-09-05 00:00:00+00",
+			{ merchant: "RESTORAN MARKET", installmentCount: 6 },
+		);
+		const purS = await s.mkPur(
+			"1000.00",
+			"SHORT_TERM_PURCHASE",
+			"2026-09-06 00:00:00+00",
+		);
+		const purV = await s.mkPur(
+			"200.00",
+			"DISCRETIONARY_SPEND",
+			"2026-09-07 00:00:00+00",
+		);
+		await s.mkPurRev(
+			purV.eid,
+			purV.er,
+			2,
+			"VOID",
+			"200.00",
+			"DISCRETIONARY_SPEND",
+			"2026-09-08 00:00:00+00",
+		);
+		const purQ = await s.mkPur(
+			"300.00",
+			"DISCRETIONARY_SPEND",
+			"2026-09-08 00:00:00+00",
+		);
+		await s.mkPurRev(
+			purQ.eid,
+			purQ.er,
+			2,
+			"UPDATE",
+			"300.00",
+			"DISCRETIONARY_SPEND",
+			"2026-09-13 00:00:00+00",
+		);
+		await s.mkObligation(
+			OBL_FAM_R,
+			P_FAM,
+			"RECEIVABLE",
+			"600.00",
+			"2026-09-06 00:00:00+00",
+		);
+		await s.mkSplit({
+			purchaseEid: purS.eid,
+			purchaseEr: purS.er,
+			splitId: "87000000-0000-4000-8000-000000000001",
+			user: "400.00",
+			ext: "600.00",
+			gross: "1000.00",
+			occ: "2026-09-06 00:00:00+00",
+			personId: P_FAM,
+			personObligationId: OBL_FAM_R,
 		});
-		await expectThrowB(
-			m.run,
-			"outside the requested period",
-			"W: a trigger payment outside the requested period is rejected (BUDGET_INVALID_INPUT)",
+		await s.mkObligation(
+			OBL_FAM_STD,
+			P_FAM,
+			"RECEIVABLE",
+			"250.00",
+			"2026-09-06 00:00:00+00",
 		);
-		await m.close();
+		await s.mkSettlement(
+			"8b000000-0000-4000-8000-000000000001",
+			OBL_FAM_R,
+			"600.00",
+			"2026-09-10 00:00:00+00",
+		);
+		await s.mkSettlement(
+			"8b000000-0000-4000-8000-000000000002",
+			OBL_FAM_STD,
+			"250.00",
+			"2026-09-11 00:00:00+00",
+		);
+		const TS1 = "81000000-0000-4000-8000-000000000001";
+		const TS2 = "81000000-0000-4000-8000-000000000002";
+		const TS3 = "81000000-0000-4000-8000-000000000003";
+		const ts1r1 = await s.mkStmt(TS1, "1000.00", 9);
+		const ts2r1 = await s.mkStmt(TS2, "500.00", 8);
+		const ts3r1 = await s.mkStmt(TS3, "400.00", 7);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: TS1,
+			statementRevisionId: ts1r1,
+			idempotencyKey: "rc-ts1",
+			components: [
+				{
+					componentType: "PURCHASE",
+					amount: "600.00",
+					ownership: "PERSONAL",
+					purchaseEventId: purA.eid,
+				},
+				{
+					componentType: "ADJUSTMENT",
+					amount: "300.00",
+					ownership: "EXTERNAL_PERSON",
+					personId: P_FAM,
+					adjustmentKind: "OTHER",
+				},
+				{
+					componentType: "ADJUSTMENT",
+					amount: "100.00",
+					ownership: "EXTERNAL_PERSON",
+					personId: P_FRI,
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: TS2,
+			statementRevisionId: ts2r1,
+			idempotencyKey: "rc-ts2",
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount: "500.00",
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await classifySupportReceipt({
+			db: s.db,
+			userId: U1,
+			incomeReceiptId: "b1000000-0000-4000-8000-000000000003",
+			supportRole: "PLANNED_FAMILY_GIFT",
+			idempotencyKey: "sup-gift-4b",
+		});
+		await classifySupportReceipt({
+			db: s.db,
+			userId: U1,
+			incomeReceiptId: "b1000000-0000-4000-8000-000000000004",
+			supportRole: "DEFICIT_FAMILY_SUPPORT",
+			idempotencyKey: "sup-def-4b",
+		});
+		await s.replica();
+		const { pe: PE1, r: PE1_PAYREV } = await s.mkPay(
+			TS1,
+			ts1r1,
+			"1000.00",
+			2,
+			"2026-09-15 00:00:00+00",
+		);
+		await s.mkPay(TS2, ts2r1, "500.00", 2, "2026-09-12 00:00:00+00");
+		await s.mkPayEvent(TS3, "400.00", "2026-09-13 00:00:00+00"); // orphan payment event
+		await s.mkStmtRev(
+			TS3,
+			ts3r1,
+			2,
+			"VOID",
+			"VOID",
+			"400.00",
+			"2026-09-14 00:00:00+00",
+		);
+		await s.origin();
+
+		const CHECKPOINT_ISO = "2026-09-15T00:00:00.000Z";
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: PE1,
+		});
+
+		// canonical trigger identity = payment event
+		eqB(rep.checkpoint.paymentEventId, PE1, "trigger identity is the payment event id");
+		eqB(rep.checkpoint.payRevisionId, PE1_PAYREV, "trigger exposes the exact PAY revision id");
+		eqB(rep.triggerPayment.paymentEventId, PE1, "triggerPayment.paymentEventId");
+		eqB(rep.triggerPayment.payRevisionId, PE1_PAYREV, "triggerPayment.payRevisionId");
+		eqB(rep.triggerPayment.checkpointAt, CHECKPOINT_ISO, "A: checkpointAt from the authoritative payment event");
+		eqB(rep.triggerPayment.statementAmount, "1000.00", "A: trigger statement amount (PAY revision)");
+		eqB(rep.triggerPayment.paymentAmount, "1000.00", "A: trigger payment amount agrees");
+		eqB(rep.triggerPayment.reconciliationRevisionNo, 1, "A: reconciliation revision no");
+		eqB(rep.triggerPayment.paymentAssetAccountId, CASH, "A: authoritative paymentAssetAccountId");
+		eqB(rep.triggerPayment.displayName, "Akbank Axess", "5: card displayName as of checkpoint");
+		eqB(rep.triggerPayment.issuer, "Akbank", "5: card issuer as of checkpoint");
+
+		eqB(rep.checkpoint.intervalStart, new Date(`${P}T00:00:00+03:00`).toISOString(), "H: first-checkpoint interval starts at period start");
+		chkB(rep.checkpoint.intervalStartInclusive === true && rep.checkpoint.isFirstCheckpoint === true, "H: first-checkpoint interval start INCLUSIVE");
+		chkB(rep.interval.income.activity.some((x) => x.receiptId === "b1000000-0000-4000-8000-000000000001"), "H: income receipt exactly at period start is INCLUDED");
+
+		const own = rep.triggerPayment.ownership;
+		eqB(own.grossStatementAmount, "1000.00", "I: gross reconciled statement amount");
+		eqB(own.personalEconomicShare, "600.00", "I: personal economic share");
+		eqB(own.familyExternalShare, "300.00", "I: FAMILY external share");
+		eqB(own.friendExternalShare, "100.00", "I: FRIEND external share");
+		eqB(own.otherExternalShare, "0.00", "I: OTHER external share");
+		eqB(own.externalShareTotal, "400.00", "I: external share total");
+		chkB(
+			centsB(own.personalEconomicShare) +
+				centsB(own.familyExternalShare) +
+				centsB(own.friendExternalShare) +
+				centsB(own.otherExternalShare) ===
+				centsB(own.grossStatementAmount),
+			"J: personal + family + friend + other == reconciled statement amount",
+		);
+
+		eqB(rep.interval.income.regularReceipts, "20000.00", "income: REGULAR interval total");
+		eqB(rep.interval.income.extraReceipts, "333.00", "income: EXTRA interval total");
+		eqB(rep.interval.income.plannedFamilyGiftReceipts, "2000.00", "N: PLANNED_FAMILY_GIFT reported separately");
+		eqB(rep.interval.income.deficitFamilySupportReceipts, "1500.00", "O: DEFICIT_FAMILY_SUPPORT reported separately");
+
+		chkB(rep.interval.purchases.newlyPostedPurchases.includes(purA.eid), "P: a purchase CREATE in the interval is newly posted");
+		chkB(rep.interval.purchases.correctedPurchases.includes(purQ.eid), "Q: a purchase UPDATE in the interval is a correction");
+		chkB(rep.interval.purchases.voidedPurchases.includes(purV.eid), "R: a purchase VOID in the interval is void activity");
+		const purSAct = rep.interval.purchases.activity.find((x) => x.eventId === purS.eid && x.operation === "CREATE");
+		chkB(
+			!!purSAct &&
+				purSAct.ownership.available === true &&
+				purSAct.ownership.basis === "SEALED_SPLIT_AS_OF" &&
+				purSAct.ownership.personalShare === "400.00",
+			"7: interval purchase ownership comes from the sealed split effective at the activity instant",
+		);
+
+		const famReim = rep.interval.peopleFamily.familyReimbursements;
+		chkB(
+			famReim.length === 1 &&
+				famReim[0]?.obligationId === OBL_FAM_R &&
+				famReim[0]?.purchaseEventId === purS.eid &&
+				!!famReim[0]?.splitRevisionId &&
+				famReim[0]?.settlementAmount === "600.00",
+			"K: sealed split-generated FAMILY receivable settlement => FAMILY_REIMBURSEMENT",
+		);
+		chkB(
+			rep.interval.peopleFamily.standaloneReceivableSettlements.some(
+				(x) => x.obligationId === OBL_FAM_STD && x.settlementAmount === "250.00",
+			) && !famReim.some((x) => x.obligationId === OBL_FAM_STD),
+			"K: a standalone FAMILY receivable settlement is reported separately, never as a reimbursement",
+		);
+		chkB(
+			rep.interval.income.regularReceipts === "20000.00" &&
+				rep.interval.income.extraReceipts === "333.00",
+			"L: FAMILY_REIMBURSEMENT (600) never leaks into any interval income total",
+		);
+
+		const sp = rep.interval.statementPayments;
+		eqB(sp.length, 3, "11: all three interval statement payments listed");
+		const spTrig = sp.find((x) => x.paymentEventId === PE1);
+		const spTs2 = sp.find((x) => x.statementId === TS2);
+		const spTs3 = sp.find((x) => x.statementId === TS3);
+		chkB(!!spTrig && spTrig.isTrigger === true && spTrig.ownership.available === true, "11/E: the trigger payment (exactly at checkpointAt) is INCLUDED with an authoritative decomposition");
+		chkB(!!spTs2 && spTs2.isTrigger === false && spTs2.ownership.available === true && spTs2.ownership.personalEconomicShare === "500.00", "11: a reconciled non-trigger statement payment carries an ownership decomposition");
+		chkB(!!spTs3 && spTs3.ownership.available === false && spTs3.ownership.reason === "RECONCILIATION_UNAVAILABLE", "11: a non-reconciled statement payment reports ownership UNAVAILABLE");
+
+		const spend = rep.mtd.spending;
+		eqB(spend.byCategoryPersonalShare.MANDATORY_EXPENSE, "600.00", "T: MTD MANDATORY_EXPENSE personal share");
+		eqB(spend.byCategoryPersonalShare.DISCRETIONARY_SPEND, "1500.00", "T: MTD DISCRETIONARY_SPEND personal share");
+		eqB(spend.byCategoryPersonalShare.SHORT_TERM_PURCHASE, "400.00", "S/T: MTD SHORT_TERM_PURCHASE uses the 400 personal share, not 1000 gross");
+		eqB(spend.byCategoryPersonalShare.UNCLASSIFIED, "0.00", "T: MTD UNCLASSIFIED personal share");
+		eqB(spend.grossCardPurchasesMTD, "3100.00", "S: gross card purchases MTD");
+		eqB(spend.personalCardSpendMTD, "2500.00", "S: personal card spend MTD < gross");
+		eqB(spend.externalCardSpendMTD, "600.00", "S: external card spend MTD");
+		eqB(spend.externalCardSpendByRelationship.FAMILY, "600.00", "S: external card spend MTD attributed to FAMILY by exact split truth");
+
+		chkB(
+			rep.foodAnalytics.available === false && rep.foodAnalytics.merchantInferenceUsed === false,
+			"U: a market/restaurant merchant name does NOT trigger any food inference",
+		);
+		const inst = rep.installmentAnalytics;
+		chkB(
+			inst.purchases.some((x) => x.eventId === purI.eid && x.installmentCount === 6 && x.grossAmount === "1200.00") &&
+				inst.futureInstallmentProjection.available === false,
+			"V: installmentCount=6 metadata visible; forward projection unavailable",
+		);
+		chkB(rep.availableToAllocateNow.available === false, "15: availableToAllocateNow preserved");
+
+		const live = await resolveBudgetV2LiveSnapshot({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			asOf: new Date(CHECKPOINT_ISO),
+		});
+		eqB(JSON.stringify(rep.mtd.budget.inputs), JSON.stringify(live.inputs), "X: mtd.budget.inputs === live resolver inputs");
+		eqB(rep.mtd.budget.policyOutput.trueSurplus, live.policyResult.outputs.trueSurplus.amount, "X: mtd.budget.policyOutput.trueSurplus === live resolver");
+		eqB(rep.mtd.budget.policyOutput.deficit, live.policyResult.outputs.deficit.amount, "X: mtd.budget.policyOutput.deficit === live resolver");
+		eqB(
+			rep.mtd.budget.basicLiving.basicLivingFunding,
+			(live.evidenceSnapshot as { basicLiving: { basicLivingFunding: string } }).basicLiving.basicLivingFunding,
+			"X: mtd.budget.basicLiving.basicLivingFunding === live resolver",
+		);
+		eqB(rep.mtd.emergencyFund.currentBalance, "10000.00", "X: mtd.emergencyFund.currentBalance");
+		eqB(rep.mtd.emergencyFund.gap, "0.00", "X: mtd.emergencyFund.gap");
+
+		// report 2: subsequent checkpoint
+		const prev = new Date("2026-09-10T09:00:00.000Z");
+		const rep2 = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: PE1,
+			previousCheckpointAt: prev,
+		});
+		eqB(rep2.checkpoint.intervalStart, prev.toISOString(), "interval: subsequent checkpoint starts at previousCheckpointAt");
+		chkB(rep2.checkpoint.intervalStartInclusive === false && rep2.checkpoint.isFirstCheckpoint === false, "interval: previousCheckpointAt is EXCLUSIVE");
+		chkB(!rep2.interval.income.activity.some((x) => x.receiptId === "b1000000-0000-4000-8000-000000000005"), "F: activity exactly at previousCheckpointAt is EXCLUDED");
+		chkB(rep2.interval.income.activity.some((x) => x.receiptId === "b1000000-0000-4000-8000-000000000006"), "G: activity 1ms after previousCheckpointAt is INCLUDED");
+		chkB(rep2.interval.purchases.correctedPurchases.includes(purQ.eid) && !rep2.interval.purchases.newlyPostedPurchases.includes(purQ.eid), "Q: CREATE before the interval, UPDATE inside => correction only");
+
+		await s.close();
+	}
+
+	// =====================================================================
+	// 4B.1/A -- PAY -> REOPEN -> PAY : two distinct payment-event checkpoints
+	// =====================================================================
+	{
+		const s = await scenario();
+		const TS = "81000000-0000-4000-8000-0000000000a1";
+		await s.replica();
+		const r1 = await s.mkStmt(TS, "1000.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: TS,
+			statementRevisionId: r1,
+			idempotencyKey: "rc-a",
+			components: [
+				{ componentType: "ADJUSTMENT", amount: "1000.00", ownership: "PERSONAL", adjustmentKind: "OTHER" },
+			],
+		});
+		await s.replica();
+		const { pe: PE_A, r: rev2 } = await s.mkPay(TS, r1, "1000.00", 2, "2026-09-08 00:00:00+00");
+		const rev3 = await s.mkStmtRev(TS, rev2, 3, "REOPEN", "OPEN", "1000.00", "2026-09-10 00:00:00+00");
+		const { pe: PE_B, r: rev4 } = await s.mkPay(TS, rev3, "1000.00", 4, "2026-09-14 00:00:00+00");
+		await s.origin();
+
+		const repA = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_A });
+		const repB = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_B });
+		eqB(repA.checkpoint.checkpointAt, "2026-09-08T00:00:00.000Z", "4B.1/A: first payment event identifies the first checkpoint");
+		eqB(repA.checkpoint.payRevisionId, rev2, "4B.1/A: first checkpoint resolves the FIRST PAY revision (no latest-PAY substitution)");
+		eqB(repB.checkpoint.checkpointAt, "2026-09-14T00:00:00.000Z", "4B.1/A: second payment event identifies the second checkpoint");
+		eqB(repB.checkpoint.payRevisionId, rev4, "4B.1/A: second checkpoint resolves the SECOND PAY revision");
+		await expectThrowB(
+			() => buildBudgetV2CheckpointReportByStatement({ db: s.db, userId: U1, periodMonth: P, triggerStatementId: TS }),
+			"distinct trigger payment events",
+			"4B.1/A: the statementId wrapper rejects the PAY->REOPEN->PAY ambiguity (BUDGET_CHECKPOINT_TRIGGER_AMBIGUOUS)",
+		);
+		await s.close();
+	}
+
+	// =====================================================================
+	// 4B.1/B & C -- unknown payment event / no PAY revision references it
+	// =====================================================================
+	{
+		const s = await scenario();
+		const TS = "81000000-0000-4000-8000-0000000000c1";
+		await s.replica();
+		await s.mkStmt(TS, "500.00", 9);
+		const PE_C = await s.mkPayEvent(TS, "500.00", "2026-09-10 00:00:00+00"); // no PAY revision
+		await s.origin();
+		await expectThrowB(
+			() => buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: "90000000-0000-4000-8000-0000000fffff" }),
+			"does not exist for this user",
+			"4B.1/B: an unknown / not-owned trigger payment event is rejected",
+		);
+		await expectThrowB(
+			() => buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_C }),
+			"no PAY statement revision references payment event",
+			"4B.1/C: a payment event that no PAY revision references is rejected",
+		);
+		await s.close();
+	}
+
+	// =====================================================================
+	// 4B.1/D & E -- unsealed / internally-inconsistent split => MTD fails closed
+	// =====================================================================
+	for (const variant of ["UNSEALED", "ITEM_MISMATCH"] as const) {
+		const s = await scenario();
+		const TS = "81000000-0000-4000-8000-0000000000d1";
+		const OBL = "8a000000-0000-4000-8000-0000000000d1";
+		await s.replica();
+		const r1 = await s.mkStmt(TS, "500.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-d",
+			components: [{ componentType: "ADJUSTMENT", amount: "500.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
+		});
+		await s.replica();
+		const { pe: PE_D } = await s.mkPay(TS, r1, "500.00", 2, "2026-09-14 00:00:00+00");
+		const purU = await s.mkPur("800.00", "DISCRETIONARY_SPEND", "2026-09-05 00:00:00+00");
+		await s.mkObligation(OBL, P_FAM, "RECEIVABLE", "500.00", "2026-09-05 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: purU.eid, purchaseEr: purU.er, splitId: "87000000-0000-4000-8000-0000000000d1",
+			user: "300.00", ext: "500.00", gross: "800.00", occ: "2026-09-05 00:00:00+00",
+			personId: P_FAM, personObligationId: OBL,
+			sealed: variant === "ITEM_MISMATCH",
+			itemShare: variant === "ITEM_MISMATCH" ? "400.00" : "500.00",
+		});
+		await s.origin();
+		await expectThrowB(
+			() => buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_D }),
+			variant === "UNSEALED" ? "is not sealed" : "item share sum",
+			`4B.1/${variant === "UNSEALED" ? "D" : "E"}: an ${variant === "UNSEALED" ? "unsealed" : "inconsistent (item sum != external)"} split makes MTD ownership FAIL CLOSED`,
+		);
+		await s.close();
+	}
+
+	// =====================================================================
+	// 4B.1/F & G -- future split revision ignored / VOID split not shared
+	// =====================================================================
+	for (const variant of ["FUTURE", "VOID"] as const) {
+		const s = await scenario();
+		const TS = "81000000-0000-4000-8000-0000000000f1";
+		const OBL = "8a000000-0000-4000-8000-0000000000f1";
+		const SPLIT = "87000000-0000-4000-8000-0000000000f1";
+		await s.replica();
+		const r1 = await s.mkStmt(TS, "300.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-f",
+			components: [{ componentType: "ADJUSTMENT", amount: "300.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
+		});
+		await s.replica();
+		const { pe: PE_F } = await s.mkPay(TS, r1, "300.00", 2, "2026-09-12 00:00:00+00");
+		const pur = await s.mkPur("1000.00", "SHORT_TERM_PURCHASE", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL, P_FAM, "RECEIVABLE", "500.00", "2026-09-03 00:00:00+00");
+		const sp1 = await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: SPLIT,
+			user: "500.00", ext: "500.00", gross: "1000.00", occ: "2026-09-03 00:00:00+00",
+			personId: P_FAM, personObligationId: OBL,
+		});
+		if (variant === "FUTURE") {
+			await s.mkSplit({
+				purchaseEid: pur.eid, purchaseEr: pur.er, splitId: SPLIT, revNo: 2, prevRevId: sp1.splitRev,
+				op: "UPDATE", user: "100.00", ext: "900.00", gross: "1000.00", occ: "2026-09-20 00:00:00+00",
+				personId: P_FAM, participantId: sp1.participantId, itemShare: "900.00",
+			});
+		} else {
+			await s.mkSplit({
+				purchaseEid: pur.eid, purchaseEr: pur.er, splitId: SPLIT, revNo: 2, prevRevId: sp1.splitRev,
+				op: "VOID", user: "1000.00", ext: "0.00", gross: "1000.00", occ: "2026-09-05 00:00:00+00",
+				withItem: false, sealed: false,
+			});
+		}
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_F });
+		if (variant === "FUTURE") {
+			eqB(rep.mtd.spending.externalCardSpendByRelationship.FAMILY, "500.00", "4B.1/F: a split revision after the checkpoint does NOT alter checkpoint ownership (500, not 900)");
+			eqB(rep.mtd.spending.personalCardSpendMTD, "500.00", "4B.1/F: MTD personal share uses the checkpoint-effective split");
+		} else {
+			eqB(rep.mtd.spending.externalCardSpendByRelationship.FAMILY, "0.00", "4B.1/G: a split VOIDed before the checkpoint is NOT treated as active shared ownership");
+			eqB(rep.mtd.spending.personalCardSpendMTD, "1000.00", "4B.1/G: the VOID-split purchase is 100% personal");
+		}
+		await s.close();
+	}
+
+	// =====================================================================
+	// 4B.1/H -- person revision only AFTER checkpoint => fail closed
+	// =====================================================================
+	{
+		const s = await scenario();
+		const TS = "81000000-0000-4000-8000-00000000c101";
+		const P_LATE = "9a000000-0000-4000-8000-0000000000f9";
+		await s.replica();
+		await s.mkPerson(P_LATE, "Sonradan", "OTHER", "2026-09-20 00:00:00+00");
+		const r1 = await s.mkStmt(TS, "1000.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-h",
+			components: [
+				{ componentType: "ADJUSTMENT", amount: "400.00", ownership: "PERSONAL", adjustmentKind: "OTHER" },
+				{ componentType: "ADJUSTMENT", amount: "600.00", ownership: "EXTERNAL_PERSON", personId: P_LATE, adjustmentKind: "OTHER" },
+			],
+		});
+		await s.replica();
+		const { pe: PE_H } = await s.mkPay(TS, r1, "1000.00", 2, "2026-09-14 00:00:00+00");
+		await s.origin();
+		await expectThrowB(
+			() => buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_H }),
+			"no revision effective at or before",
+			"4B.1/H: a person whose only revision is after the checkpoint => fail closed (no future fallback)",
+		);
+		await s.close();
+	}
+
+	// =====================================================================
+	// 4B.1/I -- relationship change after checkpoint => prior relationship kept
+	// =====================================================================
+	{
+		const s = await scenario();
+		const TS = "81000000-0000-4000-8000-00000000c201";
+		await s.replica();
+		// P_FRI is FRIEND at 2026-07-01; becomes FAMILY only at 2026-09-20
+		const friRev1 = (
+			await s.q<{ id: string }>(
+				`select id from person_revisions where person_id=$1 and revision_no=1`,
+				[P_FRI],
+			)
+		).rows[0].id;
+		await s.mkPersonRev(P_FRI, friRev1, 2, "Kerem", "FAMILY", "2026-09-20 00:00:00+00");
+		const r1 = await s.mkStmt(TS, "1000.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-i",
+			components: [
+				{ componentType: "ADJUSTMENT", amount: "700.00", ownership: "PERSONAL", adjustmentKind: "OTHER" },
+				{ componentType: "ADJUSTMENT", amount: "300.00", ownership: "EXTERNAL_PERSON", personId: P_FRI, adjustmentKind: "OTHER" },
+			],
+		});
+		await s.replica();
+		const { pe: PE_I } = await s.mkPay(TS, r1, "1000.00", 2, "2026-09-10 00:00:00+00");
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_I });
+		eqB(rep.triggerPayment.ownership.friendExternalShare, "300.00", "4B.1/I: relationship at the checkpoint (FRIEND) is used, not a later FAMILY revision");
+		eqB(rep.triggerPayment.ownership.familyExternalShare, "0.00", "4B.1/I: the later FAMILY reclassification does not time-travel into the report");
+		await s.close();
+	}
+
+	// =====================================================================
+	// 4B.1/J -- card rename after checkpoint => old label kept
+	// =====================================================================
+	{
+		const s = await scenario();
+		const TS = "81000000-0000-4000-8000-00000000c301";
+		await s.replica();
+		const cardRev1 = (
+			await s.q<{ id: string }>(
+				`select id from credit_card_revisions where credit_card_id=$1 and revision_no=1`,
+				[CARD],
+			)
+		).rows[0].id;
+		await s.mkCardRev(2, cardRev1, "Yeni Kart", "Baska Banka", "2026-09-20 00:00:00+00");
+		const r1 = await s.mkStmt(TS, "400.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-j",
+			components: [{ componentType: "ADJUSTMENT", amount: "400.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
+		});
+		await s.replica();
+		const { pe: PE_J } = await s.mkPay(TS, r1, "400.00", 2, "2026-09-10 00:00:00+00");
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_J });
+		eqB(rep.triggerPayment.displayName, "Akbank Axess", "4B.1/J: a card rename after the checkpoint does not rewrite the historical label");
+		eqB(rep.triggerPayment.issuer, "Akbank", "4B.1/J: card issuer at the checkpoint is preserved");
+		await s.close();
+	}
+
+	// =====================================================================
+	// 4B.1/L, M, N -- FAMILY_REIMBURSEMENT chain must be fully authoritative
+	// =====================================================================
+	for (const variant of ["VOID", "UNSEALED", "PARTICIPANT_REMOVED"] as const) {
+		const s = await scenario();
+		const TS = "81000000-0000-4000-8000-00000000c401";
+		const OBL = "8a000000-0000-4000-8000-00000000c401";
+		const SPLIT = "87000000-0000-4000-8000-00000000c401";
+		const outOfMtd = variant === "UNSEALED"; // unsealed split would fail MTD -> keep the purchase out of the MTD window
+		const purOcc = outOfMtd ? "2026-08-20 00:00:00+00" : "2026-09-03 00:00:00+00";
+		await s.replica();
+		const r1 = await s.mkStmt(TS, "300.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-l",
+			components: [{ componentType: "ADJUSTMENT", amount: "300.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
+		});
+		await s.replica();
+		const { pe: PE_L } = await s.mkPay(TS, r1, "300.00", 2, "2026-09-15 00:00:00+00");
+		const pur = await s.mkPur("1000.00", "SHORT_TERM_PURCHASE", purOcc);
+		await s.mkObligation(OBL, P_FAM, "RECEIVABLE", "600.00", purOcc);
+		const sp1 = await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: SPLIT,
+			user: "400.00", ext: "600.00", gross: "1000.00", occ: purOcc,
+			personId: P_FAM, personObligationId: OBL,
+			sealed: variant !== "UNSEALED",
+		});
+		if (variant === "VOID") {
+			await s.mkSplit({
+				purchaseEid: pur.eid, purchaseEr: pur.er, splitId: SPLIT, revNo: 2, prevRevId: sp1.splitRev,
+				op: "VOID", user: "1000.00", ext: "0.00", gross: "1000.00", occ: "2026-09-05 00:00:00+00",
+				withItem: false, sealed: false,
+			});
+		} else if (variant === "PARTICIPANT_REMOVED") {
+			await s.mkSplit({
+				purchaseEid: pur.eid, purchaseEr: pur.er, splitId: SPLIT, revNo: 2, prevRevId: sp1.splitRev,
+				op: "UPDATE", user: "1000.00", ext: "0.00", gross: "1000.00", occ: "2026-09-06 00:00:00+00",
+				participantId: sp1.participantId, withItem: false,
+			});
+		}
+		await s.mkSettlement("8b000000-0000-4000-8000-00000000c401", OBL, "600.00", "2026-09-10 00:00:00+00");
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_L });
+		chkB(
+			rep.interval.peopleFamily.familyReimbursements.length === 0,
+			`4B.1/${variant === "VOID" ? "L" : variant === "UNSEALED" ? "M" : "N"}: a ${variant.toLowerCase()} split chain is NOT labelled FAMILY_REIMBURSEMENT`,
+		);
+		chkB(
+			rep.interval.peopleFamily.settlementActivity.some((x) => x.obligationId === OBL),
+			`4B.1/${variant === "VOID" ? "L" : variant === "UNSEALED" ? "M" : "N"}: the settlement still appears as ordinary People activity`,
+		);
+		await s.close();
+	}
+
+	// =====================================================================
+	// 4B.1/O -- SUPPORT role created AFTER checkpoint => fail closed
+	// =====================================================================
+	{
+		const s = await scenario();
+		const TS = "81000000-0000-4000-8000-00000000c501";
+		const RC_O = "b1000000-0000-4000-8000-0000000000a1";
+		await s.replica();
+		await s.mkReceipt(RC_O, SUP1, "2000.00", "2026-09-05 00:00:00+00");
+		// classification revision effective only AFTER the checkpoint
+		await s.q(
+			`insert into income_receipt_budget_v2_semantic_revisions (id,user_id,income_receipt_id,revision_no,operation,support_role,idempotency_key,revision_fingerprint,occurred_at) values ($1,$2,$3,1,'CREATE','PLANNED_FAMILY_GIFT',$4,$5,'2026-09-20 00:00:00+00')`,
+			[s.gid(), U1, RC_O, "sem-o", F],
+		);
+		const r1 = await s.mkStmt(TS, "400.00", 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-o",
+			components: [{ componentType: "ADJUSTMENT", amount: "400.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
+		});
+		await s.replica();
+		const { pe: PE_O } = await s.mkPay(TS, r1, "400.00", 2, "2026-09-10 00:00:00+00");
+		await s.origin();
+		await expectThrowB(
+			() => buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: PE_O }),
+			"support-role classification effective by",
+			"4B.1/O: a SUPPORT role classified only after the checkpoint cannot classify earlier interval activity",
+		);
+		await s.close();
 	}
 }
 
-function centsB(v: string): bigint {
-	const [i, f = "0"] = v.split(".");
-	return BigInt(i ?? "0") * 100n + BigInt((f + "00").slice(0, 2));
-}
 
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
