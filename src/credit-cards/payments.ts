@@ -1,4 +1,5 @@
 import { and, desc, eq } from "drizzle-orm";
+import { maybeEnqueueBudgetV2CheckpointRequest } from "../budget/checkpoint-request-v2";
 import type { Database, DatabaseTransaction } from "../db/client";
 import { users } from "../db/schema/auth";
 import { creditCardStatementPaymentEvents } from "../db/schema/credit-card-ledger";
@@ -614,6 +615,21 @@ export async function payCreditCardStatementInTransaction({
 		occurredAt: validOccurredAt,
 		idempotencyKey: validKey,
 		revisionFingerprint: fingerprint,
+	});
+
+	// 15. Transactional OUTBOX boundary (Budget V2 Checkpoint 5): if this card
+	// is an explicitly user-approved checkpoint-trigger card as of the payment
+	// instant, enqueue exactly one durable checkpoint REQUEST. This is bound to
+	// the PAY event; report generation happens later, asynchronously. A card
+	// that is not configured (or DISABLED) does nothing here.
+	await maybeEnqueueBudgetV2CheckpointRequest({
+		tx,
+		userId: validUserId,
+		statementId: validStatementId,
+		creditCardId: statement.creditCardId,
+		paymentEventId,
+		payRevisionId: newRevisionId,
+		occurredAt: validOccurredAt,
 	});
 
 	return {

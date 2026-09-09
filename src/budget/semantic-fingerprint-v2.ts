@@ -127,6 +127,34 @@ export interface SpendingFoodSemanticFingerprintParams {
 const lc = (v: string | null): string | null =>
 	v ? v.trim().toLowerCase() : null;
 
+export interface CheckpointTriggerCardFingerprintParams {
+	userId: string;
+	creditCardId: string;
+	operation: "CREATE" | "UPDATE";
+	revisionNo: number;
+	previousRevisionId: string | null;
+	status: "ENABLED" | "DISABLED";
+	sourceKind: string;
+	occurredAt: Date;
+}
+
+/** Deterministic 64 lowercase-hex fingerprint for a checkpoint trigger-card config revision. */
+export function calculateCheckpointTriggerCardRevisionFingerprint(
+	params: CheckpointTriggerCardFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"budget-v2-checkpoint-trigger-card-v1",
+		params.userId.trim().toLowerCase(),
+		params.creditCardId.trim().toLowerCase(),
+		params.operation,
+		params.revisionNo,
+		lc(params.previousRevisionId),
+		params.status,
+		params.sourceKind,
+		params.occurredAt.toISOString(),
+	]);
+}
+
 /** Deterministic 64 lowercase-hex fingerprint for a spending-food semantic revision. */
 export function calculateSpendingFoodSemanticRevisionFingerprint(
 	params: SpendingFoodSemanticFingerprintParams,

@@ -46,7 +46,7 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		}
 	}
 
-	it("audited all database functions and confirmed total count is 164", () => {
+	it("audited all database functions and confirmed total count is 168", () => {
 		// 147 through migration 0060; +3 in migration 0061 (PERSONAL_BUDGET_V2
 		// foundation: two immutability guards + one revision insert guard);
 		// +1 in migration 0062 (the V2 anchor BEFORE INSERT guard);
@@ -60,7 +60,23 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		// -- no new function name, so the count is unchanged.
 		// +2 in migration 0067 (spending food semantics: one immutability guard +
 		// one BEFORE INSERT subject/chain guard).
-		expect(effectiveFunctions.size).toBe(164);
+		// +4 in migration 0068 (durable checkpoint persistence: one SHARED
+		// immutability guard for all three tables + one BEFORE INSERT guard each
+		// for the trigger-card / request / snapshot tables).
+		expect(effectiveFunctions.size).toBe(168);
+	});
+
+	it("migration 0068 contributes exactly the four durable-checkpoint guard functions", () => {
+		for (const fnName of [
+			"trg_fn_guard_bv2ckpt_immutability",
+			"trg_fn_guard_bv2ckcard_revisions_insert",
+			"trg_fn_guard_bv2ckreq_insert",
+			"trg_fn_guard_bv2cksnap_insert",
+		]) {
+			expect(effectiveFunctions.get(fnName)?.migration).toBe(
+				"0068_add_budget_v2_checkpoint_persistence",
+			);
+		}
 	});
 
 	it("migration 0064 contributes exactly the two basic-living config guard functions", () => {

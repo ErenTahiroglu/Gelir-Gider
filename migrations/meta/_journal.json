@@ -477,6 +477,13 @@
       "when": 1789020000000,
       "tag": "0067_add_budget_v2_spending_food_semantics",
       "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1789040000000,
+      "tag": "0068_add_budget_v2_checkpoint_persistence",
+      "breakpoints": true
     }
   ]
 }

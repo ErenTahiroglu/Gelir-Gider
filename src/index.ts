@@ -7,6 +7,7 @@ import {
 	listCompletedBackupObjects,
 	runDatabaseBackup,
 } from "./backups/service";
+import { processPendingBudgetV2CheckpointRequests } from "./budget/checkpoint-processor-v2";
 import type { AppEnv } from "./config/env";
 import {
 	getBackupBucket,
@@ -160,6 +161,48 @@ export default {
 							component: "scheduled",
 						});
 						throw new Error("Scheduled notification run failed");
+					}
+				})(),
+			);
+
+			// Budget V2 durable checkpoint persistence (Checkpoint 5, Section 17).
+			// Reuses the existing hourly invocation but runs independently of the
+			// notification scheduler: one expected fail-closed checkpoint request
+			// must not cancel notification work, and vice versa. No report JSON,
+			// balances, card amounts, person names, or income amounts are ever
+			// logged -- only sanitized outcome events / safe counts.
+			ctx.waitUntil(
+				(async () => {
+					try {
+						const db = createDatabase(getDatabaseUrl(env));
+						const counts = await processPendingBudgetV2CheckpointRequests({
+							db,
+						});
+						logOperationalEvent({
+							level: "info",
+							eventCode: "BUDGET_CHECKPOINT_PROCESSOR_COMPLETED",
+							component: "scheduled",
+							counts: {
+								pendingDiscovered: counts.pendingDiscovered,
+								persisted: counts.persisted,
+								blocked: counts.blocked,
+								failedReport: counts.failedReport,
+								collisionPeriods: counts.collisionPeriods,
+								periodsProcessed: counts.periodsProcessed,
+							},
+						});
+					} catch {
+						// A fail-closed checkpoint report is handled inside the
+						// processor and never reaches here. Anything that does is an
+						// unexpected infrastructure failure: surface it operationally
+						// (sanitized) and reject the waitUntil promise so the run is
+						// recorded as failed -- without a raw message.
+						logOperationalEvent({
+							level: "error",
+							eventCode: "BUDGET_CHECKPOINT_PROCESSOR_FAILED",
+							component: "scheduled",
+						});
+						throw new Error("Scheduled Budget V2 checkpoint processing failed");
 					}
 				})(),
 			);

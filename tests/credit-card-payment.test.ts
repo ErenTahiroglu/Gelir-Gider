@@ -91,6 +91,9 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 							}
 							return {
 								limit: vi.fn().mockResolvedValue([]),
+								orderBy: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([]),
+								}),
 							};
 						}),
 					})),
@@ -98,6 +101,13 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 				insert: vi.fn().mockReturnValue({
 					values: vi.fn().mockReturnValue({
 						returning: vi.fn().mockResolvedValue([{ id: "new-id" }]),
+						// Budget V2 checkpoint enqueue path: no trigger card is
+						// configured in this mocked scenario, so the config lookup
+						// returns [] and the ON CONFLICT insert is never reached -- but
+						// the chained builder shape must still exist.
+						onConflictDoNothing: vi.fn().mockReturnValue({
+							returning: vi.fn().mockResolvedValue([]),
+						}),
 					}),
 				}),
 			} as unknown as DatabaseTransaction;
@@ -235,6 +245,9 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 							}
 							return {
 								limit: vi.fn().mockResolvedValue([]),
+								orderBy: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([]),
+								}),
 							};
 						}),
 					})),
@@ -242,6 +255,13 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 				insert: vi.fn().mockReturnValue({
 					values: vi.fn().mockReturnValue({
 						returning: vi.fn().mockResolvedValue([{ id: "new-id" }]),
+						// Budget V2 checkpoint enqueue path: no trigger card is
+						// configured in this mocked scenario, so the config lookup
+						// returns [] and the ON CONFLICT insert is never reached -- but
+						// the chained builder shape must still exist.
+						onConflictDoNothing: vi.fn().mockReturnValue({
+							returning: vi.fn().mockResolvedValue([]),
+						}),
 					}),
 				}),
 			} as unknown as DatabaseTransaction;
@@ -894,6 +914,9 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 							}
 							return {
 								limit: vi.fn().mockResolvedValue([]),
+								orderBy: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([]),
+								}),
 							};
 						}),
 					})),
@@ -1032,6 +1055,9 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 							}
 							return {
 								limit: vi.fn().mockResolvedValue([]),
+								orderBy: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([]),
+								}),
 							};
 						}),
 					})),
@@ -1162,6 +1188,9 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 							}
 							return {
 								limit: vi.fn().mockResolvedValue([]),
+								orderBy: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([]),
+								}),
 							};
 						}),
 					})),
@@ -1265,6 +1294,9 @@ describe("Credit Card Statement Payment & Reopen Domain Unit Tests", () => {
 							}
 							return {
 								limit: vi.fn().mockResolvedValue([]),
+								orderBy: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([]),
+								}),
 							};
 						}),
 					})),

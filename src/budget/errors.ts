@@ -31,7 +31,24 @@ export type BudgetErrorCode =
 	// figure from authoritative stored truth (unsealed / inconsistent split,
 	// missing required resolver evidence, unresolvable historical person / card
 	// state) and refuses to substitute a plausible value.
-	| "BUDGET_CHECKPOINT_REPORT_FAIL_CLOSED";
+	| "BUDGET_CHECKPOINT_REPORT_FAIL_CLOSED"
+	// Budget V2 durable checkpoint persistence (Checkpoint 5).
+	// A checkpoint trigger-card config lifecycle target could not be
+	// established (card not owned, no config chain, wrong operation position).
+	| "BUDGET_CHECKPOINT_TRIGGER_CARD_INVALID"
+	// The persistence processor must persist an earlier still-pending
+	// checkpoint request for the same user+period before this one; this
+	// request stays pending/blocked (never persisted with a wrong interval).
+	| "BUDGET_CHECKPOINT_REQUEST_BLOCKED"
+	// Two distinct eligible payment events for the same user+period share the
+	// exact same checkpointAt and the timestamp interval model cannot order
+	// them without inference -- fail closed at the report layer (payments and
+	// requests remain durable and intact).
+	| "BUDGET_CHECKPOINT_TIMESTAMP_COLLISION"
+	// A stored checkpoint snapshot failed integrity verification on read
+	// (recomputed canonical fingerprint / schemaVersion / paymentEventId /
+	// periodMonth / checkpointAt / previousCheckpointAt identity mismatch).
+	| "BUDGET_CHECKPOINT_SNAPSHOT_CORRUPT";
 
 export class BudgetError extends Error {
 	readonly code: BudgetErrorCode;
