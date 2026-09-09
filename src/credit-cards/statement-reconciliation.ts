@@ -30,6 +30,7 @@ import {
 } from "../ledger/money";
 import { validateCcCanonicalUuid } from "./calendar";
 import { CreditCardError } from "./errors";
+import { resolveAuthoritativePurchaseSplitAsOf } from "./purchase-split-read";
 import {
 	calculateStatementReconciliationRevisionFingerprint,
 	type ReconciliationComponentFingerprintInput,
@@ -601,52 +602,13 @@ async function purchaseComponentStaleReason(
 // AS-OF (business-effective) read path -- for historical payment-event reports
 // ============================================================================
 
-/** The split effective for a purchase AT `asOf` (its split anchor's highest
- * revisionNo with occurredAt <= asOf). Null when unsplit / VOID at that instant. */
-async function splitForPurchaseAsOf(
-	db: Database,
-	purchaseEventId: string,
-	asOf: Date,
-): Promise<ActiveSplitInfo | null> {
-	const [split] = await db
-		.select({ id: creditCardPurchaseSplits.id })
-		.from(creditCardPurchaseSplits)
-		.where(eq(creditCardPurchaseSplits.purchaseEventId, purchaseEventId))
-		.limit(1);
-	if (!split) return null;
-	const revs = await db
-		.select({
-			id: creditCardPurchaseSplitRevisions.id,
-			revisionNo: creditCardPurchaseSplitRevisions.revisionNo,
-			operation: creditCardPurchaseSplitRevisions.operation,
-			userShare: creditCardPurchaseSplitRevisions.userShareAmount,
-			occurredAt: creditCardPurchaseSplitRevisions.occurredAt,
-		})
-		.from(creditCardPurchaseSplitRevisions)
-		.where(eq(creditCardPurchaseSplitRevisions.splitId, split.id));
-	const rev = effectiveRevisionAsOf(revs, asOf);
-	if (!rev || rev.operation === "VOID") return null;
-	const [seal] = await db
-		.select({ id: creditCardPurchaseSplitRevisionSeals.splitRevisionId })
-		.from(creditCardPurchaseSplitRevisionSeals)
-		.where(eq(creditCardPurchaseSplitRevisionSeals.splitRevisionId, rev.id))
-		.limit(1);
-	const items = await db
-		.select({ personId: creditCardPurchaseSplitRevisionItems.personId })
-		.from(creditCardPurchaseSplitRevisionItems)
-		.where(eq(creditCardPurchaseSplitRevisionItems.splitRevisionId, rev.id));
-	return {
-		splitRevisionId: rev.id,
-		userShareCents: parseAggregateMoneyString(rev.userShare).cents,
-		sealed: Boolean(seal),
-		participantPersonIds: new Set(items.map((i) => i.personId)),
-	};
-}
-
 /** Why a stored PURCHASE component was not trustworthy AT `asOf` (a future VOID /
- * supersede must NOT retroactively stale a historical reconciliation). */
+ * supersede must NOT retroactively stale a historical reconciliation). Uses the
+ * ONE authoritative as-of split reader -- an inconsistent / unsealed effective
+ * split makes the component (and the reconciliation) STALE / unusable. */
 async function purchaseComponentStaleReasonAsOf(
 	db: Database,
+	userId: string,
 	item: ReconciliationComponentItem,
 	asOf: Date,
 ): Promise<string | null> {
@@ -666,8 +628,14 @@ async function purchaseComponentStaleReasonAsOf(
 	if (ev.operation === "VOID") {
 		return `purchase event ${item.purchaseEventId} was VOID as of ${asOf.toISOString()}`;
 	}
-	const active = await splitForPurchaseAsOf(db, item.purchaseEventId, asOf);
-	if (!active) {
+
+	const split = await resolveAuthoritativePurchaseSplitAsOf({
+		db,
+		userId,
+		purchaseEventId: item.purchaseEventId,
+		asOf,
+	});
+	if (split.kind === "NO_SPLIT" || split.kind === "VOID_SPLIT") {
 		if (item.purchaseSplitRevisionId) {
 			return `purchase ${item.purchaseEventId} had no active split as of the checkpoint`;
 		}
@@ -676,20 +644,22 @@ async function purchaseComponentStaleReasonAsOf(
 		}
 		return null;
 	}
-	if (item.purchaseSplitRevisionId !== active.splitRevisionId) {
-		return `purchase ${item.purchaseEventId} split evidence not effective as of the checkpoint (${item.purchaseSplitRevisionId} -> ${active.splitRevisionId})`;
+	if (split.kind === "UNRESOLVED") {
+		return `purchase ${item.purchaseEventId} split evidence is not authoritative as of the checkpoint (${split.reason})`;
 	}
-	if (!active.sealed) {
-		return `split revision ${active.splitRevisionId} was not sealed as of the checkpoint`;
+	// ACTIVE
+	if (item.purchaseSplitRevisionId !== split.splitRevisionId) {
+		return `purchase ${item.purchaseEventId} split evidence not effective as of the checkpoint (${item.purchaseSplitRevisionId} -> ${split.splitRevisionId})`;
 	}
 	if (
 		item.ownership === "EXTERNAL_PERSON" &&
-		(!item.personId || !active.participantPersonIds.has(item.personId))
+		(!item.personId ||
+			!split.participants.some((p) => p.personId === item.personId))
 	) {
-		return `personId ${item.personId} was not a participant of split ${active.splitRevisionId} as of the checkpoint`;
+		return `personId ${item.personId} was not a participant of split ${split.splitRevisionId} as of the checkpoint`;
 	}
-	if (item.ownership === "PERSONAL" && active.userShareCents <= 0n) {
-		return `split ${active.splitRevisionId} user share was zero as of the checkpoint`;
+	if (item.ownership === "PERSONAL" && split.userShareCents <= 0n) {
+		return `split ${split.splitRevisionId} user share was zero as of the checkpoint`;
 	}
 	return null;
 }
@@ -1402,7 +1372,7 @@ export async function getStatementReconciliationAsOf(params: {
 
 	const components = await componentsFor(db, rev.id);
 	for (const c of components) {
-		const reason = await purchaseComponentStaleReasonAsOf(db, c, asOf);
+		const reason = await purchaseComponentStaleReasonAsOf(db, userId, c, asOf);
 		if (reason) {
 			return { ...base, status: "STALE", staleReason: reason };
 		}

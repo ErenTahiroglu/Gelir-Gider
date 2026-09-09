@@ -1,4 +1,5 @@
 import { and, eq, lt, lte, or, sql } from "drizzle-orm";
+import { resolveAuthoritativePurchaseSplitAsOf } from "../credit-cards/purchase-split-read";
 import { getStatementReconciliationAsOf } from "../credit-cards/statement-reconciliation";
 import type { Database } from "../db/client";
 import { effectiveRevisionAsOf } from "../db/effective-revision";
@@ -16,10 +17,6 @@ import {
 	creditCardLiabilityEvents,
 	creditCardStatementPaymentEvents,
 } from "../db/schema/credit-card-ledger";
-import {
-	creditCardPurchaseSplitRevisions,
-	creditCardPurchaseSplits,
-} from "../db/schema/credit-card-splits";
 import {
 	creditCardStatementRevisions,
 	creditCardStatements,
@@ -577,28 +574,57 @@ async function resolveDateBoundNecessary(
 // INPUT: basicLivingFunding (section 4)
 // ============================================================================
 
-async function personalPurchaseShareCentsAsOf(
+interface MandatoryPurchaseShare {
+	personalCents: bigint;
+	splitBasis: "NO_SPLIT" | "VOID_SPLIT" | "SEALED_SPLIT_AS_OF";
+	splitRevisionId: string | null;
+}
+
+/**
+ * PERSONAL economic share of a MANDATORY_EXPENSE purchase as of `asOf`, via the
+ * ONE authoritative split reader. NO_SPLIT / VOID_SPLIT -> 100% personal;
+ * ACTIVE (sealed + internally consistent + gross matches the effective purchase
+ * amount) -> its exact user share; anything else fails the resolver closed. An
+ * unsealed split's userShareAmount is NEVER read.
+ */
+async function mandatoryPurchasePersonalShareAsOf(
 	db: Database,
+	userId: string,
 	purchaseEventId: string,
 	grossCents: bigint,
 	asOf: Date,
-): Promise<bigint> {
-	const revs = await db
-		.select({
-			revisionNo: creditCardPurchaseSplitRevisions.revisionNo,
-			userShare: creditCardPurchaseSplitRevisions.userShareAmount,
-			operation: creditCardPurchaseSplitRevisions.operation,
-			occurredAt: creditCardPurchaseSplitRevisions.occurredAt,
-		})
-		.from(creditCardPurchaseSplitRevisions)
-		.innerJoin(
-			creditCardPurchaseSplits,
-			eq(creditCardPurchaseSplits.id, creditCardPurchaseSplitRevisions.splitId),
-		)
-		.where(eq(creditCardPurchaseSplits.purchaseEventId, purchaseEventId));
-	const eff = effectiveRevisionAsOf(revs, asOf);
-	if (!eff || eff.operation === "VOID") return grossCents;
-	return parseAggregateMoneyString(eff.userShare).cents;
+): Promise<MandatoryPurchaseShare> {
+	const res = await resolveAuthoritativePurchaseSplitAsOf({
+		db,
+		userId,
+		purchaseEventId,
+		asOf,
+		expectedPurchaseCents: grossCents,
+	});
+	if (res.kind === "NO_SPLIT") {
+		return {
+			personalCents: grossCents,
+			splitBasis: "NO_SPLIT",
+			splitRevisionId: null,
+		};
+	}
+	if (res.kind === "VOID_SPLIT") {
+		return {
+			personalCents: grossCents,
+			splitBasis: "VOID_SPLIT",
+			splitRevisionId: res.splitRevisionId,
+		};
+	}
+	if (res.kind === "ACTIVE") {
+		return {
+			personalCents: res.userShareCents,
+			splitBasis: "SEALED_SPLIT_AS_OF",
+			splitRevisionId: res.splitRevisionId,
+		};
+	}
+	failClosed(
+		`credit-card purchase ${purchaseEventId}: its economic split is not authoritative as of ${asOf.toISOString()} (${res.reason})`,
+	);
 }
 
 interface BasicLivingResult {
@@ -686,12 +712,14 @@ async function resolveBasicLiving(
 		const at = asDate(p.occurredAt);
 		if (!win.inMtd(at)) continue;
 		const grossCents = parseAggregateMoneyString(p.amount).cents;
-		const personalCents = await personalPurchaseShareCentsAsOf(
+		const share = await mandatoryPurchasePersonalShareAsOf(
 			db,
+			userId,
 			eventId,
 			grossCents,
 			win.asOf,
 		);
+		const personalCents = share.personalCents;
 		spend += personalCents;
 		mandatoryPersonalByEvent.set(
 			eventId,
@@ -701,6 +729,8 @@ async function resolveBasicLiving(
 			source: "CREDIT_CARD_PURCHASE",
 			eventId,
 			personalShare: formatCentsToMoney(personalCents),
+			splitBasis: share.splitBasis,
+			splitRevisionId: share.splitRevisionId,
 			occurredAt: at.toISOString(),
 		});
 	}

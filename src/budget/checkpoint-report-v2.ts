@@ -1,4 +1,5 @@
 import { and, asc, eq } from "drizzle-orm";
+import { resolveAuthoritativePurchaseSplitAsOf } from "../credit-cards/purchase-split-read";
 import {
 	getStatementReconciliationAsOf,
 	type StatementReconciliationStatus,
@@ -13,9 +14,6 @@ import {
 } from "../db/schema/credit-card-ledger";
 import {
 	creditCardPurchaseSplitParticipants,
-	creditCardPurchaseSplitRevisionItems,
-	creditCardPurchaseSplitRevisionSeals,
-	creditCardPurchaseSplitRevisions,
 	creditCardPurchaseSplits,
 } from "../db/schema/credit-card-splits";
 import {
@@ -538,159 +536,6 @@ function makeCardMetaAsOf(
 // Sealed split truth (strict), effective AS OF a point in time
 // ============================================================================
 
-type SealedSplitResolution =
-	| { kind: "NO_SPLIT" }
-	| { kind: "VOID_SPLIT"; splitRevisionId: string }
-	| {
-			kind: "ACTIVE";
-			splitRevisionId: string;
-			grossCents: bigint;
-			userShareCents: bigint;
-			externalShareCents: bigint;
-			participants: Array<{
-				personId: string;
-				shareCents: bigint;
-				personObligationId: string;
-			}>;
-	  }
-	| { kind: "UNRESOLVED"; reason: string; inconsistent: boolean };
-
-/**
- * The authoritative economic split of a purchase, effective at `at`:
- *  - no split anchor, or no split revision with occurredAt <= at -> NO_SPLIT
- *  - effective revision is VOID -> VOID_SPLIT (100% personal)
- *  - effective revision is non-VOID -> ACTIVE only when it is SEALED and
- *    internally consistent (user + external == gross, item shares sum to the
- *    external share, every item person has a participant anchor); otherwise
- *    UNRESOLVED (`inconsistent` distinguishes "not yet authoritative" from
- *    "internally corrupt").
- * Never trusts an unsealed or future revision; never infers by amount / name.
- */
-async function resolveSealedSplitAsOf(
-	db: Database,
-	userId: string,
-	purchaseEventId: string,
-	at: Date,
-): Promise<SealedSplitResolution> {
-	const [split] = await db
-		.select({
-			id: creditCardPurchaseSplits.id,
-			userId: creditCardPurchaseSplits.userId,
-		})
-		.from(creditCardPurchaseSplits)
-		.where(eq(creditCardPurchaseSplits.purchaseEventId, purchaseEventId))
-		.limit(1);
-	if (!split) return { kind: "NO_SPLIT" };
-	if (split.userId !== userId) {
-		return {
-			kind: "UNRESOLVED",
-			reason: `split for purchase ${purchaseEventId} is not owned by this user`,
-			inconsistent: true,
-		};
-	}
-
-	const revs = await db
-		.select({
-			id: creditCardPurchaseSplitRevisions.id,
-			revisionNo: creditCardPurchaseSplitRevisions.revisionNo,
-			operation: creditCardPurchaseSplitRevisions.operation,
-			gross: creditCardPurchaseSplitRevisions.grossAmount,
-			userShare: creditCardPurchaseSplitRevisions.userShareAmount,
-			externalShare: creditCardPurchaseSplitRevisions.externalShareAmount,
-			occurredAt: creditCardPurchaseSplitRevisions.occurredAt,
-		})
-		.from(creditCardPurchaseSplitRevisions)
-		.where(eq(creditCardPurchaseSplitRevisions.splitId, split.id));
-	const eff = effectiveRevisionAsOf(revs, at);
-	if (!eff) return { kind: "NO_SPLIT" };
-	if (eff.operation === "VOID") {
-		return { kind: "VOID_SPLIT", splitRevisionId: eff.id };
-	}
-
-	const [seal] = await db
-		.select({ id: creditCardPurchaseSplitRevisionSeals.splitRevisionId })
-		.from(creditCardPurchaseSplitRevisionSeals)
-		.where(eq(creditCardPurchaseSplitRevisionSeals.splitRevisionId, eff.id))
-		.limit(1);
-	if (!seal) {
-		return {
-			kind: "UNRESOLVED",
-			reason: `active split revision ${eff.id} for purchase ${purchaseEventId} is not sealed`,
-			inconsistent: false,
-		};
-	}
-
-	const grossCents = centsOf(eff.gross);
-	const userShareCents = centsOf(eff.userShare);
-	const externalShareCents = centsOf(eff.externalShare);
-	if (userShareCents + externalShareCents !== grossCents) {
-		return {
-			kind: "UNRESOLVED",
-			reason: `split revision ${eff.id}: user ${userShareCents} + external ${externalShareCents} != gross ${grossCents}`,
-			inconsistent: true,
-		};
-	}
-
-	const items = await db
-		.select({
-			personId: creditCardPurchaseSplitRevisionItems.personId,
-			shareAmount: creditCardPurchaseSplitRevisionItems.shareAmount,
-		})
-		.from(creditCardPurchaseSplitRevisionItems)
-		.where(eq(creditCardPurchaseSplitRevisionItems.splitRevisionId, eff.id));
-	const anchors = await db
-		.select({
-			personId: creditCardPurchaseSplitParticipants.personId,
-			personObligationId:
-				creditCardPurchaseSplitParticipants.personObligationId,
-		})
-		.from(creditCardPurchaseSplitParticipants)
-		.where(eq(creditCardPurchaseSplitParticipants.splitId, split.id));
-	const anchorByPerson = new Map(
-		anchors.map((a) => [a.personId, a.personObligationId]),
-	);
-
-	let itemsSum = 0n;
-	const participants: {
-		personId: string;
-		shareCents: bigint;
-		personObligationId: string;
-	}[] = [];
-	for (const it of items) {
-		const sc = centsOf(it.shareAmount);
-		itemsSum += sc;
-		const obl = anchorByPerson.get(it.personId);
-		if (!obl) {
-			return {
-				kind: "UNRESOLVED",
-				reason: `split revision ${eff.id} item person ${it.personId} has no participant anchor`,
-				inconsistent: true,
-			};
-		}
-		participants.push({
-			personId: it.personId,
-			shareCents: sc,
-			personObligationId: obl,
-		});
-	}
-	if (itemsSum !== externalShareCents) {
-		return {
-			kind: "UNRESOLVED",
-			reason: `split revision ${eff.id}: item share sum ${itemsSum} != external share ${externalShareCents}`,
-			inconsistent: true,
-		};
-	}
-
-	return {
-		kind: "ACTIVE",
-		splitRevisionId: eff.id,
-		grossCents,
-		userShareCents,
-		externalShareCents,
-		participants,
-	};
-}
-
 interface PurchaseSharesAvailable {
 	available: true;
 	personalCents: bigint;
@@ -714,7 +559,13 @@ async function purchaseSharesAsOf(
 	grossCents: bigint,
 	at: Date,
 ): Promise<PurchaseSharesResult> {
-	const res = await resolveSealedSplitAsOf(db, userId, purchaseEventId, at);
+	const res = await resolveAuthoritativePurchaseSplitAsOf({
+		db,
+		userId,
+		purchaseEventId,
+		asOf: at,
+		expectedPurchaseCents: grossCents,
+	});
 	if (res.kind === "NO_SPLIT") {
 		return {
 			available: true,
@@ -735,12 +586,6 @@ async function purchaseSharesAsOf(
 	}
 	if (res.kind === "UNRESOLVED") {
 		return { available: false, reason: res.reason };
-	}
-	if (res.grossCents !== grossCents) {
-		return {
-			available: false,
-			reason: `sealed split gross ${res.grossCents} does not match the purchase amount ${grossCents} being reported`,
-		};
 	}
 	const participants: PurchaseSharesAvailable["participants"] = [];
 	for (const p of res.participants) {
@@ -1477,12 +1322,12 @@ async function buildPeopleFamily(
 					`split participant for obligation ${o.id} references a missing split anchor ${link.splitId}`,
 				);
 			}
-			const sres = await resolveSealedSplitAsOf(
+			const sres = await resolveAuthoritativePurchaseSplitAsOf({
 				db,
 				userId,
-				split.purchaseEventId,
-				checkpointAt,
-			);
+				purchaseEventId: split.purchaseEventId,
+				asOf: checkpointAt,
+			});
 			if (sres.kind === "ACTIVE") {
 				const inRevision = sres.participants.some(
 					(pp) =>

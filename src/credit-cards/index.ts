@@ -3,6 +3,7 @@ export * from "./errors";
 export * from "./fingerprint";
 export * from "./ledger-provisioning";
 export * from "./payments";
+export * from "./purchase-split-read";
 export * from "./purchases";
 export * from "./reconciliation-fingerprint";
 export * from "./service";

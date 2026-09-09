@@ -4019,6 +4019,364 @@ async function resolverRuntime4B2() {
 	}
 }
 
+// ============================================================================
+// PHASE 4B.3: ONE AUTHORITATIVE AS-OF PURCHASE-SPLIT READER
+// ============================================================================
+
+async function resolverRuntime4B3() {
+	console.log(
+		"\n== PHASE 4B.3: ONE AUTHORITATIVE AS-OF SPLIT READER (drizzle / PGlite) ==",
+	);
+	const { buildBudgetV2CheckpointReport } = await import(
+		"../src/budget/checkpoint-report-v2.ts"
+	);
+	const { resolveBudgetV2LiveSnapshot } = await import(
+		"../src/budget/live-resolver-v2.ts"
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+	const { P } = B4_IDS;
+	const RECON_AT = new Date("2026-09-01T00:00:00Z");
+	const at = (iso: string) => new Date(iso);
+	const asOf15 = at("2026-09-15T00:00:00Z");
+
+	const eqB = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `-> got ${JSON.stringify(a)} want ${JSON.stringify(b)}`);
+	const chkB = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	const expectThrowB = async (
+		fn: () => Promise<unknown>,
+		needle: string,
+		name: string,
+	) => {
+		try {
+			await fn();
+			bad(name, "-> did not throw");
+		} catch (e) {
+			String((e as Error).message).includes(needle)
+				? ok(name)
+				: bad(name, `-> ${(e as Error).message}`);
+		}
+	};
+
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+	const mandSpend = (r: unknown) =>
+		(r as { evidenceSnapshot: { basicLiving: { actualPersonalMandatorySpendMTD: string } } })
+			.evidenceSnapshot.basicLiving.actualPersonalMandatorySpendMTD;
+	// seed a MANDATORY_EXPENSE purchase (returns eid/er), caller manages replica
+	const mkMand = async (s: S, amount: string, occ = "2026-09-05 00:00:00+00") =>
+		s.mkPur(amount, "MANDATORY_EXPENSE", occ);
+	// seed a PAID + reconciled (all-personal ADJUSTMENT) trigger, returns pe
+	const mkTrigger = async (s: S, amount = "400.00") => {
+		await s.replica();
+		const sid = "81000000-0000-4000-8000-0000000000e1";
+		const r1 = await s.mkStmt(sid, amount, 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: "rc-trig3",
+			occurredAt: RECON_AT,
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe } = await s.mkPay(sid, r1, amount, 2, "2026-09-15 00:00:00+00");
+		await s.origin();
+		return pe;
+	};
+
+	// ---- A: sealed valid split => resolver uses the exact user share
+	{
+		const s = await make4bScenario();
+		const OBL = "8a000000-0000-4000-8000-00000000c1a1";
+		await s.replica();
+		const pur = await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-03 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: "87000000-0000-4000-8000-00000000c1a1",
+			user: "400.00", ext: "600.00", gross: "1000.00", occ: "2026-09-03 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL,
+		});
+		await s.origin();
+		const r = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: asOf15 });
+		eqB(mandSpend(r), "400.00", "4B.3/A: a sealed valid split => resolver uses the exact user share (400)");
+		await s.close();
+	}
+
+	// ---- B: no split => 100% personal
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await s.origin();
+		const r = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: asOf15 });
+		eqB(mandSpend(r), "1000.00", "4B.3/B: no split => 100% personal");
+		await s.close();
+	}
+
+	// ---- C: effective VOID split => 100% personal
+	{
+		const s = await make4bScenario();
+		const OBL = "8a000000-0000-4000-8000-00000000c1a2";
+		await s.replica();
+		const pur = await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-03 00:00:00+00");
+		const sp = await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: "87000000-0000-4000-8000-00000000c1a2",
+			user: "400.00", ext: "600.00", gross: "1000.00", occ: "2026-09-03 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL,
+		});
+		await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: sp.splitId, revNo: 2, prevRevId: sp.splitRev,
+			op: "VOID", user: "1000.00", ext: "0.00", gross: "1000.00", occ: "2026-09-05 00:00:00+00",
+			withItem: false, sealed: false,
+		});
+		await s.origin();
+		const r = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: asOf15 });
+		eqB(mandSpend(r), "1000.00", "4B.3/C: an effective VOID split => 100% personal");
+		await s.close();
+	}
+
+	// ---- D: effective non-VOID split WITHOUT seal => live resolver FAILS CLOSED
+	{
+		const s = await make4bScenario();
+		const OBL = "8a000000-0000-4000-8000-00000000c1a3";
+		await s.replica();
+		const pur = await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-03 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: "87000000-0000-4000-8000-00000000c1a3",
+			user: "400.00", ext: "600.00", gross: "1000.00", occ: "2026-09-03 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL, sealed: false,
+		});
+		await s.origin();
+		await expectThrowB(
+			() => resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: asOf15 }),
+			"is not sealed",
+			"4B.3/D: an effective non-VOID split WITHOUT a seal fails the live resolver closed (userShare never read)",
+		);
+		await s.close();
+	}
+
+	// ---- E: user + external != gross is guaranteed by a DB CHECK constraint
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await expectThrowB(
+			() =>
+				s.q(
+					`insert into credit_card_purchase_split_revisions (id,split_id,revision_no,operation,method,purchase_event_revision_id,gross_amount,user_share_amount,external_share_amount,occurred_at,revision_fingerprint)
+					 values ($1,$1,1,'CREATE','MANUAL',$2,'1000.00','400.00','500.00','2026-09-03 00:00:00+00',$3)`,
+					[s.gid(), pur.er, s.F],
+				),
+			"sum_check",
+			"4B.3/E: user + external != gross is rejected by the DB CHECK (reader invariant 6 is belt-and-suspenders)",
+		);
+		await s.origin();
+		await s.close();
+	}
+
+	// ---- F: sealed split item sum != external => FAIL CLOSED
+	{
+		const s = await make4bScenario();
+		const OBL = "8a000000-0000-4000-8000-00000000c1a4";
+		await s.replica();
+		const pur = await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-03 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: "87000000-0000-4000-8000-00000000c1a4",
+			user: "400.00", ext: "600.00", gross: "1000.00", occ: "2026-09-03 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL, itemShare: "500.00",
+		});
+		await s.origin();
+		await expectThrowB(
+			() => resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: asOf15 }),
+			"item share sum",
+			"4B.3/F: a sealed split whose item shares do not sum to the external share fails closed",
+		);
+		await s.close();
+	}
+
+	// ---- G: split gross != effective purchase amount => FAIL CLOSED
+	{
+		const s = await make4bScenario();
+		const OBL = "8a000000-0000-4000-8000-00000000c1a5";
+		await s.replica();
+		const pur = await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "500.00", "2026-09-03 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: "87000000-0000-4000-8000-00000000c1a5",
+			user: "300.00", ext: "500.00", gross: "800.00", occ: "2026-09-03 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL,
+		});
+		await s.origin();
+		await expectThrowB(
+			() => resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: asOf15 }),
+			"does not match the effective purchase amount",
+			"4B.3/G: a sealed split whose gross != the effective purchase amount fails closed",
+		);
+		await s.close();
+	}
+
+	// ---- H: split item references a participant anchor from a DIFFERENT split => FAIL CLOSED
+	{
+		const s = await make4bScenario();
+		const OBL1 = "8a000000-0000-4000-8000-00000000c1a6";
+		const OBL2 = "8a000000-0000-4000-8000-00000000c1a7";
+		await s.replica();
+		const pur1 = await mkMand(s, "500.00", "2026-09-02 00:00:00+00");
+		const pur2 = await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL1, s.P_FAM, "RECEIVABLE", "200.00", "2026-09-02 00:00:00+00");
+		await s.mkObligation(OBL2, s.P_FRI, "RECEIVABLE", "600.00", "2026-09-03 00:00:00+00");
+		// split1 -> creates participant anchor A1 for P_FAM
+		const sp1 = await s.mkSplit({
+			purchaseEid: pur1.eid, purchaseEr: pur1.er, splitId: "87000000-0000-4000-8000-00000000c1a6",
+			user: "300.00", ext: "200.00", gross: "500.00", occ: "2026-09-02 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL1,
+		});
+		// split2 for pur2: its revision item points at split1's participant anchor A1
+		await s.mkSplit({
+			purchaseEid: pur2.eid, purchaseEr: pur2.er, splitId: "87000000-0000-4000-8000-00000000c1a7",
+			user: "400.00", ext: "600.00", gross: "1000.00", occ: "2026-09-03 00:00:00+00",
+			personId: s.P_FAM, participantId: sp1.participantId, itemShare: "600.00",
+		});
+		await s.origin();
+		await expectThrowB(
+			() => resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: asOf15 }),
+			"is not an anchored participant of split",
+			"4B.3/H: a split revision item that references a participant from another split fails closed",
+		);
+		await s.close();
+	}
+
+	// ---- I: a future split revision after asOf is ignored; earlier state retained
+	{
+		const s = await make4bScenario();
+		const OBL = "8a000000-0000-4000-8000-00000000c1a8";
+		await s.replica();
+		const pur = await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "900.00", "2026-09-03 00:00:00+00");
+		const sp = await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: "87000000-0000-4000-8000-00000000c1a8",
+			user: "400.00", ext: "600.00", gross: "1000.00", occ: "2026-09-03 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL,
+		});
+		await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: sp.splitId, revNo: 2, prevRevId: sp.splitRev,
+			op: "UPDATE", user: "100.00", ext: "900.00", gross: "1000.00", occ: "2026-09-20 00:00:00+00",
+			personId: s.P_FAM, participantId: sp.participantId, itemShare: "900.00",
+		});
+		await s.origin();
+		const r15 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: asOf15 });
+		const r25 = await resolveBudgetV2LiveSnapshot({ db: s.db, userId: U1, periodMonth: P, asOf: at("2026-09-25T00:00:00Z") });
+		eqB(mandSpend(r15), "400.00", "4B.3/I: at Sep-15 the earlier authoritative split revision is retained (user 400)");
+		eqB(mandSpend(r25), "100.00", "4B.3/I: the Sep-20 split revision applies only from Sep-25 onward (user 100)");
+		await s.close();
+	}
+
+	// ---- J: report MTD personal/external totals for a valid split are unchanged
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		const OBL = "8a000000-0000-4000-8000-00000000c1a9";
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "SHORT_TERM_PURCHASE", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-03 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: "87000000-0000-4000-8000-00000000c1a9",
+			user: "400.00", ext: "600.00", gross: "1000.00", occ: "2026-09-03 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL,
+		});
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: pe });
+		eqB(rep.mtd.spending.byCategoryPersonalShare.SHORT_TERM_PURCHASE, "400.00", "4B.3/J: report MTD personal share via the shared reader is unchanged (400)");
+		eqB(rep.mtd.spending.externalCardSpendMTD, "600.00", "4B.3/J: report MTD external share is unchanged (600)");
+		eqB(rep.mtd.spending.externalCardSpendByRelationship.FAMILY, "600.00", "4B.3/J: external attributed to FAMILY by exact split truth");
+		await s.close();
+	}
+
+	// ---- K: interval report ownership stays `{available:false}` where unprovable
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		const OBL = "8a000000-0000-4000-8000-00000000c1b1";
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "SHORT_TERM_PURCHASE", "2026-09-05 00:00:00+00");
+		await s.mkPurRev(pur.eid, pur.er, 2, "VOID", "1000.00", "SHORT_TERM_PURCHASE", "2026-09-08 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-04 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: "87000000-0000-4000-8000-00000000c1b1",
+			user: "400.00", ext: "600.00", gross: "1000.00", occ: "2026-09-04 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL, sealed: false,
+		});
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: pe });
+		const rows = rep.interval.purchases.activity.filter((x) => x.eventId === pur.eid);
+		chkB(
+			rows.length > 0 && rows.every((x) => x.ownership.available === false),
+			"4B.3/K: an interval purchase whose split is unsealed reports ownership {available:false} (unchanged)",
+		);
+		await s.close();
+	}
+
+	// ---- M: statement reconciliation sees an unsealed effective split => STALE / unusable
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const sid = "81000000-0000-4000-8000-0000000000e2";
+		const r1 = await s.mkStmt(sid, "1000.00", 9);
+		const pur = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", "2026-09-02 00:00:00+00");
+		const OBL = "8a000000-0000-4000-8000-00000000c1b2";
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "1.00", "2026-09-02 00:00:00+00");
+		const sp = await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: "87000000-0000-4000-8000-00000000c1b2",
+			user: "1000.00", ext: "0.00", gross: "1000.00", occ: "2026-09-02 00:00:00+00",
+			personId: s.P_FAM, personObligationId: OBL, withItem: false,
+		});
+		await s.origin();
+		await reconcileStatement({
+			db: s.db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: "rc-m3", occurredAt: RECON_AT,
+			components: [
+				{
+					componentType: "PURCHASE",
+					amount: "1000.00",
+					ownership: "PERSONAL",
+					purchaseEventId: pur.eid,
+					purchaseSplitRevisionId: sp.splitRev,
+				},
+			],
+		});
+		await s.replica();
+		// an UNSEALED split revision effective BEFORE the checkpoint supersedes rev1
+		await s.mkSplit({
+			purchaseEid: pur.eid, purchaseEr: pur.er, splitId: sp.splitId, revNo: 2, prevRevId: sp.splitRev,
+			op: "UPDATE", user: "1000.00", ext: "0.00", gross: "1000.00", occ: "2026-09-05 00:00:00+00",
+			personId: s.P_FAM, participantId: sp.participantId, withItem: false, sealed: false,
+		});
+		const { pe } = await s.mkPay(sid, r1, "1000.00", 2, "2026-09-15 00:00:00+00");
+		await s.origin();
+		await expectThrowB(
+			() => buildBudgetV2CheckpointReport({ db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: pe }),
+			"reconciliation is STALE",
+			"4B.3/M: a reconciliation whose referenced split is unsealed as of the checkpoint is STALE / unusable",
+		);
+		await s.close();
+	}
+}
+
 
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
@@ -4029,6 +4387,7 @@ if (probed) {
 	await resolverRuntime4A1();
 	await resolverRuntime4B();
 	await resolverRuntime4B2();
+	await resolverRuntime4B3();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
