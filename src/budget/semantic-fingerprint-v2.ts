@@ -2,6 +2,12 @@ import type {
 	StgBudgetV2Purpose,
 	SupportReceiptRole,
 } from "../db/schema/budget-v2-semantics";
+import type {
+	SpendingFoodOperation,
+	SpendingFoodSourceKind,
+	SpendingFoodSplitBasis,
+	SpendingFoodSubjectType,
+} from "../db/schema/budget-v2-spending-food";
 
 async function sha256Hex(tuple: unknown[]): Promise<string> {
 	const encoded = new TextEncoder().encode(JSON.stringify(tuple));
@@ -95,6 +101,53 @@ export function calculateBasicLivingConfigRevisionFingerprint(
 		params.monthlyTargetAmount,
 		params.currency,
 		params.sourceKind,
+		params.occurredAt.toISOString(),
+	]);
+}
+
+export interface SpendingFoodSemanticFingerprintParams {
+	userId: string;
+	subjectType: SpendingFoodSubjectType;
+	purchaseEventId: string | null;
+	personObligationId: string | null;
+	operation: SpendingFoodOperation;
+	revisionNo: number;
+	previousRevisionId: string | null;
+	basisPersonalAmount: string;
+	foodHomeMarketAmount: string;
+	foodOutsideAmount: string;
+	sourceKind: SpendingFoodSourceKind;
+	purchaseEventRevisionId: string | null;
+	personObligationRevisionId: string | null;
+	splitBasis: SpendingFoodSplitBasis | null;
+	splitRevisionId: string | null;
+	occurredAt: Date;
+}
+
+const lc = (v: string | null): string | null =>
+	v ? v.trim().toLowerCase() : null;
+
+/** Deterministic 64 lowercase-hex fingerprint for a spending-food semantic revision. */
+export function calculateSpendingFoodSemanticRevisionFingerprint(
+	params: SpendingFoodSemanticFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"budget-v2-spending-food-semantic-v1",
+		params.userId.trim().toLowerCase(),
+		params.subjectType,
+		lc(params.purchaseEventId),
+		lc(params.personObligationId),
+		params.operation,
+		params.revisionNo,
+		lc(params.previousRevisionId),
+		params.basisPersonalAmount,
+		params.foodHomeMarketAmount,
+		params.foodOutsideAmount,
+		params.sourceKind,
+		lc(params.purchaseEventRevisionId),
+		lc(params.personObligationRevisionId),
+		params.splitBasis,
+		lc(params.splitRevisionId),
 		params.occurredAt.toISOString(),
 	]);
 }

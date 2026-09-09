@@ -9,6 +9,7 @@ export * from "./policy-v2";
 export * from "./semantic-fingerprint-v2";
 export * from "./service";
 export * from "./service-v2";
+export * from "./spending-food-classification-v2";
 export * from "./support-classification-v2";
 export * from "./support-semantics-v2";
 export * from "./utils";

@@ -4,6 +4,7 @@ export * from "./budget";
 export * from "./budget-basic-living";
 export * from "./budget-v2";
 export * from "./budget-v2-semantics";
+export * from "./budget-v2-spending-food";
 export * from "./campaigns";
 export * from "./credit-card-ledger";
 export * from "./credit-card-splits";

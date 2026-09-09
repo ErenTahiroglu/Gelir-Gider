@@ -43,6 +43,10 @@ import {
 	type ResolverWindow,
 	resolveBudgetV2LiveSnapshot,
 } from "./live-resolver-v2";
+import {
+	type FoodClassificationKind,
+	getSpendingFoodClassificationAsOf,
+} from "./spending-food-classification-v2";
 import { normalizeUuid, validateBudgetPeriodMonth } from "./utils";
 
 /**
@@ -341,12 +345,66 @@ export interface MtdSection {
 	};
 }
 
-export interface FoodAnalyticsSection {
-	available: false;
-	reason: "FOOD_SEMANTIC_CLASSIFICATION_NOT_STORED";
-	supportedBudgetTruth: string;
-	merchantInferenceUsed: false;
+/**
+ * One eligible PERSONAL economic spending subject in the MTD window and its
+ * explicit (user-approved) food-semantic status effective at the checkpoint.
+ * `classificationStatus`:
+ *   CLASSIFIED   -- an active, non-stale approved allocation (incl. NON_FOOD 0/0)
+ *   UNCLASSIFIED -- no approved allocation
+ *   STALE        -- the stored basis no longer matches the authoritative
+ *                   personal economic amount; a new approved UPDATE is required
+ */
+export interface FoodSubjectEntry {
+	subjectType: "CREDIT_CARD_PURCHASE" | "PEOPLE_PAYABLE";
+	subjectId: string;
+	effectiveFinancialRevisionId: string;
+	personalEconomicAmount: string;
+	classificationStatus: "CLASSIFIED" | "UNCLASSIFIED" | "STALE";
+	semanticRevisionId: string | null;
+	semanticRevisionNo: number | null;
+	foodHomeMarketAmount: string | null;
+	foodOutsideAmount: string | null;
+	foodTotalAmount: string | null;
+	nonFoodAmount: string | null;
+	classificationKind: FoodClassificationKind | null;
+	sourceKind: "USER_APPROVED" | "USER_APPROVED_FROM_SUGGESTION" | null;
 }
+
+/**
+ * FOOD_TOTAL is presented as an EXACT total only when every eligible active
+ * MTD spending subject is CLASSIFIED. Any UNCLASSIFIED / STALE subject flips
+ * `available` to false with reason FOOD_CLASSIFICATION_INCOMPLETE, and only
+ * clearly-labelled partial known totals are exposed.
+ */
+export interface FoodAnalyticsAvailable {
+	available: true;
+	merchantInferenceUsed: false;
+	subjects: FoodSubjectEntry[];
+	classifiedSubjectCount: number;
+	foodHomeMarket: string;
+	foodOutside: string;
+	foodTotal: string;
+	classifiedPersonalSpend: string;
+}
+
+export interface FoodAnalyticsIncomplete {
+	available: false;
+	reason: "FOOD_CLASSIFICATION_INCOMPLETE";
+	merchantInferenceUsed: false;
+	subjects: FoodSubjectEntry[];
+	classifiedSubjectCount: number;
+	unclassifiedSubjectIds: string[];
+	staleSubjectIds: string[];
+	classifiedPersonalSpend: string;
+	unclassifiedOrStalePersonalSpend: string;
+	partialKnownFoodHomeMarket: string;
+	partialKnownFoodOutside: string;
+	partialKnownFoodTotal: string;
+}
+
+export type FoodAnalyticsSection =
+	| FoodAnalyticsAvailable
+	| FoodAnalyticsIncomplete;
 
 export interface InstallmentAnalyticsSection {
 	purchases: Array<{
@@ -1523,6 +1581,236 @@ export function assembleMtdNonSpending(
 }
 
 // ============================================================================
+// Section 12 -- authoritative MTD food semantics (checkpoint 4C)
+// ============================================================================
+
+interface FoodUniverseSubject {
+	subjectType: "CREDIT_CARD_PURCHASE" | "PEOPLE_PAYABLE";
+	subjectId: string;
+	effectiveFinancialRevisionId: string;
+	personalCents: bigint;
+}
+
+/**
+ * Every eligible PERSONAL economic spending subject whose economic occurrence
+ * lands in the MTD window and is still economically active at `checkpointAt`:
+ *   - CREDIT_CARD_PURCHASE: effective non-VOID purchase revision, PERSONAL
+ *     share (reusing the 4B.3 shared split reader via `purchaseSharesAsOf`)
+ *   - PEOPLE_PAYABLE: effective non-VOID PAYABLE obligation, principal, whose
+ *     CREATE (economic occurrence) is in the MTD window
+ * Family/friend external shares, People RECEIVABLE, reimbursements, family
+ * gift / support income, statement payments and Midas movement are excluded.
+ */
+async function loadFoodUniverse(
+	db: Database,
+	userId: string,
+	win: ResolverWindow,
+	checkpointAt: Date,
+	events: PurchaseEventRow[],
+): Promise<FoodUniverseSubject[]> {
+	const subjects: FoodUniverseSubject[] = [];
+
+	for (const ev of events) {
+		const revs = await db
+			.select({
+				id: creditCardLiabilityEventRevisions.id,
+				revisionNo: creditCardLiabilityEventRevisions.revisionNo,
+				operation: creditCardLiabilityEventRevisions.operation,
+				amount: creditCardLiabilityEventRevisions.amount,
+				occurredAt: creditCardLiabilityEventRevisions.occurredAt,
+			})
+			.from(creditCardLiabilityEventRevisions)
+			.where(eq(creditCardLiabilityEventRevisions.eventId, ev.eventId));
+		const eff = effectiveRevisionAsOf(revs, checkpointAt);
+		if (!eff || eff.operation === "VOID") continue;
+		const at = asDate(eff.occurredAt);
+		if (!win.inMtd(at)) continue;
+		const grossCents = centsOf(eff.amount);
+		const shares = await purchaseSharesAsOf(
+			db,
+			userId,
+			ev.eventId,
+			grossCents,
+			checkpointAt,
+		);
+		if (!shares.available) {
+			reportFailClosed(
+				`MTD food: purchase ${ev.eventId} ownership cannot be authoritatively resolved as of the checkpoint (${shares.reason})`,
+			);
+		}
+		if (shares.personalCents <= 0n) continue; // no personal spend to classify
+		subjects.push({
+			subjectType: "CREDIT_CARD_PURCHASE",
+			subjectId: ev.eventId,
+			effectiveFinancialRevisionId: eff.id,
+			personalCents: shares.personalCents,
+		});
+	}
+
+	const payables = await db
+		.select({ id: personObligations.id })
+		.from(personObligations)
+		.where(
+			and(
+				eq(personObligations.userId, userId),
+				eq(personObligations.direction, "PAYABLE"),
+			),
+		);
+	for (const o of payables) {
+		const oRevs = await db
+			.select({
+				id: personObligationRevisions.id,
+				revisionNo: personObligationRevisions.revisionNo,
+				operation: personObligationRevisions.operation,
+				principal: personObligationRevisions.principalAmount,
+				occurredAt: personObligationRevisions.occurredAt,
+			})
+			.from(personObligationRevisions)
+			.where(eq(personObligationRevisions.obligationId, o.id));
+		const eff = effectiveRevisionAsOf(oRevs, checkpointAt);
+		if (!eff || eff.operation === "VOID") continue;
+		const create = oRevs.find((r) => r.revisionNo === 1);
+		if (!create) continue;
+		// Economic expense occurrence = the CREATE revision instant. A later
+		// UPDATE corrects the principal but not when the expense happened.
+		if (!win.inMtd(asDate(create.occurredAt))) continue;
+		const principalCents = centsOf(eff.principal);
+		if (principalCents <= 0n) continue;
+		subjects.push({
+			subjectType: "PEOPLE_PAYABLE",
+			subjectId: o.id,
+			effectiveFinancialRevisionId: eff.id,
+			personalCents: principalCents,
+		});
+	}
+
+	subjects.sort((a, b) =>
+		a.subjectType === b.subjectType
+			? a.subjectId.localeCompare(b.subjectId)
+			: a.subjectType.localeCompare(b.subjectType),
+	);
+	return subjects;
+}
+
+async function buildFoodAnalytics(
+	db: Database,
+	userId: string,
+	win: ResolverWindow,
+	checkpointAt: Date,
+	events: PurchaseEventRow[],
+): Promise<FoodAnalyticsSection> {
+	const universe = await loadFoodUniverse(
+		db,
+		userId,
+		win,
+		checkpointAt,
+		events,
+	);
+
+	const subjects: FoodSubjectEntry[] = [];
+	let homeTotal = 0n;
+	let outsideTotal = 0n;
+	let classifiedPersonal = 0n;
+	let unclassifiedOrStalePersonal = 0n;
+	const unclassifiedSubjectIds: string[] = [];
+	const staleSubjectIds: string[] = [];
+
+	for (const subj of universe) {
+		const view = await getSpendingFoodClassificationAsOf({
+			db,
+			userId,
+			subject:
+				subj.subjectType === "CREDIT_CARD_PURCHASE"
+					? { type: "CREDIT_CARD_PURCHASE", purchaseEventId: subj.subjectId }
+					: { type: "PEOPLE_PAYABLE", personObligationId: subj.subjectId },
+			asOf: checkpointAt,
+		});
+
+		// The subject was pre-filtered to an economically-active source, so the
+		// only statuses possible here are CLASSIFIED / UNCLASSIFIED / STALE.
+		const status: FoodSubjectEntry["classificationStatus"] =
+			view.status === "CLASSIFIED"
+				? "CLASSIFIED"
+				: view.status === "STALE" || view.status === "SOURCE_VOID"
+					? "STALE"
+					: "UNCLASSIFIED";
+
+		const entry: FoodSubjectEntry = {
+			subjectType: subj.subjectType,
+			subjectId: subj.subjectId,
+			effectiveFinancialRevisionId: subj.effectiveFinancialRevisionId,
+			personalEconomicAmount: formatCentsToMoney(subj.personalCents),
+			classificationStatus: status,
+			semanticRevisionId: view.semanticRevisionId,
+			semanticRevisionNo: view.semanticRevisionNo,
+			foodHomeMarketAmount:
+				status === "CLASSIFIED" ? view.foodHomeMarketAmount : null,
+			foodOutsideAmount:
+				status === "CLASSIFIED" ? view.foodOutsideAmount : null,
+			foodTotalAmount: status === "CLASSIFIED" ? view.foodTotalAmount : null,
+			nonFoodAmount: status === "CLASSIFIED" ? view.nonFoodAmount : null,
+			classificationKind:
+				status === "CLASSIFIED" ? view.classificationKind : null,
+			sourceKind: status === "CLASSIFIED" ? view.sourceKind : null,
+		};
+		subjects.push(entry);
+
+		if (status === "CLASSIFIED") {
+			homeTotal += centsOf(view.foodHomeMarketAmount ?? "0.00");
+			outsideTotal += centsOf(view.foodOutsideAmount ?? "0.00");
+			classifiedPersonal += subj.personalCents;
+		} else {
+			unclassifiedOrStalePersonal += subj.personalCents;
+			if (status === "STALE") staleSubjectIds.push(subj.subjectId);
+			else unclassifiedSubjectIds.push(subj.subjectId);
+		}
+	}
+
+	const classifiedSubjectCount = subjects.filter(
+		(s) => s.classificationStatus === "CLASSIFIED",
+	).length;
+	const complete =
+		subjects.length === classifiedSubjectCount &&
+		unclassifiedSubjectIds.length === 0 &&
+		staleSubjectIds.length === 0;
+
+	if (complete) {
+		const foodTotal = homeTotal + outsideTotal;
+		// FOOD_TOTAL = FOOD_HOME_MARKET + FOOD_OUTSIDE -- assert the invariant.
+		if (foodTotal !== homeTotal + outsideTotal) {
+			reportFailClosed("FOOD_TOTAL invariant violated");
+		}
+		return {
+			available: true,
+			merchantInferenceUsed: false,
+			subjects,
+			classifiedSubjectCount,
+			foodHomeMarket: formatCentsToMoney(homeTotal),
+			foodOutside: formatCentsToMoney(outsideTotal),
+			foodTotal: formatCentsToMoney(foodTotal),
+			classifiedPersonalSpend: formatCentsToMoney(classifiedPersonal),
+		};
+	}
+
+	return {
+		available: false,
+		reason: "FOOD_CLASSIFICATION_INCOMPLETE",
+		merchantInferenceUsed: false,
+		subjects,
+		classifiedSubjectCount,
+		unclassifiedSubjectIds,
+		staleSubjectIds,
+		classifiedPersonalSpend: formatCentsToMoney(classifiedPersonal),
+		unclassifiedOrStalePersonalSpend: formatCentsToMoney(
+			unclassifiedOrStalePersonal,
+		),
+		partialKnownFoodHomeMarket: formatCentsToMoney(homeTotal),
+		partialKnownFoodOutside: formatCentsToMoney(outsideTotal),
+		partialKnownFoodTotal: formatCentsToMoney(homeTotal + outsideTotal),
+	};
+}
+
+// ============================================================================
 // Orchestration
 // ============================================================================
 
@@ -1619,6 +1907,13 @@ export async function buildBudgetV2CheckpointReport(
 		checkpointAt,
 		purchaseEvents,
 	);
+	const foodAnalytics = await buildFoodAnalytics(
+		db,
+		userId,
+		win,
+		checkpointAt,
+		purchaseEvents,
+	);
 
 	const nonSpending = assembleMtdNonSpending(resolution);
 
@@ -1653,12 +1948,7 @@ export async function buildBudgetV2CheckpointReport(
 			mobility: nonSpending.mobility,
 			necessaryPurchases: nonSpending.necessaryPurchases,
 		},
-		foodAnalytics: {
-			available: false,
-			reason: "FOOD_SEMANTIC_CLASSIFICATION_NOT_STORED",
-			supportedBudgetTruth: "FOOD_TOTAL requires explicit semantic data",
-			merchantInferenceUsed: false,
-		},
+		foodAnalytics,
 		installmentAnalytics: {
 			purchases: installmentPurchases,
 			futureInstallmentProjection: {

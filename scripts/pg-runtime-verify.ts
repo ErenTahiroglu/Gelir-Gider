@@ -310,12 +310,12 @@ function v2Payload(inputs: Record<string, string>, evidence: Record<string, unkn
 }
 
 async function runtime() {
-	console.log("\n== PHASE 2: APPLY MIGRATION CHAIN 0000..0066 (empty disposable DB) ==");
+	console.log("\n== PHASE 2: APPLY MIGRATION CHAIN 0000..0067 (empty disposable DB) ==");
 	const db = new PGlite();
 	await db.query("SET timezone='UTC'");
 	try {
-		await applyChain(db, 66);
-		ok("migration chain 0000..0066 applied to an empty PostgreSQL database");
+		await applyChain(db, 67);
+		ok("migration chain 0000..0067 applied to an empty PostgreSQL database");
 	} catch (e) {
 		bad("migration chain apply", "\n" + (e as Error).message);
 		await db.close();
@@ -335,6 +335,7 @@ async function runtime() {
 		"credit_card_statement_reconciliation_revisions",
 		"credit_card_statement_reconciliation_components",
 		"credit_card_statement_reconciliation_seals",
+		"budget_v2_spending_food_semantic_revisions",
 	]) {
 		tbls.includes(need) ? ok(`table present: ${need}`) : bad(`missing table ${need}`);
 	}
@@ -991,7 +992,7 @@ async function resolverRuntime() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 66);
+	await applyChain(pg, 67);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -1393,7 +1394,7 @@ async function resolverRuntime4A() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 66);
+	await applyChain(pg, 67);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	const F = "f".repeat(64);
@@ -1881,7 +1882,7 @@ async function resolverRuntime4A1() {
 	{
 		const pg0 = new PGlite();
 		await pg0.query("SET timezone='UTC'");
-		await applyChain(pg0, 66);
+		await applyChain(pg0, 67);
 		// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 		const db0 = drizzle(pg0 as any) as any;
 		try {
@@ -1904,7 +1905,7 @@ async function resolverRuntime4A1() {
 	// --- partial carry-in overlap (A..E) ----------------------------------
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 66);
+	await applyChain(pg, 67);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	const F = "f".repeat(64);
@@ -2166,7 +2167,7 @@ async function make4bScenario() {
 	} = B4_IDS;
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 66);
+	await applyChain(pg, 67);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -4378,6 +4379,766 @@ async function resolverRuntime4B3() {
 }
 
 
+async function resolverRuntime4C() {
+	console.log(
+		"\n== PHASE 4C: EXPLICIT SPENDING FOOD SEMANTICS (drizzle / PGlite) ==",
+	);
+	const { buildBudgetV2CheckpointReport } = await import(
+		"../src/budget/checkpoint-report-v2.ts"
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+	const {
+		createSpendingFoodClassification,
+		updateSpendingFoodClassification,
+		voidSpendingFoodClassification,
+		getSpendingFoodClassificationAsOf,
+	} = await import("../src/budget/spending-food-classification-v2.ts");
+	const { P } = B4_IDS;
+	const RECON_AT = new Date("2026-09-01T00:00:00Z");
+	const at = (iso: string) => new Date(iso);
+	const CP15 = at("2026-09-15T00:00:00Z");
+
+	const eqC = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `-> got ${JSON.stringify(a)} want ${JSON.stringify(b)}`);
+	const chkC = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	const expectThrowC = async (
+		fn: () => Promise<unknown>,
+		needle: string,
+		name: string,
+	) => {
+		try {
+			await fn();
+			bad(name, "-> did not throw");
+		} catch (e) {
+			const m = String((e as Error).message);
+			m.includes(needle) && !/23505|duplicate key/.test(m)
+				? ok(name)
+				: bad(name, `-> ${m}`);
+		}
+	};
+
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+	const mkMand = async (s: S, amount: string, occ = "2026-09-05 00:00:00+00") =>
+		s.mkPur(amount, "MANDATORY_EXPENSE", occ);
+	// a PAID + reconciled (all-personal ADJUSTMENT) trigger; returns the payment event
+	const mkTrigger = async (s: S, amount = "400.00") => {
+		await s.replica();
+		const sid = "81000000-0000-4000-8000-0000000000f1";
+		const r1 = await s.mkStmt(sid, amount, 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: "rc-trig4c",
+			occurredAt: RECON_AT,
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe } = await s.mkPay(sid, r1, amount, 2, "2026-09-15 00:00:00+00");
+		await s.origin();
+		return pe;
+	};
+	const ccSub = (id: string) =>
+		({ type: "CREDIT_CARD_PURCHASE", purchaseEventId: id }) as const;
+	const ppSub = (id: string) =>
+		({ type: "PEOPLE_PAYABLE", personObligationId: id }) as const;
+
+	// ---- A: card purchase 100% FOOD_HOME_MARKET
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "300.00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "300.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-a",
+			occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		const v = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: CP15,
+		});
+		eqC(v.status, "CLASSIFIED", "4C/A: 100% home/market classification is CLASSIFIED");
+		eqC(v.classificationKind, "FOOD_HOME_MARKET", "4C/A: derived kind FOOD_HOME_MARKET");
+		eqC(v.foodTotalAmount, "300.00", "4C/A: FOOD_TOTAL = 300");
+		eqC(v.nonFoodAmount, "0.00", "4C/A: nonFood = 0");
+		await s.close();
+	}
+
+	// ---- B: card purchase 100% FOOD_OUTSIDE
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "300.00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "0.00",
+			foodOutsideAmount: "300.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-b",
+			occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		const v = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: CP15,
+		});
+		eqC(v.classificationKind, "FOOD_OUTSIDE", "4C/B: derived kind FOOD_OUTSIDE");
+		await s.close();
+	}
+
+	// ---- C: explicit NON_FOOD (0 / 0)
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "300.00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "0.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-c",
+			occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		const v = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: CP15,
+		});
+		eqC(v.status, "CLASSIFIED", "4C/C: explicit NON_FOOD is CLASSIFIED (not unclassified)");
+		eqC(v.classificationKind, "NON_FOOD", "4C/C: derived kind NON_FOOD");
+		eqC(v.nonFoodAmount, "300.00", "4C/C: nonFood = full basis");
+		await s.close();
+	}
+
+	// ---- D: mixed -- basis 1000, home 500, outside 100, non-food derived 400
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "1000.00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "500.00",
+			foodOutsideAmount: "100.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-d",
+			occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		const v = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: CP15,
+		});
+		eqC(v.classificationKind, "MIXED", "4C/D: derived kind MIXED");
+		eqC(v.foodTotalAmount, "600.00", "4C/D: FOOD_TOTAL = 600");
+		eqC(v.nonFoodAmount, "400.00", "4C/D: nonFood derived = 400");
+		await s.close();
+	}
+
+	// ---- E: home + outside > basis is rejected
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "300.00");
+		await s.origin();
+		await expectThrowC(
+			() =>
+				createSpendingFoodClassification({
+					db: s.db,
+					userId: U1,
+					subject: ccSub(pur.eid),
+					foodHomeMarketAmount: "200.00",
+					foodOutsideAmount: "200.00",
+					sourceKind: "USER_APPROVED",
+					idempotencyKey: "f-e",
+					occurredAt: at("2026-09-10T00:00:00Z"),
+				}),
+			"exceeds the personal economic basis",
+			"4C/E: home + outside > basis is rejected",
+		);
+		await s.close();
+	}
+
+	// ---- F: shared card purchase gross 1000, personal share 400 -> basis is 400
+	{
+		const s = await make4bScenario();
+		const OBL = "8c000000-0000-4000-8000-00000000f001";
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", "2026-09-05 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-05 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid,
+			purchaseEr: pur.er,
+			splitId: "87000000-0000-4000-8000-00000000f001",
+			user: "400.00",
+			ext: "600.00",
+			gross: "1000.00",
+			occ: "2026-09-05 00:00:00+00",
+			personId: s.P_FAM,
+			personObligationId: OBL,
+		});
+		await s.origin();
+		const res = await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "400.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-f",
+			occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		eqC(res.classification.basisPersonalAmount, "400.00", "4C/F: basis is the personal share (400), not gross (1000)");
+		eqC(res.classification.splitBasis, "SEALED_SPLIT_AS_OF", "4C/F: splitBasis evidence = SEALED_SPLIT_AS_OF");
+		await expectThrowC(
+			() =>
+				createSpendingFoodClassification({
+					db: s.db,
+					userId: U1,
+					subject: ccSub(pur.eid),
+					foodHomeMarketAmount: "500.00",
+					foodOutsideAmount: "0.00",
+					sourceKind: "USER_APPROVED",
+					idempotencyKey: "f-f2",
+					occurredAt: at("2026-09-10T00:00:00Z"),
+				}),
+			"already food-classified",
+			"4C/F: a second create on the same subject is a revision conflict",
+		);
+		await s.close();
+	}
+
+	// ---- G: the external family 600 never enters FOOD_TOTAL
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		const OBL = "8c000000-0000-4000-8000-00000000f002";
+		await s.replica();
+		const pur = await mkMand(s, "1000.00", "2026-09-05 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-05 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid,
+			purchaseEr: pur.er,
+			splitId: "87000000-0000-4000-8000-00000000f002",
+			user: "400.00",
+			ext: "600.00",
+			gross: "1000.00",
+			occ: "2026-09-05 00:00:00+00",
+			personId: s.P_FAM,
+			personObligationId: OBL,
+		});
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "400.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-g",
+			occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		chkC(rep.foodAnalytics.available === true, "4C/G: single classified subject -> foodAnalytics available");
+		if (rep.foodAnalytics.available) {
+			eqC(rep.foodAnalytics.foodTotal, "400.00", "4C/G: FOOD_TOTAL = personal 400 (external 600 excluded)");
+			eqC(rep.foodAnalytics.foodHomeMarket, "400.00", "4C/G: FOOD_HOME_MARKET = 400");
+			eqC(rep.foodAnalytics.subjects[0]?.personalEconomicAmount, "400.00", "4C/G: subject personal economic amount = 400");
+		}
+		await s.close();
+	}
+
+	// ---- H: unsealed / unresolved split -> classification creation fails closed
+	{
+		const s = await make4bScenario();
+		const OBL = "8c000000-0000-4000-8000-00000000f003";
+		await s.replica();
+		const pur = await mkMand(s, "1000.00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-05 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid,
+			purchaseEr: pur.er,
+			splitId: "87000000-0000-4000-8000-00000000f003",
+			user: "400.00",
+			ext: "600.00",
+			gross: "1000.00",
+			occ: "2026-09-05 00:00:00+00",
+			personId: s.P_FAM,
+			personObligationId: OBL,
+			sealed: false,
+		});
+		await s.origin();
+		await expectThrowC(
+			() =>
+				createSpendingFoodClassification({
+					db: s.db,
+					userId: U1,
+					subject: ccSub(pur.eid),
+					foodHomeMarketAmount: "100.00",
+					foodOutsideAmount: "0.00",
+					sourceKind: "USER_APPROVED",
+					idempotencyKey: "f-h",
+					occurredAt: at("2026-09-10T00:00:00Z"),
+				}),
+			"is not sealed",
+			"4C/H: an unsealed effective split fails food classification closed",
+		);
+		await s.close();
+	}
+
+	// ---- I: People PAYABLE basis = principal
+	{
+		const s = await make4bScenario();
+		const OBL = "8c000000-0000-4000-8000-00000000f004";
+		await s.replica();
+		await s.mkObligation(OBL, s.P_FRI, "PAYABLE", "250.00", "2026-09-04 00:00:00+00");
+		await s.origin();
+		const res = await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ppSub(OBL),
+			foodHomeMarketAmount: "250.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-i",
+			occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		eqC(res.classification.basisPersonalAmount, "250.00", "4C/I: People PAYABLE basis = obligation principal (250)");
+		eqC(res.classification.subjectType, "PEOPLE_PAYABLE", "4C/I: subject type PEOPLE_PAYABLE");
+		await s.close();
+	}
+
+	// ---- J: People RECEIVABLE -> rejected
+	{
+		const s = await make4bScenario();
+		const OBL = "8c000000-0000-4000-8000-00000000f005";
+		await s.replica();
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "250.00", "2026-09-04 00:00:00+00");
+		await s.origin();
+		await expectThrowC(
+			() =>
+				createSpendingFoodClassification({
+					db: s.db,
+					userId: U1,
+					subject: ppSub(OBL),
+					foodHomeMarketAmount: "250.00",
+					foodOutsideAmount: "0.00",
+					sourceKind: "USER_APPROVED",
+					idempotencyKey: "f-j",
+					occurredAt: at("2026-09-10T00:00:00Z"),
+				}),
+			"PAYABLE",
+			"4C/J: a RECEIVABLE obligation is not eligible for food classification",
+		);
+		await s.close();
+	}
+
+	// ---- K / N: later card personal-share change -> old classification STALE, earlier as-of retained
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "1000.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-k",
+			occurredAt: at("2026-09-05T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkPurRev(pur.eid, pur.er, 2, "UPDATE", "700.00", "MANDATORY_EXPENSE", "2026-09-10 00:00:00+00");
+		await s.origin();
+		const early = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: at("2026-09-08T00:00:00Z"),
+		});
+		const late = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: at("2026-09-20T00:00:00Z"),
+		});
+		eqC(early.status, "CLASSIFIED", "4C/K,N: before the source change the classification is still CLASSIFIED");
+		eqC(late.status, "STALE", "4C/K: after the personal-share drop (1000 -> 700) the stored basis is STALE");
+
+		// ---- M: a semantic UPDATE restores the authoritative classification
+		await updateSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			expectedRevisionNo: 1,
+			foodHomeMarketAmount: "700.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-m",
+			occurredAt: at("2026-09-12T00:00:00Z"),
+		});
+		const restored = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: at("2026-09-20T00:00:00Z"),
+		});
+		eqC(restored.status, "CLASSIFIED", "4C/M: an approved UPDATE to the new basis restores CLASSIFIED");
+		eqC(restored.basisPersonalAmount, "700.00", "4C/M: restored basis = 700");
+		await s.close();
+	}
+
+	// ---- L: later People PAYABLE principal change -> STALE
+	{
+		const s = await make4bScenario();
+		const OBL = "8c000000-0000-4000-8000-00000000f006";
+		await s.replica();
+		await s.mkObligation(OBL, s.P_FRI, "PAYABLE", "250.00", "2026-09-04 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ppSub(OBL),
+			foodHomeMarketAmount: "250.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-l",
+			occurredAt: at("2026-09-05T00:00:00Z"),
+		});
+		await s.replica();
+		const { tr } = await s.mkCanon("PERSON_PAYABLE_EXPENSE", "2026-09-10 00:00:00+00");
+		const prev = (
+			await s.q(
+				"select id from person_obligation_revisions where obligation_id=$1 and revision_no=1",
+				[OBL],
+			)
+		).rows[0].id as string;
+		await s.q(
+			`insert into person_obligation_revisions (id,user_id,obligation_id,revision_no,previous_revision_id,canonical_revision_id,operation,principal_amount,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,2,$4,$5,'UPDATE','400.00','2026-09-10 00:00:00+00',$6,$7)`,
+			[s.gid(), U1, OBL, prev, tr, "ok-l2", s.F],
+		);
+		await s.origin();
+		const v = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ppSub(OBL),
+			asOf: at("2026-09-20T00:00:00Z"),
+		});
+		eqC(v.status, "STALE", "4C/L: a later People principal change (250 -> 400) makes the stored basis STALE");
+		await s.close();
+	}
+
+	// ---- N: a future semantic UPDATE after the checkpoint does not rewrite the old checkpoint
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "300.00", "2026-09-03 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "300.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-n",
+			occurredAt: at("2026-09-05T00:00:00Z"),
+		});
+		await updateSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			expectedRevisionNo: 1,
+			foodHomeMarketAmount: "0.00",
+			foodOutsideAmount: "300.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-n2",
+			occurredAt: at("2026-09-25T00:00:00Z"),
+		});
+		const cp = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: CP15,
+		});
+		const now = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: at("2026-09-26T00:00:00Z"),
+		});
+		eqC(cp.classificationKind, "FOOD_HOME_MARKET", "4C/N: the Sep-15 checkpoint still sees revision 1 (home/market)");
+		eqC(now.classificationKind, "FOOD_OUTSIDE", "4C/N: the Sep-25 reclassification only applies from Sep-25 onward");
+		await s.close();
+	}
+
+	// ---- O: semantic VOID -> subject UNCLASSIFIED at a later asOf; P: no row != NON_FOOD
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "300.00", "2026-09-03 00:00:00+00");
+		const pur2 = await mkMand(s, "150.00", "2026-09-03 00:00:00+00");
+		await s.origin();
+		// P: pur2 is never classified
+		const p = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur2.eid),
+			asOf: CP15,
+		});
+		eqC(p.status, "UNCLASSIFIED", "4C/P: an unclassified subject reports UNCLASSIFIED");
+		eqC(p.classificationKind, null, "4C/P: 'no classification' is NOT NON_FOOD (kind is null)");
+
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "300.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-o",
+			occurredAt: at("2026-09-05T00:00:00Z"),
+		});
+		await voidSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			expectedRevisionNo: 1,
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-o2",
+			occurredAt: at("2026-09-12T00:00:00Z"),
+		});
+		const before = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: at("2026-09-08T00:00:00Z"),
+		});
+		const after = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: at("2026-09-20T00:00:00Z"),
+		});
+		eqC(before.status, "CLASSIFIED", "4C/O: before the VOID instant the classification still applies");
+		eqC(after.status, "UNCLASSIFIED", "4C/O: after the VOID the subject is UNCLASSIFIED");
+		eqC(after.operation, "VOID", "4C/O: the effective revision is the VOID");
+		await s.close();
+	}
+
+	// ---- Q / T: complete MTD coverage -> FOOD_TOTAL == HOME + OUTSIDE (NON_FOOD counts as coverage)
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		await s.replica();
+		const a = await mkMand(s, "300.00", "2026-09-05 00:00:00+00");
+		const b = await mkMand(s, "200.00", "2026-09-06 00:00:00+00");
+		const c = await mkMand(s, "120.00", "2026-09-06 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db, userId: U1, subject: ccSub(a.eid),
+			foodHomeMarketAmount: "300.00", foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED", idempotencyKey: "f-q1", occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		await createSpendingFoodClassification({
+			db: s.db, userId: U1, subject: ccSub(b.eid),
+			foodHomeMarketAmount: "0.00", foodOutsideAmount: "200.00",
+			sourceKind: "USER_APPROVED", idempotencyKey: "f-q2", occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		// T: explicit NON_FOOD still counts as classified coverage
+		await createSpendingFoodClassification({
+			db: s.db, userId: U1, subject: ccSub(c.eid),
+			foodHomeMarketAmount: "0.00", foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED", idempotencyKey: "f-q3", occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: pe,
+		});
+		chkC(rep.foodAnalytics.available === true, "4C/Q: every active MTD subject classified -> foodAnalytics available");
+		if (rep.foodAnalytics.available) {
+			eqC(rep.foodAnalytics.classifiedSubjectCount, 3, "4C/T: NON_FOOD subject is counted as classified coverage (3/3)");
+			eqC(rep.foodAnalytics.foodHomeMarket, "300.00", "4C/Q: FOOD_HOME_MARKET = 300");
+			eqC(rep.foodAnalytics.foodOutside, "200.00", "4C/Q: FOOD_OUTSIDE = 200");
+			eqC(rep.foodAnalytics.foodTotal, "500.00", "4C/Q: FOOD_TOTAL == HOME + OUTSIDE");
+		}
+		await s.close();
+	}
+
+	// ---- R: one active subject unclassified -> available=false, FOOD_CLASSIFICATION_INCOMPLETE
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		await s.replica();
+		const a = await mkMand(s, "300.00", "2026-09-05 00:00:00+00");
+		const b = await mkMand(s, "200.00", "2026-09-06 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db, userId: U1, subject: ccSub(a.eid),
+			foodHomeMarketAmount: "300.00", foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED", idempotencyKey: "f-r1", occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: pe,
+		});
+		chkC(rep.foodAnalytics.available === false, "4C/R: an unclassified active subject -> foodAnalytics NOT available");
+		if (!rep.foodAnalytics.available) {
+			eqC(rep.foodAnalytics.reason, "FOOD_CLASSIFICATION_INCOMPLETE", "4C/R: reason = FOOD_CLASSIFICATION_INCOMPLETE");
+			chkC(rep.foodAnalytics.unclassifiedSubjectIds.includes(b.eid), "4C/R: the unclassified subject id is reported");
+			eqC(rep.foodAnalytics.partialKnownFoodTotal, "300.00", "4C/R: partial known FOOD_TOTAL is labelled (300), never called FOOD_TOTAL");
+		}
+		await s.close();
+	}
+
+	// ---- S: one stale subject -> available=false
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		await s.replica();
+		const a = await mkMand(s, "300.00", "2026-09-05 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db, userId: U1, subject: ccSub(a.eid),
+			foodHomeMarketAmount: "300.00", foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED", idempotencyKey: "f-s", occurredAt: at("2026-09-07T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkPurRev(a.eid, a.er, 2, "UPDATE", "200.00", "MANDATORY_EXPENSE", "2026-09-09 00:00:00+00");
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db, userId: U1, periodMonth: P, triggerPaymentEventId: pe,
+		});
+		chkC(rep.foodAnalytics.available === false, "4C/S: a STALE active subject -> foodAnalytics NOT available");
+		if (!rep.foodAnalytics.available) {
+			chkC(rep.foodAnalytics.staleSubjectIds.includes(a.eid), "4C/S: the stale subject id is reported");
+		}
+		await s.close();
+	}
+
+	// ---- X: idempotent exact retry without an explicit occurredAt
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "300.00", "2026-09-05 00:00:00+00");
+		await s.origin();
+		const first = await createSpendingFoodClassification({
+			db: s.db, userId: U1, subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "300.00", foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED", idempotencyKey: "f-x",
+		});
+		const retry = await createSpendingFoodClassification({
+			db: s.db, userId: U1, subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "300.00", foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED", idempotencyKey: "f-x",
+		});
+		eqC(first.idempotentReplay, false, "4C/X: first create is not a replay");
+		eqC(retry.idempotentReplay, true, "4C/X: exact retry (no occurredAt) is an idempotent replay");
+		eqC(retry.classification.semanticRevisionId, first.classification.semanticRevisionId, "4C/X: replay returns the same stored revision");
+		await s.close();
+	}
+
+	// ---- Y: same idempotency key + different payload -> typed conflict, never a raw 23505
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "300.00", "2026-09-05 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db, userId: U1, subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "100.00", foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED", idempotencyKey: "f-y", occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		await expectThrowC(
+			() =>
+				createSpendingFoodClassification({
+					db: s.db, userId: U1, subject: ccSub(pur.eid),
+					foodHomeMarketAmount: "200.00", foodOutsideAmount: "0.00",
+					sourceKind: "USER_APPROVED", idempotencyKey: "f-y", occurredAt: at("2026-09-10T00:00:00Z"),
+				}),
+			"different food-classification parameters",
+			"4C/Y: same key + different payload -> BUDGET_IDEMPOTENCY_CONFLICT (no raw 23505)",
+		);
+		await s.close();
+	}
+
+	// ---- Z: a fresh key with a stale expectedRevisionNo -> typed revision conflict
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "300.00", "2026-09-05 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db, userId: U1, subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "300.00", foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED", idempotencyKey: "f-z", occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		await expectThrowC(
+			() =>
+				updateSpendingFoodClassification({
+					db: s.db, userId: U1, subject: ccSub(pur.eid),
+					expectedRevisionNo: 5,
+					foodHomeMarketAmount: "0.00", foodOutsideAmount: "300.00",
+					sourceKind: "USER_APPROVED", idempotencyKey: "f-z2", occurredAt: at("2026-09-12T00:00:00Z"),
+				}),
+			"but latest is 1",
+			"4C/Z: a fresh key with a stale expectedRevisionNo -> BUDGET_REVISION_CONFLICT",
+		);
+		await s.close();
+	}
+
+	// ---- AB: migrations 0000..0066 remain byte-identical (spot-check the chain still applies)
+	{
+		const s = await make4bScenario();
+		const t = (
+			await s.q(
+				"select count(*)::int c from information_schema.tables where table_name='budget_v2_spending_food_semantic_revisions'",
+			)
+		).rows[0].c as number;
+		eqC(t, 1, "4C/AB: the 0067 table exists on top of an unchanged 0000..0066 chain");
+		await s.close();
+	}
+}
+
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -4388,6 +5149,7 @@ if (probed) {
 	await resolverRuntime4B();
 	await resolverRuntime4B2();
 	await resolverRuntime4B3();
+	await resolverRuntime4C();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -470,6 +470,13 @@
       "when": 1789000000000,
       "tag": "0066_harden_statement_reconciliation_split_consistency",
       "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1789020000000,
+      "tag": "0067_add_budget_v2_spending_food_semantics",
+      "breakpoints": true
     }
   ]
 }
