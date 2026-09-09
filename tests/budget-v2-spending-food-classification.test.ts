@@ -3,6 +3,8 @@ import { BudgetError } from "../src/budget/errors";
 import {
 	createSpendingFoodClassification,
 	deriveFoodClassificationKind,
+	getSpendingFoodClassificationAsOf,
+	resolveSpendingFoodBasisAsOf,
 	updateSpendingFoodClassification,
 	voidSpendingFoodClassification,
 } from "../src/budget/spending-food-classification-v2";
@@ -132,6 +134,50 @@ describe("update / void -- pre-DB OCC guard", () => {
 				expectedRevisionNo: 1.5,
 				sourceKind: "USER_APPROVED",
 				idempotencyKey: "food-v",
+			}),
+		).rejects.toMatchObject({ code: "BUDGET_INVALID_INPUT" });
+	});
+});
+
+describe("strict asOf -- an invalid explicit cutoff is never silently 'now' (4C.1)", () => {
+	const ccSubject = {
+		type: "CREDIT_CARD_PURCHASE" as const,
+		purchaseEventId: OK_UUID,
+	};
+
+	it("getSpendingFoodClassificationAsOf rejects an Invalid Date asOf", async () => {
+		await expect(
+			getSpendingFoodClassificationAsOf({
+				db,
+				userId: OK_UUID,
+				subject: ccSubject,
+				asOf: new Date("nope"),
+			}),
+		).rejects.toMatchObject({
+			name: "BudgetError",
+			code: "BUDGET_INVALID_INPUT",
+		});
+	});
+
+	it("getSpendingFoodClassificationAsOf rejects a non-Date asOf", async () => {
+		await expect(
+			getSpendingFoodClassificationAsOf({
+				db,
+				userId: OK_UUID,
+				subject: ccSubject,
+				// biome-ignore lint/suspicious/noExplicitAny: deliberately invalid
+				asOf: "2026-09-15" as any,
+			}),
+		).rejects.toBeInstanceOf(BudgetError);
+	});
+
+	it("resolveSpendingFoodBasisAsOf requires a valid Date asOf", async () => {
+		await expect(
+			resolveSpendingFoodBasisAsOf({
+				db,
+				userId: OK_UUID,
+				subject: ccSubject,
+				asOf: new Date("nope"),
 			}),
 		).rejects.toMatchObject({ code: "BUDGET_INVALID_INPUT" });
 	});

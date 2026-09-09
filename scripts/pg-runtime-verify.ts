@@ -5136,6 +5136,380 @@ async function resolverRuntime4C() {
 		eqC(t, 1, "4C/AB: the 0067 table exists on top of an unchanged 0000..0066 chain");
 		await s.close();
 	}
+
+	// ================================================================
+	// 4C.1 -- integrity closure (strict asOf / interval visibility / no fallbacks)
+	// ================================================================
+
+	// ---- 3: an explicitly-supplied invalid asOf is rejected, never silently "now"
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await mkMand(s, "300.00", "2026-09-05 00:00:00+00");
+		await s.origin();
+		await expectThrowC(
+			() =>
+				getSpendingFoodClassificationAsOf({
+					db: s.db,
+					userId: U1,
+					subject: ccSub(pur.eid),
+					asOf: new Date("not-a-date"),
+				}),
+			"asOf must be a valid Date",
+			"4C.1/3: getSpendingFoodClassificationAsOf rejects an invalid explicit asOf (never falls back to now)",
+		);
+		const okUndefined = await getSpendingFoodClassificationAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+		});
+		eqC(okUndefined.status, "UNCLASSIFIED", "4C.1/3: omitting asOf still uses current time for the convenience read");
+		await s.close();
+	}
+
+	// ---- U: FAMILY_REIMBURSEMENT is never a food subject and never enters FOOD_TOTAL
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		const OBL = "8c000000-0000-4000-8000-00000000fa01";
+		const SET = "8b000000-0000-4000-8000-00000000fa01";
+		await s.replica();
+		const pur = await mkMand(s, "1000.00", "2026-09-03 00:00:00+00");
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", "2026-09-03 00:00:00+00");
+		await s.mkSplit({
+			purchaseEid: pur.eid,
+			purchaseEr: pur.er,
+			splitId: "87000000-0000-4000-8000-00000000fa01",
+			user: "400.00",
+			ext: "600.00",
+			gross: "1000.00",
+			occ: "2026-09-03 00:00:00+00",
+			personId: s.P_FAM,
+			personObligationId: OBL,
+		});
+		await s.mkSettlement(SET, OBL, "600.00", "2026-09-10 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "400.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-u",
+			occurredAt: at("2026-09-11T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		chkC(
+			rep.interval.peopleFamily.familyReimbursements.length === 1 &&
+				rep.interval.peopleFamily.familyReimbursements[0]?.obligationId === OBL,
+			"4C.1/U: the family-owned split receivable settlement is reported as a FAMILY_REIMBURSEMENT",
+		);
+		chkC(rep.foodAnalytics.available === true, "4C.1/U: the food universe resolves (only the personal card share)");
+		if (rep.foodAnalytics.available) {
+			eqC(rep.foodAnalytics.subjects.length, 1, "4C.1/U: exactly one food subject -- the reimbursement is NOT one");
+			chkC(
+				!rep.foodAnalytics.subjects.some((x) => x.subjectId === OBL),
+				"4C.1/U: the RECEIVABLE reimbursement obligation is not a food subject",
+			);
+			eqC(rep.foodAnalytics.foodTotal, "400.00", "4C.1/U: FOOD_TOTAL = personal 400 (reimbursement 600 excluded)");
+		}
+		await s.close();
+	}
+
+	// ---- V: a statement payment is not a food expense
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		await s.replica();
+		const pur = await mkMand(s, "250.00", "2026-09-05 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "250.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-v",
+			occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		chkC(rep.interval.statementPayments.length === 1, "4C.1/V: the statement payment appears in interval.statementPayments");
+		chkC(rep.foodAnalytics.available === true, "4C.1/V: food universe resolves");
+		if (rep.foodAnalytics.available) {
+			eqC(rep.foodAnalytics.subjects.length, 1, "4C.1/V: only the purchase is a food subject -- the payment is not");
+			eqC(rep.foodAnalytics.foodTotal, "250.00", "4C.1/V: FOOD_TOTAL unchanged by the payment");
+		}
+		await s.close();
+	}
+
+	// ---- W: UPDATE / VOID activity never creates a second food expense
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		await s.replica();
+		const pur = await s.mkPur("100.00", "MANDATORY_EXPENSE", "2026-09-04 00:00:00+00");
+		await s.mkPurRev(pur.eid, pur.er, 2, "UPDATE", "100.00", "MANDATORY_EXPENSE", "2026-09-08 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "100.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-w",
+			occurredAt: at("2026-09-06T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		const foodRows = rep.foodAnalytics.available
+			? rep.foodAnalytics.subjects.filter((x) => x.subjectId === pur.eid)
+			: [];
+		eqC(foodRows.length, 1, "4C.1/W: a CREATE + same-subject UPDATE yields exactly ONE MTD food subject, not two");
+		const actRows = rep.interval.purchases.activity.filter((x) => x.eventId === pur.eid);
+		eqC(actRows.length, 2, "4C.1/W: both the CREATE and UPDATE appear as interval ACTIVITY rows");
+		chkC(
+			actRows.every((x) => x.foodClassification.applicable === true),
+			"4C.1/W: interval activity carries food visibility (no second economic amount is derived)",
+		);
+		await s.close();
+	}
+
+	// ---- W (VOID part): a VOIDed purchase leaves the active food universe
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		await s.replica();
+		const pur = await s.mkPur("100.00", "MANDATORY_EXPENSE", "2026-09-04 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "100.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-wv",
+			occurredAt: at("2026-09-05T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkPurRev(pur.eid, pur.er, 2, "VOID", "100.00", "MANDATORY_EXPENSE", "2026-09-08 00:00:00+00");
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		const inUniverse = rep.foodAnalytics.subjects.some((x) => x.subjectId === pur.eid);
+		chkC(!inUniverse, "4C.1/W: a purchase VOIDed before the checkpoint is not an active MTD food subject");
+		const voidRow = rep.interval.purchases.activity.find(
+			(x) => x.eventId === pur.eid && x.operation === "VOID",
+		);
+		chkC(!!voidRow, "4C.1/W: the VOID still appears as interval ACTIVITY");
+		chkC(
+			!!voidRow &&
+				voidRow.foodClassification.applicable === true &&
+				voidRow.foodClassification.available === true &&
+				voidRow.foodClassification.status === "SOURCE_VOID" &&
+				!("foodTotalAmount" in voidRow.foodClassification),
+			"4C.1/W: the VOID activity row shows SOURCE_VOID with no fabricated food amounts",
+		);
+		await s.close();
+	}
+
+	// ---- 7A/7B: purchase CREATE before classification -> activity UNCLASSIFIED; MTD subject CLASSIFIED
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		await s.replica();
+		const pur = await mkMand(s, "300.00", "2026-09-05 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "300.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-7a",
+			occurredAt: at("2026-09-06T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		const createRow = rep.interval.purchases.activity.find(
+			(x) => x.eventId === pur.eid && x.operation === "CREATE",
+		);
+		chkC(
+			!!createRow &&
+				createRow.foodClassification.applicable === true &&
+				createRow.foodClassification.available === true &&
+				createRow.foodClassification.status === "UNCLASSIFIED",
+			"4C.1/7A: the Sep-5 CREATE activity row is UNCLASSIFIED at its own instant (the Sep-6 classification is not borrowed)",
+		);
+		chkC(
+			rep.foodAnalytics.available === true &&
+				rep.foodAnalytics.subjects.some(
+					(x) => x.subjectId === pur.eid && x.classificationStatus === "CLASSIFIED",
+				),
+			"4C.1/7B: the same subject IS CLASSIFIED in the Sep-15 MTD state (not a contradiction)",
+		);
+		await s.close();
+	}
+
+	// ---- 7C/7D: a purchase UPDATE activity shows the classification effective at its instant; a later reclassification never rewrites it
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		await s.replica();
+		const pur = await s.mkPur("300.00", "MANDATORY_EXPENSE", "2026-09-03 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			foodHomeMarketAmount: "300.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-7c",
+			occurredAt: at("2026-09-05T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkPurRev(pur.eid, pur.er, 2, "UPDATE", "300.00", "MANDATORY_EXPENSE", "2026-09-08 00:00:00+00");
+		await s.origin();
+		// a future reclassification (Sep-20) must not rewrite the Sep-8 activity row
+		await updateSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			expectedRevisionNo: 1,
+			foodHomeMarketAmount: "0.00",
+			foodOutsideAmount: "300.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-7d",
+			occurredAt: at("2026-09-20T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		const updRow = rep.interval.purchases.activity.find(
+			(x) => x.eventId === pur.eid && x.operation === "UPDATE",
+		);
+		chkC(
+			!!updRow &&
+				updRow.foodClassification.applicable === true &&
+				updRow.foodClassification.available === true &&
+				updRow.foodClassification.status === "CLASSIFIED" &&
+				updRow.foodClassification.semanticRevisionNo === 1 &&
+				updRow.foodClassification.classificationKind === "FOOD_HOME_MARKET",
+			"4C.1/7C+7D: the Sep-8 UPDATE row shows semantic revision 1 (home/market); the Sep-20 reclassification does not rewrite it",
+		);
+		await s.close();
+	}
+
+	// ---- 7E/7F/7G: PAYABLE activity gets food state at its instant; RECEIVABLE not applicable; settlements never
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		const PAY = "8c000000-0000-4000-8000-00000000fb01";
+		const REC = "8c000000-0000-4000-8000-00000000fb02";
+		const SET = "8b000000-0000-4000-8000-00000000fb02";
+		await s.replica();
+		await s.mkObligation(PAY, s.P_FRI, "PAYABLE", "250.00", "2026-09-04 00:00:00+00");
+		await s.mkObligation(REC, s.P_FAM, "RECEIVABLE", "120.00", "2026-09-04 00:00:00+00");
+		await s.mkSettlement(SET, REC, "120.00", "2026-09-06 00:00:00+00");
+		await s.origin();
+		await createSpendingFoodClassification({
+			db: s.db,
+			userId: U1,
+			subject: ppSub(PAY),
+			foodHomeMarketAmount: "250.00",
+			foodOutsideAmount: "0.00",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "f-7e",
+			occurredAt: at("2026-09-05T00:00:00Z"),
+		});
+		await s.replica();
+		const { tr } = await s.mkCanon("PERSON_PAYABLE_EXPENSE", "2026-09-08 00:00:00+00");
+		const prev = (
+			await s.q(
+				"select id from person_obligation_revisions where obligation_id=$1 and revision_no=1",
+				[PAY],
+			)
+		).rows[0].id as string;
+		await s.q(
+			`insert into person_obligation_revisions (id,user_id,obligation_id,revision_no,previous_revision_id,canonical_revision_id,operation,principal_amount,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,2,$4,$5,'UPDATE','250.00','2026-09-08 00:00:00+00',$6,$7)`,
+			[s.gid(), U1, PAY, prev, tr, "ok-7e2", s.F],
+		);
+		await s.origin();
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+		const payCreate = rep.interval.peopleFamily.obligationActivity.find(
+			(x) => x.obligationId === PAY && x.operation === "CREATE",
+		);
+		const payUpdate = rep.interval.peopleFamily.obligationActivity.find(
+			(x) => x.obligationId === PAY && x.operation === "UPDATE",
+		);
+		const recRow = rep.interval.peopleFamily.obligationActivity.find(
+			(x) => x.obligationId === REC,
+		);
+		chkC(
+			!!payCreate &&
+				payCreate.foodClassification.applicable === true &&
+				payCreate.foodClassification.available === true &&
+				payCreate.foodClassification.status === "UNCLASSIFIED",
+			"4C.1/7E: PAYABLE CREATE (Sep-4) is UNCLASSIFIED at its instant (before the Sep-5 classification)",
+		);
+		chkC(
+			!!payUpdate &&
+				payUpdate.foodClassification.applicable === true &&
+				payUpdate.foodClassification.available === true &&
+				payUpdate.foodClassification.status === "CLASSIFIED",
+			"4C.1/7E: PAYABLE UPDATE (Sep-8) shows the classification effective by then",
+		);
+		chkC(
+			!!recRow && recRow.foodClassification.applicable === false,
+			"4C.1/7F: RECEIVABLE obligation activity has foodClassification.applicable = false",
+		);
+		chkC(
+			rep.interval.peopleFamily.settlementActivity.every(
+				(x) => !("foodClassification" in x),
+			),
+			"4C.1/7G: settlement activity rows carry no food classification",
+		);
+		chkC(
+			!rep.foodAnalytics.subjects.some((x) => x.subjectId === REC),
+			"4C.1/7G: the RECEIVABLE obligation never enters the food universe",
+		);
+		await s.close();
+	}
 }
 
 

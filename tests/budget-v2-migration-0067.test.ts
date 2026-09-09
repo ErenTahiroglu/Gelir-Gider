@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import migration0063Sql from "../migrations/0063_add_budget_v2_semantic_classifications.sql?raw";
 import migration0067Sql from "../migrations/0067_add_budget_v2_spending_food_semantics.sql?raw";
 import journal from "../migrations/meta/_journal.json";
+import snapshot0065 from "../migrations/meta/0065_snapshot.json";
+import snapshot0067 from "../migrations/meta/0067_snapshot.json";
 import { computeRestoreOrderFromSchema } from "../scripts/restore-backup";
 import { getBackupTableDescriptors } from "../src/backups/registry";
 import {
@@ -114,6 +116,24 @@ describe("Migration 0067 -- Budget V2 explicit spending food semantics", () => {
 		expect(migration0063Sql).toContain(
 			"CREATE OR REPLACE FUNCTION trg_fn_guard_irbv2sem_revisions_insert()",
 		);
+	});
+
+	it("has a Drizzle metadata snapshot representing the post-0067 schema (continuity audit, 4C.1)", () => {
+		// Without this file `drizzle-kit generate` diffs against 0065_snapshot
+		// (0066 is function-only, no snapshot) and re-proposes the 0067 table.
+		const snap = snapshot0067 as {
+			version: string;
+			dialect: string;
+			prevId: string;
+			tables: Record<string, unknown>;
+		};
+		expect(snap.version).toBe("7");
+		expect(snap.dialect).toBe("postgresql");
+		expect(
+			snap.tables["public.budget_v2_spending_food_semantic_revisions"],
+		).toBeTruthy();
+		// snapshot chain: 0066 has no snapshot, so 0065 is the predecessor.
+		expect(snap.prevId).toBe((snapshot0065 as { id: string }).id);
 	});
 
 	it("the backup registry auto-discovers the new table and derives an FK-consistent restore order", () => {

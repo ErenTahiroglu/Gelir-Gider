@@ -77,10 +77,19 @@ import { normalizeUuid, validateBudgetPeriodMonth } from "./utils";
  *
  * MTD state comes verbatim from `resolveBudgetV2LiveSnapshot` (no re-derived
  * waterfall math); required evidence fields are typed-asserted, never coerced
- * into a plausible "0.00". Food semantics and forward installment schedules are
- * not stored and are never inferred. No persistence, no trigger wiring, no
- * learning -- future persisted checkpoint snapshots (keyed by paymentEventId)
- * will be the historical replay source.
+ * into a plausible "0.00".
+ *
+ * FOOD semantics (checkpoint 4C): explicit, user-approved FOOD_HOME_MARKET /
+ * FOOD_OUTSIDE allocations ARE stored (`budget_v2_spending_food_semantic_
+ * revisions`) and are read here authoritatively -- `mtd.foodAnalytics` for the
+ * current spending-state total (exact only when every active MTD subject is
+ * CLASSIFIED, including explicit NON_FOOD) and a per-row `foodClassification`
+ * on interval activity as of each activity instant. Merchant / MCC / heuristic
+ * food inference is NEVER used. Forward installment schedules remain unstored
+ * and unsupported.
+ *
+ * No persistence, no trigger wiring, no learning -- future persisted checkpoint
+ * snapshots (keyed by paymentEventId) will be the historical replay source.
  */
 
 export const BUDGET_V2_CHECKPOINT_REPORT_SCHEMA_VERSION =
@@ -206,6 +215,49 @@ export type PurchaseOwnership =
 	  }
 	| { available: false; reason: string };
 
+/**
+ * Explicit (user-approved) food-semantic visibility for ONE interval activity
+ * row, evaluated AS OF that activity revision's own `occurredAt` -- never a
+ * later classification. This is historical activity CONTEXT; the authoritative
+ * current spending-state total is `mtd.foodAnalytics`. A correction / VOID
+ * revision is visible here but never contributes a second food amount.
+ *
+ *   applicable:false           -- the subject is not a food-expense subject
+ *                                 (People RECEIVABLE, settlements)
+ *   applicable:true available:false
+ *                              -- the classification could not be resolved
+ *   applicable:true available:true status:"CLASSIFIED"
+ *                              -- an active approved allocation at that instant
+ *   applicable:true available:true status:"UNCLASSIFIED"|"STALE"|"SOURCE_VOID"
+ *                              -- no active allocation at that instant; no
+ *                                 fabricated food amounts
+ */
+export type IntervalFoodClassification =
+	| { applicable: false }
+	| { applicable: true; available: false; reason: string }
+	| {
+			applicable: true;
+			available: true;
+			status: "CLASSIFIED";
+			semanticRevisionId: string;
+			semanticRevisionNo: number;
+			basisPersonalAmount: string;
+			foodHomeMarketAmount: string;
+			foodOutsideAmount: string;
+			foodTotalAmount: string;
+			nonFoodAmount: string;
+			classificationKind: FoodClassificationKind;
+			sourceKind: "USER_APPROVED" | "USER_APPROVED_FROM_SUGGESTION";
+	  }
+	| {
+			applicable: true;
+			available: true;
+			status: "UNCLASSIFIED" | "STALE" | "SOURCE_VOID";
+			semanticRevisionId: string | null;
+			semanticRevisionNo: number | null;
+			reason: string | null;
+	  };
+
 export interface IntervalPurchaseActivityItem {
 	eventId: string;
 	revisionNo: number;
@@ -221,6 +273,8 @@ export interface IntervalPurchaseActivityItem {
 	occurredAt: string;
 	/** Ownership effective at THIS activity instant; unavailable if unprovable. */
 	ownership: PurchaseOwnership;
+	/** Approved food-semantic status AS OF this activity instant (context only). */
+	foodClassification: IntervalFoodClassification;
 }
 
 export interface IntervalPurchaseSection {
@@ -244,6 +298,11 @@ export interface PeopleObligationActivityItem {
 	budgetCategory: string | null;
 	dueDate: string | null;
 	occurredAt: string;
+	/**
+	 * Approved food-semantic status AS OF this activity instant. PAYABLE is a
+	 * food-expense subject; RECEIVABLE is explicitly `applicable:false`.
+	 */
+	foodClassification: IntervalFoodClassification;
 }
 
 export interface PeopleSettlementActivityItem {
@@ -1038,6 +1097,90 @@ async function loadPurchaseEvents(
 	return rows;
 }
 
+/**
+ * Approved food-semantic status for one interval activity row, resolved AS OF
+ * that row's own `occurredAt`. `getSpendingFoodClassificationAsOf` already
+ * applies the Checkpoint 4B.2 effective-revision rule, so a food revision
+ * authored after `atInstant` never rewrites this row. A CLASSIFIED view whose
+ * required money / identity fields are missing or malformed fails the report
+ * closed (never a plausible zero).
+ */
+async function evaluateIntervalFoodClassification(
+	db: Database,
+	userId: string,
+	subject:
+		| { type: "CREDIT_CARD_PURCHASE"; purchaseEventId: string }
+		| { type: "PEOPLE_PAYABLE"; personObligationId: string },
+	applicable: boolean,
+	atInstant: Date,
+): Promise<IntervalFoodClassification> {
+	if (!applicable) return { applicable: false };
+	const view = await getSpendingFoodClassificationAsOf({
+		db,
+		userId,
+		subject,
+		asOf: atInstant,
+	});
+	if (view.status !== "CLASSIFIED") {
+		return {
+			applicable: true,
+			available: true,
+			status: view.status,
+			semanticRevisionId: view.semanticRevisionId,
+			semanticRevisionNo: view.semanticRevisionNo,
+			reason: view.reason,
+		};
+	}
+	const path = `interval.foodClassification[${view.subjectId}]`;
+	const home = reqMoney(
+		view.foodHomeMarketAmount,
+		`${path}.foodHomeMarketAmount`,
+	);
+	const outside = reqMoney(view.foodOutsideAmount, `${path}.foodOutsideAmount`);
+	const total = reqMoney(view.foodTotalAmount, `${path}.foodTotalAmount`);
+	const nonFood = reqMoney(view.nonFoodAmount, `${path}.nonFoodAmount`);
+	const basis = reqMoney(
+		view.basisPersonalAmount,
+		`${path}.basisPersonalAmount`,
+	);
+	if (!view.semanticRevisionId || view.semanticRevisionNo == null) {
+		reportFailClosed(
+			`${path} is CLASSIFIED but carries no semantic revision identity`,
+		);
+	}
+	if (!view.classificationKind || !view.sourceKind) {
+		reportFailClosed(
+			`${path} is CLASSIFIED but carries no classificationKind / sourceKind`,
+		);
+	}
+	const hc = centsOf(home);
+	const oc = centsOf(outside);
+	if (centsOf(total) !== hc + oc) {
+		reportFailClosed(
+			`${path}: FOOD_TOTAL ${total} != FOOD_HOME_MARKET ${home} + FOOD_OUTSIDE ${outside}`,
+		);
+	}
+	if (centsOf(basis) !== hc + oc + centsOf(nonFood)) {
+		reportFailClosed(
+			`${path}: basis ${basis} != food ${total} + nonFood ${nonFood}`,
+		);
+	}
+	return {
+		applicable: true,
+		available: true,
+		status: "CLASSIFIED",
+		semanticRevisionId: view.semanticRevisionId,
+		semanticRevisionNo: view.semanticRevisionNo,
+		basisPersonalAmount: basis,
+		foodHomeMarketAmount: home,
+		foodOutsideAmount: outside,
+		foodTotalAmount: total,
+		nonFoodAmount: nonFood,
+		classificationKind: view.classificationKind,
+		sourceKind: view.sourceKind,
+	};
+}
+
 async function buildIntervalPurchases(
 	db: Database,
 	userId: string,
@@ -1094,6 +1237,13 @@ async function buildIntervalPurchases(
 						basis: shares.basis,
 					}
 				: { available: false, reason: shares.reason };
+			const foodClassification = await evaluateIntervalFoodClassification(
+				db,
+				userId,
+				{ type: "CREDIT_CARD_PURCHASE", purchaseEventId: ev.eventId },
+				true,
+				at,
+			);
 			activity.push({
 				eventId: ev.eventId,
 				revisionNo: rev.revisionNo,
@@ -1108,6 +1258,7 @@ async function buildIntervalPurchases(
 				installmentCount: rev.installmentCount,
 				occurredAt: at.toISOString(),
 				ownership,
+				foodClassification,
 			});
 			if (op === "CREATE") newlyPosted.push(ev.eventId);
 			else if (op === "UPDATE") corrected.push(ev.eventId);
@@ -1292,6 +1443,15 @@ async function buildPeopleFamily(
 		for (const rev of oRevs) {
 			const at = asDate(rev.occurredAt);
 			if (!win.inInterval(at)) continue;
+			// PAYABLE is a food-expense subject; RECEIVABLE never is. Settlements
+			// (handled below) are never food-expense subjects.
+			const foodClassification = await evaluateIntervalFoodClassification(
+				db,
+				userId,
+				{ type: "PEOPLE_PAYABLE", personObligationId: o.id },
+				direction === "PAYABLE",
+				at,
+			);
 			obligationActivity.push({
 				obligationId: o.id,
 				personId: o.personId,
@@ -1305,6 +1465,7 @@ async function buildPeopleFamily(
 				budgetCategory: rev.budgetCategory,
 				dueDate: rev.dueDate,
 				occurredAt: at.toISOString(),
+				foodClassification,
 			});
 		}
 
@@ -1735,35 +1896,87 @@ async function buildFoodAnalytics(
 					? "STALE"
 					: "UNCLASSIFIED";
 
-		const entry: FoodSubjectEntry = {
-			subjectType: subj.subjectType,
-			subjectId: subj.subjectId,
-			effectiveFinancialRevisionId: subj.effectiveFinancialRevisionId,
-			personalEconomicAmount: formatCentsToMoney(subj.personalCents),
-			classificationStatus: status,
-			semanticRevisionId: view.semanticRevisionId,
-			semanticRevisionNo: view.semanticRevisionNo,
-			foodHomeMarketAmount:
-				status === "CLASSIFIED" ? view.foodHomeMarketAmount : null,
-			foodOutsideAmount:
-				status === "CLASSIFIED" ? view.foodOutsideAmount : null,
-			foodTotalAmount: status === "CLASSIFIED" ? view.foodTotalAmount : null,
-			nonFoodAmount: status === "CLASSIFIED" ? view.nonFoodAmount : null,
-			classificationKind:
-				status === "CLASSIFIED" ? view.classificationKind : null,
-			sourceKind: status === "CLASSIFIED" ? view.sourceKind : null,
-		};
-		subjects.push(entry);
-
+		let entry: FoodSubjectEntry;
 		if (status === "CLASSIFIED") {
-			homeTotal += centsOf(view.foodHomeMarketAmount ?? "0.00");
-			outsideTotal += centsOf(view.foodOutsideAmount ?? "0.00");
+			// Every field below is REQUIRED for a CLASSIFIED subject. Corruption
+			// fails the report closed -- never a plausible zero food spend.
+			const path = `foodAnalytics.subject[${subj.subjectId}]`;
+			const home = reqMoney(
+				view.foodHomeMarketAmount,
+				`${path}.foodHomeMarketAmount`,
+			);
+			const outside = reqMoney(
+				view.foodOutsideAmount,
+				`${path}.foodOutsideAmount`,
+			);
+			const total = reqMoney(view.foodTotalAmount, `${path}.foodTotalAmount`);
+			const nonFood = reqMoney(view.nonFoodAmount, `${path}.nonFoodAmount`);
+			const basis = reqMoney(
+				view.basisPersonalAmount,
+				`${path}.basisPersonalAmount`,
+			);
+			if (!view.semanticRevisionId || view.semanticRevisionNo == null) {
+				reportFailClosed(
+					`${path} is CLASSIFIED but carries no semantic revision identity`,
+				);
+			}
+			if (!view.classificationKind || !view.sourceKind) {
+				reportFailClosed(
+					`${path} is CLASSIFIED but carries no classificationKind / sourceKind`,
+				);
+			}
+			const hc = centsOf(home);
+			const oc = centsOf(outside);
+			// FOOD_TOTAL = FOOD_HOME_MARKET + FOOD_OUTSIDE (per subject).
+			if (centsOf(total) !== hc + oc) {
+				reportFailClosed(
+					`${path}: FOOD_TOTAL ${total} != FOOD_HOME_MARKET ${home} + FOOD_OUTSIDE ${outside}`,
+				);
+			}
+			if (centsOf(basis) !== hc + oc + centsOf(nonFood)) {
+				reportFailClosed(
+					`${path}: basis ${basis} != food ${total} + nonFood ${nonFood}`,
+				);
+			}
+			entry = {
+				subjectType: subj.subjectType,
+				subjectId: subj.subjectId,
+				effectiveFinancialRevisionId: subj.effectiveFinancialRevisionId,
+				personalEconomicAmount: formatCentsToMoney(subj.personalCents),
+				classificationStatus: "CLASSIFIED",
+				semanticRevisionId: view.semanticRevisionId,
+				semanticRevisionNo: view.semanticRevisionNo,
+				foodHomeMarketAmount: home,
+				foodOutsideAmount: outside,
+				foodTotalAmount: total,
+				nonFoodAmount: nonFood,
+				classificationKind: view.classificationKind,
+				sourceKind: view.sourceKind,
+			};
+			homeTotal += hc;
+			outsideTotal += oc;
 			classifiedPersonal += subj.personalCents;
 		} else {
+			entry = {
+				subjectType: subj.subjectType,
+				subjectId: subj.subjectId,
+				effectiveFinancialRevisionId: subj.effectiveFinancialRevisionId,
+				personalEconomicAmount: formatCentsToMoney(subj.personalCents),
+				classificationStatus: status,
+				semanticRevisionId: view.semanticRevisionId,
+				semanticRevisionNo: view.semanticRevisionNo,
+				foodHomeMarketAmount: null,
+				foodOutsideAmount: null,
+				foodTotalAmount: null,
+				nonFoodAmount: null,
+				classificationKind: null,
+				sourceKind: null,
+			};
 			unclassifiedOrStalePersonal += subj.personalCents;
 			if (status === "STALE") staleSubjectIds.push(subj.subjectId);
 			else unclassifiedSubjectIds.push(subj.subjectId);
 		}
+		subjects.push(entry);
 	}
 
 	const classifiedSubjectCount = subjects.filter(
@@ -1776,9 +1989,18 @@ async function buildFoodAnalytics(
 
 	if (complete) {
 		const foodTotal = homeTotal + outsideTotal;
-		// FOOD_TOTAL = FOOD_HOME_MARKET + FOOD_OUTSIDE -- assert the invariant.
-		if (foodTotal !== homeTotal + outsideTotal) {
-			reportFailClosed("FOOD_TOTAL invariant violated");
+		// FOOD_TOTAL = FOOD_HOME_MARKET + FOOD_OUTSIDE -- assert against the
+		// independently summed per-subject foodTotalAmount fields.
+		let subjectFoodTotal = 0n;
+		for (const sEntry of subjects) {
+			subjectFoodTotal += centsOf(sEntry.foodTotalAmount ?? "0.00");
+		}
+		if (subjectFoodTotal !== foodTotal) {
+			reportFailClosed(
+				`FOOD_TOTAL invariant violated: sum of subject foodTotalAmount ${formatCentsToMoney(
+					subjectFoodTotal,
+				)} != FOOD_HOME_MARKET + FOOD_OUTSIDE ${formatCentsToMoney(foodTotal)}`,
+			);
 		}
 		return {
 			available: true,

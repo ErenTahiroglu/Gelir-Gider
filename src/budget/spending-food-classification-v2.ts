@@ -155,7 +155,8 @@ export async function resolveSpendingFoodBasisAsOf(params: {
 }): Promise<SpendingFoodBasisResolution> {
 	const userId = normalizeUuid(params.userId, "userId");
 	const subject = normalizeSubject(params.subject);
-	const { db, asOf } = params;
+	const { db } = params;
+	const asOf = validateRequiredDate(params.asOf, "asOf");
 
 	if (subject.subjectType === "CREDIT_CARD_PURCHASE") {
 		const purchaseEventId = subject.purchaseEventId as string;
@@ -440,6 +441,20 @@ function validateOptionalOccurredAt(value: Date | undefined): Date | undefined {
 		throw new BudgetError(
 			"BUDGET_INVALID_INPUT",
 			"occurredAt must be a valid Date object",
+		);
+	}
+	return value;
+}
+
+/**
+ * A required historical cutoff. Never silently substitutes `new Date()` for an
+ * invalid value -- an unusable `asOf` is a caller bug, not "now".
+ */
+function validateRequiredDate(value: unknown, field: string): Date {
+	if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+		throw new BudgetError(
+			"BUDGET_INVALID_INPUT",
+			`${field} must be a valid Date object`,
 		);
 	}
 	return value;
@@ -1080,10 +1095,12 @@ export async function getSpendingFoodClassificationAsOf(params: {
 }): Promise<SpendingFoodClassificationView> {
 	const userId = normalizeUuid(params.userId, "userId");
 	const subject = normalizeSubject(params.subject);
+	// `asOf` omitted -> current time is allowed for the convenience read API.
+	// `asOf` supplied but not a valid Date -> BUDGET_INVALID_INPUT (never "now").
 	const asOf =
-		params.asOf instanceof Date && !Number.isNaN(params.asOf.getTime())
-			? params.asOf
-			: new Date();
+		params.asOf === undefined
+			? new Date()
+			: validateRequiredDate(params.asOf, "asOf");
 
 	const revs = await loadSubjectRevisions(params.db, userId, subject);
 	const eff = effectiveRevisionAsOf(
