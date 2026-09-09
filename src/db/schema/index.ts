@@ -6,6 +6,7 @@ export * from "./budget-v2";
 export * from "./budget-v2-checkpoint";
 export * from "./budget-v2-semantics";
 export * from "./budget-v2-spending-food";
+export * from "./budget-v2-surplus-use";
 export * from "./campaigns";
 export * from "./credit-card-ledger";
 export * from "./credit-card-splits";

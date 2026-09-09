@@ -16,4 +16,5 @@ export * from "./service-v2";
 export * from "./spending-food-classification-v2";
 export * from "./support-classification-v2";
 export * from "./support-semantics-v2";
+export * from "./surplus-use-attribution-v2";
 export * from "./utils";

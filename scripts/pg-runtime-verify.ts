@@ -310,12 +310,12 @@ function v2Payload(inputs: Record<string, string>, evidence: Record<string, unkn
 }
 
 async function runtime() {
-	console.log("\n== PHASE 2: APPLY MIGRATION CHAIN 0000..0069 (empty disposable DB) ==");
+	console.log("\n== PHASE 2: APPLY MIGRATION CHAIN 0000..0070 (empty disposable DB) ==");
 	const db = new PGlite();
 	await db.query("SET timezone='UTC'");
 	try {
-		await applyChain(db, 69);
-		ok("migration chain 0000..0069 applied to an empty PostgreSQL database");
+		await applyChain(db, 70);
+		ok("migration chain 0000..0070 applied to an empty PostgreSQL database");
 	} catch (e) {
 		bad("migration chain apply", "\n" + (e as Error).message);
 		await db.close();
@@ -339,6 +339,7 @@ async function runtime() {
 		"budget_v2_checkpoint_trigger_card_revisions",
 		"budget_v2_checkpoint_requests",
 		"budget_v2_checkpoint_snapshots",
+		"budget_v2_surplus_use_attribution_revisions",
 	]) {
 		tbls.includes(need) ? ok(`table present: ${need}`) : bad(`missing table ${need}`);
 	}
@@ -995,7 +996,7 @@ async function resolverRuntime() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 69);
+	await applyChain(pg, 70);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -1397,7 +1398,7 @@ async function resolverRuntime4A() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 69);
+	await applyChain(pg, 70);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	const F = "f".repeat(64);
@@ -1885,7 +1886,7 @@ async function resolverRuntime4A1() {
 	{
 		const pg0 = new PGlite();
 		await pg0.query("SET timezone='UTC'");
-		await applyChain(pg0, 69);
+		await applyChain(pg0, 70);
 		// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 		const db0 = drizzle(pg0 as any) as any;
 		try {
@@ -1908,7 +1909,7 @@ async function resolverRuntime4A1() {
 	// --- partial carry-in overlap (A..E) ----------------------------------
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 69);
+	await applyChain(pg, 70);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	const F = "f".repeat(64);
@@ -2170,7 +2171,7 @@ async function make4bScenario() {
 	} = B4_IDS;
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 69);
+	await applyChain(pg, 70);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -6144,9 +6145,8 @@ async function resolverRuntime5() {
 		chk5(
 			snap.status === "PERSISTED" &&
 				canonicalJsonStringify((snap.report as S).availableToAllocateNow) ===
-					canonicalJsonStringify(live.availableToAllocateNow) &&
-				(snap.report as S).availableToAllocateNow.available === false,
-			"5/W: the checkpoint report carries the existing authoritative availableToAllocateNow, unchanged (no fabricated allocation)",
+					canonicalJsonStringify(live.availableToAllocateNow),
+			"5/W: the persisted checkpoint's availableToAllocateNow matches a fresh live build (frozen, deterministic)",
 		);
 		await s.close();
 	}
@@ -6804,6 +6804,1186 @@ async function resolverRuntime5A() {
 }
 
 
+async function resolverRuntime5B() {
+	console.log(
+		"\n== PHASE 5B: SURPLUS-USE ATTRIBUTION PROVENANCE & availableToAllocateNow ==",
+	);
+	const {
+		createSurplusUseAttribution,
+		updateSurplusUseAttribution,
+		voidSurplusUseAttribution,
+		getSurplusUseAttributionAsOf,
+		resolveSurplusUseBasisAsOf,
+	} = await import("../src/budget/surplus-use-attribution-v2.ts");
+	const { buildBudgetV2CheckpointReport } = await import(
+		"../src/budget/checkpoint-report-v2.ts"
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+	const { P } = B4_IDS;
+	const RECON = new Date("2026-09-01T00:00:00Z");
+	const at = (iso: string) => new Date(iso);
+	const CP = at("2026-09-15T00:00:00Z");
+	const W = at("2026-09-12T00:00:00Z"); // attribution write instant
+	const SEP5 = "2026-09-05 00:00:00+00";
+
+	const show = (v: unknown) =>
+		typeof v === "bigint" ? `${v}n` : JSON.stringify(v);
+	const eqB = (a: unknown, b: unknown, name: string) =>
+		a === b ? ok(name) : bad(name, `-> got ${show(a)} want ${show(b)}`);
+	const chkB = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	const throwB = async (
+		fn: () => Promise<unknown>,
+		needle: string,
+		name: string,
+	) => {
+		try {
+			await fn();
+			bad(name, "-> did not throw");
+		} catch (e) {
+			const m = String((e as Error).message);
+			m.includes(needle) && !/23505|duplicate key/.test(m)
+				? ok(name)
+				: bad(name, `-> ${m}`);
+		}
+	};
+
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+	const ccSub = (id: string) =>
+		({ type: "CREDIT_CARD_PURCHASE", purchaseEventId: id }) as const;
+	const ppSub = (id: string) =>
+		({ type: "PEOPLE_PAYABLE", personObligationId: id }) as const;
+	const mmSub = (id: string) =>
+		({ type: "MOBILITY_MIDAS_TRANSFER", midasAllocationTransferId: id }) as const;
+	const ltSub = (id: string) =>
+		({ type: "LONG_TERM_SEND_TASK", longTermSendTaskId: id }) as const;
+	const USER = () => ({ sourceKind: "USER_APPROVED" as const });
+
+	let bcodeSeq = 0;
+	const bcode = (prefix: string) => {
+		bcodeSeq++;
+		return `${prefix}${bcodeSeq.toString().padStart(3, "0")}`;
+	};
+	const mkGoalBucket = (s: S, bucketId: string, _code: string) =>
+		s.q(
+			`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,$4,'goal','SHORT_TERM_GOAL')`,
+			[bucketId, U1, s.MID, bcode("GB")],
+		);
+	const mkGoal = async (
+		s: S,
+		goalId: string,
+		bucketId: string,
+		occ = "2026-08-01 00:00:00+00",
+	) => {
+		await s.q(
+			`insert into short_term_goals (id,user_id,midas_account_id,midas_bucket_id) values ($1,$2,$3,$4)`,
+			[goalId, U1, s.MID, bucketId],
+		);
+		await s.q(
+			`insert into short_term_goal_revisions (id,user_id,goal_id,revision_no,operation,status,name,funding_target,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','ACTIVE','G','5000.00',$4,$5,$6)`,
+			[s.gid(), U1, goalId, occ, `stg-${goalId.slice(-6)}`, s.F],
+		);
+	};
+	const mkPurposeRev = (
+		s: S,
+		goalId: string,
+		revNo: number,
+		prev: string | null,
+		purpose: string,
+		occ: string,
+	) =>
+		s.q(
+			`insert into short_term_goal_budget_v2_purpose_revisions (id,user_id,goal_id,revision_no,previous_revision_id,operation,purpose,idempotency_key,revision_fingerprint,occurred_at) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			[
+				s.gid(),
+				U1,
+				goalId,
+				revNo,
+				prev,
+				revNo === 1 ? "CREATE" : "UPDATE",
+				purpose,
+				`pp-${goalId.slice(-6)}-${revNo}`,
+				s.F,
+				occ,
+			],
+		);
+	const mkTransfer = (
+		s: S,
+		tid: string,
+		toBucketId: string | null,
+		amount: string,
+		occ: string,
+		opts: { from?: string | null; reversalOf?: string | null } = {},
+	) =>
+		s.q(
+			`insert into midas_allocation_transfers (id,user_id,midas_account_id,idempotency_key,transfer_fingerprint,from_bucket_id,to_bucket_id,amount,occurred_at,reversal_of_transfer_id) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			[
+				tid,
+				U1,
+				s.MID,
+				`mt-${tid.slice(-8)}`,
+				s.F,
+				opts.from ?? null,
+				toBucketId,
+				amount,
+				occ,
+				opts.reversalOf ?? null,
+			],
+		);
+	const mkLtBucket = (s: S, bucketId: string) =>
+		s.q(
+			`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,$4,'lt','PENDING_LONG_TERM')`,
+			[bucketId, U1, s.MID, bcode("LT")],
+		);
+	const mkLtTask = async (
+		s: S,
+		taskId: string,
+		bucketId: string,
+		amount: string,
+		occ: string,
+	) => {
+		const t0 = s.gid();
+		await mkTransfer(s, t0, bucketId, amount, occ, { from: null });
+		await s.q(
+			`insert into long_term_send_tasks (id,user_id,midas_account_id,pending_bucket_id) values ($1,$2,$3,$4)`,
+			[taskId, U1, s.MID, bucketId],
+		);
+		await s.q(
+			`insert into long_term_send_task_revisions (id,user_id,task_id,revision_no,operation,status,amount,midas_allocation_transfer_id,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','PENDING',$4,$5,$6,$7,$8)`,
+			[s.gid(), U1, taskId, amount, t0, occ, `lt-${taskId.slice(-6)}-1`, s.F],
+		);
+	};
+	const mkLtRev = async (
+		s: S,
+		taskId: string,
+		revNo: number,
+		prev: string,
+		op: string,
+		status: string,
+		amount: string,
+		occ: string,
+	) => {
+		const tX = s.gid();
+		await mkTransfer(s, tX, s.CEF, amount, occ, { from: null });
+		const id = s.gid();
+		await s.q(
+			`insert into long_term_send_task_revisions (id,user_id,task_id,revision_no,previous_revision_id,operation,status,amount,midas_allocation_transfer_id,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			[
+				id,
+				U1,
+				taskId,
+				revNo,
+				prev,
+				op,
+				status,
+				amount,
+				tX,
+				occ,
+				`lt-${taskId.slice(-6)}-${revNo}`,
+				s.F,
+			],
+		);
+		return id;
+	};
+	// a PAID + reconciled (all-personal ADJUSTMENT) trigger; returns payment event
+	const mkTrigger = async (s: S, amount = "400.00") => {
+		await s.replica();
+		const sid = "81000000-0000-4000-8000-0000000000b5";
+		const r1 = await s.mkStmt(sid, amount, 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: "rc-trig5b",
+			occurredAt: RECON,
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe } = await s.mkPay(sid, r1, amount, 2, "2026-09-15 00:00:00+00");
+		await s.origin();
+		return pe;
+	};
+	const report = (s: S, pe: string) =>
+		buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: pe,
+		});
+
+	// ---- A: explicit 0-current-surplus attribution != UNATTRIBUTED
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await s.mkPur("500.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			currentSurplusAmount: "0.00",
+			...USER(),
+			idempotencyKey: "su-a",
+			occurredAt: W,
+		});
+		const v = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(v.status, "ATTRIBUTED", "5B/A: explicit 0-current-surplus is ATTRIBUTED, not UNATTRIBUTED");
+		eqB(v.attributedCurrentSurplusAmount, "0.00", "5B/A: current surplus use = 0.00 (explicit)");
+		eqB(v.otherFundingAmount, "500.00", "5B/A: other funding = full basis");
+		await s.close();
+	}
+
+	// ---- B: full discretionary attribution ; C: partial ; D: amount > basis rejected
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pB = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pB.eid),
+			periodMonth: P,
+			currentSurplusAmount: "1000.00",
+			...USER(),
+			idempotencyKey: "su-b",
+			occurredAt: W,
+		});
+		const vB = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pB.eid),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(vB.attributedCurrentSurplusAmount, "1000.00", "5B/B: full discretionary attribution stored");
+		eqB(vB.otherFundingAmount, "0.00", "5B/B: other funding 0");
+
+		await s.replica();
+		const pC = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pC.eid),
+			periodMonth: P,
+			currentSurplusAmount: "600.00",
+			...USER(),
+			idempotencyKey: "su-c",
+			occurredAt: W,
+		});
+		const vC = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pC.eid),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(vC.attributedCurrentSurplusAmount, "600.00", "5B/C: partial attribution 600 of 1000");
+		eqB(vC.otherFundingAmount, "400.00", "5B/C: remainder 400 from non-current-surplus funding (not inferred)");
+
+		await s.replica();
+		const pD = await s.mkPur("500.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		await throwB(
+			() =>
+				createSurplusUseAttribution({
+					db: s.db,
+					userId: U1,
+					subject: ccSub(pD.eid),
+					periodMonth: P,
+					currentSurplusAmount: "600.00",
+					...USER(),
+					idempotencyKey: "su-d",
+					occurredAt: W,
+				}),
+			"exceeds the authoritative source basis",
+			"5B/D: currentSurplusAmount > basis is rejected",
+		);
+		await s.close();
+	}
+
+	// ---- E: shared card purchase -> basis is the personal share only
+	{
+		const s = await make4bScenario();
+		const OBL = "8a000000-0000-4000-8000-0000000005e1";
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", SEP5);
+		await s.mkSplit({
+			purchaseEid: pur.eid,
+			purchaseEr: pur.er,
+			splitId: "87000000-0000-4000-8000-0000000005e1",
+			user: "400.00",
+			ext: "600.00",
+			gross: "1000.00",
+			occ: SEP5,
+			personId: s.P_FAM,
+			personObligationId: OBL,
+		});
+		await s.origin();
+		const basis = await resolveSurplusUseBasisAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			asOf: CP,
+		});
+		chkB(
+			basis.kind === "ACTIVE" && basis.basisAmount === "400.00",
+			"5B/E: shared purchase basis = personal 400 (external 600 excluded)",
+		);
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			currentSurplusAmount: "400.00",
+			...USER(),
+			idempotencyKey: "su-e",
+			occurredAt: W,
+		});
+		const v = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(v.storedBasisAmount, "400.00", "5B/E: stored basis is the personal share");
+		await s.close();
+	}
+
+	// ---- F: unsealed split -> attribution creation fail closed
+	{
+		const s = await make4bScenario();
+		const OBL = "8a000000-0000-4000-8000-0000000005f1";
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.mkObligation(OBL, s.P_FAM, "RECEIVABLE", "600.00", SEP5);
+		await s.mkSplit({
+			purchaseEid: pur.eid,
+			purchaseEr: pur.er,
+			splitId: "87000000-0000-4000-8000-0000000005f1",
+			user: "400.00",
+			ext: "600.00",
+			gross: "1000.00",
+			occ: SEP5,
+			personId: s.P_FAM,
+			personObligationId: OBL,
+			sealed: false,
+		});
+		await s.origin();
+		await throwB(
+			() =>
+				createSurplusUseAttribution({
+					db: s.db,
+					userId: U1,
+					subject: ccSub(pur.eid),
+					periodMonth: P,
+					currentSurplusAmount: "100.00",
+					...USER(),
+					idempotencyKey: "su-f",
+					occurredAt: W,
+				}),
+			"not authoritative",
+			"5B/F: an unsealed split makes attribution creation FAIL CLOSED",
+		);
+		await s.close();
+	}
+
+	// ---- G: People PAYABLE accepted ; H: People RECEIVABLE rejected
+	{
+		const s = await make4bScenario();
+		const PAY = "8a000000-0000-4000-8000-0000000005g1".replace(/g/g, "a");
+		const REC = "8a000000-0000-4000-8000-0000000005c2";
+		await s.replica();
+		await s.mkObligation(PAY, s.P_FRI, "PAYABLE", "300.00", SEP5);
+		await s.mkObligation(REC, s.P_FAM, "RECEIVABLE", "200.00", SEP5);
+		await s.origin();
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ppSub(PAY),
+			periodMonth: P,
+			currentSurplusAmount: "300.00",
+			...USER(),
+			idempotencyKey: "su-g",
+			occurredAt: W,
+		});
+		const vG = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ppSub(PAY),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(vG.status, "ATTRIBUTED", "5B/G: People PAYABLE surplus-use attribution accepted");
+		eqB(vG.lane, "DISCRETIONARY", "5B/G: People PAYABLE lane is DISCRETIONARY");
+		await throwB(
+			() =>
+				createSurplusUseAttribution({
+					db: s.db,
+					userId: U1,
+					subject: ppSub(REC),
+					periodMonth: P,
+					currentSurplusAmount: "100.00",
+					...USER(),
+					idempotencyKey: "su-h",
+					occurredAt: W,
+				}),
+			"not an owned PAYABLE",
+			"5B/H: a People RECEIVABLE is rejected as a surplus-use subject",
+		);
+		await s.close();
+	}
+
+	// ---- I/J/K/L: Mobility transfer
+	{
+		const s = await make4bScenario();
+		const GB = "f0000000-0000-4000-8000-00000000c001";
+		const GOAL = "99000000-0000-4000-8000-00000000c001";
+		const GB2 = "f0000000-0000-4000-8000-00000000c002";
+		const GOAL2 = "99000000-0000-4000-8000-00000000c002";
+		const T = "9a000000-0000-4000-8000-00000000c001";
+		const T2 = "9a000000-0000-4000-8000-00000000c002";
+		const TREV = "9a000000-0000-4000-8000-00000000c0ff";
+		await s.replica();
+		await mkGoalBucket(s, GB, "MOB");
+		await mkGoal(s, GOAL, GB);
+		await mkPurposeRev(s, GOAL, 1, null, "INTERNATIONAL_MOBILITY", "2026-08-05 00:00:00+00");
+		await mkTransfer(s, T, GB, "800.00", SEP5, { from: null });
+		await mkGoalBucket(s, GB2, "DISC");
+		await mkGoal(s, GOAL2, GB2);
+		await mkPurposeRev(s, GOAL2, 1, null, "PLANNED_DISCRETIONARY", "2026-08-05 00:00:00+00");
+		await mkTransfer(s, T2, GB2, "300.00", SEP5, { from: null });
+		await s.origin();
+		// I: accepted
+		const bI = await resolveSurplusUseBasisAsOf({
+			db: s.db,
+			userId: U1,
+			subject: mmSub(T),
+			asOf: CP,
+		});
+		chkB(
+			bI.kind === "ACTIVE" &&
+				bI.lane === "INTERNATIONAL_MOBILITY" &&
+				bI.basisAmount === "800.00",
+			"5B/I: an UNALLOCATED -> active INTERNATIONAL_MOBILITY goal transfer is an ACTIVE mobility basis (exact transfer amount)",
+		);
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: mmSub(T),
+			periodMonth: P,
+			currentSurplusAmount: "800.00",
+			...USER(),
+			idempotencyKey: "su-i",
+			occurredAt: W,
+		});
+		const vI = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: mmSub(T),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(vI.status, "ATTRIBUTED", "5B/I: mobility attribution ATTRIBUTED");
+		// J: no memo/name inference -- basis is keyed by transfer + goal purpose only
+		chkB(
+			bI.kind === "ACTIVE" &&
+				vI.lane === "INTERNATIONAL_MOBILITY",
+			"5B/J: mobility identity comes from transfer id + as-of goal purpose, never memo / goal name / bucket balance",
+		);
+		// K: non-Mobility goal transfer rejected as Mobility subject
+		await throwB(
+			() =>
+				createSurplusUseAttribution({
+					db: s.db,
+					userId: U1,
+					subject: mmSub(T2),
+					periodMonth: P,
+					currentSurplusAmount: "100.00",
+					...USER(),
+					idempotencyKey: "su-k",
+					occurredAt: W,
+				}),
+			"not classified INTERNATIONAL_MOBILITY",
+			"5B/K: a transfer into a non-INTERNATIONAL_MOBILITY goal is rejected as a Mobility subject",
+		);
+		// L: exact reversal makes the Mobility source inactive
+		await s.replica();
+		await mkTransfer(s, TREV, null, "800.00", "2026-09-14 00:00:00+00", {
+			from: GB,
+			reversalOf: T,
+		});
+		await s.origin();
+		const bL = await resolveSurplusUseBasisAsOf({
+			db: s.db,
+			userId: U1,
+			subject: mmSub(T),
+			asOf: CP,
+		});
+		chkB(
+			bL.kind === "SOURCE_INACTIVE",
+			"5B/L: an authoritative reversal makes the Mobility allocation source inactive",
+		);
+		const vL = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: mmSub(T),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(vL.status, "SOURCE_INACTIVE", "5B/L: the read model reports SOURCE_INACTIVE after reversal");
+		await s.close();
+	}
+
+	// ---- M/N/O/P: Long-Term task lifecycle = ONE active source
+	{
+		const s = await make4bScenario();
+		const LB = "f0000000-0000-4000-8000-00000000d001";
+		const TASK = "9b000000-0000-4000-8000-00000000d001";
+		await s.replica();
+		await mkLtBucket(s, LB);
+		await mkLtTask(s, TASK, LB, "700.00", SEP5);
+		await s.origin();
+		const bM = await resolveSurplusUseBasisAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ltSub(TASK),
+			asOf: CP,
+		});
+		chkB(
+			bM.kind === "ACTIVE" &&
+				bM.lane === "LONG_TERM_INVESTMENT" &&
+				bM.basisAmount === "700.00",
+			"5B/M: Long-Term CREATE/PENDING is one active LONG_TERM_INVESTMENT source (task allocation amount)",
+		);
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ltSub(TASK),
+			periodMonth: P,
+			currentSurplusAmount: "700.00",
+			...USER(),
+			idempotencyKey: "su-m",
+			occurredAt: W,
+		});
+		// N: SENT is still ONE use
+		await s.replica();
+		const cr = (
+			await s.q(
+				"select id from long_term_send_task_revisions where task_id=$1 and revision_no=1",
+				[TASK],
+			)
+		).rows[0].id as string;
+		await mkLtRev(s, TASK, 2, cr, "SENT", "SENT", "700.00", "2026-09-13 00:00:00+00");
+		await s.origin();
+		const vN = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ltSub(TASK),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(vN.status, "ATTRIBUTED", "5B/N: after SENT the Long-Term source is still ONE attributed use, not two");
+		// O: REOPEN -> still one active use
+		await s.replica();
+		const r2 = (
+			await s.q(
+				"select id from long_term_send_task_revisions where task_id=$1 and revision_no=2",
+				[TASK],
+			)
+		).rows[0].id as string;
+		await mkLtRev(s, TASK, 3, r2, "REOPEN", "PENDING", "700.00", "2026-09-14 00:00:00+00");
+		await s.origin();
+		const bO = await resolveSurplusUseBasisAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ltSub(TASK),
+			asOf: CP,
+		});
+		chkB(bO.kind === "ACTIVE", "5B/O: REOPEN -> the Long-Term source is still ONE active use");
+		// P: CANCELLED -> source inactive
+		await s.replica();
+		const r3 = (
+			await s.q(
+				"select id from long_term_send_task_revisions where task_id=$1 and revision_no=3",
+				[TASK],
+			)
+		).rows[0].id as string;
+		await mkLtRev(s, TASK, 4, r3, "CANCEL", "CANCELLED", "700.00", "2026-09-14 12:00:00+00");
+		await s.origin();
+		const bP = await resolveSurplusUseBasisAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ltSub(TASK),
+			asOf: CP,
+		});
+		chkB(bP.kind === "SOURCE_INACTIVE", "5B/P: CANCELLED makes the Long-Term source inactive");
+		await s.close();
+	}
+
+	// ---- Q/R: later source correction => STALE ; S: attribution UPDATE restores ATTRIBUTED
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			currentSurplusAmount: "600.00",
+			...USER(),
+			idempotencyKey: "su-q1",
+			occurredAt: W,
+		});
+		// later personal-share correction 1000 -> 700 (an UPDATE purchase revision)
+		await s.replica();
+		const er1 = (
+			await s.q(
+				"select id from credit_card_liability_event_revisions where event_id=$1 and revision_no=1",
+				[pur.eid],
+			)
+		).rows[0].id as string;
+		await s.mkPurRev(
+			pur.eid,
+			er1,
+			2,
+			"UPDATE",
+			"700.00",
+			"DISCRETIONARY_SPEND",
+			"2026-09-13 00:00:00+00",
+		);
+		await s.origin();
+		const vQ = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(vQ.status, "STALE", "5B/Q: a later purchase personal-share correction makes the attribution STALE (never prorated)");
+		eqB(vQ.storedBasisAmount, "1000.00", "5B/Q: the stored basis is unchanged (no silent proration)");
+		eqB(vQ.currentBasisAmount, "700.00", "5B/Q: the current authoritative basis is exposed for the user to approve");
+		// S: an explicit UPDATE restores authoritative status
+		await updateSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			expectedRevisionNo: 1,
+			currentSurplusAmount: "500.00",
+			...USER(),
+			idempotencyKey: "su-q2",
+			occurredAt: at("2026-09-14T00:00:00Z"),
+		});
+		const vS = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(vS.status, "ATTRIBUTED", "5B/S: an explicit user-approved UPDATE after the source correction restores ATTRIBUTED");
+		eqB(vS.storedBasisAmount, "700.00", "5B/S: the UPDATE re-stores the current authoritative basis");
+		await s.close();
+	}
+
+	// ---- R: later People principal correction => STALE
+	{
+		const s = await make4bScenario();
+		const PAY = "8a000000-0000-4000-8000-0000000005r1".replace(/r/g, "a");
+		await s.replica();
+		await s.mkObligation(PAY, s.P_FRI, "PAYABLE", "500.00", SEP5);
+		await s.origin();
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ppSub(PAY),
+			periodMonth: P,
+			currentSurplusAmount: "500.00",
+			...USER(),
+			idempotencyKey: "su-r",
+			occurredAt: W,
+		});
+		await s.replica();
+		const { tr } = await s.mkCanon("PERSON_PAYABLE_EXPENSE", "2026-09-13 00:00:00+00");
+		const prev = (
+			await s.q(
+				"select id from person_obligation_revisions where obligation_id=$1 and revision_no=1",
+				[PAY],
+			)
+		).rows[0].id as string;
+		await s.q(
+			`insert into person_obligation_revisions (id,user_id,obligation_id,revision_no,previous_revision_id,canonical_revision_id,operation,principal_amount,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,2,$4,$5,'UPDATE','800.00','2026-09-13 00:00:00+00',$6,$7)`,
+			[s.gid(), U1, PAY, prev, tr, "ok-r2", s.F],
+		);
+		await s.origin();
+		const vR = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ppSub(PAY),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(vR.status, "STALE", "5B/R: a later People PAYABLE principal correction (500 -> 800) makes the attribution STALE");
+		await s.close();
+	}
+
+	// ---- T: semantic UPDATE after checkpoint does not rewrite prior as-of state ;
+	//      U: semantic VOID => later UNATTRIBUTED ; AG: CREATE+UPDATE != two uses
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			currentSurplusAmount: "400.00",
+			...USER(),
+			idempotencyKey: "su-t1",
+			occurredAt: at("2026-09-10T00:00:00Z"),
+		});
+		// a later UPDATE (Sep 20) must not rewrite the Sep 15 as-of view
+		await updateSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			expectedRevisionNo: 1,
+			currentSurplusAmount: "900.00",
+			...USER(),
+			idempotencyKey: "su-t2",
+			occurredAt: at("2026-09-20T00:00:00Z"),
+		});
+		const vAtCP = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			asOf: CP,
+		});
+		eqB(vAtCP.attributedCurrentSurplusAmount, "400.00", "5B/T: the Sep-15 as-of view still shows 400 (the Sep-20 UPDATE does not rewrite it)");
+		eqB(vAtCP.semanticRevisionNo, 1, "5B/AG: exactly ONE effective revision as of the checkpoint (CREATE + UPDATE is not two uses)");
+		const vLater = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			asOf: at("2026-09-25T00:00:00Z"),
+		});
+		eqB(vLater.attributedCurrentSurplusAmount, "900.00", "5B/T: after the UPDATE instant the view reflects 900");
+		// U: VOID -> later UNATTRIBUTED
+		await voidSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			expectedRevisionNo: 2,
+			...USER(),
+			idempotencyKey: "su-u",
+			occurredAt: at("2026-09-26T00:00:00Z"),
+		});
+		const vVoid = await getSurplusUseAttributionAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			asOf: at("2026-09-27T00:00:00Z"),
+		});
+		eqB(vVoid.status, "UNATTRIBUTED", "5B/U: a semantic VOID leaves the source UNATTRIBUTED from that instant onward");
+		await s.close();
+	}
+
+	// ---- V: complete coverage, no uses -> available = trueSurplus
+	{
+		const s = await make4bScenario();
+		const pe = await mkTrigger(s);
+		const rep = await report(s, pe);
+		const atn = rep.availableToAllocateNow;
+		chkB(
+			atn.available === true &&
+				atn.amount === atn.trueSurplus &&
+				atn.totalAttributedCurrentSurplusUse === "0.00",
+			"5B/V: complete coverage with no active MTD uses -> available = true, amount = trueSurplus",
+		);
+		eqB(rep.mtd.surplusUseAttribution.candidateCount, 0, "5B/V: empty candidate universe");
+		await s.close();
+	}
+
+	// ---- W/X/Y/Z: full attribution + lane accounting + oversubscription
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		const pW = await s.mkPur("300.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		const pe = await mkTrigger(s);
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pW.eid),
+			periodMonth: P,
+			currentSurplusAmount: "300.00",
+			...USER(),
+			idempotencyKey: "su-w",
+			occurredAt: W,
+		});
+		const rep = await report(s, pe);
+		const atn = rep.availableToAllocateNow;
+		chkB(atn.available === true, "5B/W: a fully attributed candidate yields available = true");
+		if (atn.available === true) {
+			eqB(
+				atn.totalAttributedCurrentSurplusUse,
+				"300.00",
+				"5B/W: total effective current-surplus use = 300",
+			);
+			eqB(atn.lanes.DISCRETIONARY.used, "300.00", "5B/W: discretionary lane used = 300");
+			// X: lane invariant -- planned sum == trueSurplus
+			const sum =
+				centsB(atn.lanes.INTERNATIONAL_MOBILITY.planned) +
+				centsB(atn.lanes.LONG_TERM_INVESTMENT.planned) +
+				centsB(atn.lanes.DISCRETIONARY.planned);
+			eqB(
+				sum,
+				centsB(atn.trueSurplus),
+				"5B/X: mobility + longTerm + discretionary planned == trueSurplus (no silent rebalance)",
+			);
+			// Y: total available is max(trueSurplus - totalUsed, 0), NOT sum of per-lane remaining
+			eqB(
+				centsB(atn.amount),
+				centsB(atn.trueSurplus) - 300n * 100n,
+				"5B/Y: total available = max(trueSurplus - totalUsed, 0), not the sum of per-lane remaining",
+			);
+		}
+		await s.close();
+	}
+
+	// ---- Z: total attributed use > trueSurplus -> available 0 + exact oversubscription
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		// a very large discretionary purchase attributed fully to current surplus
+		const pZ = await s.mkPur("999999.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		const pe = await mkTrigger(s);
+		const basisZ = await resolveSurplusUseBasisAsOf({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pZ.eid),
+			asOf: CP,
+		});
+		const zCents = basisZ.kind === "ACTIVE" ? basisZ.basisAmount : "0.00";
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pZ.eid),
+			periodMonth: P,
+			currentSurplusAmount: zCents,
+			...USER(),
+			idempotencyKey: "su-z",
+			occurredAt: W,
+		});
+		const rep = await report(s, pe);
+		const atn = rep.availableToAllocateNow;
+		chkB(
+			atn.available === true &&
+				atn.amount === "0.00" &&
+				centsB(atn.oversubscribedBy) ===
+					centsB(atn.totalAttributedCurrentSurplusUse) - centsB(atn.trueSurplus),
+			"5B/Z: total attributed use > trueSurplus -> available amount 0, oversubscribedBy exact (not an error)",
+		);
+		await s.close();
+	}
+
+	// ---- AD: an active candidate without attribution -> INCOMPLETE ;
+	//      AE: an explicit currentSurplusAmount=0 candidate counts as complete
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pAD = await s.mkPur("250.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		const pe = await mkTrigger(s);
+		let rep = await report(s, pe);
+		chkB(
+			rep.availableToAllocateNow.available === false &&
+				rep.availableToAllocateNow.reason === "SURPLUS_USE_ATTRIBUTION_INCOMPLETE",
+			"5B/AD: an active MTD candidate with no attribution -> available = false (SURPLUS_USE_ATTRIBUTION_INCOMPLETE)",
+		);
+		chkB(
+			rep.mtd.surplusUseAttribution.unattributedSubjectIds.includes(pAD.eid),
+			"5B/AD: the unattributed subject id is surfaced",
+		);
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pAD.eid),
+			periodMonth: P,
+			currentSurplusAmount: "0.00",
+			...USER(),
+			idempotencyKey: "su-ae",
+			occurredAt: W,
+		});
+		rep = await report(s, pe);
+		chkB(
+			rep.availableToAllocateNow.available === true,
+			"5B/AE: an explicit currentSurplusAmount=0 attribution counts as COMPLETE coverage",
+		);
+		await s.close();
+	}
+
+	// ---- AF: a STALE attribution makes availability unavailable
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		const pe = await mkTrigger(s);
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			currentSurplusAmount: "600.00",
+			...USER(),
+			idempotencyKey: "su-af",
+			occurredAt: W,
+		});
+		await s.replica();
+		const er1 = (
+			await s.q(
+				"select id from credit_card_liability_event_revisions where event_id=$1 and revision_no=1",
+				[pur.eid],
+			)
+		).rows[0].id as string;
+		await s.mkPurRev(
+			pur.eid,
+			er1,
+			2,
+			"UPDATE",
+			"700.00",
+			"DISCRETIONARY_SPEND",
+			"2026-09-13 00:00:00+00",
+		);
+		await s.origin();
+		const rep = await report(s, pe);
+		chkB(
+			rep.availableToAllocateNow.available === false &&
+				rep.availableToAllocateNow.reason === "SURPLUS_USE_ATTRIBUTION_INCOMPLETE" &&
+				rep.mtd.surplusUseAttribution.staleSubjectIds.includes(pur.eid),
+			"5B/AF: a STALE attribution flips availableToAllocateNow to unavailable",
+		);
+		await s.close();
+	}
+
+	// ---- AH: a persisted checkpoint freezes availableToAllocateNow;
+	//      later attribution changes do not alter replay
+	{
+		const {
+			processPendingBudgetV2CheckpointRequests,
+			getBudgetV2CheckpointByPaymentEventId,
+		} = await import("../src/budget/checkpoint-processor-v2.ts");
+		const { maybeEnqueueBudgetV2CheckpointRequest } = await import(
+			"../src/budget/checkpoint-request-v2.ts"
+		);
+		const { createCheckpointTriggerCard } = await import(
+			"../src/budget/checkpoint-trigger-card-v2.ts"
+		);
+		const { canonicalJsonStringify } = await import(
+			"../src/budget/checkpoint-canonical-v2.ts"
+		);
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-5b-ah",
+			occurredAt: at("2026-08-01T00:00:00Z"),
+		});
+		await s.replica();
+		const pur = await s.mkPur("300.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			currentSurplusAmount: "300.00",
+			...USER(),
+			idempotencyKey: "su-ah",
+			occurredAt: W,
+		});
+		const pe = await mkTrigger(s);
+		const payRevRow = (
+			await s.q<{ id: string }>(
+				"select id from credit_card_statement_revisions where payment_event_id=$1",
+				[pe],
+			)
+		).rows[0] as { id: string };
+		await s.db.transaction((tx: S) =>
+			maybeEnqueueBudgetV2CheckpointRequest({
+				tx,
+				userId: U1,
+				statementId: "81000000-0000-4000-8000-0000000000b5",
+				creditCardId: s.CARD,
+				paymentEventId: pe,
+				payRevisionId: payRevRow.id,
+				occurredAt: at("2026-09-15T00:00:00Z"),
+			}),
+		);
+		await processPendingBudgetV2CheckpointRequests({ db: s.db });
+		const before = await getBudgetV2CheckpointByPaymentEventId({
+			db: s.db,
+			userId: U1,
+			paymentEventId: pe,
+		});
+		// mutate: VOID the attribution afterwards
+		await voidSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			expectedRevisionNo: 1,
+			...USER(),
+			idempotencyKey: "su-ah-void",
+			occurredAt: at("2026-09-16T00:00:00Z"),
+		});
+		const after = await getBudgetV2CheckpointByPaymentEventId({
+			db: s.db,
+			userId: U1,
+			paymentEventId: pe,
+		});
+		chkB(
+			before.status === "PERSISTED" &&
+				after.status === "PERSISTED" &&
+				canonicalJsonStringify(
+					(before.report as S).availableToAllocateNow,
+				) === canonicalJsonStringify((after.report as S).availableToAllocateNow),
+			"5B/AH: a persisted checkpoint freezes availableToAllocateNow; a later attribution VOID does not alter replay",
+		);
+		chkB(
+			(before.report as S).availableToAllocateNow.available === true,
+			"5B/AH: the frozen availableToAllocateNow was authoritative (available = true)",
+		);
+		await s.close();
+	}
+
+	// ---- AI/AJ/AK/AL: idempotency / OCC / concurrency
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		const pur = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		const base = {
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pur.eid),
+			periodMonth: P,
+			...USER(),
+			occurredAt: W,
+		};
+		const r1 = await createSurplusUseAttribution({
+			...base,
+			currentSurplusAmount: "600.00",
+			idempotencyKey: "su-ai",
+		});
+		const r2 = await createSurplusUseAttribution({
+			...base,
+			currentSurplusAmount: "600.00",
+			idempotencyKey: "su-ai",
+		});
+		chkB(
+			r2.idempotentReplay === true && r2.revisionId === r1.revisionId,
+			"5B/AI: same key + exact command -> idempotent replay",
+		);
+		await throwB(
+			() =>
+				createSurplusUseAttribution({
+					...base,
+					currentSurplusAmount: "700.00",
+					idempotencyKey: "su-ai",
+				}),
+			"different surplus-use attribution parameters",
+			"5B/AJ: same key + different payload -> typed BUDGET_IDEMPOTENCY_CONFLICT",
+		);
+		await throwB(
+			() =>
+				updateSurplusUseAttribution({
+					...base,
+					expectedRevisionNo: 5,
+					currentSurplusAmount: "100.00",
+					idempotencyKey: "su-ak",
+				}),
+			"expected surplus-use attribution revision",
+			"5B/AK: a stale expectedRevisionNo -> typed BUDGET_REVISION_CONFLICT",
+		);
+		// AL: concurrent same-key CREATE race -> one row, no raw 23505
+		const s2 = await make4bScenario();
+		await s2.replica();
+		const pur2 = await s2.mkPur("500.00", "DISCRETIONARY_SPEND", SEP5);
+		await s2.origin();
+		const mk = () =>
+			createSurplusUseAttribution({
+				db: s2.db,
+				userId: U1,
+				subject: ccSub(pur2.eid),
+				periodMonth: P,
+				currentSurplusAmount: "500.00",
+				...USER(),
+				idempotencyKey: "su-al",
+				occurredAt: W,
+			});
+		const settled = await Promise.allSettled([mk(), mk()]);
+		const cnt = (
+			await s2.q(
+				"select count(*)::int c from budget_v2_surplus_use_attribution_revisions where purchase_event_id=$1",
+				[pur2.eid],
+			)
+		).rows[0].c as number;
+		chkB(
+			cnt === 1 &&
+				settled.every(
+					(x) =>
+						x.status === "fulfilled" ||
+						!/23505|duplicate key/.test(
+							String((x as PromiseRejectedResult).reason?.message),
+						),
+				),
+			"5B/AL: concurrent same-key CREATE race -> exactly one row, no raw 23505",
+		);
+		await s.close();
+		await s2.close();
+	}
+}
+
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -6817,6 +7997,7 @@ if (probed) {
 	await resolverRuntime4C();
 	await resolverRuntime5();
 	await resolverRuntime5A();
+	await resolverRuntime5B();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

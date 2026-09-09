@@ -48,7 +48,18 @@ export type BudgetErrorCode =
 	// A stored checkpoint snapshot failed integrity verification on read
 	// (recomputed canonical fingerprint / schemaVersion / paymentEventId /
 	// periodMonth / checkpointAt / previousCheckpointAt identity mismatch).
-	| "BUDGET_CHECKPOINT_SNAPSHOT_CORRUPT";
+	| "BUDGET_CHECKPOINT_SNAPSHOT_CORRUPT"
+	// Budget V2 surplus-use attribution (Checkpoint 5B).
+	// The attribution subject is not an eligible surplus-use source: wrong
+	// polymorphic anchor, not owned, People target not PAYABLE, credit-card
+	// target not PURCHASE, Midas transfer not an UNALLOCATED -> INTERNATIONAL
+	// MOBILITY goal allocation, Long-Term task not owned, or a lane that is
+	// structurally incompatible with the subject type.
+	| "BUDGET_SURPLUS_USE_SUBJECT_INVALID"
+	// The attribution's bound source is inactive as of the attribution instant
+	// (purchase VOID, People PAYABLE VOID, Midas transfer reversed, Long-Term
+	// task CANCELLED) so it cannot open a surplus-use attribution.
+	| "BUDGET_SURPLUS_USE_SOURCE_INACTIVE";
 
 export class BudgetError extends Error {
 	readonly code: BudgetErrorCode;

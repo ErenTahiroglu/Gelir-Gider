@@ -6,7 +6,10 @@ import {
 } from "../credit-cards/statement-reconciliation";
 import type { Database } from "../db/client";
 import { effectiveRevisionAsOf } from "../db/effective-revision";
-import { incomeReceiptBudgetV2SemanticRevisions } from "../db/schema/budget-v2-semantics";
+import {
+	incomeReceiptBudgetV2SemanticRevisions,
+	shortTermGoalBudgetV2PurposeRevisions,
+} from "../db/schema/budget-v2-semantics";
 import {
 	creditCardLiabilityEventRevisions,
 	creditCardLiabilityEvents,
@@ -28,6 +31,11 @@ import {
 	incomeSources,
 } from "../db/schema/income";
 import {
+	longTermSendTaskRevisions,
+	longTermSendTasks,
+} from "../db/schema/long-term";
+import { midasAllocationTransfers } from "../db/schema/midas";
+import {
 	type PersonRelationship,
 	personObligationRevisions,
 	personObligations,
@@ -35,18 +43,25 @@ import {
 	personSettlementRevisions,
 	personSettlements,
 } from "../db/schema/people";
+import { shortTermGoals } from "../db/schema/short-term-goals";
 import { formatCentsToMoney, parseAggregateMoneyString } from "../ledger/money";
 import { BudgetError } from "./errors";
 import {
 	type BudgetV2LiveResolution,
 	buildResolverWindow,
+	type CurrentObligationsOverlap,
 	type ResolverWindow,
+	resolveBudgetV2CurrentObligationsOverlap,
 	resolveBudgetV2LiveSnapshot,
 } from "./live-resolver-v2";
 import {
 	type FoodClassificationKind,
 	getSpendingFoodClassificationAsOf,
 } from "./spending-food-classification-v2";
+import {
+	getSurplusUseAttributionAsOf,
+	type SurplusUseSubjectRef,
+} from "./surplus-use-attribution-v2";
 import { normalizeUuid, validateBudgetPeriodMonth } from "./utils";
 
 /**
@@ -402,7 +417,107 @@ export interface MtdSection {
 		perGoal: unknown[];
 		overdueGoalIds: unknown[];
 	};
+	surplusUseAttribution: SurplusUseAttributionSection;
 }
+
+// ============================================================================
+// Section 5B -- surplus-use attribution + authoritative availableToAllocateNow
+// ============================================================================
+
+export type SurplusUseLaneName =
+	| "DISCRETIONARY"
+	| "INTERNATIONAL_MOBILITY"
+	| "LONG_TERM_INVESTMENT";
+
+export type SurplusUseCandidateStatus = "ATTRIBUTED" | "UNATTRIBUTED" | "STALE";
+
+/**
+ * One active MTD surplus-use CANDIDATE and its explicit (user-approved) funding
+ * provenance as of the checkpoint. Funding provenance is never inferred.
+ *   - `waterfallAlreadyCoveredAmount` is the EXACT part of this source already
+ *     represented in the policy waterfall (`currentObligations`); Midas
+ *     Mobility / Long-Term allocations have zero waterfall overlap.
+ *   - `waterfallOverlapExact = false` when a partial carry-in / basic-living
+ *     aggregate makes per-source overlap ambiguous -- this forces
+ *     `availableToAllocateNow` unavailable for exactness (never guessed).
+ *   - `effectiveCurrentSurplusUseAmount = min(attributed, remaining)` when the
+ *     overlap is exact -- so an attribution need not be rewritten merely
+ *     because the same expense later enters `currentObligations`.
+ */
+export interface SurplusUseCandidateEntry {
+	subjectType:
+		| "CREDIT_CARD_PURCHASE"
+		| "PEOPLE_PAYABLE"
+		| "MOBILITY_MIDAS_TRANSFER"
+		| "LONG_TERM_SEND_TASK";
+	subjectId: string;
+	lane: SurplusUseLaneName;
+	sourceEconomicAmount: string;
+	waterfallAlreadyCoveredAmount: string;
+	waterfallOverlapExact: boolean;
+	waterfallOverlapUnresolvedReason: string | null;
+	remainingPotentialSurplusUseAmount: string;
+	status: SurplusUseCandidateStatus;
+	semanticRevisionId: string | null;
+	semanticRevisionNo: number | null;
+	storedBasisAmount: string | null;
+	attributedCurrentSurplusAmount: string | null;
+	effectiveCurrentSurplusUseAmount: string | null;
+	sourceKind: "USER_APPROVED" | null;
+	reason: string | null;
+}
+
+export interface SurplusUseAttributionSection {
+	candidates: SurplusUseCandidateEntry[];
+	candidateCount: number;
+	attributedCount: number;
+	coverageComplete: boolean;
+	unattributedSubjectIds: string[];
+	staleSubjectIds: string[];
+	overlapUnresolvedSubjectIds: string[];
+	knownAttributedCurrentSurplusUse: string;
+}
+
+export interface SurplusUseLaneAccounting {
+	planned: string;
+	used: string;
+	remaining: string;
+	overrun: string;
+}
+
+export interface AvailableToAllocateNowAvailable {
+	available: true;
+	amount: string;
+	trueSurplus: string;
+	totalAttributedCurrentSurplusUse: string;
+	oversubscribedBy: string;
+	lanes: Record<SurplusUseLaneName, SurplusUseLaneAccounting>;
+	provenance: {
+		method: "AUTHORITATIVE_USER_APPROVED_SURPLUS_USE_ATTRIBUTION";
+		meaning: string;
+		candidateCount: number;
+		attributedCount: number;
+	};
+}
+
+export interface AvailableToAllocateNowUnavailable {
+	available: false;
+	reason:
+		| "SURPLUS_USE_ATTRIBUTION_INCOMPLETE"
+		| "SURPLUS_USE_ATTRIBUTION_OVERLAP_UNRESOLVED";
+	trueSurplus: string;
+	candidateCount: number;
+	attributedCount: number;
+	unattributedSubjectIds: string[];
+	staleSubjectIds: string[];
+	overlapUnresolvedSubjectIds: string[];
+	knownAttributedCurrentSurplusUse: string;
+	unresolvedPotentialUseAmount: string | null;
+}
+
+export type AvailableToAllocateNowSection =
+	| AvailableToAllocateNowAvailable
+	| AvailableToAllocateNowUnavailable;
 
 /**
  * One eligible PERSONAL economic spending subject in the MTD window and its
@@ -486,7 +601,7 @@ export interface BudgetV2CheckpointReport {
 	mtd: MtdSection;
 	foodAnalytics: FoodAnalyticsSection;
 	installmentAnalytics: InstallmentAnalyticsSection;
-	availableToAllocateNow: BudgetV2LiveResolution["availableToAllocateNow"];
+	availableToAllocateNow: AvailableToAllocateNowSection;
 }
 
 // ============================================================================
@@ -1676,7 +1791,7 @@ async function buildStatementPayments(
  */
 export function assembleMtdNonSpending(
 	resolution: BudgetV2LiveResolution,
-): Omit<MtdSection, "spending"> {
+): Omit<MtdSection, "spending" | "surplusUseAttribution"> {
 	const ev = resolution.evidenceSnapshot;
 	const bl = pick(ev, "basicLiving");
 	const emergency = pick(ev, "emergencyFund");
@@ -2033,6 +2148,448 @@ async function buildFoodAnalytics(
 }
 
 // ============================================================================
+// Section 5B -- surplus-use candidate universe + authoritative availableToAllocateNow
+// ============================================================================
+
+interface SurplusUseCandidate {
+	subject: SurplusUseSubjectRef;
+	subjectType: SurplusUseCandidateEntry["subjectType"];
+	subjectId: string;
+	lane: SurplusUseLaneName;
+	sourceEconomicCents: bigint;
+	coveredCents: bigint;
+	overlapExact: boolean;
+	overlapUnresolvedReason: string | null;
+}
+
+async function loadSurplusUseCandidateUniverse(
+	db: Database,
+	userId: string,
+	win: ResolverWindow,
+	checkpointAt: Date,
+	events: PurchaseEventRow[],
+	overlap: CurrentObligationsOverlap,
+): Promise<SurplusUseCandidate[]> {
+	const out: SurplusUseCandidate[] = [];
+	const ambiguous = new Set(overlap.ambiguousPurchaseEventIds);
+
+	// ---- 11A. personal spending -- credit-card purchase PERSONAL share ----
+	for (const ev of events) {
+		const revs = await db
+			.select({
+				id: creditCardLiabilityEventRevisions.id,
+				revisionNo: creditCardLiabilityEventRevisions.revisionNo,
+				operation: creditCardLiabilityEventRevisions.operation,
+				amount: creditCardLiabilityEventRevisions.amount,
+				budgetCategory: creditCardLiabilityEventRevisions.budgetCategory,
+				occurredAt: creditCardLiabilityEventRevisions.occurredAt,
+			})
+			.from(creditCardLiabilityEventRevisions)
+			.where(eq(creditCardLiabilityEventRevisions.eventId, ev.eventId));
+		const eff = effectiveRevisionAsOf(revs, checkpointAt);
+		if (!eff || eff.operation === "VOID") continue;
+		if (!win.inMtd(asDate(eff.occurredAt))) continue;
+		const shares = await purchaseSharesAsOf(
+			db,
+			userId,
+			ev.eventId,
+			centsOf(eff.amount),
+			checkpointAt,
+		);
+		if (!shares.available) {
+			reportFailClosed(
+				`surplus-use: purchase ${ev.eventId} ownership cannot be authoritatively resolved as of the checkpoint (${shares.reason})`,
+			);
+		}
+		const personalCents = shares.personalCents;
+		if (personalCents <= 0n) continue;
+		const coveredCents =
+			overlap.purchasePersonalCoveredCents.get(ev.eventId) ?? 0n;
+		let overlapExact = true;
+		let overlapUnresolvedReason: string | null = null;
+		if (ambiguous.has(ev.eventId)) {
+			overlapExact = false;
+			overlapUnresolvedReason =
+				"a partial pre-period reserve carry-in makes the per-purchase currentObligations overlap ambiguous";
+		} else if (
+			eff.budgetCategory === "MANDATORY_EXPENSE" &&
+			coveredCents < personalCents
+		) {
+			overlapExact = false;
+			overlapUnresolvedReason =
+				"a MANDATORY_EXPENSE personal share not fully inside currentObligations is basic-living funded in aggregate; per-source overlap is not exact";
+		}
+		out.push({
+			subject: { type: "CREDIT_CARD_PURCHASE", purchaseEventId: ev.eventId },
+			subjectType: "CREDIT_CARD_PURCHASE",
+			subjectId: ev.eventId,
+			lane: "DISCRETIONARY",
+			sourceEconomicCents: personalCents,
+			coveredCents: coveredCents > personalCents ? personalCents : coveredCents,
+			overlapExact,
+			overlapUnresolvedReason,
+		});
+	}
+
+	// ---- 11A. personal spending -- People PAYABLE principal ----
+	const payables = await db
+		.select({ id: personObligations.id })
+		.from(personObligations)
+		.where(
+			and(
+				eq(personObligations.userId, userId),
+				eq(personObligations.direction, "PAYABLE"),
+			),
+		);
+	for (const o of payables) {
+		const oRevs = await db
+			.select({
+				id: personObligationRevisions.id,
+				revisionNo: personObligationRevisions.revisionNo,
+				operation: personObligationRevisions.operation,
+				principal: personObligationRevisions.principalAmount,
+				occurredAt: personObligationRevisions.occurredAt,
+			})
+			.from(personObligationRevisions)
+			.where(eq(personObligationRevisions.obligationId, o.id));
+		const eff = effectiveRevisionAsOf(oRevs, checkpointAt);
+		if (!eff || eff.operation === "VOID") continue;
+		const create = oRevs.find((r) => r.revisionNo === 1);
+		if (!create || !win.inMtd(asDate(create.occurredAt))) continue;
+		const principalCents = centsOf(eff.principal);
+		if (principalCents <= 0n) continue;
+		const coveredCents = overlap.peoplePayableCoveredCents.get(o.id) ?? 0n;
+		out.push({
+			subject: { type: "PEOPLE_PAYABLE", personObligationId: o.id },
+			subjectType: "PEOPLE_PAYABLE",
+			subjectId: o.id,
+			lane: "DISCRETIONARY",
+			sourceEconomicCents: principalCents,
+			coveredCents:
+				coveredCents > principalCents ? principalCents : coveredCents,
+			overlapExact: true,
+			overlapUnresolvedReason: null,
+		});
+	}
+
+	// ---- 11B. Mobility -- UNALLOCATED -> INTERNATIONAL_MOBILITY goal transfer ----
+	const transfers = await db
+		.select({
+			id: midasAllocationTransfers.id,
+			fromBucketId: midasAllocationTransfers.fromBucketId,
+			toBucketId: midasAllocationTransfers.toBucketId,
+			amount: midasAllocationTransfers.amount,
+			occurredAt: midasAllocationTransfers.occurredAt,
+			reversalOfTransferId: midasAllocationTransfers.reversalOfTransferId,
+		})
+		.from(midasAllocationTransfers)
+		.where(eq(midasAllocationTransfers.userId, userId));
+	const reversedTargets = new Set(
+		transfers
+			.filter(
+				(t) =>
+					t.reversalOfTransferId !== null &&
+					asDate(t.occurredAt).getTime() <= checkpointAt.getTime(),
+			)
+			.map((t) => t.reversalOfTransferId as string),
+	);
+	for (const t of transfers) {
+		if (t.reversalOfTransferId !== null) continue;
+		if (t.fromBucketId !== null || t.toBucketId === null) continue;
+		if (!win.inMtd(asDate(t.occurredAt))) continue;
+		if (reversedTargets.has(t.id)) continue; // SOURCE_INACTIVE -- not a candidate
+		const [goal] = await db
+			.select({ id: shortTermGoals.id })
+			.from(shortTermGoals)
+			.where(eq(shortTermGoals.midasBucketId, t.toBucketId))
+			.limit(1);
+		if (!goal) continue;
+		const purposeRevs = await db
+			.select({
+				revisionNo: shortTermGoalBudgetV2PurposeRevisions.revisionNo,
+				purpose: shortTermGoalBudgetV2PurposeRevisions.purpose,
+				occurredAt: shortTermGoalBudgetV2PurposeRevisions.occurredAt,
+			})
+			.from(shortTermGoalBudgetV2PurposeRevisions)
+			.where(eq(shortTermGoalBudgetV2PurposeRevisions.goalId, goal.id));
+		const purpose = effectiveRevisionAsOf(purposeRevs, checkpointAt);
+		if (purpose?.purpose !== "INTERNATIONAL_MOBILITY") continue;
+		out.push({
+			subject: {
+				type: "MOBILITY_MIDAS_TRANSFER",
+				midasAllocationTransferId: t.id,
+			},
+			subjectType: "MOBILITY_MIDAS_TRANSFER",
+			subjectId: t.id,
+			lane: "INTERNATIONAL_MOBILITY",
+			sourceEconomicCents: centsOf(t.amount),
+			coveredCents: 0n,
+			overlapExact: true,
+			overlapUnresolvedReason: null,
+		});
+	}
+
+	// ---- 11C. Long Term -- one active source per task (CREATE; SENT is not a 2nd) ----
+	const tasks = await db
+		.select({ id: longTermSendTasks.id })
+		.from(longTermSendTasks)
+		.where(eq(longTermSendTasks.userId, userId));
+	for (const task of tasks) {
+		const tRevs = await db
+			.select({
+				id: longTermSendTaskRevisions.id,
+				revisionNo: longTermSendTaskRevisions.revisionNo,
+				status: longTermSendTaskRevisions.status,
+				amount: longTermSendTaskRevisions.amount,
+				occurredAt: longTermSendTaskRevisions.occurredAt,
+			})
+			.from(longTermSendTaskRevisions)
+			.where(eq(longTermSendTaskRevisions.taskId, task.id));
+		const eff = effectiveRevisionAsOf(tRevs, checkpointAt);
+		if (!eff || eff.status === "CANCELLED") continue; // SOURCE_INACTIVE
+		const create = tRevs.find((r) => r.revisionNo === 1);
+		if (!create || !win.inMtd(asDate(create.occurredAt))) continue;
+		out.push({
+			subject: { type: "LONG_TERM_SEND_TASK", longTermSendTaskId: task.id },
+			subjectType: "LONG_TERM_SEND_TASK",
+			subjectId: task.id,
+			lane: "LONG_TERM_INVESTMENT",
+			sourceEconomicCents: centsOf(eff.amount),
+			coveredCents: 0n,
+			overlapExact: true,
+			overlapUnresolvedReason: null,
+		});
+	}
+
+	out.sort((a, b) =>
+		a.subjectType === b.subjectType
+			? a.subjectId.localeCompare(b.subjectId)
+			: a.subjectType.localeCompare(b.subjectType),
+	);
+	return out;
+}
+
+const ATAN_MEANING =
+	"remaining Budget V2 current-period true-surplus policy capacity after authoritative realized-use attribution -- NOT a bank-account balance, cash promise, investment advice, or auto-spend permission";
+
+function max0(v: bigint): bigint {
+	return v > 0n ? v : 0n;
+}
+
+async function buildSurplusUseAttribution(
+	db: Database,
+	userId: string,
+	periodMonth: string,
+	checkpointAt: Date,
+	candidates: SurplusUseCandidate[],
+	policy: BudgetV2LiveResolution["policyResult"],
+): Promise<{
+	section: SurplusUseAttributionSection;
+	availableToAllocateNow: AvailableToAllocateNowSection;
+}> {
+	const entries: SurplusUseCandidateEntry[] = [];
+	const unattributedSubjectIds: string[] = [];
+	const staleSubjectIds: string[] = [];
+	const overlapUnresolvedSubjectIds: string[] = [];
+	let attributedCount = 0;
+	let knownAttributedUseCents = 0n;
+	let unresolvedPotentialUseCents = 0n;
+	let anyUnresolvedPotentialInexact = false;
+	const usedByLane: Record<SurplusUseLaneName, bigint> = {
+		DISCRETIONARY: 0n,
+		INTERNATIONAL_MOBILITY: 0n,
+		LONG_TERM_INVESTMENT: 0n,
+	};
+
+	for (const c of candidates) {
+		const remainingCents = max0(c.sourceEconomicCents - c.coveredCents);
+		const view = await getSurplusUseAttributionAsOf({
+			db,
+			userId,
+			subject: c.subject,
+			periodMonth,
+			asOf: checkpointAt,
+		});
+
+		let status: SurplusUseCandidateStatus;
+		let effectiveUseCents: bigint | null = null;
+		if (view.status === "SOURCE_INACTIVE") {
+			// The universe already excludes inactive sources; a disagreement is
+			// an authoritative contradiction.
+			reportFailClosed(
+				`surplus-use: candidate ${c.subjectId} is an active MTD source but its attribution resolves SOURCE_INACTIVE (${view.reason})`,
+			);
+		} else if (view.status === "ATTRIBUTED") {
+			status = "ATTRIBUTED";
+			attributedCount += 1;
+			const attributedCents = centsOf(
+				reqMoney(
+					view.attributedCurrentSurplusAmount,
+					"attributedCurrentSurplusAmount",
+				),
+			);
+			if (c.overlapExact) {
+				effectiveUseCents =
+					attributedCents < remainingCents ? attributedCents : remainingCents;
+				usedByLane[c.lane] += effectiveUseCents;
+				knownAttributedUseCents += effectiveUseCents;
+			}
+		} else if (view.status === "STALE") {
+			status = "STALE";
+			if (c.overlapExact && remainingCents > 0n) {
+				staleSubjectIds.push(c.subjectId);
+				unresolvedPotentialUseCents += remainingCents;
+			}
+		} else {
+			status = "UNATTRIBUTED";
+			if (c.overlapExact && remainingCents > 0n) {
+				unattributedSubjectIds.push(c.subjectId);
+				unresolvedPotentialUseCents += remainingCents;
+			}
+		}
+
+		if (!c.overlapExact && remainingCents > 0n) {
+			overlapUnresolvedSubjectIds.push(c.subjectId);
+			anyUnresolvedPotentialInexact = true;
+		}
+
+		entries.push({
+			subjectType: c.subjectType,
+			subjectId: c.subjectId,
+			lane: c.lane,
+			sourceEconomicAmount: formatCentsToMoney(c.sourceEconomicCents),
+			waterfallAlreadyCoveredAmount: formatCentsToMoney(c.coveredCents),
+			waterfallOverlapExact: c.overlapExact,
+			waterfallOverlapUnresolvedReason: c.overlapUnresolvedReason,
+			remainingPotentialSurplusUseAmount: formatCentsToMoney(remainingCents),
+			status,
+			semanticRevisionId: view.semanticRevisionId,
+			semanticRevisionNo: view.semanticRevisionNo,
+			storedBasisAmount: view.storedBasisAmount,
+			attributedCurrentSurplusAmount: view.attributedCurrentSurplusAmount,
+			effectiveCurrentSurplusUseAmount:
+				effectiveUseCents === null
+					? null
+					: formatCentsToMoney(effectiveUseCents),
+			sourceKind: view.sourceKind,
+			reason: view.reason,
+		});
+	}
+
+	const coverageComplete =
+		overlapUnresolvedSubjectIds.length === 0 &&
+		unattributedSubjectIds.length === 0 &&
+		staleSubjectIds.length === 0;
+
+	const section: SurplusUseAttributionSection = {
+		candidates: entries,
+		candidateCount: entries.length,
+		attributedCount,
+		coverageComplete,
+		unattributedSubjectIds,
+		staleSubjectIds,
+		overlapUnresolvedSubjectIds,
+		knownAttributedCurrentSurplusUse: formatCentsToMoney(
+			knownAttributedUseCents,
+		),
+	};
+
+	const trueSurplus = policy.outputs.trueSurplus.amount;
+
+	if (overlapUnresolvedSubjectIds.length > 0) {
+		return {
+			section,
+			availableToAllocateNow: {
+				available: false,
+				reason: "SURPLUS_USE_ATTRIBUTION_OVERLAP_UNRESOLVED",
+				trueSurplus,
+				candidateCount: entries.length,
+				attributedCount,
+				unattributedSubjectIds,
+				staleSubjectIds,
+				overlapUnresolvedSubjectIds,
+				knownAttributedCurrentSurplusUse: formatCentsToMoney(
+					knownAttributedUseCents,
+				),
+				unresolvedPotentialUseAmount: null,
+			},
+		};
+	}
+
+	if (unattributedSubjectIds.length > 0 || staleSubjectIds.length > 0) {
+		return {
+			section,
+			availableToAllocateNow: {
+				available: false,
+				reason: "SURPLUS_USE_ATTRIBUTION_INCOMPLETE",
+				trueSurplus,
+				candidateCount: entries.length,
+				attributedCount,
+				unattributedSubjectIds,
+				staleSubjectIds,
+				overlapUnresolvedSubjectIds,
+				knownAttributedCurrentSurplusUse: formatCentsToMoney(
+					knownAttributedUseCents,
+				),
+				unresolvedPotentialUseAmount: anyUnresolvedPotentialInexact
+					? null
+					: formatCentsToMoney(unresolvedPotentialUseCents),
+			},
+		};
+	}
+
+	// COMPLETE -- authoritative availableToAllocateNow
+	const tsCents = centsOf(trueSurplus);
+	const totalUsedCents =
+		usedByLane.DISCRETIONARY +
+		usedByLane.INTERNATIONAL_MOBILITY +
+		usedByLane.LONG_TERM_INVESTMENT;
+	const lane = (
+		planned: string,
+		usedCents: bigint,
+	): SurplusUseLaneAccounting => {
+		const plannedCents = centsOf(planned);
+		return {
+			planned,
+			used: formatCentsToMoney(usedCents),
+			remaining: formatCentsToMoney(max0(plannedCents - usedCents)),
+			overrun: formatCentsToMoney(max0(usedCents - plannedCents)),
+		};
+	};
+
+	return {
+		section,
+		availableToAllocateNow: {
+			available: true,
+			amount: formatCentsToMoney(max0(tsCents - totalUsedCents)),
+			trueSurplus,
+			totalAttributedCurrentSurplusUse: formatCentsToMoney(totalUsedCents),
+			oversubscribedBy: formatCentsToMoney(max0(totalUsedCents - tsCents)),
+			lanes: {
+				INTERNATIONAL_MOBILITY: lane(
+					policy.outputs.mobilityAllocation.amount,
+					usedByLane.INTERNATIONAL_MOBILITY,
+				),
+				LONG_TERM_INVESTMENT: lane(
+					policy.outputs.longTermInvestment.amount,
+					usedByLane.LONG_TERM_INVESTMENT,
+				),
+				DISCRETIONARY: lane(
+					policy.outputs.discretionaryAllocation.amount,
+					usedByLane.DISCRETIONARY,
+				),
+			},
+			provenance: {
+				method: "AUTHORITATIVE_USER_APPROVED_SURPLUS_USE_ATTRIBUTION",
+				meaning: ATAN_MEANING,
+				candidateCount: entries.length,
+				attributedCount,
+			},
+		},
+	};
+}
+
+// ============================================================================
 // Orchestration
 // ============================================================================
 
@@ -2137,6 +2694,31 @@ export async function buildBudgetV2CheckpointReport(
 		purchaseEvents,
 	);
 
+	// Section 5B -- surplus-use attribution + authoritative availableToAllocateNow.
+	const obligationsOverlap = await resolveBudgetV2CurrentObligationsOverlap({
+		db,
+		userId,
+		periodMonth,
+		asOf: checkpointAt,
+		previousCheckpointAt: prevRaw ?? undefined,
+	});
+	const surplusUseCandidates = await loadSurplusUseCandidateUniverse(
+		db,
+		userId,
+		win,
+		checkpointAt,
+		purchaseEvents,
+		obligationsOverlap,
+	);
+	const surplusUse = await buildSurplusUseAttribution(
+		db,
+		userId,
+		periodMonth,
+		checkpointAt,
+		surplusUseCandidates,
+		resolution.policyResult,
+	);
+
 	const nonSpending = assembleMtdNonSpending(resolution);
 
 	return {
@@ -2169,6 +2751,7 @@ export async function buildBudgetV2CheckpointReport(
 			emergencyFund: nonSpending.emergencyFund,
 			mobility: nonSpending.mobility,
 			necessaryPurchases: nonSpending.necessaryPurchases,
+			surplusUseAttribution: surplusUse.section,
 		},
 		foodAnalytics,
 		installmentAnalytics: {
@@ -2178,7 +2761,7 @@ export async function buildBudgetV2CheckpointReport(
 				reason: "INSTALLMENT_SCHEDULE_NOT_STORED",
 			},
 		},
-		availableToAllocateNow: resolution.availableToAllocateNow,
+		availableToAllocateNow: surplusUse.availableToAllocateNow,
 	};
 }
 

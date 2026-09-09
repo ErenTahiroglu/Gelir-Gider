@@ -127,6 +127,60 @@ export interface SpendingFoodSemanticFingerprintParams {
 const lc = (v: string | null): string | null =>
 	v ? v.trim().toLowerCase() : null;
 
+export interface SurplusUseAttributionFingerprintParams {
+	userId: string;
+	periodMonth: string;
+	subjectType: string;
+	purchaseEventId: string | null;
+	personObligationId: string | null;
+	midasAllocationTransferId: string | null;
+	longTermSendTaskId: string | null;
+	operation: "CREATE" | "UPDATE" | "VOID";
+	revisionNo: number;
+	previousRevisionId: string | null;
+	lane: string;
+	basisAmount: string;
+	currentSurplusAmount: string;
+	sourceKind: string;
+	purchaseEventRevisionId: string | null;
+	purchaseSplitRevisionId: string | null;
+	personObligationRevisionId: string | null;
+	mobilityGoalId: string | null;
+	mobilityPurposeRevisionId: string | null;
+	longTermTaskRevisionId: string | null;
+	occurredAt: Date;
+}
+
+/** Deterministic 64 lowercase-hex fingerprint for a surplus-use attribution revision. */
+export function calculateSurplusUseAttributionRevisionFingerprint(
+	params: SurplusUseAttributionFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"budget-v2-surplus-use-attribution-v1",
+		params.userId.trim().toLowerCase(),
+		params.periodMonth,
+		params.subjectType,
+		lc(params.purchaseEventId),
+		lc(params.personObligationId),
+		lc(params.midasAllocationTransferId),
+		lc(params.longTermSendTaskId),
+		params.operation,
+		params.revisionNo,
+		lc(params.previousRevisionId),
+		params.lane,
+		params.basisAmount,
+		params.currentSurplusAmount,
+		params.sourceKind,
+		lc(params.purchaseEventRevisionId),
+		lc(params.purchaseSplitRevisionId),
+		lc(params.personObligationRevisionId),
+		lc(params.mobilityGoalId),
+		lc(params.mobilityPurposeRevisionId),
+		lc(params.longTermTaskRevisionId),
+		params.occurredAt.toISOString(),
+	]);
+}
+
 export interface CheckpointTriggerCardFingerprintParams {
 	userId: string;
 	creditCardId: string;

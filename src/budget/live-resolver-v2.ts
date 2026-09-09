@@ -895,6 +895,15 @@ interface RecognizedStatement {
 	personalShareCents: bigint;
 	carryInFundedCents: bigint;
 	burdenCents: bigint;
+	/**
+	 * A_NO_CARRY_IN       -- burden == personal; each personal purchase component
+	 *                        is EXACTLY inside currentObligations.
+	 * B_FULLY_PREFUNDED   -- burden 0; NONE of the components are in
+	 *                        currentObligations (all pre-period reserve funded).
+	 * C_PARTIAL_ALL_PERSONAL -- burden = personal - carryIn spread across
+	 *                        components; per-component overlap is AMBIGUOUS.
+	 */
+	carryInCase: "A_NO_CARRY_IN" | "B_FULLY_PREFUNDED" | "C_PARTIAL_ALL_PERSONAL";
 	personalPurchaseComponents: Array<{
 		purchaseEventId: string;
 		personalCents: bigint;
@@ -1059,7 +1068,7 @@ async function resolveCurrentObligations(
 			const isAllPersonal = externalCents === 0n;
 
 			let burden: bigint;
-			let carryInCase: string;
+			let carryInCase: RecognizedStatement["carryInCase"];
 			if (carryInFunded === 0n) {
 				burden = recon.personalCents;
 				carryInCase = "A_NO_CARRY_IN";
@@ -1095,6 +1104,7 @@ async function resolveCurrentObligations(
 				personalShareCents: recon.personalCents,
 				carryInFundedCents: carryInFunded,
 				burdenCents: burden,
+				carryInCase,
 				personalPurchaseComponents,
 			});
 			ccEvidence.push({
@@ -1219,6 +1229,84 @@ async function resolveCurrentObligations(
 		unresolvedPayables: unresolved,
 		recognizedStatements,
 		recognizedPeopleByObligation,
+	};
+}
+
+// ============================================================================
+// currentObligations <-> source overlap (Checkpoint 5B surplus-use waterfall
+// double-count protection). Exact per-source identity overlap only.
+// ============================================================================
+
+export interface CurrentObligationsOverlap {
+	/**
+	 * purchaseEventId -> personal cents of that purchase EXACTLY recognized
+	 * inside `currentObligations` (only carry-in case A statements, where the
+	 * recognized burden equals the personal share so each component's personal
+	 * cents is fully covered).
+	 */
+	purchasePersonalCoveredCents: Map<string, bigint>;
+	/** obligationId -> recognized People PAYABLE burden inside currentObligations. */
+	peoplePayableCoveredCents: Map<string, bigint>;
+	/**
+	 * purchaseEventIds whose per-component overlap with currentObligations is
+	 * ambiguous (a partial pre-period reserve carry-in funds the statement, so
+	 * the covered portion cannot be attributed to individual purchase
+	 * components without an implicit ordering). A surplus-use candidate that
+	 * appears here forces `availableToAllocateNow` unavailable for exactness.
+	 */
+	ambiguousPurchaseEventIds: string[];
+}
+
+export async function resolveBudgetV2CurrentObligationsOverlap(params: {
+	db: Database;
+	userId: string;
+	periodMonth: string;
+	asOf: Date;
+	previousCheckpointAt?: Date | undefined;
+}): Promise<CurrentObligationsOverlap> {
+	const userId = normalizeUuid(params.userId, "userId");
+	const periodMonth = validateBudgetPeriodMonth(params.periodMonth);
+	const asOf =
+		params.asOf instanceof Date && !Number.isNaN(params.asOf.getTime())
+			? params.asOf
+			: new Date();
+	const win = buildResolverWindow(
+		periodMonth,
+		asOf,
+		params.previousCheckpointAt,
+	);
+	const obligations = await resolveCurrentObligations(
+		params.db,
+		userId,
+		periodMonth,
+		win,
+	);
+
+	const purchasePersonalCoveredCents = new Map<string, bigint>();
+	const ambiguous = new Set<string>();
+	for (const st of obligations.recognizedStatements) {
+		if (st.carryInCase === "A_NO_CARRY_IN") {
+			for (const c of st.personalPurchaseComponents) {
+				purchasePersonalCoveredCents.set(
+					c.purchaseEventId,
+					(purchasePersonalCoveredCents.get(c.purchaseEventId) ?? 0n) +
+						c.personalCents,
+				);
+			}
+		} else if (st.carryInCase === "C_PARTIAL_ALL_PERSONAL") {
+			for (const c of st.personalPurchaseComponents) {
+				ambiguous.add(c.purchaseEventId);
+			}
+		}
+		// B_FULLY_PREFUNDED: nothing is inside currentObligations -> covered 0.
+	}
+
+	return {
+		purchasePersonalCoveredCents,
+		peoplePayableCoveredCents: new Map(
+			obligations.recognizedPeopleByObligation,
+		),
+		ambiguousPurchaseEventIds: [...ambiguous],
 	};
 }
 

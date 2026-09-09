@@ -46,7 +46,7 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		}
 	}
 
-	it("audited all database functions and confirmed total count is 168", () => {
+	it("audited all database functions and confirmed total count is 170", () => {
 		// 147 through migration 0060; +3 in migration 0061 (PERSONAL_BUDGET_V2
 		// foundation: two immutability guards + one revision insert guard);
 		// +1 in migration 0062 (the V2 anchor BEFORE INSERT guard);
@@ -66,7 +66,20 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		// 0069 CREATE OR REPLACEs an existing function
 		// (trg_fn_guard_bv2ckreq_insert) -- no new function name, so the count
 		// is unchanged.
-		expect(effectiveFunctions.size).toBe(168);
+		// +2 in migration 0070 (surplus-use attribution: one immutability guard +
+		// one BEFORE INSERT subject/period/chain guard).
+		expect(effectiveFunctions.size).toBe(170);
+	});
+
+	it("migration 0070 contributes exactly the two surplus-use attribution guard functions", () => {
+		for (const fnName of [
+			"trg_fn_guard_bv2surplus_revisions_immutability",
+			"trg_fn_guard_bv2surplus_revisions_insert",
+		]) {
+			expect(effectiveFunctions.get(fnName)?.migration).toBe(
+				"0070_add_budget_v2_surplus_use_attribution",
+			);
+		}
 	});
 
 	it("migration 0068 defines the durable-checkpoint guard functions (request guard later hardened by 0069)", () => {
