@@ -7984,6 +7984,469 @@ async function resolverRuntime5B() {
 }
 
 
+async function resolverRuntime5B1() {
+	console.log(
+		"\n== PHASE 5B.1: SURPLUS-USE <-> currentObligations OVERLAP INTEGRATION PROOF ==",
+	);
+	const { createSurplusUseAttribution } = await import(
+		"../src/budget/surplus-use-attribution-v2.ts"
+	);
+	const { buildBudgetV2CheckpointReport } = await import(
+		"../src/budget/checkpoint-report-v2.ts"
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+	const {
+		processPendingBudgetV2CheckpointRequests,
+		getBudgetV2CheckpointByPaymentEventId,
+	} = await import("../src/budget/checkpoint-processor-v2.ts");
+	const { maybeEnqueueBudgetV2CheckpointRequest } = await import(
+		"../src/budget/checkpoint-request-v2.ts"
+	);
+	const { createCheckpointTriggerCard } = await import(
+		"../src/budget/checkpoint-trigger-card-v2.ts"
+	);
+	const { canonicalJsonStringify } = await import(
+		"../src/budget/checkpoint-canonical-v2.ts"
+	);
+
+	const { P } = B4_IDS;
+	const RECON = new Date("2026-09-01T00:00:00Z");
+	const at = (iso: string) => new Date(iso);
+	const SEP5 = "2026-09-05 00:00:00+00";
+	const eqB = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `-> got ${JSON.stringify(a)} want ${JSON.stringify(b)}`);
+	const chkB = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+	const ccSub = (id: string) =>
+		({ type: "CREDIT_CARD_PURCHASE", purchaseEventId: id }) as const;
+	const ppSub = (id: string) =>
+		({ type: "PEOPLE_PAYABLE", personObligationId: id }) as const;
+	const USER = { sourceKind: "USER_APPROVED" as const };
+
+	// a PAID + reconciled trigger on its own statement (distinct cycle) -> payment event
+	let trigSeq = 0;
+	const mkTrig = async (s: S, payAt: string, amount = "400.00") => {
+		trigSeq++;
+		const sid = `81000000-0000-4000-8000-0000000005b${trigSeq}`;
+		await s.replica();
+		const r1 = await s.mkStmt(sid, amount, 3 + trigSeq); // distinct cycle
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: `rc-trig5b1-${trigSeq}`,
+			occurredAt: RECON,
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe, r } = await s.mkPay(sid, r1, amount, 2, payAt);
+		await s.origin();
+		return { pe, sid, payRev: r };
+	};
+
+	// raw statement whose CREATE revision instant is `createOcc` (so it can be
+	// invisible at an earlier checkpoint), cycle month `cycle`, on the main card
+	const mkStmtAt = async (
+		s: S,
+		sid: string,
+		amount: string,
+		cycle: number,
+		createOcc: string,
+		reserveBucket?: string,
+	) => {
+		const rb = reserveBucket ?? s.gid();
+		await s.replica();
+		await s.q(
+			`insert into midas_buckets (id,user_id,midas_account_id,code,name,bucket_type) values ($1,$2,$3,$4,'reserve','CREDIT_CARD_RESERVE')`,
+			[rb, U1, s.MID, `RBX${cycle}${trigSeq}`],
+		);
+		await s.q(
+			`insert into credit_card_statements (id,user_id,credit_card_id,midas_account_id,midas_reserve_bucket_id,cycle_year,cycle_month) values ($1,$2,$3,$4,$5,2026,$6)`,
+			[sid, U1, s.CARD, s.MID, rb, cycle],
+		);
+		const r1 = s.gid();
+		await s.q(
+			`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,'CREATE','OPEN',$4,'2026-09-01','2026-09-20','MIDAS_FUND',$5,$6,$7)`,
+			[r1, U1, sid, amount, createOcc, `stkx-${sid.slice(-6)}`, s.F],
+		);
+		await s.origin();
+		return { r1, rb };
+	};
+
+	const reconcilePurchaseStmt = (
+		s: S,
+		sid: string,
+		r1: string,
+		purchaseEventId: string,
+		amount: string,
+		occ: string,
+		key: string,
+	) =>
+		reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: key,
+			occurredAt: at(occ),
+			components: [
+				{ componentType: "PURCHASE", purchaseEventId, ownership: "PERSONAL", amount },
+			],
+		});
+
+	const cand = (rep: S, subjectId: string) =>
+		rep.mtd.surplusUseAttribution.candidates.filter(
+			(c: S) => c.subjectId === subjectId,
+		);
+
+	// ---------------------------------------------------------------- AA
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		const pAA = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		const t = await mkTrig(s, "2026-09-15 00:00:00+00");
+		const cs = await mkStmtAt(
+			s,
+			"85100000-0000-4000-8000-0000000000aa",
+			"1000.00",
+			8,
+			"2026-09-06 00:00:00+00",
+		);
+		await reconcilePurchaseStmt(
+			s,
+			"85100000-0000-4000-8000-0000000000aa",
+			cs.r1,
+			pAA.eid,
+			"1000.00",
+			"2026-09-10T00:00:00Z",
+			"rc-aa",
+		);
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pAA.eid),
+			periodMonth: P,
+			currentSurplusAmount: "1000.00",
+			...USER,
+			idempotencyKey: "su-aa",
+			occurredAt: at("2026-09-12T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: t.pe,
+		});
+		const cs2 = cand(rep, pAA.eid);
+		eqB(cs2.length, 1, "5B.1/AA: the purchase is a surplus-use candidate exactly once (exact eventId identity)");
+		const c0 = cs2[0] as S;
+		eqB(c0.waterfallAlreadyCoveredAmount, "1000.00", "5B.1/AA: waterfallAlreadyCoveredAmount = 1000.00 (exact currentObligations overlap)");
+		eqB(c0.waterfallOverlapExact, true, "5B.1/AA: overlap is exact (no-carry-in statement)");
+		eqB(c0.remainingPotentialSurplusUseAmount, "0.00", "5B.1/AA: remainingPotentialSurplusUseAmount = 0.00");
+		eqB(c0.attributedCurrentSurplusAmount, "1000.00", "5B.1/AA: attribution still says 1000 (stored truth preserved)");
+		eqB(c0.effectiveCurrentSurplusUseAmount, "0.00", "5B.1/AA: effectiveCurrentSurplusUseAmount = 0.00 (currentObligations already subtracts it)");
+		chkB(
+			rep.availableToAllocateNow.available === true &&
+				rep.availableToAllocateNow.lanes.DISCRETIONARY.used === "0.00",
+			"5B.1/AA: DISCRETIONARY lane does NOT receive a second 1000; availability not reduced twice",
+		);
+		eqB(
+			rep.availableToAllocateNow.available === true
+				? rep.availableToAllocateNow.amount
+				: "x",
+			rep.availableToAllocateNow.available === true
+				? rep.availableToAllocateNow.trueSurplus
+				: "y",
+			"5B.1/AA: availableToAllocateNow.amount == trueSurplus (source counted once, in currentObligations)",
+		);
+		await s.close();
+	}
+
+	// ---------------------------------------------------------------- AB
+	{
+		const s = await make4bScenario();
+		const PAY = "8a000000-0000-4000-8000-0000000005ab";
+		const SET = "8b000000-0000-4000-8000-0000000005ab";
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		await s.mkObligation(PAY, s.P_FRI, "PAYABLE", "1000.00", SEP5);
+		await s.mkSettlement(SET, PAY, "400.00", "2026-09-08 00:00:00+00");
+		await s.origin();
+		const t = await mkTrig(s, "2026-09-15 00:00:00+00");
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ppSub(PAY),
+			periodMonth: P,
+			currentSurplusAmount: "800.00",
+			...USER,
+			idempotencyKey: "su-ab",
+			occurredAt: at("2026-09-12T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: t.pe,
+		});
+		const c0 = (cand(rep, PAY)[0] ?? {}) as S;
+		eqB(c0.sourceEconomicAmount, "1000.00", "5B.1/AB: People PAYABLE sourceEconomicAmount = 1000.00");
+		eqB(c0.waterfallAlreadyCoveredAmount, "400.00", "5B.1/AB: waterfallAlreadyCoveredAmount = 400.00 (exact period settlement burden)");
+		eqB(c0.remainingPotentialSurplusUseAmount, "600.00", "5B.1/AB: remainingPotentialSurplusUseAmount = 600.00");
+		eqB(c0.attributedCurrentSurplusAmount, "800.00", "5B.1/AB: attribution says 800");
+		eqB(c0.effectiveCurrentSurplusUseAmount, "600.00", "5B.1/AB: effectiveCurrentSurplusUseAmount = 600.00 (not 800, not 200, not 1000)");
+		chkB(
+			rep.availableToAllocateNow.available === true &&
+				rep.availableToAllocateNow.lanes.DISCRETIONARY.used === "600.00",
+			"5B.1/AB: the surplus-use layer consumes only the 600 not already in currentObligations",
+		);
+		await s.close();
+	}
+
+	// ---------------------------------------------------------------- AC + AE
+	{
+		const s = await make4bScenario();
+		const RB = "f0000000-0000-4000-8000-0000000005ac";
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		const pAC = await s.mkPur("1000.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		const t = await mkTrig(s, "2026-09-15 00:00:00+00");
+		const cs = await mkStmtAt(
+			s,
+			"85100000-0000-4000-8000-0000000000ac",
+			"1000.00",
+			9,
+			"2026-09-06 00:00:00+00",
+			RB,
+		);
+		// PARTIAL pre-period CREDIT_CARD_RESERVE carry-in (300 of a 1000 all-personal statement)
+		await s.replica();
+		await s.q(
+			`insert into midas_allocation_transfers (id,user_id,midas_account_id,idempotency_key,transfer_fingerprint,from_bucket_id,to_bucket_id,amount,occurred_at) values ($1,$2,$3,$4,$5,null,$6,'300.00','2026-08-15 00:00:00+00')`,
+			[s.gid(), U1, s.MID, "mt-ac-carryin", s.F, RB],
+		);
+		await s.origin();
+		await reconcilePurchaseStmt(
+			s,
+			"85100000-0000-4000-8000-0000000000ac",
+			cs.r1,
+			pAC.eid,
+			"1000.00",
+			"2026-09-10T00:00:00Z",
+			"rc-ac",
+		);
+		// AE: explicit currentSurplusAmount = 0 on the ambiguous candidate
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pAC.eid),
+			periodMonth: P,
+			currentSurplusAmount: "0.00",
+			...USER,
+			idempotencyKey: "su-ac",
+			occurredAt: at("2026-09-12T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: t.pe,
+		});
+		const c0 = (cand(rep, pAC.eid)[0] ?? {}) as S;
+		eqB(c0.waterfallOverlapExact, false, "5B.1/AC: a partial pre-period reserve carry-in makes per-purchase overlap NOT exact");
+		chkB(
+			rep.mtd.surplusUseAttribution.overlapUnresolvedSubjectIds.includes(pAC.eid),
+			"5B.1/AC: overlapUnresolvedSubjectIds contains the exact subject id",
+		);
+		chkB(
+			rep.availableToAllocateNow.available === false &&
+				rep.availableToAllocateNow.reason ===
+					"SURPLUS_USE_ATTRIBUTION_OVERLAP_UNRESOLVED" &&
+				!("amount" in rep.availableToAllocateNow),
+			"5B.1/AC: availableToAllocateNow fails closed (OVERLAP_UNRESOLVED, no authoritative amount)",
+		);
+		eqB(
+			c0.attributedCurrentSurplusAmount,
+			"0.00",
+			"5B.1/AE: the candidate's explicit attribution is 0.00 ...",
+		);
+		chkB(
+			rep.availableToAllocateNow.available === false,
+			"5B.1/AE: ... but explicit-zero does NOT cure the unresolved waterfall overlap -> still unavailable",
+		);
+		await s.close();
+	}
+
+	// ---------------------------------------------------------------- AD
+	{
+		const s = await make4bScenario();
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		const pAD = await s.mkPur("500.00", "MANDATORY_EXPENSE", SEP5);
+		await s.origin();
+		const t = await mkTrig(s, "2026-09-15 00:00:00+00");
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pAD.eid),
+			periodMonth: P,
+			currentSurplusAmount: "100.00",
+			...USER,
+			idempotencyKey: "su-ad",
+			occurredAt: at("2026-09-12T00:00:00Z"),
+		});
+		const rep = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: t.pe,
+		});
+		const c0 = (cand(rep, pAD.eid)[0] ?? {}) as S;
+		eqB(c0.waterfallOverlapExact, false, "5B.1/AD: a MANDATORY_EXPENSE purchase not identity-covered by currentObligations is NOT exact (basic-living aggregate)");
+		chkB(
+			rep.availableToAllocateNow.available === false &&
+				rep.availableToAllocateNow.reason ===
+					"SURPLUS_USE_ATTRIBUTION_OVERLAP_UNRESOLVED",
+			"5B.1/AD: availableToAllocateNow fails closed (basic-living aggregate ambiguity, never invented per-source)",
+		);
+		await s.close();
+	}
+
+	// ---------------------------------------------------------------- AF + AG
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-5b1-af",
+			occurredAt: at("2026-08-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		const pAF = await s.mkPur("300.00", "DISCRETIONARY_SPEND", SEP5);
+		await s.origin();
+		await createSurplusUseAttribution({
+			db: s.db,
+			userId: U1,
+			subject: ccSub(pAF.eid),
+			periodMonth: P,
+			currentSurplusAmount: "300.00",
+			...USER,
+			idempotencyKey: "su-af",
+			occurredAt: at("2026-09-06T00:00:00Z"),
+		});
+		// checkpoint A -- Sep 8, before the covering statement exists
+		const tA = await mkTrig(s, "2026-09-08 00:00:00+00");
+		const repA = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: tA.pe,
+		});
+		const aA = repA.availableToAllocateNow;
+		const cAF_A = (cand(repA, pAF.eid)[0] ?? {}) as S;
+		eqB(cAF_A.waterfallAlreadyCoveredAmount, "0.00", "5B.1/AF: at checkpoint A the purchase is NOT yet in currentObligations (covered 0)");
+		eqB(cAF_A.effectiveCurrentSurplusUseAmount, "300.00", "5B.1/AF: at checkpoint A effective surplus use = 300");
+		const usedA =
+			aA.available === true ? aA.lanes.DISCRETIONARY.used : "n/a";
+		eqB(usedA, "300.00", "5B.1/AF: at A DISCRETIONARY used = 300");
+
+		// persist checkpoint A (Checkpoint 5 durable snapshot)
+		await s.db.transaction((tx: S) =>
+			maybeEnqueueBudgetV2CheckpointRequest({
+				tx,
+				userId: U1,
+				statementId: tA.sid,
+				creditCardId: s.CARD,
+				paymentEventId: tA.pe,
+				payRevisionId: tA.payRev,
+				occurredAt: at("2026-09-08T00:00:00Z"),
+			}),
+		);
+		await processPendingBudgetV2CheckpointRequests({ db: s.db });
+
+		// state change: the same purchase now enters a recognized no-carry-in statement
+		const cs = await mkStmtAt(
+			s,
+			"85100000-0000-4000-8000-0000000000af",
+			"300.00",
+			10,
+			"2026-09-12 00:00:00+00",
+		);
+		await reconcilePurchaseStmt(
+			s,
+			"85100000-0000-4000-8000-0000000000af",
+			cs.r1,
+			pAF.eid,
+			"300.00",
+			"2026-09-13T00:00:00Z",
+			"rc-af",
+		);
+
+		// checkpoint B -- Sep 20, sees the new overlap
+		const tB = await mkTrig(s, "2026-09-20 00:00:00+00");
+		const repB = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: tB.pe,
+			previousCheckpointAt: at("2026-09-08T00:00:00Z"),
+		});
+		const cAF_B = (cand(repB, pAF.eid)[0] ?? {}) as S;
+		eqB(cAF_B.status, "ATTRIBUTED", "5B.1/AF: at checkpoint B the stored attribution is STILL ATTRIBUTED (no UPDATE required)");
+		eqB(cAF_B.semanticRevisionNo, 1, "5B.1/AF: same stored revision (not rewritten)");
+		eqB(cAF_B.waterfallAlreadyCoveredAmount, "300.00", "5B.1/AF: at B currentObligations now covers the full 300");
+		eqB(cAF_B.effectiveCurrentSurplusUseAmount, "0.00", "5B.1/AF: effectiveCurrentSurplusUseAmount dynamically falls to 0 -- no double count");
+		const usedB =
+			repB.availableToAllocateNow.available === true
+				? repB.availableToAllocateNow.lanes.DISCRETIONARY.used
+				: "n/a";
+		eqB(usedB, "0.00", "5B.1/AF: at B DISCRETIONARY used = 0 (the source is now only in currentObligations)");
+
+		// AG -- replay of the PERSISTED checkpoint A is frozen despite the later state change
+		const replayA = await getBudgetV2CheckpointByPaymentEventId({
+			db: s.db,
+			userId: U1,
+			paymentEventId: tA.pe,
+		});
+		chkB(
+			replayA.status === "PERSISTED" &&
+				canonicalJsonStringify(
+					(replayA.report as S).mtd.surplusUseAttribution.candidates.find(
+						(c: S) => c.subjectId === pAF.eid,
+					),
+				) === canonicalJsonStringify(cAF_A) &&
+				canonicalJsonStringify(
+					(replayA.report as S).availableToAllocateNow,
+				) === canonicalJsonStringify(aA),
+			"5B.1/AG: replay of persisted checkpoint A returns its ORIGINAL frozen covered / effective / availableToAllocateNow (no live recomputation)",
+		);
+		await s.close();
+	}
+}
+
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -7998,6 +8461,7 @@ if (probed) {
 	await resolverRuntime5();
 	await resolverRuntime5A();
 	await resolverRuntime5B();
+	await resolverRuntime5B1();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

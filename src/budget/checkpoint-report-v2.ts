@@ -103,8 +103,38 @@ import { normalizeUuid, validateBudgetPeriodMonth } from "./utils";
  * food inference is NEVER used. Forward installment schedules remain unstored
  * and unsupported.
  *
- * No persistence, no trigger wiring, no learning -- future persisted checkpoint
- * snapshots (keyed by paymentEventId) will be the historical replay source.
+ * SURPLUS-USE ATTRIBUTION (checkpoint 5B / 5B.1): `mtd.surplusUseAttribution`
+ * lists every active MTD surplus-use candidate (credit-card purchase personal
+ * share, People PAYABLE principal, UNALLOCATED -> INTERNATIONAL_MOBILITY goal
+ * transfer, Long-Term send task) with its user-approved funding provenance;
+ * `availableToAllocateNow` is the AUTHORITATIVE observation of remaining
+ * current-period true-surplus policy capacity. An economic source is never
+ * subtracted twice: `waterfallAlreadyCoveredAmount` (exact per-source overlap
+ * with `currentObligations`) is removed dynamically, and
+ * `effectiveCurrentSurplusUseAmount = min(attributed, remaining)` -- so an
+ * attribution does NOT need an UPDATE merely because the same expense later
+ * enters a statement. When per-source overlap cannot be proven exactly
+ * (partial reserve carry-in, basic-living aggregate), the report fails closed
+ * (SURPLUS_USE_ATTRIBUTION_OVERLAP_UNRESOLVED); explicit zero attribution does
+ * not cure an unresolved overlap.
+ *
+ * LAYERING / AUTHORITY BOUNDARY:
+ *   - `resolveBudgetV2LiveSnapshot(...)` is the lower-level six-input / policy
+ *     resolver. Its `availableToAllocateNow` stays the legacy
+ *     `{available:false, reason:"SURPLUS_USE_ATTRIBUTION_UNSUPPORTED"}` digest
+ *     and MUST NOT be treated as an authority; surplus-use candidate
+ *     construction is NOT duplicated there.
+ *   - `buildBudgetV2CheckpointReport(...)` is READ-ONLY but authoritative: it
+ *     combines the live policy result + exact currentObligations overlap +
+ *     the surplus-use candidate universe + user-approved attribution + food
+ *     semantics.
+ *   - the Checkpoint 5 durable snapshot (`budget_v2_checkpoint_snapshots`)
+ *     FREEZES this report's output at a real PAID payment event and is the
+ *     authoritative HISTORICAL replay source (replay-before-live). A later
+ *     attribution / source / currentObligations change never rewrites a
+ *     stored snapshot. The Behavior Engine (future) consumes persisted
+ *     checkpoint observations -- `extractBehaviorEngineCheckpointObservation`
+ *     -- never a recomputation from mutable live sources.
  */
 
 export const BUDGET_V2_CHECKPOINT_REPORT_SCHEMA_VERSION =
@@ -2843,4 +2873,63 @@ export async function buildBudgetV2CheckpointReportByStatement(params: {
 		triggerPaymentEventId,
 		previousCheckpointAt: params.previousCheckpointAt,
 	});
+}
+
+// ============================================================================
+// Behavior-Engine observation contract (Checkpoint 5B.1, section 9)
+// ============================================================================
+
+/**
+ * The deterministic, machine-readable slice of ONE checkpoint report that the
+ * (future) Behavior Engine is allowed to consume.
+ *
+ * AUTHORITY BOUNDARY -- the Behavior Engine's observation source is the
+ * PERSISTED Budget V2 checkpoint report (`budget_v2_checkpoint_snapshots`,
+ * replayed via `getBudgetV2CheckpointByPaymentEventId`), NEVER
+ * `resolveBudgetV2LiveSnapshot(...).availableToAllocateNow` and never a
+ * recomputation from mutable live sources. `extract...` is a pure projection
+ * of an already-built (typically frozen) report object -- it performs no I/O
+ * and adds no new math.
+ */
+export interface BehaviorEngineCheckpointObservation {
+	paymentEventId: string;
+	checkpointAt: string;
+	periodMonth: string;
+	previousCheckpointAt: string | null;
+	trueSurplus: string;
+	coverageComplete: boolean;
+	candidateCount: number;
+	attributedCount: number;
+	unattributedSubjectIds: string[];
+	staleSubjectIds: string[];
+	overlapUnresolvedSubjectIds: string[];
+	availableToAllocateNow: AvailableToAllocateNowSection;
+	/** flat convenience mirrors (null when availability is not authoritative) */
+	availableAmount: string | null;
+	oversubscribedBy: string | null;
+	lanes: Record<SurplusUseLaneName, SurplusUseLaneAccounting> | null;
+}
+
+export function extractBehaviorEngineCheckpointObservation(
+	report: BudgetV2CheckpointReport,
+): BehaviorEngineCheckpointObservation {
+	const su = report.mtd.surplusUseAttribution;
+	const atn = report.availableToAllocateNow;
+	return {
+		paymentEventId: report.checkpoint.paymentEventId,
+		checkpointAt: report.checkpoint.checkpointAt,
+		periodMonth: report.checkpoint.periodMonth,
+		previousCheckpointAt: report.checkpoint.previousCheckpointAt,
+		trueSurplus: report.mtd.budget.policyOutput.trueSurplus,
+		coverageComplete: su.coverageComplete,
+		candidateCount: su.candidateCount,
+		attributedCount: su.attributedCount,
+		unattributedSubjectIds: su.unattributedSubjectIds,
+		staleSubjectIds: su.staleSubjectIds,
+		overlapUnresolvedSubjectIds: su.overlapUnresolvedSubjectIds,
+		availableToAllocateNow: atn,
+		availableAmount: atn.available ? atn.amount : null,
+		oversubscribedBy: atn.available ? atn.oversubscribedBy : null,
+		lanes: atn.available ? atn.lanes : null,
+	};
 }
