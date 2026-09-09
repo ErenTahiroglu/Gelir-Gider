@@ -185,6 +185,7 @@ export default {
 							counts: {
 								pendingDiscovered: counts.pendingDiscovered,
 								persisted: counts.persisted,
+								alreadyPersisted: counts.alreadyPersisted,
 								blocked: counts.blocked,
 								failedReport: counts.failedReport,
 								collisionPeriods: counts.collisionPeriods,

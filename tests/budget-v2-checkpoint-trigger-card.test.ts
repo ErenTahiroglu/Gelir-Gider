@@ -3,6 +3,7 @@ import {
 	canonicalJsonStringify,
 	verifyStoredCheckpointSnapshot,
 } from "../src/budget/checkpoint-canonical-v2";
+import { hasDistinctEventTimestampCollision } from "../src/budget/checkpoint-processor-v2";
 import {
 	createCheckpointTriggerCard,
 	getEffectiveCheckpointTriggerCard,
@@ -112,6 +113,37 @@ describe("canonicalJsonStringify -- deterministic, key-order-independent", () =>
 		expect(() => canonicalJsonStringify({ n: Number.NaN })).toThrow(
 			BudgetError,
 		);
+	});
+});
+
+describe("hasDistinctEventTimestampCollision -- identity-aware (Checkpoint 5A)", () => {
+	const d = (iso: string) => new Date(iso);
+
+	it("the SAME payment event as a request + its persisted snapshot is NOT a collision", () => {
+		expect(
+			hasDistinctEventTimestampCollision([
+				{ checkpointAt: d("2026-09-15T00:00:00Z"), paymentEventId: "pe-1" },
+				{ checkpointAt: d("2026-09-15T00:00:00Z"), paymentEventId: "pe-1" },
+			]),
+		).toBe(false);
+	});
+
+	it("TWO DISTINCT payment events at the exact same checkpointAt ARE a collision", () => {
+		expect(
+			hasDistinctEventTimestampCollision([
+				{ checkpointAt: d("2026-09-15T00:00:00Z"), paymentEventId: "pe-1" },
+				{ checkpointAt: d("2026-09-15T00:00:00Z"), paymentEventId: "pe-2" },
+			]),
+		).toBe(true);
+	});
+
+	it("distinct events at distinct instants are not a collision", () => {
+		expect(
+			hasDistinctEventTimestampCollision([
+				{ checkpointAt: d("2026-09-05T00:00:00Z"), paymentEventId: "pe-1" },
+				{ checkpointAt: d("2026-09-15T00:00:00Z"), paymentEventId: "pe-2" },
+			]),
+		).toBe(false);
 	});
 });
 

@@ -6,6 +6,7 @@ import {
 	type CheckpointTriggerCardSourceKind,
 	type CheckpointTriggerCardStatus,
 } from "../db/schema/budget-v2-checkpoint";
+import { creditCards } from "../db/schema/credit-cards";
 import { BudgetError } from "./errors";
 import { calculateCheckpointTriggerCardRevisionFingerprint } from "./semantic-fingerprint-v2";
 import { normalizeUuid } from "./utils";
@@ -156,6 +157,34 @@ async function findByIdempotencyKey(
 	return row;
 }
 
+/**
+ * Take a stable per-card write lock. This MUST run first inside the write
+ * transaction -- BEFORE the second idempotency lookup and before the
+ * CREATE/OCC decision -- so two different fresh idempotency keys can never
+ * race onto the same revision position for one card. The DB INSERT trigger
+ * also locks `credit_cards`, but that is too late: the application has
+ * already chosen `revisionNo` / `previousRevisionId` by then.
+ */
+async function lockOwnedCard(
+	txdb: Database,
+	userId: string,
+	creditCardId: string,
+): Promise<void> {
+	const [card] = await txdb
+		.select({ id: creditCards.id })
+		.from(creditCards)
+		.where(
+			and(eq(creditCards.id, creditCardId), eq(creditCards.userId, userId)),
+		)
+		.for("update");
+	if (!card) {
+		throw new BudgetError(
+			"BUDGET_CHECKPOINT_TRIGGER_CARD_INVALID",
+			`credit card ${creditCardId} does not exist for this user`,
+		);
+	}
+}
+
 async function latestRevisionForCard(
 	db: Database,
 	userId: string,
@@ -256,10 +285,16 @@ export async function createCheckpointTriggerCard(
 
 	return await db.transaction(async (tx) => {
 		const txdb = tx as unknown as Database;
+		// 1. stable per-card write lock (before the 2nd lookup / CREATE decision)
+		await lockOwnedCard(txdb, userId, creditCardId);
+		// 2. second (userId, idempotencyKey) lookup, now under the card lock
 		const raced = await findByIdempotencyKey(txdb, userId, idempotencyKey);
 		if (raced) return reconcileExisting(raced, ctx);
 
+		// 3. read the latest trigger-card revision for this card
 		const latest = await latestRevisionForCard(txdb, userId, creditCardId);
+		// 4. CREATE decision: a concurrent fresh key that already won CREATE is
+		//    visible here because it committed before this tx got the card lock.
 		if (latest) {
 			throw new BudgetError(
 				"BUDGET_REVISION_CONFLICT",
@@ -359,9 +394,13 @@ export async function updateCheckpointTriggerCard(
 
 	return await db.transaction(async (tx) => {
 		const txdb = tx as unknown as Database;
+		// 1. stable per-card write lock (before the 2nd lookup / OCC decision)
+		await lockOwnedCard(txdb, userId, creditCardId);
+		// 2. second (userId, idempotencyKey) lookup, now under the card lock
 		const raced = await findByIdempotencyKey(txdb, userId, idempotencyKey);
 		if (raced) return reconcileExisting(raced, ctx);
 
+		// 3. read the latest trigger-card revision for this card
 		const latest = await latestRevisionForCard(txdb, userId, creditCardId);
 		if (!latest) {
 			throw new BudgetError(
@@ -369,6 +408,10 @@ export async function updateCheckpointTriggerCard(
 				`No checkpoint trigger-card config to update for card ${creditCardId}; use createCheckpointTriggerCard`,
 			);
 		}
+		// 4. OCC decision: a concurrent fresh key that already appended
+		//    `expectedRevisionNo + 1` is visible here (it committed before this
+		//    tx acquired the card lock) -> this caller loses with a typed
+		//    BUDGET_REVISION_CONFLICT, never a raw 23505.
 		if (latest.revisionNo !== expectedRevisionNo) {
 			throw new BudgetError(
 				"BUDGET_REVISION_CONFLICT",

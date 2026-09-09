@@ -310,12 +310,12 @@ function v2Payload(inputs: Record<string, string>, evidence: Record<string, unkn
 }
 
 async function runtime() {
-	console.log("\n== PHASE 2: APPLY MIGRATION CHAIN 0000..0068 (empty disposable DB) ==");
+	console.log("\n== PHASE 2: APPLY MIGRATION CHAIN 0000..0069 (empty disposable DB) ==");
 	const db = new PGlite();
 	await db.query("SET timezone='UTC'");
 	try {
-		await applyChain(db, 68);
-		ok("migration chain 0000..0068 applied to an empty PostgreSQL database");
+		await applyChain(db, 69);
+		ok("migration chain 0000..0069 applied to an empty PostgreSQL database");
 	} catch (e) {
 		bad("migration chain apply", "\n" + (e as Error).message);
 		await db.close();
@@ -995,7 +995,7 @@ async function resolverRuntime() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 68);
+	await applyChain(pg, 69);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -1397,7 +1397,7 @@ async function resolverRuntime4A() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 68);
+	await applyChain(pg, 69);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	const F = "f".repeat(64);
@@ -1885,7 +1885,7 @@ async function resolverRuntime4A1() {
 	{
 		const pg0 = new PGlite();
 		await pg0.query("SET timezone='UTC'");
-		await applyChain(pg0, 68);
+		await applyChain(pg0, 69);
 		// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 		const db0 = drizzle(pg0 as any) as any;
 		try {
@@ -1908,7 +1908,7 @@ async function resolverRuntime4A1() {
 	// --- partial carry-in overlap (A..E) ----------------------------------
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 68);
+	await applyChain(pg, 69);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	const F = "f".repeat(64);
@@ -2170,7 +2170,7 @@ async function make4bScenario() {
 	} = B4_IDS;
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 68);
+	await applyChain(pg, 69);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -6170,6 +6170,640 @@ async function updateCheckpointTriggerCardOrCreate(s: any, cardId: string) {
 }
 
 
+async function resolverRuntime5A() {
+	console.log(
+		"\n== PHASE 5A: CHECKPOINT PERSISTENCE AUTHORITY & CONCURRENCY CLOSURE ==",
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+	const { createCheckpointTriggerCard, updateCheckpointTriggerCard } =
+		await import("../src/budget/checkpoint-trigger-card-v2.ts");
+	const { maybeEnqueueBudgetV2CheckpointRequest } = await import(
+		"../src/budget/checkpoint-request-v2.ts"
+	);
+	const {
+		processPendingBudgetV2CheckpointRequests,
+		getBudgetV2CheckpointByPaymentEventId,
+		persistCheckpointSnapshot,
+	} = await import("../src/budget/checkpoint-processor-v2.ts");
+	const { buildBudgetV2CheckpointReport } = await import(
+		"../src/budget/checkpoint-report-v2.ts"
+	);
+	const { budgetV2CheckpointRequests } = await import(
+		"../src/db/schema/budget-v2-checkpoint.ts"
+	);
+	const { eq } = await import("drizzle-orm");
+
+	const { P } = B4_IDS;
+	const RECON = new Date("2026-09-01T00:00:00Z");
+	const at = (iso: string) => new Date(iso);
+	const eqA = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `-> got ${JSON.stringify(a)} want ${JSON.stringify(b)}`);
+	const chkA = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	const throwA = async (
+		fn: () => Promise<unknown>,
+		needle: string,
+		name: string,
+		forbidRaw = true,
+	) => {
+		try {
+			await fn();
+			bad(name, "-> did not throw");
+		} catch (e) {
+			const m = String((e as Error).message);
+			const rawLeak = forbidRaw && /23505|duplicate key/.test(m);
+			m.includes(needle) && !rawLeak ? ok(name) : bad(name, `-> ${m}`);
+		}
+	};
+
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+	const enableCard = (
+		s: S,
+		cardId: string,
+		occ: string,
+		key: string,
+		status: "ENABLED" | "DISABLED" = "ENABLED",
+	) =>
+		createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: cardId,
+			status,
+			sourceKind: "USER_APPROVED" as const,
+			idempotencyKey: key,
+			occurredAt: at(occ),
+		});
+
+	const paidStmt = async (
+		s: S,
+		opts: { sid: string; amount?: string; cycle?: number; payAt: string; key: string },
+	) => {
+		const amount = opts.amount ?? "400.00";
+		await s.replica();
+		const r1 = await s.mkStmt(opts.sid, amount, opts.cycle ?? 9);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: opts.sid,
+			statementRevisionId: r1,
+			idempotencyKey: opts.key,
+			occurredAt: RECON,
+			components: [
+				{ componentType: "ADJUSTMENT", amount, ownership: "PERSONAL", adjustmentKind: "OTHER" },
+			],
+		});
+		await s.replica();
+		const { pe, r } = await s.mkPay(opts.sid, r1, amount, 2, opts.payAt);
+		await s.origin();
+		return { sid: opts.sid, pe, payRev: r };
+	};
+
+	const enqueue = (
+		s: S,
+		opts: { sid: string; cardId: string; pe: string; payRev: string; occurredAt: Date },
+	) =>
+		s.db.transaction((tx: S) =>
+			maybeEnqueueBudgetV2CheckpointRequest({
+				tx,
+				userId: U1,
+				statementId: opts.sid,
+				creditCardId: opts.cardId,
+				paymentEventId: opts.pe,
+				payRevisionId: opts.payRev,
+				occurredAt: opts.occurredAt,
+			}),
+		);
+
+	const rawInsertReq = (
+		s: S,
+		o: {
+			pe: string;
+			sid: string;
+			cardId: string;
+			payRev: string;
+			cfgId: string;
+			checkpointAt: string;
+			periodMonth: string;
+		},
+	) =>
+		s.q(
+			`insert into budget_v2_checkpoint_requests (id,user_id,payment_event_id,statement_id,credit_card_id,pay_revision_id,trigger_config_revision_id,checkpoint_at,period_month) values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			[s.gid(), U1, o.pe, o.sid, o.cardId, o.payRev, o.cfgId, o.checkpointAt, o.periodMonth],
+		);
+
+	const reqCount = async (s: S) =>
+		(await s.q("select count(*)::int c from budget_v2_checkpoint_requests")).rows[0]
+			.c as number;
+	const snapCount = async (s: S) =>
+		(await s.q("select count(*)::int c from budget_v2_checkpoint_snapshots")).rows[0]
+			.c as number;
+	const cardConfigCount = async (s: S, cardId: string) =>
+		(
+			await s.q(
+				"select count(*)::int c from budget_v2_checkpoint_trigger_card_revisions where credit_card_id=$1",
+				[cardId],
+			)
+		).rows[0].c as number;
+
+	// ---- A: concurrent SAME-KEY trigger-card CREATE -> one row, exact replay
+	{
+		const s = await make4bScenario();
+		const results = await Promise.allSettled([
+			enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-a"),
+			enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-a"),
+		]);
+		const fulfilled = results.filter((r) => r.status === "fulfilled");
+		eqA(fulfilled.length, 2, "5A/A: concurrent same-key CREATE both resolve (idempotent)");
+		eqA(await cardConfigCount(s, s.CARD), 1, "5A/A: exactly one trigger-card revision row");
+		chkA(
+			results.every(
+				(r) => r.status === "fulfilled" || !/23505|duplicate key/.test(String((r as PromiseRejectedResult).reason?.message)),
+			),
+			"5A/A: no raw 23505 leaked",
+		);
+		await s.close();
+	}
+
+	// ---- B: concurrent DIFFERENT-KEY CREATE same card -> one winner, loser typed conflict
+	{
+		const s = await make4bScenario();
+		const results = await Promise.allSettled([
+			enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-b1"),
+			enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-b2"),
+		]);
+		const win = results.filter((r) => r.status === "fulfilled");
+		const lose = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+		eqA(win.length, 1, "5A/B: exactly one different-key CREATE wins");
+		eqA(lose.length, 1, "5A/B: the other loses");
+		chkA(
+			lose[0]?.reason?.name === "BudgetError" &&
+				lose[0]?.reason?.code === "BUDGET_REVISION_CONFLICT",
+			"5A/B: loser gets typed BUDGET_REVISION_CONFLICT",
+		);
+		chkA(
+			!/23505|duplicate key/.test(String(lose[0]?.reason?.message)),
+			"5A/B: no raw 23505 in the loser error",
+		);
+		eqA(await cardConfigCount(s, s.CARD), 1, "5A/B: exactly one revision row");
+		await s.close();
+	}
+
+	// ---- C: concurrent SAME-KEY UPDATE -> one revision appended, replay for loser
+	{
+		const s = await make4bScenario();
+		await enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-c0");
+		const upd = () =>
+			updateCheckpointTriggerCard({
+				db: s.db,
+				userId: U1,
+				creditCardId: s.CARD,
+				expectedRevisionNo: 1,
+				status: "DISABLED",
+				sourceKind: "USER_APPROVED",
+				idempotencyKey: "tc-c-upd",
+				occurredAt: at("2026-08-10T00:00:00Z"),
+			});
+		const results = await Promise.allSettled([upd(), upd()]);
+		eqA(
+			results.filter((r) => r.status === "fulfilled").length,
+			2,
+			"5A/C: concurrent same-key UPDATE both resolve (one appends, one replays)",
+		);
+		eqA(await cardConfigCount(s, s.CARD), 2, "5A/C: exactly one UPDATE revision appended");
+		await s.close();
+	}
+
+	// ---- D: concurrent DIFFERENT-KEY UPDATE same expectedRevisionNo -> one winner
+	{
+		const s = await make4bScenario();
+		await enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-d0");
+		const upd = (key: string) =>
+			updateCheckpointTriggerCard({
+				db: s.db,
+				userId: U1,
+				creditCardId: s.CARD,
+				expectedRevisionNo: 1,
+				status: "DISABLED",
+				sourceKind: "USER_APPROVED",
+				idempotencyKey: key,
+				occurredAt: at("2026-08-10T00:00:00Z"),
+			});
+		const results = await Promise.allSettled([upd("tc-d-a"), upd("tc-d-b")]);
+		const win = results.filter((r) => r.status === "fulfilled");
+		const lose = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+		eqA(win.length, 1, "5A/D: exactly one different-key UPDATE wins");
+		chkA(
+			lose[0]?.reason?.code === "BUDGET_REVISION_CONFLICT",
+			"5A/D: loser gets typed BUDGET_REVISION_CONFLICT",
+		);
+		chkA(
+			!/23505|duplicate key/.test(String(lose[0]?.reason?.message)),
+			"5A/D: no raw 23505 in the loser error",
+		);
+		eqA(await cardConfigCount(s, s.CARD), 2, "5A/D: exactly one UPDATE revision appended");
+		await s.close();
+	}
+
+	// ---- E/F/J: direct request insert -- checkpointAt / periodMonth DB binding
+	{
+		const s = await make4bScenario();
+		const cfg = await enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-ef");
+		const p = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000e1",
+			payAt: "2026-09-15 00:00:00+00",
+			key: "rc-ef",
+		});
+		// J: the exact effective config + exact instant + derived period is accepted
+		await rawInsertReq(s, {
+			pe: p.pe,
+			sid: p.sid,
+			cardId: s.CARD,
+			payRev: p.payRev,
+			cfgId: cfg.config.revisionId,
+			checkpointAt: "2026-09-15 00:00:00+00",
+			periodMonth: "2026-09-01",
+		});
+		eqA(await reqCount(s), 1, "5A/J: a request with the exact effective config / instant / period is accepted");
+		// E: a caller-invented checkpoint time is rejected
+		const p2 = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000e2",
+			cycle: 8,
+			payAt: "2026-09-16 00:00:00+00",
+			key: "rc-ef2",
+		});
+		await throwA(
+			() =>
+				rawInsertReq(s, {
+					pe: p2.pe,
+					sid: p2.sid,
+					cardId: s.CARD,
+					payRev: p2.payRev,
+					cfgId: cfg.config.revisionId,
+					checkpointAt: "2026-09-16 01:00:00+00",
+					periodMonth: "2026-09-01",
+				}),
+			"checkpoint_at",
+			"5A/E: checkpoint_at != payment event occurred_at -> DB rejects",
+			false,
+		);
+		// F: a wrong period month is rejected
+		await throwA(
+			() =>
+				rawInsertReq(s, {
+					pe: p2.pe,
+					sid: p2.sid,
+					cardId: s.CARD,
+					payRev: p2.payRev,
+					cfgId: cfg.config.revisionId,
+					checkpointAt: "2026-09-16 00:00:00+00",
+					periodMonth: "2026-08-01",
+				}),
+			"Europe/Istanbul month",
+			"5A/F: period_month != derived Europe/Istanbul month -> DB rejects",
+			false,
+		);
+		await s.close();
+	}
+
+	// ---- G: Istanbul UTC/month boundary period derivation
+	{
+		const s = await make4bScenario();
+		const cfg = await enableCard(s, s.CARD, "2026-07-01T00:00:00Z", "tc-g");
+		const p = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000g1".replace(/g/g, "a"),
+			payAt: "2026-08-31 22:30:00+00",
+			key: "rc-g",
+		});
+		// 2026-08-31T22:30Z is 2026-09-01 01:30 in Europe/Istanbul -> September
+		await rawInsertReq(s, {
+			pe: p.pe,
+			sid: p.sid,
+			cardId: s.CARD,
+			payRev: p.payRev,
+			cfgId: cfg.config.revisionId,
+			checkpointAt: "2026-08-31 22:30:00+00",
+			periodMonth: "2026-09-01",
+		});
+		eqA(await reqCount(s), 1, "5A/G: the Europe/Istanbul month (September) is accepted for a 22:30Z Aug-31 payment");
+		const p2 = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000a2",
+			cycle: 8,
+			payAt: "2026-08-31 22:30:00+00",
+			key: "rc-g2",
+		});
+		await throwA(
+			() =>
+				rawInsertReq(s, {
+					pe: p2.pe,
+					sid: p2.sid,
+					cardId: s.CARD,
+					payRev: p2.payRev,
+					cfgId: cfg.config.revisionId,
+					checkpointAt: "2026-08-31 22:30:00+00",
+					periodMonth: "2026-08-01",
+				}),
+			"Europe/Istanbul month",
+			"5A/G: the UTC month (August) is rejected for the same payment",
+			false,
+		);
+		await s.close();
+	}
+
+	// ---- H: request references a superseded ENABLED config while effective is DISABLED
+	{
+		const s = await make4bScenario();
+		const rev1 = await enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-h1");
+		await updateCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			expectedRevisionNo: 1,
+			status: "DISABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-h2",
+			occurredAt: at("2026-08-15T00:00:00Z"),
+		});
+		const p = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000h1".replace(/h/g, "b"),
+			payAt: "2026-09-15 00:00:00+00",
+			key: "rc-h",
+		});
+		await throwA(
+			() =>
+				rawInsertReq(s, {
+					pe: p.pe,
+					sid: p.sid,
+					cardId: s.CARD,
+					payRev: p.payRev,
+					cfgId: rev1.config.revisionId,
+					checkpointAt: "2026-09-15 00:00:00+00",
+					periodMonth: "2026-09-01",
+				}),
+			"not the config effective at the payment instant",
+			"5A/H: a request referencing a superseded ENABLED config (effective is DISABLED) -> DB rejects",
+			false,
+		);
+		eqA(await reqCount(s), 0, "5A/H: no request row written");
+		await s.close();
+	}
+
+	// ---- I: request references a FUTURE ENABLED config
+	{
+		const s = await make4bScenario();
+		await enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-i1");
+		const rev2 = await updateCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			expectedRevisionNo: 1,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-i2",
+			occurredAt: at("2026-10-01T00:00:00Z"),
+		});
+		const p = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000c1",
+			payAt: "2026-09-15 00:00:00+00",
+			key: "rc-i",
+		});
+		await throwA(
+			() =>
+				rawInsertReq(s, {
+					pe: p.pe,
+					sid: p.sid,
+					cardId: s.CARD,
+					payRev: p.payRev,
+					cfgId: rev2.config.revisionId,
+					checkpointAt: "2026-09-15 00:00:00+00",
+					periodMonth: "2026-09-01",
+				}),
+			"not the config effective at the payment instant",
+			"5A/I: a request referencing a FUTURE ENABLED config -> DB rejects",
+			false,
+		);
+		await s.close();
+	}
+
+	// ---- J (app path): the ordinary enqueue still succeeds under the stricter guard
+	{
+		const s = await make4bScenario();
+		await enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-j");
+		const p = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000c2",
+			payAt: "2026-09-15 00:00:00+00",
+			key: "rc-j",
+		});
+		const r = await enqueue(s, {
+			sid: p.sid,
+			cardId: s.CARD,
+			pe: p.pe,
+			payRev: p.payRev,
+			occurredAt: at("2026-09-15T00:00:00Z"),
+		});
+		eqA(r.enqueued, true, "5A/J: the ordinary PAY enqueue still succeeds with the exact effective ENABLED config");
+		eqA(await reqCount(s), 1, "5A/J: exactly one request");
+		await s.close();
+	}
+
+	// ---- K: stale request + already-persisted snapshot for the SAME payment event is NOT a collision
+	{
+		const s = await make4bScenario();
+		await enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-k");
+		const A = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000d1",
+			amount: "300.00",
+			cycle: 9,
+			payAt: "2026-09-05 00:00:00+00",
+			key: "rc-k1",
+		});
+		const B = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000d2",
+			amount: "300.00",
+			cycle: 8,
+			payAt: "2026-09-15 00:00:00+00",
+			key: "rc-k2",
+		});
+		await enqueue(s, { sid: A.sid, cardId: s.CARD, pe: A.pe, payRev: A.payRev, occurredAt: at("2026-09-05T00:00:00Z") });
+		await enqueue(s, { sid: B.sid, cardId: s.CARD, pe: B.pe, payRev: B.payRev, occurredAt: at("2026-09-15T00:00:00Z") });
+		// pre-persist B's snapshot directly so its request row + snapshot coexist
+		const [reqB] = await s.db
+			.select()
+			.from(budgetV2CheckpointRequests)
+			.where(eq(budgetV2CheckpointRequests.paymentEventId, B.pe));
+		const reportB = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: B.pe,
+		});
+		await persistCheckpointSnapshot(s.db, reqB, reportB, null);
+		const proc = await processPendingBudgetV2CheckpointRequests({ db: s.db });
+		eqA(proc.collisionPeriods, 0, "5A/K: request + its own persisted snapshot is NOT a same-timestamp collision");
+		eqA(await snapCount(s), 2, "5A/K: A persists, B stays as its single pre-existing snapshot");
+		chkA(proc.persisted === 1, "5A/K: only A is newly persisted; B keeps its single pre-existing snapshot (no rebuild)");
+		await s.close();
+	}
+
+	// ---- L: a snapshot appearing before the live build -> stored replay used, no rebuild
+	{
+		const s = await make4bScenario();
+		await enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-l");
+		const A = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000e5",
+			payAt: "2026-09-05 00:00:00+00",
+			key: "rc-l1",
+		});
+		const B = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000e6",
+			cycle: 8,
+			payAt: "2026-09-15 00:00:00+00",
+			key: "rc-l2",
+		});
+		await enqueue(s, { sid: A.sid, cardId: s.CARD, pe: A.pe, payRev: A.payRev, occurredAt: at("2026-09-05T00:00:00Z") });
+		await enqueue(s, { sid: B.sid, cardId: s.CARD, pe: B.pe, payRev: B.payRev, occurredAt: at("2026-09-15T00:00:00Z") });
+		const [reqB] = await s.db
+			.select()
+			.from(budgetV2CheckpointRequests)
+			.where(eq(budgetV2CheckpointRequests.paymentEventId, B.pe));
+		const reportB = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: B.pe,
+		});
+		const pre = await persistCheckpointSnapshot(s.db, reqB, reportB, null);
+		const proc = await processPendingBudgetV2CheckpointRequests({ db: s.db });
+		chkA(proc.persisted === 1, "5A/L: only A is newly persisted; B's pre-existing snapshot is adopted, not rebuilt");
+		const bReplay = await getBudgetV2CheckpointByPaymentEventId({ db: s.db, userId: U1, paymentEventId: B.pe });
+		chkA(
+			bReplay.status === "PERSISTED" && bReplay.fingerprint === pre.snapshot.reportFingerprint,
+			"5A/L: B's stored snapshot is byte-identical to the pre-inserted one (no live recomputation)",
+		);
+		await s.close();
+	}
+
+	// ---- M: two DISTINCT payment events at identical checkpointAt -> true collision preserved
+	{
+		const s = await make4bScenario();
+		await enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-m");
+		const T1 = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000f1",
+			amount: "400.00",
+			cycle: 9,
+			payAt: "2026-09-15 00:00:00+00",
+			key: "rc-m1",
+		});
+		const T2 = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-0000000000f2",
+			amount: "300.00",
+			cycle: 8,
+			payAt: "2026-09-15 00:00:00+00",
+			key: "rc-m2",
+		});
+		await enqueue(s, { sid: T1.sid, cardId: s.CARD, pe: T1.pe, payRev: T1.payRev, occurredAt: at("2026-09-15T00:00:00Z") });
+		await enqueue(s, { sid: T2.sid, cardId: s.CARD, pe: T2.pe, payRev: T2.payRev, occurredAt: at("2026-09-15T00:00:00Z") });
+		const proc = await processPendingBudgetV2CheckpointRequests({ db: s.db });
+		eqA(proc.collisionPeriods, 1, "5A/M: two distinct payment events at identical checkpointAt still fail closed");
+		eqA(await snapCount(s), 0, "5A/M: no snapshot for the colliding chain");
+		eqA(await reqCount(s), 2, "5A/M: payments and requests remain intact");
+		await s.close();
+	}
+
+	// ---- N: predecessor-changed BUDGET_CHECKPOINT_REQUEST_BLOCKED is typed + non-fatal;
+	//        a halted period does not stop an independent period
+	{
+		const s = await make4bScenario();
+		await enableCard(s, s.CARD, "2026-08-01T00:00:00Z", "tc-n");
+		// Sep: persist A, then force a stale predecessor for C via persistCheckpointSnapshot
+		const A = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-000000000101",
+			payAt: "2026-09-05 00:00:00+00",
+			key: "rc-n1",
+		});
+		const C = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-000000000102",
+			cycle: 8,
+			payAt: "2026-09-15 00:00:00+00",
+			key: "rc-n2",
+		});
+		await enqueue(s, { sid: A.sid, cardId: s.CARD, pe: A.pe, payRev: A.payRev, occurredAt: at("2026-09-05T00:00:00Z") });
+		await enqueue(s, { sid: C.sid, cardId: s.CARD, pe: C.pe, payRev: C.payRev, occurredAt: at("2026-09-15T00:00:00Z") });
+		await processPendingBudgetV2CheckpointRequests({ db: s.db }); // persists A + C normally
+		// deterministic BLOCKED: persist a fresh request with a deliberately stale builtPredecessor
+		const D = await paidStmt(s, {
+			sid: "86000000-0000-4000-8000-000000000103",
+			cycle: 7,
+			payAt: "2026-09-20 00:00:00+00",
+			key: "rc-n3",
+		});
+		await enqueue(s, { sid: D.sid, cardId: s.CARD, pe: D.pe, payRev: D.payRev, occurredAt: at("2026-09-20T00:00:00Z") });
+		const [reqD] = await s.db
+			.select()
+			.from(budgetV2CheckpointRequests)
+			.where(eq(budgetV2CheckpointRequests.paymentEventId, D.pe));
+		const reportD = await buildBudgetV2CheckpointReport({
+			db: s.db,
+			userId: U1,
+			periodMonth: P,
+			triggerPaymentEventId: D.pe,
+			previousCheckpointAt: at("2026-09-15T00:00:00Z"),
+		});
+		await throwA(
+			() => persistCheckpointSnapshot(s.db, reqD, reportD, null),
+			"predecessor changed under lock",
+			"5A/N: persistCheckpointSnapshot raises typed BUDGET_CHECKPOINT_REQUEST_BLOCKED on a stale predecessor",
+		);
+		// processor resilience: a Sep period that fails closed does not stop an Oct period, and does not throw
+		const s2 = await make4bScenario();
+		await enableCard(s2, s2.CARD, "2026-08-01T00:00:00Z", "tc-n2");
+		const SA = await paidStmt(s2, {
+			sid: "86000000-0000-4000-8000-000000000111",
+			amount: "300.00",
+			payAt: "2026-09-05 00:00:00+00",
+			key: "rc-nsa",
+		});
+		await enqueue(s2, { sid: SA.sid, cardId: s2.CARD, pe: SA.pe, payRev: SA.payRev, occurredAt: at("2026-09-05T00:00:00Z") });
+		// unsealed split -> Sep report fails closed
+		await s2.replica();
+		const purU = await s2.mkPur("800.00", "DISCRETIONARY_SPEND", "2026-09-03 00:00:00+00");
+		await s2.mkObligation("8a000000-0000-4000-8000-000000000111", s2.P_FAM, "RECEIVABLE", "500.00", "2026-09-03 00:00:00+00");
+		await s2.mkSplit({
+			purchaseEid: purU.eid,
+			purchaseEr: purU.er,
+			splitId: "87000000-0000-4000-8000-000000000111",
+			user: "300.00",
+			ext: "500.00",
+			gross: "800.00",
+			occ: "2026-09-03 00:00:00+00",
+			personId: s2.P_FAM,
+			personObligationId: "8a000000-0000-4000-8000-000000000111",
+			sealed: false,
+		});
+		await s2.origin();
+		// Oct period, independent
+		const OA = await paidStmt(s2, {
+			sid: "86000000-0000-4000-8000-000000000112",
+			amount: "500.00",
+			cycle: 10,
+			payAt: "2026-10-10 00:00:00+00",
+			key: "rc-noa",
+		});
+		await enqueue(s2, { sid: OA.sid, cardId: s2.CARD, pe: OA.pe, payRev: OA.payRev, occurredAt: at("2026-10-10T00:00:00Z") });
+		const proc = await processPendingBudgetV2CheckpointRequests({ db: s2.db });
+		chkA(proc.failedReport === 1, "5A/N: the Sep period fails closed (failedReport = 1)");
+		const oct = await getBudgetV2CheckpointByPaymentEventId({ db: s2.db, userId: U1, paymentEventId: OA.pe });
+		chkA(oct.status === "PERSISTED", "5A/N: the independent October period still persists in the same run");
+		await s.close();
+		await s2.close();
+	}
+}
+
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -6182,6 +6816,7 @@ if (probed) {
 	await resolverRuntime4B3();
 	await resolverRuntime4C();
 	await resolverRuntime5();
+	await resolverRuntime5A();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

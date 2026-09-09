@@ -63,20 +63,32 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		// +4 in migration 0068 (durable checkpoint persistence: one SHARED
 		// immutability guard for all three tables + one BEFORE INSERT guard each
 		// for the trigger-card / request / snapshot tables).
+		// 0069 CREATE OR REPLACEs an existing function
+		// (trg_fn_guard_bv2ckreq_insert) -- no new function name, so the count
+		// is unchanged.
 		expect(effectiveFunctions.size).toBe(168);
 	});
 
-	it("migration 0068 contributes exactly the four durable-checkpoint guard functions", () => {
+	it("migration 0068 defines the durable-checkpoint guard functions (request guard later hardened by 0069)", () => {
 		for (const fnName of [
 			"trg_fn_guard_bv2ckpt_immutability",
 			"trg_fn_guard_bv2ckcard_revisions_insert",
-			"trg_fn_guard_bv2ckreq_insert",
 			"trg_fn_guard_bv2cksnap_insert",
 		]) {
 			expect(effectiveFunctions.get(fnName)?.migration).toBe(
 				"0068_add_budget_v2_checkpoint_persistence",
 			);
 		}
+	});
+
+	it("migration 0069 provides the effective version of trg_fn_guard_bv2ckreq_insert (request-provenance hardening)", () => {
+		const fn = effectiveFunctions.get("trg_fn_guard_bv2ckreq_insert");
+		expect(fn?.migration).toBe("0069_harden_budget_v2_checkpoint_persistence");
+		expect(fn?.body).toContain("Europe/Istanbul");
+		expect(fn?.body).toContain("checkpoint_at % does not match payment event");
+		expect(fn?.body).toContain(
+			"is not the config effective at the payment instant",
+		);
 	});
 
 	it("migration 0064 contributes exactly the two basic-living config guard functions", () => {

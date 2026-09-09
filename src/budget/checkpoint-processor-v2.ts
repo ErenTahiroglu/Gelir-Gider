@@ -13,28 +13,41 @@ import { BudgetError } from "./errors";
 import { normalizeUuid, validateBudgetPeriodMonth } from "./utils";
 
 /**
- * DURABLE CHECKPOINT PERSISTENCE PROCESSOR (Checkpoint 5, Sections 9-16).
+ * DURABLE CHECKPOINT PERSISTENCE PROCESSOR (Checkpoint 5 / 5A).
  *
  * A bounded, retryable processor that turns pending checkpoint REQUEST rows
  * (an actual PAID payment event on a trigger card, no snapshot yet) into
  * immutable checkpoint SNAPSHOT rows.
  *
  * Guarantees:
- *   - REPLAY BEFORE LIVE: `getBudgetV2CheckpointByPaymentEventId` returns the
- *     frozen stored snapshot verbatim when one exists -- it never rebuilds the
- *     report or resolves current source truth.
+ *   - REPLAY BEFORE LIVE: before building a report for a request, the processor
+ *     re-checks whether that request's snapshot has appeared since discovery
+ *     (a concurrent worker persisted it). If so it verifies the stored
+ *     snapshot's integrity, treats it as chain state, and does NOT rebuild
+ *     live truth for that request. `getBudgetV2CheckpointByPaymentEventId`
+ *     likewise returns the frozen stored snapshot verbatim.
  *   - PREVIOUS-CHECKPOINT CHAIN is derived from stored successful snapshots,
  *     per user+periodMonth, month boundaries starting a fresh chain.
  *   - NEVER SKIP AN EARLIER PENDING CHECKPOINT: requests are processed oldest
- *     first per user+period; a failure stops that period (later requests stay
- *     pending) but never blocks other periods/users.
+ *     first per user+period; a fail-closed report or a predecessor-changed
+ *     BUDGET_CHECKPOINT_REQUEST_BLOCKED stops that period (later requests stay
+ *     pending, counted `blocked`) but never blocks other periods/users and
+ *     never turns the whole run into an infrastructure failure.
  *   - CONCURRENCY: one snapshot per request (row lock + unique(request_id) +
- *     ON CONFLICT DO NOTHING); a losing worker returns the stored snapshot.
- *   - SAME-TIMESTAMP COLLISION: two distinct eligible events in one
- *     user+period sharing the exact `checkpointAt` fail closed at the report
- *     layer -- payments and requests remain intact.
+ *     ON CONFLICT DO NOTHING); a losing worker observes the stored snapshot.
+ *   - SAME-TIMESTAMP COLLISION is IDENTITY-AWARE: only TWO DISTINCT payment
+ *     events in one user+period sharing the exact `checkpointAt` are a
+ *     collision (fail closed, no snapshot). The same payment event represented
+ *     by a still-present request row AND an already-persisted snapshot is NOT
+ *     a collision.
  *   - A failed-closed report never fabricates a snapshot and never deletes the
  *     request; a later run may succeed once evidence is repaired.
+ *
+ * COUNT SEMANTICS: `persisted` counts snapshots THIS run newly wrote (the
+ * race/insert winner). `alreadyPersisted` counts requests this run found
+ * already persisted by a concurrent worker (replay / stale-pending) and did
+ * NOT rebuild. `pendingDiscovered` is the count of requests with no snapshot
+ * at discovery time.
  *
  * No `report_json` / balances / amounts / names in any operational count.
  * Month-close is never invoked from here.
@@ -49,8 +62,12 @@ export interface ProcessPendingCheckpointRequestsParams {
 }
 
 export interface ProcessPendingCheckpointRequestsResult {
+	/** Requests with no snapshot at discovery time. */
 	pendingDiscovered: number;
+	/** Snapshots THIS run newly wrote (insert / race winner). */
 	persisted: number;
+	/** Requests THIS run found already persisted by a concurrent worker. */
+	alreadyPersisted: number;
 	/** Left pending because an earlier same-period request is unresolved. */
 	blocked: number;
 	/** Requests whose authoritative report build failed closed this run. */
@@ -65,6 +82,53 @@ type SnapshotRow = typeof budgetV2CheckpointSnapshots.$inferSelect;
 
 function groupKey(userId: string, periodMonth: string): string {
 	return `${userId}|${periodMonth}`;
+}
+
+/**
+ * IDENTITY-AWARE same-`checkpointAt` collision test. Groups the given entries
+ * by exact `checkpointAt` instant and reports a collision only when a single
+ * instant carries TWO OR MORE DISTINCT `paymentEventId`s. A request row and
+ * its own already-persisted snapshot share a `paymentEventId`, so they never
+ * count as a collision.
+ */
+export function hasDistinctEventTimestampCollision(
+	entries: ReadonlyArray<{ checkpointAt: Date; paymentEventId: string }>,
+): boolean {
+	const byInstant = new Map<number, Set<string>>();
+	for (const e of entries) {
+		const key = e.checkpointAt.getTime();
+		const set = byInstant.get(key) ?? new Set<string>();
+		set.add(e.paymentEventId);
+		byInstant.set(key, set);
+	}
+	for (const set of byInstant.values()) {
+		if (set.size > 1) return true;
+	}
+	return false;
+}
+
+async function loadSnapshotByRequestId(
+	db: Database,
+	requestId: string,
+): Promise<SnapshotRow | undefined> {
+	const [row] = await db
+		.select()
+		.from(budgetV2CheckpointSnapshots)
+		.where(eq(budgetV2CheckpointSnapshots.requestId, requestId))
+		.limit(1);
+	return row;
+}
+
+async function verifySnapshotRow(row: SnapshotRow): Promise<void> {
+	await verifyStoredCheckpointSnapshot({
+		reportSchemaVersion: row.reportSchemaVersion,
+		reportJson: row.reportJson,
+		reportFingerprint: row.reportFingerprint,
+		paymentEventId: row.paymentEventId,
+		periodMonth: row.periodMonth,
+		checkpointAt: row.checkpointAt,
+		previousCheckpointAt: row.previousCheckpointAt,
+	});
 }
 
 export async function processPendingBudgetV2CheckpointRequests(
@@ -88,22 +152,26 @@ export async function processPendingBudgetV2CheckpointRequests(
 				.from(budgetV2CheckpointSnapshots)
 		).map((r) => r.requestId),
 	);
-
-	const pending = allRequests.filter((r) => !persistedRequestIds.has(r.id));
+	const pendingIds = new Set(
+		allRequests.filter((r) => !persistedRequestIds.has(r.id)).map((r) => r.id),
+	);
 
 	const result: ProcessPendingCheckpointRequestsResult = {
-		pendingDiscovered: pending.length,
+		pendingDiscovered: pendingIds.size,
 		persisted: 0,
+		alreadyPersisted: 0,
 		blocked: 0,
 		failedReport: 0,
 		collisionPeriods: 0,
 		periodsProcessed: 0,
 	};
-	if (pending.length === 0) return result;
+	if (pendingIds.size === 0) return result;
 
-	// Group pending by user+period, preserving chronological order.
+	// Group ALL requests by user+period (chronological). A request whose
+	// snapshot already exists is still carried so identity-aware collision
+	// detection can dedupe it against its own snapshot.
 	const groups = new Map<string, RequestRow[]>();
-	for (const r of pending) {
+	for (const r of allRequests) {
 		const key = groupKey(r.userId, r.periodMonth);
 		const list = groups.get(key) ?? [];
 		list.push(r);
@@ -111,8 +179,9 @@ export async function processPendingBudgetV2CheckpointRequests(
 	}
 
 	for (const [, groupRequests] of groups) {
-		result.periodsProcessed += 1;
 		const { userId, periodMonth } = groupRequests[0] as RequestRow;
+		if (!groupRequests.some((r) => pendingIds.has(r.id))) continue; // nothing to do
+		result.periodsProcessed += 1;
 
 		// Persisted snapshots already in this (user, period) chain.
 		let chain: SnapshotRow[] = await db
@@ -126,31 +195,44 @@ export async function processPendingBudgetV2CheckpointRequests(
 			)
 			.orderBy(asc(budgetV2CheckpointSnapshots.checkpointAt));
 
-		// Same-`checkpointAt` collision: any two distinct eligible events in
-		// this user+period sharing the exact instant -> fail closed here.
-		const instants = new Map<number, number>();
-		for (const s of chain) {
-			instants.set(
-				s.checkpointAt.getTime(),
-				(instants.get(s.checkpointAt.getTime()) ?? 0) + 1,
-			);
-		}
-		for (const r of groupRequests) {
-			instants.set(
-				r.checkpointAt.getTime(),
-				(instants.get(r.checkpointAt.getTime()) ?? 0) + 1,
-			);
-		}
-		if ([...instants.values()].some((count) => count > 1)) {
+		// Identity-aware same-`checkpointAt` collision over {persisted chain}
+		// UNION {this period's requests}. Only two DISTINCT payment events at
+		// the same instant fail closed.
+		if (
+			hasDistinctEventTimestampCollision([
+				...chain.map((s) => ({
+					checkpointAt: s.checkpointAt,
+					paymentEventId: s.paymentEventId,
+				})),
+				...groupRequests.map((r) => ({
+					checkpointAt: r.checkpointAt,
+					paymentEventId: r.paymentEventId,
+				})),
+			])
+		) {
 			result.collisionPeriods += 1;
-			result.blocked += groupRequests.length;
+			result.blocked += groupRequests.filter((r) =>
+				pendingIds.has(r.id),
+			).length;
 			continue;
 		}
 
 		let halted = false;
 		for (const request of groupRequests) {
+			const isPending = pendingIds.has(request.id);
 			if (halted) {
-				result.blocked += 1;
+				if (isPending) result.blocked += 1;
+				continue;
+			}
+
+			// Replay-before-live: has this request's snapshot appeared since
+			// discovery (a concurrent worker persisted it)? If so, adopt it as
+			// chain state -- never rebuild live truth for it.
+			const existing = await loadSnapshotByRequestId(db, request.id);
+			if (existing) {
+				await verifySnapshotRow(existing);
+				chain = mergeChain(chain, existing);
+				if (isPending) result.alreadyPersisted += 1;
 				continue;
 			}
 
@@ -178,20 +260,41 @@ export async function processPendingBudgetV2CheckpointRequests(
 				throw err;
 			}
 
-			const persistedSnap = await persistCheckpointSnapshot(
-				db,
-				request,
-				report,
-				predecessor ?? null,
-			);
-			chain = [...chain, persistedSnap].sort(
-				(a, b) => a.checkpointAt.getTime() - b.checkpointAt.getTime(),
-			);
-			result.persisted += 1;
+			let persisted: PersistResult;
+			try {
+				persisted = await persistCheckpointSnapshot(
+					db,
+					request,
+					report,
+					predecessor ?? null,
+				);
+			} catch (err) {
+				if (err instanceof BudgetError) {
+					// Expected concurrency/retry outcome (e.g. predecessor changed
+					// under lock -> BUDGET_CHECKPOINT_REQUEST_BLOCKED). Leave the
+					// request pending, halt this user+period for this run, keep
+					// processing other periods/users. NOT an infra failure.
+					result.blocked += 1;
+					halted = true;
+					continue;
+				}
+				throw err;
+			}
+
+			chain = mergeChain(chain, persisted.snapshot);
+			if (persisted.created) result.persisted += 1;
+			else if (isPending) result.alreadyPersisted += 1;
 		}
 	}
 
 	return result;
+}
+
+function mergeChain(chain: SnapshotRow[], row: SnapshotRow): SnapshotRow[] {
+	if (chain.some((s) => s.id === row.id)) return chain;
+	return [...chain, row].sort(
+		(a, b) => a.checkpointAt.getTime() - b.checkpointAt.getTime(),
+	);
 }
 
 function lastBefore(chain: SnapshotRow[], at: Date): SnapshotRow | undefined {
@@ -206,19 +309,26 @@ function lastBefore(chain: SnapshotRow[], at: Date): SnapshotRow | undefined {
 	return chosen;
 }
 
+export interface PersistResult {
+	snapshot: SnapshotRow;
+	/** true when THIS call inserted the row; false when it observed one already present. */
+	created: boolean;
+}
+
 /**
  * Hardened single-snapshot persist. Serializes on the request row, second-checks
  * for an existing snapshot under lock, recomputes the predecessor under lock and
- * refuses to persist a report built against a now-stale interval, then inserts
- * with ON CONFLICT (request_id) DO NOTHING. A losing worker returns the stored
- * snapshot; a raw 23505 never escapes.
+ * refuses to persist a report built against a now-stale interval
+ * (BUDGET_CHECKPOINT_REQUEST_BLOCKED -- an expected concurrency/retry outcome),
+ * then inserts with ON CONFLICT (request_id) DO NOTHING. A losing worker
+ * observes the stored snapshot (`created: false`); a raw 23505 never escapes.
  */
-async function persistCheckpointSnapshot(
+export async function persistCheckpointSnapshot(
 	db: Database,
 	request: RequestRow,
 	report: Awaited<ReturnType<typeof buildBudgetV2CheckpointReport>>,
 	builtPredecessor: SnapshotRow | null,
-): Promise<SnapshotRow> {
+): Promise<PersistResult> {
 	const fingerprint = await calculateCheckpointReportFingerprint(report);
 
 	return db.transaction(async (tx) => {
@@ -241,7 +351,7 @@ async function persistCheckpointSnapshot(
 			.from(budgetV2CheckpointSnapshots)
 			.where(eq(budgetV2CheckpointSnapshots.requestId, request.id))
 			.limit(1);
-		if (already) return already;
+		if (already) return { snapshot: already, created: false };
 
 		const [predecessor] = await txdb
 			.select()
@@ -281,7 +391,7 @@ async function persistCheckpointSnapshot(
 				target: [budgetV2CheckpointSnapshots.requestId],
 			})
 			.returning();
-		if (inserted) return inserted;
+		if (inserted) return { snapshot: inserted, created: true };
 
 		const [afterConflict] = await txdb
 			.select()
@@ -294,7 +404,7 @@ async function persistCheckpointSnapshot(
 				`checkpoint snapshot for request ${request.id} conflicted but no row is visible`,
 			);
 		}
-		return afterConflict;
+		return { snapshot: afterConflict, created: false };
 	});
 }
 
