@@ -184,3 +184,57 @@ export async function verifyStoredBudgetV2RecommendationInstance(
 		);
 	}
 }
+
+export interface StoredBudgetV2RecommendationFeedbackRevisionRow {
+	id: string;
+	userId: string;
+	recommendationInstanceId: string;
+	revisionNo: number;
+	previousRevisionId: string | null;
+	operation: string;
+	decision: string;
+	modificationJson: unknown;
+	sourceKind: string;
+	idempotencyKey: string;
+	revisionFingerprint: string;
+	occurredAt: Date;
+	createdAt: Date;
+}
+
+/**
+ * Re-derives and verifies the integrity of a stored recommendation feedback revision.
+ * Any mismatch between the stored row data and its recomputed revision fingerprint
+ * is a typed corruption error -- fail closed, never silently ignored or repaired.
+ */
+export async function verifyStoredBudgetV2RecommendationFeedbackRevision(
+	row: StoredBudgetV2RecommendationFeedbackRevisionRow,
+): Promise<void> {
+	if (!row || typeof row !== "object") {
+		throw new BudgetError(
+			"BUDGET_RECOMMENDATION_FEEDBACK_CORRUPT",
+			"feedback revision row is invalid or null",
+		);
+	}
+
+	const occurredAt =
+		row.occurredAt instanceof Date ? row.occurredAt : new Date(row.occurredAt);
+
+	const recomputed = await calculateFeedbackRevisionFingerprint({
+		userId: row.userId,
+		recommendationInstanceId: row.recommendationInstanceId,
+		operation: row.operation,
+		revisionNo: row.revisionNo,
+		previousRevisionId: row.previousRevisionId,
+		decision: row.decision,
+		modificationJson: row.modificationJson,
+		sourceKind: row.sourceKind,
+		occurredAt,
+	});
+
+	if (recomputed !== row.revisionFingerprint) {
+		throw new BudgetError(
+			"BUDGET_RECOMMENDATION_FEEDBACK_CORRUPT",
+			`feedback revision ${row.id} fingerprint mismatch: stored ${row.revisionFingerprint}, recomputed ${recomputed}`,
+		);
+	}
+}

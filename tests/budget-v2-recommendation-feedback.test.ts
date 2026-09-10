@@ -417,3 +417,139 @@ describe("Modification Schema Validation (Sections 10 & 11)", () => {
 		).toThrow(BudgetError);
 	});
 });
+
+describe("Stored Feedback Revision Verification (Checkpoint 6C.1 Section 5)", () => {
+	it("verifies a valid stored feedback revision row", async () => {
+		const row = {
+			id: "00000000-0000-0000-0000-000000000050",
+			userId: "00000000-0000-0000-0000-000000000002",
+			recommendationInstanceId: "00000000-0000-0000-0000-000000000010",
+			operation: "CREATE",
+			revisionNo: 1,
+			previousRevisionId: null,
+			decision: "ACCEPT",
+			modificationJson: null,
+			feedbackReason: null,
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "fb-test-1",
+			revisionFingerprint: "",
+			occurredAt: new Date("2026-09-15T13:00:00.000Z"),
+			createdAt: new Date("2026-09-15T13:00:00.000Z"),
+		};
+		row.revisionFingerprint = await calculateFeedbackRevisionFingerprint({
+			userId: row.userId,
+			recommendationInstanceId: row.recommendationInstanceId,
+			operation: row.operation,
+			revisionNo: row.revisionNo,
+			previousRevisionId: row.previousRevisionId,
+			decision: row.decision,
+			modificationJson: row.modificationJson,
+			sourceKind: row.sourceKind,
+			occurredAt: row.occurredAt,
+		});
+
+		const { verifyStoredBudgetV2RecommendationFeedbackRevision } = await import(
+			"../src/budget/recommendation-feedback-canonical-v2"
+		);
+		await expect(
+			verifyStoredBudgetV2RecommendationFeedbackRevision(row),
+		).resolves.toBeUndefined();
+	});
+
+	it("fails closed on tampered decision", async () => {
+		const row = {
+			id: "00000000-0000-0000-0000-000000000050",
+			userId: "00000000-0000-0000-0000-000000000002",
+			recommendationInstanceId: "00000000-0000-0000-0000-000000000010",
+			operation: "CREATE",
+			revisionNo: 1,
+			previousRevisionId: null,
+			decision: "ACCEPT",
+			modificationJson: null,
+			feedbackReason: null,
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "fb-test-1",
+			revisionFingerprint: "",
+			occurredAt: new Date("2026-09-15T13:00:00.000Z"),
+			createdAt: new Date("2026-09-15T13:00:00.000Z"),
+		};
+		row.revisionFingerprint = await calculateFeedbackRevisionFingerprint({
+			userId: row.userId,
+			recommendationInstanceId: row.recommendationInstanceId,
+			operation: row.operation,
+			revisionNo: row.revisionNo,
+			previousRevisionId: row.previousRevisionId,
+			decision: row.decision,
+			modificationJson: row.modificationJson,
+			sourceKind: row.sourceKind,
+			occurredAt: row.occurredAt,
+		});
+
+		// Tamper decision
+		const tamperedRow = { ...row, decision: "IGNORE" };
+		const { verifyStoredBudgetV2RecommendationFeedbackRevision } = await import(
+			"../src/budget/recommendation-feedback-canonical-v2"
+		);
+		await expect(
+			verifyStoredBudgetV2RecommendationFeedbackRevision(tamperedRow),
+		).rejects.toMatchObject({
+			code: "BUDGET_RECOMMENDATION_FEEDBACK_CORRUPT",
+		});
+	});
+
+	it("fails closed on tampered modification_json or revision_fingerprint", async () => {
+		const row = {
+			id: "00000000-0000-0000-0000-000000000050",
+			userId: "00000000-0000-0000-0000-000000000002",
+			recommendationInstanceId: "00000000-0000-0000-0000-000000000010",
+			operation: "UPDATE",
+			revisionNo: 2,
+			previousRevisionId: "00000000-0000-0000-0000-000000000049",
+			decision: "MODIFY",
+			modificationJson: { type: "NOTE_ONLY", note: "Original note" },
+			feedbackReason: null,
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "fb-test-2",
+			revisionFingerprint: "",
+			occurredAt: new Date("2026-09-15T14:00:00.000Z"),
+			createdAt: new Date("2026-09-15T14:00:00.000Z"),
+		};
+		row.revisionFingerprint = await calculateFeedbackRevisionFingerprint({
+			userId: row.userId,
+			recommendationInstanceId: row.recommendationInstanceId,
+			operation: row.operation,
+			revisionNo: row.revisionNo,
+			previousRevisionId: row.previousRevisionId,
+			decision: row.decision,
+			modificationJson: row.modificationJson,
+			sourceKind: row.sourceKind,
+			occurredAt: row.occurredAt,
+		});
+
+		const { verifyStoredBudgetV2RecommendationFeedbackRevision } = await import(
+			"../src/budget/recommendation-feedback-canonical-v2"
+		);
+
+		// Tampered modificationJson
+		const tamperedMod = {
+			...row,
+			modificationJson: { type: "NOTE_ONLY", note: "Tampered note" },
+		};
+		await expect(
+			verifyStoredBudgetV2RecommendationFeedbackRevision(tamperedMod),
+		).rejects.toMatchObject({
+			code: "BUDGET_RECOMMENDATION_FEEDBACK_CORRUPT",
+		});
+
+		// Tampered fingerprint
+		const tamperedFp = {
+			...row,
+			revisionFingerprint: "0".repeat(64),
+		};
+		await expect(
+			verifyStoredBudgetV2RecommendationFeedbackRevision(tamperedFp),
+		).rejects.toMatchObject({
+			code: "BUDGET_RECOMMENDATION_FEEDBACK_CORRUPT",
+		});
+	});
+});

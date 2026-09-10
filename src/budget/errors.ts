@@ -78,7 +78,10 @@ export type BudgetErrorCode =
 	| "BUDGET_RECOMMENDATION_NOT_FOUND"
 	// A stored recommendation instance failed canonical integrity verification
 	// (recomputed canonical fingerprint / identity column mismatch). Fail closed.
-	| "BUDGET_RECOMMENDATION_INSTANCE_CORRUPT";
+	| "BUDGET_RECOMMENDATION_INSTANCE_CORRUPT"
+	// A stored recommendation feedback revision failed canonical integrity verification
+	// (recomputed revision fingerprint mismatch). Fail closed.
+	| "BUDGET_RECOMMENDATION_FEEDBACK_CORRUPT";
 
 export class BudgetError extends Error {
 	readonly code: BudgetErrorCode;

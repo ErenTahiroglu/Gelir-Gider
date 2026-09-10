@@ -16,6 +16,7 @@ import {
 } from "./behavior-recommendations-v2";
 import {
 	calculateRecommendationFingerprint,
+	verifyStoredBudgetV2RecommendationFeedbackRevision,
 	verifyStoredBudgetV2RecommendationInstance,
 } from "./recommendation-feedback-canonical-v2";
 
@@ -56,9 +57,22 @@ export async function buildBudgetV2RecommendationReviewSet(params: {
 	};
 }
 
+export interface BudgetV2RecommendationDrift {
+	currentRecommendationFingerprint: string;
+	capturedRecommendationFingerprint: string;
+	capturedRecommendation: BudgetV2Recommendation;
+	historicalDecision: "ACCEPT" | "MODIFY" | "IGNORE";
+	historicalFeedbackRevisionNo: number;
+}
+
 export interface BudgetV2RecommendationReviewItem {
 	recommendation: BudgetV2ReviewableRecommendation;
-	status: "UNRESPONDED" | "ACCEPT" | "MODIFY" | "IGNORE";
+	status:
+		| "UNRESPONDED"
+		| "ACCEPT"
+		| "MODIFY"
+		| "IGNORE"
+		| "CHANGED_SINCE_RESPONSE";
 	effectiveFeedback: {
 		revisionNo: number;
 		decision: "ACCEPT" | "MODIFY" | "IGNORE";
@@ -68,6 +82,7 @@ export interface BudgetV2RecommendationReviewItem {
 		revisionFingerprint: string;
 		occurredAt: string;
 	} | null;
+	drift?: BudgetV2RecommendationDrift;
 }
 
 export interface BudgetV2RecommendationReviewView {
@@ -152,7 +167,29 @@ export async function buildBudgetV2RecommendationReviewView(params: {
 				};
 			}
 
+			await verifyStoredBudgetV2RecommendationFeedbackRevision(rev);
+
 			const decision = rev.decision as "ACCEPT" | "MODIFY" | "IGNORE";
+
+			// Section 8: Compare current recommendation fingerprint vs stored instance fingerprint
+			if (
+				rec.recommendationFingerprint !== instance.recommendationFingerprint
+			) {
+				return {
+					recommendation: rec,
+					status: "CHANGED_SINCE_RESPONSE",
+					effectiveFeedback: null,
+					drift: {
+						currentRecommendationFingerprint: rec.recommendationFingerprint,
+						capturedRecommendationFingerprint:
+							instance.recommendationFingerprint,
+						capturedRecommendation:
+							instance.recommendationJson as BudgetV2Recommendation,
+						historicalDecision: decision,
+						historicalFeedbackRevisionNo: rev.revisionNo,
+					},
+				};
+			}
 
 			return {
 				recommendation: rec,
