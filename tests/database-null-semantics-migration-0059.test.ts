@@ -68,7 +68,22 @@ describe("Database Null-Semantics & Migration 0059 Effective Function Audit", ()
 		// is unchanged.
 		// +2 in migration 0070 (surplus-use attribution: one immutability guard +
 		// one BEFORE INSERT subject/period/chain guard).
-		expect(effectiveFunctions.size).toBe(170);
+		// +4 in migration 0071 (recommendation feedback lifecycle: one immutability
+		// guard + one insert guard each for instances and feedback revisions).
+		expect(effectiveFunctions.size).toBe(174);
+	});
+
+	it("migration 0071 contributes exactly four recommendation feedback guard functions", () => {
+		for (const fnName of [
+			"trg_fn_guard_bv2rec_instances_immutability",
+			"trg_fn_guard_bv2rec_instances_insert",
+			"trg_fn_guard_bv2rec_feedback_revisions_immutability",
+			"trg_fn_guard_bv2rec_feedback_revisions_insert",
+		]) {
+			expect(effectiveFunctions.get(fnName)?.migration).toBe(
+				"0071_add_budget_v2_recommendation_feedback",
+			);
+		}
 	});
 
 	it("migration 0070 contributes exactly the two surplus-use attribution guard functions", () => {

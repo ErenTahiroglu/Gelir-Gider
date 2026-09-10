@@ -1,5 +1,6 @@
 export * from "./basic-living-config-v2";
 export * from "./behavior-profile-v2";
+export * from "./behavior-recommendations-review-v2";
 export * from "./behavior-recommendations-v2";
 export * from "./checkpoint-canonical-v2";
 export * from "./checkpoint-processor-v2";
@@ -12,6 +13,8 @@ export * from "./live-resolver-v2";
 export * from "./payload-v2";
 export * from "./policy";
 export * from "./policy-v2";
+export * from "./recommendation-feedback-canonical-v2";
+export * from "./recommendation-feedback-service-v2";
 export * from "./semantic-fingerprint-v2";
 export * from "./service";
 export * from "./service-v2";

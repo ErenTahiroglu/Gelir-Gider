@@ -65,7 +65,20 @@ export type BudgetErrorCode =
 	// the target payment event has no successfully persisted checkpoint, or the
 	// persisted history violates a Checkpoint 5 invariant (two distinct payment
 	// events sharing the exact checkpointAt). Never a silently dropped row.
-	| "BUDGET_BEHAVIOR_PROFILE_FAIL_CLOSED";
+	| "BUDGET_BEHAVIOR_PROFILE_FAIL_CLOSED"
+	// Budget V2 Recommendation Feedback Lifecycle (Checkpoint 6C).
+	// A submitted recommendation feedback response contained an expected
+	// recommendation fingerprint that diverges from the recomputed canonical
+	// fingerprint for that recommendation at the active checkpoint.
+	| "BUDGET_RECOMMENDATION_STALE"
+	// A target recommendation is no longer in the active (shown) set for the
+	// checkpoint snapshot (e.g. suppressed or not present).
+	| "BUDGET_RECOMMENDATION_NOT_ACTIVE"
+	// A target recommendation instance could not be found for an update command.
+	| "BUDGET_RECOMMENDATION_NOT_FOUND"
+	// A stored recommendation instance failed canonical integrity verification
+	// (recomputed canonical fingerprint / identity column mismatch). Fail closed.
+	| "BUDGET_RECOMMENDATION_INSTANCE_CORRUPT";
 
 export class BudgetError extends Error {
 	readonly code: BudgetErrorCode;

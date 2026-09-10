@@ -310,12 +310,12 @@ function v2Payload(inputs: Record<string, string>, evidence: Record<string, unkn
 }
 
 async function runtime() {
-	console.log("\n== PHASE 2: APPLY MIGRATION CHAIN 0000..0070 (empty disposable DB) ==");
+	console.log("\n== PHASE 2: APPLY MIGRATION CHAIN 0000..0071 (empty disposable DB) ==");
 	const db = new PGlite();
 	await db.query("SET timezone='UTC'");
 	try {
-		await applyChain(db, 70);
-		ok("migration chain 0000..0070 applied to an empty PostgreSQL database");
+		await applyChain(db, 71);
+		ok("migration chain 0000..0071 applied to an empty PostgreSQL database");
 	} catch (e) {
 		bad("migration chain apply", "\n" + (e as Error).message);
 		await db.close();
@@ -996,7 +996,7 @@ async function resolverRuntime() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 70);
+	await applyChain(pg, 71);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -1398,7 +1398,7 @@ async function resolverRuntime4A() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 70);
+	await applyChain(pg, 71);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	const F = "f".repeat(64);
@@ -2171,7 +2171,7 @@ async function make4bScenario() {
 	} = B4_IDS;
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 70);
+	await applyChain(pg, 71);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -8838,6 +8838,411 @@ async function resolverRuntime6B() {
 	}
 }
 
+async function resolverRuntime6C() {
+	console.log(
+		"\n== PHASE 6C: RECOMMENDATION FEEDBACK LIFECYCLE & STALE-RESPONSE PROTECTION ==",
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+	const { maybeEnqueueBudgetV2CheckpointRequest } = await import(
+		"../src/budget/checkpoint-request-v2.ts"
+	);
+	const { processPendingBudgetV2CheckpointRequests } = await import(
+		"../src/budget/checkpoint-processor-v2.ts"
+	);
+	const { createCheckpointTriggerCard } = await import(
+		"../src/budget/checkpoint-trigger-card-v2.ts"
+	);
+	const { buildBudgetV2RecommendationSet } = await import(
+		"../src/budget/behavior-recommendations-v2.ts"
+	);
+	const {
+		buildBudgetV2RecommendationReviewSet,
+		buildBudgetV2RecommendationReviewView,
+	} = await import("../src/budget/behavior-recommendations-review-v2.ts");
+	const {
+		createBudgetV2RecommendationFeedback,
+		updateBudgetV2RecommendationFeedback,
+		getBudgetV2RecommendationFeedbackAsOf,
+	} = await import("../src/budget/recommendation-feedback-service-v2.ts");
+	const { canonicalJsonStringify } = await import(
+		"../src/budget/checkpoint-canonical-v2.ts"
+	);
+
+	const RECON = new Date("2026-09-01T00:00:00Z");
+	const at = (iso: string) => new Date(iso);
+	const SEP5 = "2026-09-05 00:00:00+00";
+	const eqB = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `-> got ${JSON.stringify(a)} want ${JSON.stringify(b)}`);
+	const chkB = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+
+	let seq = 0;
+	const persistCheckpoint = async (s: S, payIso: string) => {
+		seq++;
+		const sid = `86c00000-0000-4000-8000-0000000006c${seq}`;
+		const amount = "400.00";
+		await s.replica();
+		const r1 = await s.mkStmt(sid, amount, 3 + seq);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: `rc-6c-${seq}`,
+			occurredAt: RECON,
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe, r } = await s.mkPay(sid, r1, amount, 2, payIso);
+		await s.origin();
+		await s.db.transaction((tx: S) =>
+			maybeEnqueueBudgetV2CheckpointRequest({
+				tx,
+				userId: U1,
+				statementId: sid,
+				creditCardId: s.CARD,
+				paymentEventId: pe,
+				payRevisionId: r,
+				occurredAt: at(payIso.replace(" ", "T").replace("+00", "Z")),
+			}),
+		);
+		await processPendingBudgetV2CheckpointRequests({ db: s.db });
+		return { pe, sid };
+	};
+
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-6c",
+			occurredAt: at("2026-08-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		await s.origin();
+
+		await persistCheckpoint(s, "2026-09-08 00:00:00+00");
+		const b = await persistCheckpoint(s, "2026-09-15 00:00:00+00");
+
+		// 1. build reviewable recommendation set
+		const reviewSet = await buildBudgetV2RecommendationReviewSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+
+		chkB(
+			reviewSet.recommendations.length > 0 &&
+				reviewSet.recommendations.every((r) =>
+					/^[0-9a-f]{64}$/.test(r.recommendationFingerprint),
+				),
+			"6C/A: reviewable recommendations carry deterministic 64-hex canonical fingerprints",
+		);
+
+		const targetRec = reviewSet.recommendations[0]!;
+		const recFp = targetRec.recommendationFingerprint;
+
+		// 2. Initial review view: all UNRESPONDED
+		const viewBefore = await buildBudgetV2RecommendationReviewView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		eqB(
+			viewBefore.items[0]?.status,
+			"UNRESPONDED",
+			"6C/AH: review view exposes UNRESPONDED prior to feedback capture",
+		);
+
+		// 3. Stale fingerprint submission fails closed
+		let staleThrew = "";
+		try {
+			await createBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				throughPaymentEventId: b.pe,
+				recommendationId: targetRec.recommendationId,
+				expectedRecommendationFingerprint:
+					"0000000000000000000000000000000000000000000000000000000000000000",
+				decision: "ACCEPT",
+				idempotencyKey: "fb-stale-1",
+				occurredAt: at("2026-09-15T12:00:00Z"),
+			});
+		} catch (e: S) {
+			staleThrew = e.code;
+		}
+		eqB(
+			staleThrew,
+			"BUDGET_RECOMMENDATION_STALE",
+			"6C/P+22: stale expectedRecommendationFingerprint rejected, no writes",
+		);
+
+		// Verify zero rows written on stale rejection
+		const instCountStale = await s.q(
+			`select count(*)::int as c from budget_v2_recommendation_instances where user_id = $1`,
+			[U1],
+		);
+		eqB(
+			instCountStale.rows[0].c,
+			0,
+			"6C/P: no recommendation instance written on stale error",
+		);
+
+		// Baseline financial table counts before feedback
+		const canonBefore = await s.q(
+			`select count(*)::int as c from canonical_transactions where user_id = $1`,
+			[U1],
+		);
+		const midasBefore = await s.q(
+			`select count(*)::int as c from midas_allocation_transfers where user_id = $1`,
+			[U1],
+		);
+		const taskBefore = await s.q(
+			`select count(*)::int as c from long_term_send_tasks where user_id = $1`,
+			[U1],
+		);
+
+		// 4. Successful ACCEPT: creates immutable recommendation instance + feedback revision 1
+		const created = await createBudgetV2RecommendationFeedback(s.db, {
+			userId: U1,
+			throughPaymentEventId: b.pe,
+			recommendationId: targetRec.recommendationId,
+			expectedRecommendationFingerprint: recFp,
+			decision: "ACCEPT",
+			idempotencyKey: "fb-create-1",
+			occurredAt: at("2026-09-15T12:00:00Z"),
+		});
+
+		eqB(
+			created.instance.recommendationId,
+			targetRec.recommendationId,
+			"6C/D: ACCEPT creates immutable recommendation instance snapshot",
+		);
+		eqB(
+			created.revision.revisionNo,
+			1,
+			"6C/D: first feedback creates revision 1",
+		);
+		eqB(
+			created.revision.decision,
+			"ACCEPT",
+			"6C/D: revision decision recorded as ACCEPT",
+		);
+		eqB(
+			created.revision.previousRevisionId,
+			null,
+			"6C/D: revision 1 previousRevisionId is null",
+		);
+
+		// 5. Exact Idempotent replay before recommendation regeneration
+		const replayed = await createBudgetV2RecommendationFeedback(s.db, {
+			userId: U1,
+			throughPaymentEventId: b.pe,
+			recommendationId: targetRec.recommendationId,
+			expectedRecommendationFingerprint: recFp,
+			decision: "ACCEPT",
+			idempotencyKey: "fb-create-1",
+			occurredAt: at("2026-09-15T12:00:00Z"),
+		});
+		eqB(
+			replayed.revision.id,
+			created.revision.id,
+			"6C/V: same-key CREATE retry replays exact stored revision",
+		);
+
+		// 6. Same idempotency key with different payload -> typed BUDGET_IDEMPOTENCY_CONFLICT
+		let idemThrew = "";
+		try {
+			await createBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				throughPaymentEventId: b.pe,
+				recommendationId: targetRec.recommendationId,
+				expectedRecommendationFingerprint: recFp,
+				decision: "IGNORE",
+				idempotencyKey: "fb-create-1",
+				occurredAt: at("2026-09-15T12:00:00Z"),
+			});
+		} catch (e: S) {
+			idemThrew = e.code;
+		}
+		eqB(
+			idemThrew,
+			"BUDGET_IDEMPOTENCY_CONFLICT",
+			"6C/W: same-key different payload throws BUDGET_IDEMPOTENCY_CONFLICT",
+		);
+
+		// 7. Feedback does NOT change 6B output (Section 19 / AC)
+		const setAfterFeedback = await buildBudgetV2RecommendationSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		const rawSetBefore = await buildBudgetV2RecommendationSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		eqB(
+			canonicalJsonStringify(setAfterFeedback),
+			canonicalJsonStringify(rawSetBefore),
+			"6C/AC: feedback does not change 6B recommendation generation output",
+		);
+
+		// 8. Proof ACCEPT creates no financial movement / ledger entries / policy mutations
+		const canonCount = await s.q(
+			`select count(*)::int as c from canonical_transactions where user_id = $1`,
+			[U1],
+		);
+		const midasCount = await s.q(
+			`select count(*)::int as c from midas_allocation_transfers where user_id = $1`,
+			[U1],
+		);
+		const taskCount = await s.q(
+			`select count(*)::int as c from long_term_send_tasks where user_id = $1`,
+			[U1],
+		);
+		chkB(
+			canonCount.rows[0].c === canonBefore.rows[0].c &&
+				midasCount.rows[0].c === midasBefore.rows[0].c &&
+				taskCount.rows[0].c === taskBefore.rows[0].c,
+			"6C/AE: ACCEPT creates no financial events, Midas transfers, or long-term tasks",
+		);
+
+		// 9. UPDATE feedback: appends revision 2, does not mutate revision 1
+		const updated = await updateBudgetV2RecommendationFeedback(s.db, {
+			userId: U1,
+			recommendationId: targetRec.recommendationId,
+			expectedRevisionNo: 1,
+			decision: "MODIFY",
+			modification: {
+				type: "NOTE_ONLY",
+				note: "Discuss with partner before acting",
+			},
+			idempotencyKey: "fb-update-1",
+			occurredAt: at("2026-09-15T14:00:00Z"),
+		});
+		eqB(
+			updated.revision.revisionNo,
+			2,
+			"6C/R: feedback UPDATE appends revision 2",
+		);
+		eqB(
+			updated.revision.previousRevisionId,
+			created.revision.id,
+			"6C/R: revision 2 points to revision 1 as previous",
+		);
+		eqB(
+			updated.revision.decision,
+			"MODIFY",
+			"6C/R: revision 2 decision is MODIFY",
+		);
+
+		// 10. As-of temporal read (Section 17 / S & T)
+		const asOfBeforeUpdate = await getBudgetV2RecommendationFeedbackAsOf({
+			db: s.db,
+			userId: U1,
+			recommendationId: targetRec.recommendationId,
+			asOf: at("2026-09-15T13:00:00Z"),
+		});
+		eqB(
+			asOfBeforeUpdate.status,
+			"ACCEPT",
+			"6C/S: as-of read before update returns old decision (ACCEPT)",
+		);
+
+		const asOfAfterUpdate = await getBudgetV2RecommendationFeedbackAsOf({
+			db: s.db,
+			userId: U1,
+			recommendationId: targetRec.recommendationId,
+			asOf: at("2026-09-15T15:00:00Z"),
+		});
+		eqB(
+			asOfAfterUpdate.status,
+			"MODIFY",
+			"6C/T: as-of read after update returns new decision (MODIFY)",
+		);
+
+		// 11. Stale revision OCC rejection (Section 15 / Z)
+		let staleRevThrew = "";
+		try {
+			await updateBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				recommendationId: targetRec.recommendationId,
+				expectedRevisionNo: 1, // Stale! Current is 2
+				decision: "IGNORE",
+				idempotencyKey: "fb-update-stale",
+				occurredAt: at("2026-09-15T16:00:00Z"),
+			});
+		} catch (e: S) {
+			staleRevThrew = e.code;
+		}
+		eqB(
+			staleRevThrew,
+			"BUDGET_REVISION_CONFLICT",
+			"6C/Z: concurrent UPDATE stale OCC throws BUDGET_REVISION_CONFLICT",
+		);
+
+		// 12. Review view exposes latest decision correctly (Section 18 / AH)
+		const viewAfter = await buildBudgetV2RecommendationReviewView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		eqB(
+			viewAfter.items[0]?.status,
+			"MODIFY",
+			"6C/AH: review view exposes updated decision (MODIFY)",
+		);
+
+		// 13. DB Immutability triggers (Section 25 / AA)
+		let immutThrewInst = "";
+		try {
+			await s.q(
+				`update budget_v2_recommendation_instances set priority = 999 where id = $1`,
+				[created.instance.id],
+			);
+		} catch (e: S) {
+			immutThrewInst = (e as Error).message;
+		}
+		chkB(
+			immutThrewInst.includes("immutable and cannot be updated or deleted"),
+			"6C/AA: raw UPDATE against budget_v2_recommendation_instances rejected by trigger",
+		);
+
+		let immutThrewRev = "";
+		try {
+			await s.q(
+				`delete from budget_v2_recommendation_feedback_revisions where id = $1`,
+				[created.revision.id],
+			);
+		} catch (e: S) {
+			immutThrewRev = (e as Error).message;
+		}
+		chkB(
+			immutThrewRev.includes("append-only and cannot be updated or deleted"),
+			"6C/AA: raw DELETE against budget_v2_recommendation_feedback_revisions rejected by trigger",
+		);
+
+		await s.close();
+	}
+}
 
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
@@ -8856,6 +9261,7 @@ if (probed) {
 	await resolverRuntime5B1();
 	await resolverRuntime6A();
 	await resolverRuntime6B();
+	await resolverRuntime6C();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
