@@ -8,6 +8,7 @@ export * from "./checkpoint-report-v2";
 export * from "./checkpoint-request-v2";
 export * from "./checkpoint-trigger-card-v2";
 export * from "./errors";
+export * from "./feedback-adaptation-v2";
 export * from "./goal-purpose-v2";
 export * from "./live-resolver-v2";
 export * from "./payload-v2";

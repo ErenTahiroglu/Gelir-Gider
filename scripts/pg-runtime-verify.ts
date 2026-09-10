@@ -2544,12 +2544,12 @@ async function make4bScenario() {
 	await createBasicLivingTarget({
 		db,
 		userId: U1,
-		effectivePeriodMonth: "2026-09-01",
+		effectivePeriodMonth: "2026-06-01",
 		monthlyTargetAmount: "6000.00",
 		currency: "TRY",
 		sourceKind: "USER_APPROVED",
 		idempotencyKey: "bl-4b",
-		occurredAt: new Date("2026-08-15T00:00:00Z"),
+		occurredAt: new Date("2026-05-15T00:00:00Z"),
 	});
 
 	return {
@@ -10357,6 +10357,775 @@ async function resolverRuntime6C2() {
 	}
 }
 
+// ============================================================================
+// PHASE 6D: VERIFIED FEEDBACK ADAPTATION & NON-SAFETY PERSONALIZATION
+// ============================================================================
+
+async function resolverRuntime6D() {
+	console.log(
+		"\n== PHASE 6D: VERIFIED FEEDBACK ADAPTATION & NON-SAFETY PERSONALIZATION ==",
+	);
+
+	const {
+		createBudgetV2RecommendationFeedback,
+		updateBudgetV2RecommendationFeedback,
+		getLatestBudgetV2RecommendationFeedback,
+	} = await import("../src/budget/recommendation-feedback-service-v2.ts");
+	const {
+		buildBudgetV2RecommendationReviewSet,
+		buildBudgetV2RecommendationReviewView,
+	} = await import("../src/budget/behavior-recommendations-review-v2.ts");
+	const {
+		buildBudgetV2FeedbackPreferenceProfile,
+		buildBudgetV2FeedbackAdaptedRecommendationView,
+		BUDGET_V2_FEEDBACK_ADAPTATION_ENGINE_VERSION,
+	} = await import("../src/budget/feedback-adaptation-v2.ts");
+	const { createCheckpointTriggerCard } = await import(
+		"../src/budget/checkpoint-trigger-card-v2.ts"
+	);
+	const { maybeEnqueueBudgetV2CheckpointRequest } = await import(
+		"../src/budget/checkpoint-request-v2.ts"
+	);
+	const { processPendingBudgetV2CheckpointRequests } = await import(
+		"../src/budget/checkpoint-processor-v2.ts"
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+
+	const at = (iso: string) => new Date(iso);
+	const eqD = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+
+	let seq6d = 0;
+	const persistCheckpointAtDate = async (
+		s: S,
+		monthIso: string,
+		payIso: string,
+		reconIso: string,
+		amount: string = "500.00",
+	) => {
+		seq6d++;
+		const sid = `86d00000-0000-4000-8000-0000000${seq6d.toString().padStart(5, "0")}`;
+		await s.replica();
+		const r1 = await s.mkStmt(sid, amount, (seq6d % 12) + 1);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: `rc-6d-${seq6d}`,
+			occurredAt: at(reconIso),
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe, r } = await s.mkPay(sid, r1, amount, 2, payIso);
+		await s.origin();
+		await s.db.transaction((tx: S) =>
+			maybeEnqueueBudgetV2CheckpointRequest({
+				tx,
+				userId: U1,
+				statementId: sid,
+				creditCardId: s.CARD,
+				paymentEventId: pe,
+				payRevisionId: r,
+				occurredAt: at(payIso.replace(" ", "T").replace("+00", "Z")),
+			}),
+		);
+		await processPendingBudgetV2CheckpointRequests({ db: s.db });
+		return { pe, sid };
+	};
+
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	const canon = (v: unknown) => JSON.stringify(v);
+	const countRows = async (s: S, table: string) =>
+		(
+			await s.q(`select count(*)::int as n from ${table} where user_id = $1`, [
+				U1,
+			])
+		).rows[0].n as number;
+	const findKind = (set: { recommendations: Array<{ kind: string }> }, k: string) =>
+		// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+		set.recommendations.find((r: any) => r.kind === k);
+	const acceptSweep = async (
+		s: S,
+		pe: string,
+		key: string,
+		occIso: string,
+		decision: "ACCEPT" | "IGNORE" = "ACCEPT",
+	) => {
+		const rs = await buildBudgetV2RecommendationReviewSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: pe,
+		});
+		const rec = findKind(rs, "UNUSED_DISCRETIONARY_SWEEP_REVIEW");
+		if (!rec) return null;
+		await createBudgetV2RecommendationFeedback(s.db, {
+			userId: U1,
+			throughPaymentEventId: pe,
+			recommendationId: rec.recommendationId,
+			expectedRecommendationFingerprint: rec.recommendationFingerprint,
+			decision,
+			idempotencyKey: key,
+			occurredAt: at(occIso),
+		});
+		return rec;
+	};
+
+	// =====================================================================
+	// Suite 1 -- EMPHASIZE progression, one-vote-per-instance, N -> N+1,
+	//            historical immunity, determinism, no-write, 6B set unchanged
+	// =====================================================================
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-6d-1",
+			occurredAt: at("2026-07-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-08-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-09-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-10-01 00:00:00+00");
+		await s.origin();
+
+		const RC = "2026-07-25T00:00:00Z";
+		const c1 = await persistCheckpointAtDate(s, "", "2026-08-03 00:00:00+00", RC);
+		const c2 = await persistCheckpointAtDate(s, "", "2026-08-11 00:00:00+00", RC);
+		const c3 = await persistCheckpointAtDate(s, "", "2026-08-19 00:00:00+00", RC);
+		const c4 = await persistCheckpointAtDate(s, "", "2026-08-27 00:00:00+00", RC);
+		const c5 = await persistCheckpointAtDate(s, "", "2026-09-04 00:00:00+00", RC);
+		const c6 = await persistCheckpointAtDate(s, "", "2026-09-12 00:00:00+00", RC);
+		const cT = await persistCheckpointAtDate(s, "", "2026-09-26 00:00:00+00", RC);
+
+		// ACCEPT the sweep at c1, c3, c4, c5 directly.
+		await acceptSweep(s, c1.pe, "fb-6d1-1", "2026-08-04T10:00:00Z");
+		await acceptSweep(s, c3.pe, "fb-6d1-3", "2026-08-20T10:00:00Z");
+		await acceptSweep(s, c4.pe, "fb-6d1-4", "2026-08-28T10:00:00Z");
+		await acceptSweep(s, c5.pe, "fb-6d1-5", "2026-09-05T10:00:00Z");
+
+		// c2: one recommendation EXPERIENCE with 3 revisions:
+		//   CREATE IGNORE -> UPDATE MODIFY (NOTE_ONLY) -> UPDATE ACCEPT.
+		// Effective decision is the latest one (ACCEPT); it is a SINGLE vote.
+		const c2rec = await acceptSweep(
+			s,
+			c2.pe,
+			"fb-6d1-2a",
+			"2026-08-12T10:00:00Z",
+			"IGNORE",
+		);
+		if (c2rec) {
+			await updateBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				recommendationId: c2rec.recommendationId,
+				expectedRevisionNo: 1,
+				decision: "MODIFY",
+				modification: {
+					type: "NOTE_ONLY",
+					note: "please stop showing this recommendation forever",
+				},
+				idempotencyKey: "fb-6d1-2b",
+				occurredAt: at("2026-08-13T10:00:00Z"),
+			});
+			await updateBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				recommendationId: c2rec.recommendationId,
+				expectedRevisionNo: 2,
+				decision: "ACCEPT",
+				idempotencyKey: "fb-6d1-2c",
+				occurredAt: at("2026-08-14T10:00:00Z"),
+			});
+		}
+
+		// ---- through cT: 5 verified instances, all effective ACCEPT -> EMPHASIZE
+		const profT = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		const sweepT = profT.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW;
+		eqD(
+			profT.engineVersion,
+			BUDGET_V2_FEEDBACK_ADAPTATION_ENGINE_VERSION,
+			"6D/5: adaptation profile pinned to budget-v2-feedback-adaptation-v1",
+		);
+		eqD(sweepT.attention, "EMPHASIZE", "6D/E: 5 effective ACCEPTs -> EMPHASIZE");
+		eqD(sweepT.learned, true, "6D/E: EMPHASIZE is a learned result");
+		eqD(sweepT.evidence.acceptRateBp, 10000, "6D/AO: acceptRateBp is exactly 10000");
+		eqD(sweepT.evidence.validInstanceCount, 5, "6D/N: exactly 5 votes (not 7 revisions)");
+		eqD(sweepT.evidence.acceptCount, 5, "6D/M: c2's latest effective ACCEPT is its one vote");
+		eqD(sweepT.evidence.modifyCount, 0, "6D/M: the superseded MODIFY revision is not a vote");
+		eqD(sweepT.evidence.ignoreCount, 0, "6D/M: the superseded CREATE IGNORE is not a vote");
+		eqD(sweepT.evidence.distinctCheckpointCount, 5, "6D/13: 5 distinct source checkpoints");
+		eqD(sweepT.evidence.distinctPeriodMonthCount, 2, "6D/13: 2 distinct period months");
+		chkD(sweepT.evidence.historySpanDays >= 30, "6D/13: history span >= 30 days");
+		chkD(
+			sweepT.reasonCodes.includes("ACCEPT_MAJORITY_ESTABLISHED"),
+			"6D/18: reasonCodes explain the EMPHASIZE decision",
+		);
+		chkD(
+			profT.protectedKinds.DATA_COMPLETION_REQUIRED.attention === "PROTECTED" &&
+				Object.values(profT.protectedKinds).every(
+					(p) => p.attention === "PROTECTED" && p.learned === false,
+				),
+			"6D/9: every protected kind stays PROTECTED / never learned",
+		);
+
+		// ---- 30.Y: NOTE_ONLY text ("stop showing this forever") had NO effect
+		chkD(
+			sweepT.attention === "EMPHASIZE",
+			"6D/Y: NOTE_ONLY free-text is never interpreted as a suppression command",
+		);
+
+		// ---- 30.B: through an earlier target, only 3 prior votes -> STANDARD
+		const prof4 = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: c4.pe,
+		});
+		eqD(
+			prof4.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW.evidence
+				.validInstanceCount,
+			3,
+			"6D/B: through c4 only c1..c3 feedback is visible",
+		);
+		eqD(
+			prof4.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW.attention,
+			"STANDARD",
+			"6D/B: 3 (<4) prior votes -> STANDARD",
+		);
+
+		// ---- 30.R: feedback recorded against checkpoints N influences a LATER
+		//            checkpoint (c6, after all of c1..c5)
+		const prof6 = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: c6.pe,
+		});
+		eqD(
+			prof6.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW.attention,
+			"EMPHASIZE",
+			"6D/R: checkpoint N feedback influences checkpoint N+1 (c6)",
+		);
+
+		// ---- 30.AJ: same target + same history -> byte-identical profile
+		const fpT = canon(profT);
+		const profTb = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		eqD(canon(profTb), fpT, "6D/AJ: rebuilding through cT is byte-identical");
+
+		// ---- 30.AM: building the profile / adapted view performs no writes
+		const before = [
+			await countRows(s, "budget_v2_recommendation_instances"),
+			await countRows(s, "budget_v2_recommendation_feedback_revisions"),
+			await countRows(s, "budget_v2_checkpoint_snapshots"),
+		];
+		const adaptedT = await buildBudgetV2FeedbackAdaptedRecommendationView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		const after = [
+			await countRows(s, "budget_v2_recommendation_instances"),
+			await countRows(s, "budget_v2_recommendation_feedback_revisions"),
+			await countRows(s, "budget_v2_checkpoint_snapshots"),
+		];
+		eqD(canon(after), canon(before), "6D/AM: no rows written while deriving adaptation");
+
+		// ---- 30.AA/AB/AC/AN/20: the adapted view neither reorders, drops,
+		//      resurrects, nor rewrites the base 6B recommendation set
+		const baseSet = await buildBudgetV2RecommendationReviewSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		eqD(
+			adaptedT.items.length,
+			baseSet.recommendations.length,
+			"6D/AC: adapted view keeps the base 6B item count (<= 3)",
+		);
+		chkD(adaptedT.items.length <= 3, "6D/AC: never more than 3 shown");
+		eqD(
+			canon(adaptedT.items.map((i) => i.recommendation.recommendationId)),
+			canon(baseSet.recommendations.map((r) => r.recommendationId)),
+			"6D/AB: recommendation order is identical to 6B",
+		);
+		const suppressedIds = new Set(
+			// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+			(baseSet.suppressed as any[]).map((x) => `${x.kind}:${x.scope}`),
+		);
+		chkD(
+			adaptedT.items.every(
+				(i) =>
+					!suppressedIds.has(
+						`${i.recommendation.kind}:${i.recommendation.scope}`,
+					),
+			),
+			"6D/AD: a suppressed 6B candidate is never resurrected",
+		);
+		chkD(
+			adaptedT.items.every((i, idx) => {
+				const b = baseSet.recommendations[idx];
+				return (
+					b !== undefined &&
+					i.recommendation.kind === b.kind &&
+					i.recommendation.priority === b.priority &&
+					canon(i.recommendation.evidence) === canon(b.evidence) &&
+					canon(i.recommendation.proposedAction) === canon(b.proposedAction)
+				);
+			}),
+			"6D/AA+AN: kind / priority / evidence / proposedAction are untouched by adaptation",
+		);
+
+		// ---- 20 + 30.AE: SHOWN sweep carries EMPHASIZE while its CURRENT review
+		//      status is still UNRESPONDED (the two concepts stay separate)
+		const sweepItem = adaptedT.items.find(
+			(i) => i.recommendation.kind === "UNUSED_DISCRETIONARY_SWEEP_REVIEW",
+		);
+		if (sweepItem) {
+			eqD(
+				sweepItem.feedbackAdaptation.attention,
+				"EMPHASIZE",
+				"6D/20: adapted view surfaces the learned EMPHASIZE salience",
+			);
+			eqD(
+				sweepItem.status,
+				"UNRESPONDED",
+				"6D/AE: current review status is independent of learned attention",
+			);
+		}
+		eqD(
+			adaptedT.feedbackAdaptation.available,
+			true,
+			"6D/23: personalization available flag is true for healthy history",
+		);
+
+		// ---- 30.AK: later feedback does not change an earlier-target adaptation
+		const fp4 = canon(prof4);
+		await acceptSweep(s, c6.pe, "fb-6d1-6", "2026-09-13T10:00:00Z");
+		const prof4b = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: c4.pe,
+		});
+		eqD(canon(prof4b), fp4, "6D/AK: feedback added after c4 cannot alter the through-c4 profile");
+
+		// ---- 30.AL: later live financial mutation does not change history.
+		// Re-baseline first: the AK step above legitimately added c6 feedback,
+		// which is inside cT's window, so compare against a fresh pre-mutation fp.
+		const fpTpre = canon(
+			await buildBudgetV2FeedbackPreferenceProfile({
+				db: s.db,
+				userId: U1,
+				throughPaymentEventId: cT.pe,
+			}),
+		);
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "500000.00", "2026-10-02 00:00:00+00");
+		await s.q(
+			`update credit_card_liability_event_revisions set amount = '9999.00' where user_id = $1`,
+			[U1],
+		);
+		await s.origin();
+		const profTc = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		eqD(canon(profTc), fpTpre, "6D/AL: a large unrelated live mutation leaves the historical adaptation byte-identical");
+
+		await s.close();
+	}
+
+	// =====================================================================
+	// Suite 2 -- DEEMPHASIZE, and "not suppression"; latest-decision override
+	// =====================================================================
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-6d-2",
+			occurredAt: at("2026-07-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-08-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-09-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-10-01 00:00:00+00");
+		await s.origin();
+
+		// Persist strictly in chronological order. cT (the DEEMPHASIZE target)
+		// sits between c5 and c6 so that c6's later ACCEPT cannot leak backward.
+		const RC = "2026-07-25T00:00:00Z";
+		const c1 = await persistCheckpointAtDate(s, "", "2026-08-03 00:00:00+00", RC);
+		const c2 = await persistCheckpointAtDate(s, "", "2026-08-11 00:00:00+00", RC);
+		const c3 = await persistCheckpointAtDate(s, "", "2026-08-19 00:00:00+00", RC);
+		const c4 = await persistCheckpointAtDate(s, "", "2026-08-27 00:00:00+00", RC);
+		const c5 = await persistCheckpointAtDate(s, "", "2026-09-04 00:00:00+00", RC);
+		const cT = await persistCheckpointAtDate(s, "", "2026-09-12 00:00:00+00", RC);
+
+		await acceptSweep(s, c1.pe, "fb-6d2-1", "2026-08-04T10:00:00Z", "IGNORE");
+		await acceptSweep(s, c2.pe, "fb-6d2-2", "2026-08-12T10:00:00Z", "IGNORE");
+		await acceptSweep(s, c3.pe, "fb-6d2-3", "2026-08-20T10:00:00Z", "IGNORE");
+		await acceptSweep(s, c4.pe, "fb-6d2-4", "2026-08-28T10:00:00Z", "IGNORE");
+		await acceptSweep(s, c5.pe, "fb-6d2-5", "2026-09-05T10:00:00Z", "IGNORE");
+
+		// through cT (checkpointAt 2026-09-12) sees c1..c5: 5 IGNORE -> DEEMPHASIZE
+		const profT = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		const sweepT = profT.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW;
+		eqD(sweepT.attention, "DEEMPHASIZE", "6D/F: 5 IGNOREs -> DEEMPHASIZE");
+		eqD(sweepT.learned, true, "6D/F: DEEMPHASIZE is a learned result");
+		eqD(sweepT.evidence.ignoreRateBp, 10000, "6D/AO: ignoreRateBp is exactly 10000");
+		chkD(
+			sweepT.reasonCodes.includes("IGNORE_MAJORITY_ESTABLISHED"),
+			"6D/16: reasonCodes explain the DEEMPHASIZE decision",
+		);
+
+		// "This is NOT suppression": the recommendation is still present & intact
+		const adaptedT = await buildBudgetV2FeedbackAdaptedRecommendationView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		const baseT = await buildBudgetV2RecommendationReviewSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		const shownSweep = adaptedT.items.find(
+			(i) => i.recommendation.kind === "UNUSED_DISCRETIONARY_SWEEP_REVIEW",
+		);
+		const baseSweep = findKind(baseT, "UNUSED_DISCRETIONARY_SWEEP_REVIEW");
+		chkD(
+			shownSweep !== undefined &&
+				baseSweep !== undefined &&
+				shownSweep.recommendation.recommendationId ===
+					baseSweep.recommendationId &&
+				shownSweep.recommendation.priority === baseSweep.priority,
+			"6D/16: DEEMPHASIZE does not remove the recommendation or change its priority",
+		);
+		if (shownSweep) {
+			eqD(
+				shownSweep.feedbackAdaptation.attention,
+				"DEEMPHASIZE",
+				"6D/16: adapted view carries DEEMPHASIZE salience",
+			);
+			eqD(
+				shownSweep.status,
+				"UNRESPONDED",
+				"6D/AE: current status still independent of learned attention",
+			);
+		}
+
+		// 30.J: a contradicting latest decision blocks the stale DEEMPHASIZE.
+		// Persist the later checkpoints only now, keeping chronological order.
+		const c6 = await persistCheckpointAtDate(s, "", "2026-09-20 00:00:00+00", RC);
+		const cT2 = await persistCheckpointAtDate(s, "", "2026-10-04 00:00:00+00", RC);
+		await acceptSweep(s, c6.pe, "fb-6d2-6", "2026-09-21T10:00:00Z", "ACCEPT");
+		const profT2 = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT2.pe,
+		});
+		const sweepT2 = profT2.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW;
+		eqD(
+			sweepT2.evidence.validInstanceCount,
+			6,
+			"6D/J: all 6 experiences counted (5 IGNORE + 1 ACCEPT)",
+		);
+		eqD(sweepT2.attention, "STANDARD", "6D/J: newest ACCEPT overrides the stale IGNORE majority");
+		chkD(
+			sweepT2.reasonCodes.includes("LATEST_DECISION_CONTRADICTS_IGNORE"),
+			"6D/J: reasonCodes record the contradiction",
+		);
+
+		await s.close();
+	}
+
+	// =====================================================================
+	// Suite 3 -- protected kinds never learn; 90-day window boundary (K / L)
+	// =====================================================================
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-6d-3",
+			occurredAt: at("2026-05-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-06-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-07-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-08-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-09-01 00:00:00+00");
+		await s.origin();
+
+		// The fixture credit card activates 2026-07-01, so every checkpoint sits
+		// in July -- still pre-August, hence the EMERGENCY_REBUILD regime and a
+		// protected EMERGENCY_REBUILD_REVIEW recommendation.
+		const RC = "2026-07-01T12:00:00Z";
+		const cPre = await persistCheckpointAtDate(s, "", "2026-07-02 00:00:00+00", RC);
+		const cA = await persistCheckpointAtDate(s, "", "2026-07-04 00:00:00+00", RC);
+		const cB = await persistCheckpointAtDate(s, "", "2026-07-11 00:00:00+00", RC);
+		const cC = await persistCheckpointAtDate(s, "", "2026-07-18 00:00:00+00", RC);
+		const cT = await persistCheckpointAtDate(s, "", "2026-10-05 00:00:00+00", RC);
+
+		const ignoreEmergency = async (pe: string, key: string, occIso: string) => {
+			const rs = await buildBudgetV2RecommendationReviewSet({
+				db: s.db,
+				userId: U1,
+				throughPaymentEventId: pe,
+			});
+			const rec = findKind(rs, "EMERGENCY_REBUILD_REVIEW");
+			if (!rec) return false;
+			await createBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				throughPaymentEventId: pe,
+				recommendationId: rec.recommendationId,
+				expectedRecommendationFingerprint: rec.recommendationFingerprint,
+				decision: "IGNORE",
+				idempotencyKey: key,
+				occurredAt: at(occIso),
+			});
+			return true;
+		};
+
+		// target cT.checkpointAt = 2026-10-05T00:00:00Z -> window start = 2026-07-07T00:00:00Z
+		const gotPre = await ignoreEmergency(cPre.pe, "fb-6d3-pre", "2026-07-06T00:00:00Z"); // 1 day BEFORE window -> excluded
+		const gotA = await ignoreEmergency(cA.pe, "fb-6d3-a", "2026-07-07T00:00:00Z"); // EXACT window start -> included
+		const gotB = await ignoreEmergency(cB.pe, "fb-6d3-b", "2026-07-13T00:00:00Z");
+		const gotC = await ignoreEmergency(cC.pe, "fb-6d3-c", "2026-07-20T00:00:00Z");
+		chkD(
+			gotPre && gotA && gotB && gotC,
+			"6D/setup: EMERGENCY_REBUILD_REVIEW present at every pre-August checkpoint",
+		);
+
+		const prof = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		const em = prof.protectedKinds.EMERGENCY_REBUILD_REVIEW;
+		eqD(em.attention, "PROTECTED", "6D/V: EMERGENCY_REBUILD_REVIEW stays PROTECTED after 4 IGNOREs");
+		eqD(em.learned, false, "6D/V: protected kind never becomes a learned result");
+		eqD(
+			em.evidence.validInstanceCount,
+			3,
+			"6D/K+L: exact 90-day boundary feedback included; older feedback excluded",
+		);
+		eqD(em.evidence.ignoreCount, 3, "6D/L: the pre-window IGNORE is not counted");
+		for (const k of [
+			"DATA_COMPLETION_REQUIRED",
+			"DEFICIT_STABILIZATION_REVIEW",
+			"SURPLUS_OVERSUBSCRIPTION_REVIEW",
+			"EMERGENCY_REBUILD_REVIEW",
+			"BASELINE_RESET_REVIEW",
+			"LANE_OVERRUN_REVIEW",
+		] as const) {
+			eqD(
+				prof.protectedKinds[k].attention,
+				"PROTECTED",
+				`6D/S-X: ${k} is structurally PROTECTED regardless of feedback`,
+			);
+			eqD(prof.protectedKinds[k].learned, false, `6D/S-X: ${k} learned = false`);
+		}
+
+		await s.close();
+	}
+
+	// =====================================================================
+	// Suite 4 -- corrupt-history fail-safe (AG / AH) & version incompat (AI)
+	// =====================================================================
+	const failSafeScenario = async (
+		key: string,
+		tamper: (s: S, c1pe: string) => Promise<void>,
+	) => {
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: `tc-6d-${key}`,
+			occurredAt: at("2026-07-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-08-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-09-01 00:00:00+00");
+		await s.origin();
+		const RC = "2026-07-25T00:00:00Z";
+		const c1 = await persistCheckpointAtDate(s, "", "2026-08-10 00:00:00+00", RC);
+		const c2 = await persistCheckpointAtDate(s, "", "2026-09-15 00:00:00+00", RC);
+		await acceptSweep(s, c1.pe, `fb-6d-${key}`, "2026-08-11T10:00:00Z");
+		await tamper(s, c1.pe);
+		return { s, c2 };
+	};
+
+	// AH -- corrupt recommendation instance
+	{
+		const { s, c2 } = await failSafeScenario("corruptinst", async (s, c1pe) => {
+			await s.replica();
+			await s.q(
+				`update budget_v2_recommendation_instances set recommendation_fingerprint = '0000000000000000000000000000000000000000000000000000000000000000' where payment_event_id = $1`,
+				[c1pe],
+			);
+			await s.origin();
+		});
+		const prof = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: c2.pe,
+		});
+		eqD(prof.history.available, false, "6D/AH: corrupt instance disables adaptation");
+		eqD(
+			prof.history.corruptionReason,
+			"VERIFIED_FEEDBACK_HISTORY_CORRUPT",
+			"6D/AH: corruptionReason is set",
+		);
+		eqD(
+			prof.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW.attention,
+			"STANDARD",
+			"6D/AH: adaptive kind fails safe to STANDARD",
+		);
+		eqD(
+			prof.protectedKinds.DATA_COMPLETION_REQUIRED.attention,
+			"PROTECTED",
+			"6D/AH: protected kind stays PROTECTED in fail-safe mode",
+		);
+		const view = await buildBudgetV2FeedbackAdaptedRecommendationView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: c2.pe,
+		});
+		eqD(view.feedbackAdaptation.available, false, "6D/23: adapted view reports available = false");
+		eqD(
+			view.feedbackAdaptation.reason,
+			"VERIFIED_FEEDBACK_HISTORY_CORRUPT",
+			"6D/23: adapted view carries the fail-safe reason",
+		);
+		chkD(
+			view.items.length > 0 &&
+				view.items.every(
+					(i) =>
+						i.feedbackAdaptation.attention === "STANDARD" ||
+						i.feedbackAdaptation.attention === "PROTECTED",
+				),
+			"6D/AH: base 6B recommendations remain usable; every item is STANDARD or PROTECTED",
+		);
+		await s.close();
+	}
+
+	// AG -- corrupt feedback revision
+	{
+		const { s, c2 } = await failSafeScenario("corruptrev", async (s) => {
+			await s.replica();
+			await s.q(
+				`update budget_v2_recommendation_feedback_revisions set decision = 'IGNORE' where user_id = $1`,
+				[U1],
+			);
+			await s.origin();
+		});
+		const prof = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: c2.pe,
+		});
+		eqD(prof.history.available, false, "6D/AG: corrupt feedback revision disables adaptation");
+		eqD(
+			prof.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW.attention,
+			"STANDARD",
+			"6D/AG: adaptive kind fails safe to STANDARD",
+		);
+		eqD(
+			prof.protectedKinds.EMERGENCY_REBUILD_REVIEW.attention,
+			"PROTECTED",
+			"6D/AG: safety kinds are not suppressed by corrupt personalization data",
+		);
+		await s.close();
+	}
+
+	// AI -- incompatible recommendation-engine version is excluded & diagnosed
+	{
+		const { s, c2 } = await failSafeScenario("badver", async (s, c1pe) => {
+			await s.replica();
+			await s.q(
+				`update budget_v2_recommendation_instances set recommendation_engine_version = 'budget-v2-recommendation-engine-v9-future' where payment_event_id = $1`,
+				[c1pe],
+			);
+			await s.origin();
+		});
+		const prof = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: c2.pe,
+		});
+		eqD(
+			prof.history.available,
+			true,
+			"6D/AI: version incompatibility is NOT corruption -- adaptation stays available",
+		);
+		eqD(
+			prof.history.incompatibleInstanceCount,
+			1,
+			"6D/AI: the future-version instance is counted as incompatible",
+		);
+		chkD(
+			prof.history.unsupportedRecommendationEngineVersions.includes(
+				"budget-v2-recommendation-engine-v9-future",
+			),
+			"6D/AI: the unsupported version is surfaced in diagnostics",
+		);
+		eqD(
+			prof.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW.evidence
+				.validInstanceCount,
+			0,
+			"6D/AI: the incompatible instance is not coerced into an ACCEPT / IGNORE / zero vote",
+		);
+		eqD(
+			prof.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW.attention,
+			"STANDARD",
+			"6D/AI: no learned preference from an unsupported engine version",
+		);
+		await s.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -10377,8 +11146,10 @@ if (probed) {
 	await resolverRuntime6C();
 	await resolverRuntime6C1();
 	await resolverRuntime6C2();
+	await resolverRuntime6D();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
+
 
 
