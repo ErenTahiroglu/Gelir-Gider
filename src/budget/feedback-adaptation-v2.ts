@@ -102,6 +102,13 @@ export interface BudgetV2FeedbackEvidence {
 	historySpanDays: number;
 	latestDecision: "ACCEPT" | "MODIFY" | "IGNORE" | null;
 	latestDecisionAt: string | null;
+	/**
+	 * Section 8: true when two or more votes share the exact maximum occurredAt
+	 * instant AND disagree on decision. `latestDecision` is then null and no
+	 * EMPHASIZE / DEEMPHASIZE may fire -- ordering is never guessed from UUID,
+	 * row order, createdAt, or recommendationId.
+	 */
+	latestDecisionAmbiguous: boolean;
 }
 
 export interface BudgetV2KindFeedbackPreference {
@@ -124,8 +131,6 @@ export interface BudgetV2FeedbackPreferenceProfile {
 		available: boolean;
 		verifiedInstanceCount: number;
 		incompatibleInstanceCount: number;
-		excludedFutureCount: number;
-		excludedTargetCount: number;
 		/**
 		 * Section 24: recommendation-engine versions that were seen on stored
 		 * instances but are NOT in BUDGET_V2_SUPPORTED_RECOMMENDATION_ENGINE_VERSIONS.
@@ -174,7 +179,6 @@ export interface BudgetV2FeedbackAdaptedRecommendationReviewView
 }
 
 interface HistoricalVote {
-	instanceId: string;
 	kind: BudgetV2RecommendationKind;
 	decision: "ACCEPT" | "MODIFY" | "IGNORE";
 	occurredAt: Date;
@@ -191,6 +195,8 @@ export interface BudgetV2AdaptiveAttentionInput {
 	distinctPeriodMonthCount: number;
 	historySpanDays: number;
 	latestDecision: "ACCEPT" | "MODIFY" | "IGNORE" | null;
+	/** Section 8: the max-instant votes disagree -> force STANDARD for adaptive kinds. */
+	latestDecisionAmbiguous: boolean;
 }
 
 export interface BudgetV2AdaptiveAttentionResult {
@@ -242,6 +248,7 @@ export function evaluateBudgetV2AdaptiveKindAttention(
 		distinctPeriodMonthCount,
 		historySpanDays,
 		latestDecision,
+		latestDecisionAmbiguous,
 	} = input;
 
 	const acceptRateBp = computeFeedbackRateBp(acceptCount, validInstanceCount);
@@ -272,6 +279,25 @@ export function evaluateBudgetV2AdaptiveKindAttention(
 			if (!isPeriodsOk) reasonCodes.push("EVIDENCE_INSUFFICIENT_PERIODS");
 			if (!isSpanOk) reasonCodes.push("EVIDENCE_INSUFFICIENT_SPAN");
 		}
+		return {
+			attention: "STANDARD",
+			learned: false,
+			evidenceStatus,
+			reasonCodes,
+			acceptRateBp,
+			ignoreRateBp,
+		};
+	}
+
+	// Section 8: when the most-recent votes disagree at the same exact instant we
+	// cannot say what the user's latest position is. Fail safe to STANDARD even if
+	// a raw 75% ACCEPT / IGNORE majority would otherwise qualify. Ordering is never
+	// resolved from UUID, DB row order, createdAt, or recommendationId.
+	if (latestDecisionAmbiguous) {
+		reasonCodes.push(
+			"EVIDENCE_ESTABLISHED",
+			"LATEST_DECISION_TIMESTAMP_AMBIGUOUS",
+		);
 		return {
 			attention: "STANDARD",
 			learned: false,
@@ -357,6 +383,7 @@ function emptyEvidence(
 		historySpanDays: 0,
 		latestDecision: null,
 		latestDecisionAt: null,
+		latestDecisionAmbiguous: false,
 	};
 }
 
@@ -418,8 +445,6 @@ export async function buildBudgetV2FeedbackPreferenceProfile(params: {
 
 	let verifiedInstanceCount = 0;
 	let incompatibleInstanceCount = 0;
-	let excludedFutureCount = 0;
-	let excludedTargetCount = 0;
 	let historyAvailable = true;
 	let corruptionReason: string | undefined;
 	const unsupportedEngineVersions = new Set<string>();
@@ -430,13 +455,25 @@ export async function buildBudgetV2FeedbackPreferenceProfile(params: {
 		for (const inst of rawInstances) {
 			const instCapturedAt = new Date(inst.capturedAt);
 
-			// Section 4: the TARGET recommendation checkpoint's own instances never
-			// influence that same checkpoint's adaptation.
+			// Sections 1-4 (6D.1): TEMPORAL VISIBILITY BEFORE DIAGNOSTICS.
+			// A recommendation instance whose first response is after the target
+			// checkpoint is outside the target-as-of universe. Skip it before it
+			// can be verified or touch ANY diagnostic (verified / incompatible /
+			// unsupported-version / corruption). It must behave as though the row
+			// does not yet exist, so a later first response -- to the target's own
+			// recommendation or to an older checkpoint's recommendation -- can never
+			// rewrite this historical profile.
+			if (instCapturedAt.getTime() > targetCheckpointAt.getTime()) {
+				continue;
+			}
+
+			// Section 3: the TARGET recommendation checkpoint's own instances never
+			// influence that same checkpoint's adaptation. Silent skip -- no count
+			// that could shift when the target recommendation is later answered.
 			if (
 				inst.checkpointSnapshotId === targetSnapshot.id ||
 				inst.paymentEventId === targetSnapshot.paymentEventId
 			) {
-				excludedTargetCount++;
 				continue;
 			}
 
@@ -478,13 +515,6 @@ export async function buildBudgetV2FeedbackPreferenceProfile(params: {
 			// checkpoint later must not perturb any count in this profile.
 			const sourceCheckpointAt = new Date(sourceSnapshot.checkpointAt);
 			if (sourceCheckpointAt.getTime() >= targetCheckpointAt.getTime()) {
-				continue;
-			}
-
-			// Section 4: a historical checkpoint's recommendation that was only
-			// responded to after the target is excluded from the as-of window.
-			if (instCapturedAt.getTime() > targetCheckpointAt.getTime()) {
-				excludedFutureCount++;
 				continue;
 			}
 
@@ -549,7 +579,6 @@ export async function buildBudgetV2FeedbackPreferenceProfile(params: {
 
 			verifiedInstanceCount++;
 			validHistoricalVotes.push({
-				instanceId: inst.id,
 				kind: inst.recommendationKind as BudgetV2RecommendationKind,
 				decision: effectiveRev.decision as "ACCEPT" | "MODIFY" | "IGNORE",
 				occurredAt: revOccurredAt,
@@ -612,8 +641,6 @@ export async function buildBudgetV2FeedbackPreferenceProfile(params: {
 				available: false,
 				verifiedInstanceCount,
 				incompatibleInstanceCount,
-				excludedFutureCount,
-				excludedTargetCount,
 				unsupportedRecommendationEngineVersions: [
 					...unsupportedEngineVersions,
 				].sort(),
@@ -646,20 +673,25 @@ export async function buildBudgetV2FeedbackPreferenceProfile(params: {
 			historySpanDays = Math.floor((maxTs - minTs) / (24 * 60 * 60 * 1000));
 		}
 
-		// Deterministic latest decision: newest occurredAt wins; instanceId breaks
-		// exact-instant ties so the result is byte-stable across DB orderings.
-		votes.sort(
-			(a, b) =>
-				b.occurredAt.getTime() - a.occurredAt.getTime() ||
-				(a.instanceId < b.instanceId
-					? 1
-					: a.instanceId > b.instanceId
-						? -1
-						: 0),
-		);
-		const latestVote = votes[0] ?? null;
-		const latestDecision = latestVote?.decision ?? null;
-		const latestDecisionAt = latestVote?.occurredAt.toISOString() ?? null;
+		// Sections 7-9 (6D.1): latest decision by timestamp only -- never by UUID,
+		// DB row order, createdAt, or recommendationId. Collect every vote at the
+		// exact maximum occurredAt instant. One vote -> its decision. Multiple that
+		// all agree -> the shared decision. Multiple that disagree -> ambiguous:
+		// latestDecision is null and no EMPHASIZE / DEEMPHASIZE may fire.
+		let latestDecision: "ACCEPT" | "MODIFY" | "IGNORE" | null = null;
+		let latestDecisionAt: string | null = null;
+		let latestDecisionAmbiguous = false;
+		if (votes.length > 0) {
+			const maxTs = Math.max(...votes.map((v) => v.occurredAt.getTime()));
+			const tied = votes.filter((v) => v.occurredAt.getTime() === maxTs);
+			latestDecisionAt = new Date(maxTs).toISOString();
+			const decisions = new Set(tied.map((v) => v.decision));
+			if (decisions.size === 1) {
+				latestDecision = tied[0]?.decision ?? null;
+			} else {
+				latestDecisionAmbiguous = true;
+			}
+		}
 
 		const acceptRateBp = computeFeedbackRateBp(acceptCount, validInstanceCount);
 		const ignoreRateBp = computeFeedbackRateBp(ignoreCount, validInstanceCount);
@@ -679,6 +711,7 @@ export async function buildBudgetV2FeedbackPreferenceProfile(params: {
 			historySpanDays,
 			latestDecision,
 			latestDecisionAt,
+			latestDecisionAmbiguous,
 		};
 
 		if (
@@ -706,6 +739,7 @@ export async function buildBudgetV2FeedbackPreferenceProfile(params: {
 				distinctPeriodMonthCount,
 				historySpanDays,
 				latestDecision,
+				latestDecisionAmbiguous,
 			});
 
 			preferences[kind as BudgetV2AdaptiveRecommendationKind] = {
@@ -730,8 +764,6 @@ export async function buildBudgetV2FeedbackPreferenceProfile(params: {
 			available: true,
 			verifiedInstanceCount,
 			incompatibleInstanceCount,
-			excludedFutureCount,
-			excludedTargetCount,
 			unsupportedRecommendationEngineVersions: [
 				...unsupportedEngineVersions,
 			].sort(),

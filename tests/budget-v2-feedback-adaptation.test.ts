@@ -130,6 +130,7 @@ describe("evaluateBudgetV2AdaptiveKindAttention -- pure learning rules (Sections
 		distinctPeriodMonthCount: 0,
 		historySpanDays: 0,
 		latestDecision: null,
+		latestDecisionAmbiguous: false,
 	};
 	const ev = (o: Partial<BudgetV2AdaptiveAttentionInput>) =>
 		evaluateBudgetV2AdaptiveKindAttention({ ...base, ...o });
@@ -354,10 +355,61 @@ describe("evaluateBudgetV2AdaptiveKindAttention -- pure learning rules (Sections
 			distinctPeriodMonthCount: 3,
 			historySpanDays: 61,
 			latestDecision: "ACCEPT",
+			latestDecisionAmbiguous: false,
 		};
 		expect(JSON.stringify(evaluateBudgetV2AdaptiveKindAttention(input))).toBe(
 			JSON.stringify(evaluateBudgetV2AdaptiveKindAttention(input)),
 		);
+	});
+
+	// 6D.1 Sections 7-9 / tests M-O, Q: latest-decision timestamp ambiguity
+	it("6D.1/N: an ambiguous latest instant cannot trigger EMPHASIZE even at a 75% ACCEPT majority", () => {
+		const r = ev({
+			validInstanceCount: 4,
+			acceptCount: 3,
+			ignoreCount: 1,
+			distinctCheckpointCount: 4,
+			distinctPeriodMonthCount: 2,
+			historySpanDays: 35,
+			latestDecision: null,
+			latestDecisionAmbiguous: true,
+		});
+		expect(r.attention).toBe("STANDARD");
+		expect(r.learned).toBe(false);
+		expect(r.evidenceStatus).toBe("ESTABLISHED");
+		expect(r.reasonCodes).toContain("LATEST_DECISION_TIMESTAMP_AMBIGUOUS");
+		expect(r.reasonCodes).not.toContain("ACCEPT_MAJORITY_ESTABLISHED");
+	});
+
+	it("6D.1/O: an ambiguous latest instant cannot trigger DEEMPHASIZE even at a 75% IGNORE majority", () => {
+		const r = ev({
+			validInstanceCount: 4,
+			ignoreCount: 3,
+			acceptCount: 1,
+			distinctCheckpointCount: 4,
+			distinctPeriodMonthCount: 2,
+			historySpanDays: 35,
+			latestDecision: null,
+			latestDecisionAmbiguous: true,
+		});
+		expect(r.attention).toBe("STANDARD");
+		expect(r.reasonCodes).toContain("LATEST_DECISION_TIMESTAMP_AMBIGUOUS");
+		expect(r.reasonCodes).not.toContain("IGNORE_MAJORITY_ESTABLISHED");
+	});
+
+	it("6D.1/K-L: an unambiguous latest decision still learns normally", () => {
+		expect(
+			ev({
+				validInstanceCount: 4,
+				acceptCount: 3,
+				ignoreCount: 1,
+				distinctCheckpointCount: 4,
+				distinctPeriodMonthCount: 2,
+				historySpanDays: 35,
+				latestDecision: "ACCEPT",
+				latestDecisionAmbiguous: false,
+			}).attention,
+		).toBe("EMPHASIZE");
 	});
 
 	it("30.AP: every branch returns a finite, in-catalogue result", () => {
@@ -373,6 +425,7 @@ describe("evaluateBudgetV2AdaptiveKindAttention -- pure learning rules (Sections
 				historySpanDays: (i * 7) % 120,
 				latestDecision:
 					(["ACCEPT", "MODIFY", "IGNORE", null] as const)[i % 4] ?? null,
+				latestDecisionAmbiguous: i % 7 === 0,
 			});
 			expect(attns.has(r.attention)).toBe(true);
 			expect(Number.isFinite(r.acceptRateBp)).toBe(true);

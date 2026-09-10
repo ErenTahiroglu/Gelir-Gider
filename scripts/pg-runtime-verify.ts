@@ -11124,6 +11124,287 @@ async function resolverRuntime6D() {
 		);
 		await s.close();
 	}
+
+	// =====================================================================
+	// Suite 5 (6D.1) -- historical as-of purity: a post-target response
+	//   (to the target itself, or a late first response to an old checkpoint)
+	//   must leave the through-target preference profile byte-identical, while
+	//   the ordinary current 6C review state may legitimately change.
+	// =====================================================================
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-6d-5",
+			occurredAt: at("2026-07-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-08-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-09-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-10-01 00:00:00+00");
+		await s.origin();
+
+		const RC = "2026-07-25T00:00:00Z";
+		const c1 = await persistCheckpointAtDate(s, "", "2026-08-03 00:00:00+00", RC);
+		const c2 = await persistCheckpointAtDate(s, "", "2026-08-11 00:00:00+00", RC);
+		const c3 = await persistCheckpointAtDate(s, "", "2026-08-19 00:00:00+00", RC);
+		const c4 = await persistCheckpointAtDate(s, "", "2026-08-27 00:00:00+00", RC);
+		const c5 = await persistCheckpointAtDate(s, "", "2026-09-04 00:00:00+00", RC);
+		const cB = await persistCheckpointAtDate(s, "", "2026-09-12 00:00:00+00", RC);
+		const cT = await persistCheckpointAtDate(s, "", "2026-09-26 00:00:00+00", RC);
+
+		// Some ordinary prior feedback so the through-B / through-T profiles are
+		// non-trivial (c1 deliberately left UNRESPONDED as of cB).
+		await acceptSweep(s, c2.pe, "fb-6d5-2", "2026-08-12T10:00:00Z");
+		await acceptSweep(s, c3.pe, "fb-6d5-3", "2026-08-20T10:00:00Z");
+		await acceptSweep(s, c4.pe, "fb-6d5-4", "2026-08-28T10:00:00Z");
+		await acceptSweep(s, c5.pe, "fb-6d5-5", "2026-09-05T10:00:00Z");
+
+		// ---- 11.A/B/C/E: respond to the TARGET's own recommendation after cT ----
+		const pT1 = canon(
+			await buildBudgetV2FeedbackPreferenceProfile({
+				db: s.db,
+				userId: U1,
+				throughPaymentEventId: cT.pe,
+			}),
+		);
+		const beforeRows = [
+			await countRows(s, "budget_v2_recommendation_instances"),
+			await countRows(s, "budget_v2_recommendation_feedback_revisions"),
+		];
+		await acceptSweep(s, cT.pe, "fb-6d5-self", "2026-09-27T10:00:00Z");
+		const pT2 = canon(
+			await buildBudgetV2FeedbackPreferenceProfile({
+				db: s.db,
+				userId: U1,
+				throughPaymentEventId: cT.pe,
+			}),
+		);
+		eqD(
+			pT2,
+			pT1,
+			"6D.1/C: answering the target recommendation after cT does not change the through-cT profile",
+		);
+
+		// ---- 11.D: the ordinary current 6C review DOES reflect that response ----
+		const viewT = await buildBudgetV2RecommendationReviewView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		const selfItem = viewT.items.find(
+			(i) => i.recommendation.kind === "UNUSED_DISCRETIONARY_SWEEP_REVIEW",
+		);
+		eqD(
+			selfItem?.status,
+			"ACCEPT",
+			"6D.1/D: the current 6C review view shows the target response as ACCEPT",
+		);
+
+		// ---- 11.E: learned feedbackAdaptation attached to cT is unchanged ----
+		const adaptedT = await buildBudgetV2FeedbackAdaptedRecommendationView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		eqD(
+			canon(adaptedT.feedbackPreferenceProfile),
+			pT1,
+			"6D.1/E: adapted view's feedbackPreferenceProfile for cT stays as-of cT",
+		);
+		const adaptedSelf = adaptedT.items.find(
+			(i) => i.recommendation.kind === "UNUSED_DISCRETIONARY_SWEEP_REVIEW",
+		);
+		eqD(
+			adaptedSelf?.status,
+			"ACCEPT",
+			"6D.1/9: adapted view current status = ACCEPT while learned attention is historical",
+		);
+		eqD(
+			adaptedSelf?.feedbackAdaptation.attention,
+			"STANDARD",
+			"6D.1/9: learned attention for cT is the as-of-cT result, not driven by the later self-response",
+		);
+
+		// ---- 11.F/G/H/I/J: late FIRST response to an OLD checkpoint (c1) --------
+		const pB1obj = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cB.pe,
+		});
+		const pB1 = canon(pB1obj);
+		await acceptSweep(s, c1.pe, "fb-6d5-late1", "2026-09-20T10:00:00Z");
+		const pB2obj = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cB.pe,
+		});
+		eqD(
+			canon(pB2obj),
+			pB1,
+			"6D.1/H: a late first response to c1 (occurredAt > cB) leaves the through-cB profile byte-identical",
+		);
+		eqD(
+			pB2obj.history.verifiedInstanceCount === pB1obj.history.verifiedInstanceCount &&
+				pB2obj.history.incompatibleInstanceCount ===
+					pB1obj.history.incompatibleInstanceCount &&
+				pB2obj.history.available === pB1obj.history.available &&
+				canon(pB2obj.history.unsupportedRecommendationEngineVersions) ===
+					canon(pB1obj.history.unsupportedRecommendationEngineVersions),
+			true,
+			"6D.1/I: no diagnostic / corruption field of the through-cB profile moved",
+		);
+		// a later UPDATE to that same late feedback also cannot rewrite through-cB
+		await updateBudgetV2RecommendationFeedback(s.db, {
+			userId: U1,
+			recommendationId: `budget-v2-rec:v1:${c1.pe}:UNUSED_DISCRETIONARY_SWEEP_REVIEW:GLOBAL`,
+			expectedRevisionNo: 1,
+			decision: "IGNORE",
+			idempotencyKey: "fb-6d5-late1b",
+			occurredAt: at("2026-09-22T10:00:00Z"),
+		});
+		const pB3 = canon(
+			await buildBudgetV2FeedbackPreferenceProfile({
+				db: s.db,
+				userId: U1,
+				throughPaymentEventId: cB.pe,
+			}),
+		);
+		eqD(
+			pB3,
+			pB1,
+			"6D.1/J: a later UPDATE of the late c1 feedback still leaves the through-cB profile byte-identical",
+		);
+		// ...but the ordinary current review for c1 reflects the user's response
+		const viewC1 = await buildBudgetV2RecommendationReviewView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: c1.pe,
+		});
+		const c1Item = viewC1.items.find(
+			(i) => i.recommendation.kind === "UNUSED_DISCRETIONARY_SWEEP_REVIEW",
+		);
+		eqD(
+			c1Item?.status,
+			"IGNORE",
+			"6D.1/5: current 6C review for c1 reflects the late response, independent of historical adaptation",
+		);
+
+		// ---- 11.S: no rows were written while building any profile / adapted view
+		const afterRows = [
+			await countRows(s, "budget_v2_recommendation_instances"),
+			await countRows(s, "budget_v2_recommendation_feedback_revisions"),
+		];
+		// (the acceptSweep / update calls above are legitimate writes; assert only
+		//  that the read-model builders themselves add nothing beyond those.)
+		chkD(
+			afterRows[0] === beforeRows[0] + 2 && afterRows[1] === beforeRows[1] + 3,
+			"6D.1/S: profile & adapted-view construction performs no writes (only the explicit feedback calls did)",
+		);
+
+		await s.close();
+	}
+
+	// =====================================================================
+	// Suite 6 (6D.1) -- latest-decision timestamp ambiguity: conflicting votes
+	//   at the exact same max instant cannot learn, and UUID / row order never
+	//   decides the outcome.
+	// =====================================================================
+	const buildAmbiguous = async (order: "accept-first" | "ignore-first") => {
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: `tc-6d-6-${order}`,
+			occurredAt: at("2026-07-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-08-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-09-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-10-01 00:00:00+00");
+		await s.origin();
+		const RC = "2026-07-25T00:00:00Z";
+		const c1 = await persistCheckpointAtDate(s, "", "2026-08-03 00:00:00+00", RC);
+		const c2 = await persistCheckpointAtDate(s, "", "2026-08-11 00:00:00+00", RC);
+		const c3 = await persistCheckpointAtDate(s, "", "2026-08-19 00:00:00+00", RC);
+		const c4 = await persistCheckpointAtDate(s, "", "2026-08-27 00:00:00+00", RC);
+		const c5 = await persistCheckpointAtDate(s, "", "2026-09-04 00:00:00+00", RC);
+		const cT = await persistCheckpointAtDate(s, "", "2026-09-26 00:00:00+00", RC);
+
+		await acceptSweep(s, c1.pe, "amb-1", "2026-08-04T10:00:00Z");
+		await acceptSweep(s, c2.pe, "amb-2", "2026-08-12T10:00:00Z");
+		await acceptSweep(s, c3.pe, "amb-3", "2026-08-20T10:00:00Z");
+		// c4 and c5 answered at the EXACT same instant with conflicting decisions.
+		const INSTANT = "2026-09-12T00:00:00.000Z";
+		if (order === "accept-first") {
+			await acceptSweep(s, c4.pe, "amb-4", INSTANT, "ACCEPT");
+			await acceptSweep(s, c5.pe, "amb-5", INSTANT, "IGNORE");
+		} else {
+			await acceptSweep(s, c5.pe, "amb-5", INSTANT, "IGNORE");
+			await acceptSweep(s, c4.pe, "amb-4", INSTANT, "ACCEPT");
+		}
+		const prof = await buildBudgetV2FeedbackPreferenceProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		await s.close();
+		return prof;
+	};
+
+	{
+		const profA = await buildAmbiguous("accept-first");
+		const profB = await buildAmbiguous("ignore-first");
+		const sweepA = profA.preferences.UNUSED_DISCRETIONARY_SWEEP_REVIEW;
+
+		eqD(
+			sweepA.evidence.validInstanceCount,
+			5,
+			"6D.1/setup: 5 votes established (4 ACCEPT + 1 IGNORE)",
+		);
+		eqD(
+			sweepA.evidence.acceptCount === 4 && sweepA.evidence.ignoreCount === 1,
+			true,
+			"6D.1/setup: a raw 80% ACCEPT majority is present",
+		);
+		eqD(
+			sweepA.evidence.latestDecisionAmbiguous,
+			true,
+			"6D.1/M: conflicting votes at the exact max instant -> latestDecisionAmbiguous",
+		);
+		eqD(
+			sweepA.evidence.latestDecision,
+			null,
+			"6D.1/M: latestDecision is null under timestamp ambiguity",
+		);
+		eqD(
+			sweepA.attention,
+			"STANDARD",
+			"6D.1/N+O: ambiguity fails safe to STANDARD despite the 80% ACCEPT majority",
+		);
+		eqD(sweepA.learned, false, "6D.1/N: no learned attention under ambiguity");
+		chkD(
+			sweepA.reasonCodes.includes("LATEST_DECISION_TIMESTAMP_AMBIGUOUS"),
+			"6D.1/12: reasonCodes explain the ambiguity fail-safe",
+		);
+		eqD(
+			canon(profA),
+			canon(profB),
+			"6D.1/P: reversing the order the two tied votes are written (different UUID order) does not change the profile",
+		);
+		eqD(
+			profA.protectedKinds.DATA_COMPLETION_REQUIRED.attention,
+			"PROTECTED",
+			"6D.1/Q: protected kinds stay PROTECTED regardless of timestamp ambiguity",
+		);
+	}
 }
 
 const probed = await probe();
