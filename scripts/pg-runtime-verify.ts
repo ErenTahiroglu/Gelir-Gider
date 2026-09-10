@@ -2658,6 +2658,12 @@ async function resolverRuntime4B() {
 
 	// ---- fresh disposable DB + shared fixture + seed helpers (see make4bScenario) ----
 	const scenario = make4bScenario;
+	// Anchor every reconciliation well before any checkpoint instant. Without an
+	// explicit occurredAt, reconcileStatement stamps `new Date()`, which makes a
+	// scenario whose checkpoint is "today at 00:00Z" flake once the wall clock
+	// crosses midnight UTC. These scenarios all intend a long-established
+	// reconciliation, so pin it to the period start.
+	const RECON_AT = new Date("2026-09-01T00:00:00Z");
 
 	// =====================================================================
 	// MAIN happy-path DB -- adapted 4B A..X + FAMILY_REIMBURSEMENT (K)
@@ -2792,6 +2798,7 @@ async function resolverRuntime4B() {
 			statementId: TS1,
 			statementRevisionId: ts1r1,
 			idempotencyKey: "rc-ts1",
+			occurredAt: RECON_AT,
 			components: [
 				{
 					componentType: "PURCHASE",
@@ -2821,6 +2828,7 @@ async function resolverRuntime4B() {
 			statementId: TS2,
 			statementRevisionId: ts2r1,
 			idempotencyKey: "rc-ts2",
+			occurredAt: RECON_AT,
 			components: [
 				{
 					componentType: "ADJUSTMENT",
@@ -3084,7 +3092,7 @@ async function resolverRuntime4B() {
 		const r1 = await s.mkStmt(TS, "500.00", 9);
 		await s.origin();
 		await reconcileStatement({
-			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-d",
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-d", occurredAt: RECON_AT,
 			components: [{ componentType: "ADJUSTMENT", amount: "500.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
 		});
 		await s.replica();
@@ -3119,7 +3127,7 @@ async function resolverRuntime4B() {
 		const r1 = await s.mkStmt(TS, "300.00", 9);
 		await s.origin();
 		await reconcileStatement({
-			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-f",
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-f", occurredAt: RECON_AT,
 			components: [{ componentType: "ADJUSTMENT", amount: "300.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
 		});
 		await s.replica();
@@ -3168,7 +3176,7 @@ async function resolverRuntime4B() {
 		const r1 = await s.mkStmt(TS, "1000.00", 9);
 		await s.origin();
 		await reconcileStatement({
-			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-h",
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-h", occurredAt: RECON_AT,
 			components: [
 				{ componentType: "ADJUSTMENT", amount: "400.00", ownership: "PERSONAL", adjustmentKind: "OTHER" },
 				{ componentType: "ADJUSTMENT", amount: "600.00", ownership: "EXTERNAL_PERSON", personId: P_LATE, adjustmentKind: "OTHER" },
@@ -3203,7 +3211,7 @@ async function resolverRuntime4B() {
 		const r1 = await s.mkStmt(TS, "1000.00", 9);
 		await s.origin();
 		await reconcileStatement({
-			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-i",
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-i", occurredAt: RECON_AT,
 			components: [
 				{ componentType: "ADJUSTMENT", amount: "700.00", ownership: "PERSONAL", adjustmentKind: "OTHER" },
 				{ componentType: "ADJUSTMENT", amount: "300.00", ownership: "EXTERNAL_PERSON", personId: P_FRI, adjustmentKind: "OTHER" },
@@ -3235,7 +3243,7 @@ async function resolverRuntime4B() {
 		const r1 = await s.mkStmt(TS, "400.00", 9);
 		await s.origin();
 		await reconcileStatement({
-			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-j",
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-j", occurredAt: RECON_AT,
 			components: [{ componentType: "ADJUSTMENT", amount: "400.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
 		});
 		await s.replica();
@@ -3261,7 +3269,7 @@ async function resolverRuntime4B() {
 		const r1 = await s.mkStmt(TS, "300.00", 9);
 		await s.origin();
 		await reconcileStatement({
-			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-l",
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-l", occurredAt: RECON_AT,
 			components: [{ componentType: "ADJUSTMENT", amount: "300.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
 		});
 		await s.replica();
@@ -3318,7 +3326,7 @@ async function resolverRuntime4B() {
 		const r1 = await s.mkStmt(TS, "400.00", 9);
 		await s.origin();
 		await reconcileStatement({
-			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-o",
+			db: s.db, userId: U1, statementId: TS, statementRevisionId: r1, idempotencyKey: "rc-o", occurredAt: RECON_AT,
 			components: [{ componentType: "ADJUSTMENT", amount: "400.00", ownership: "PERSONAL", adjustmentKind: "OTHER" }],
 		});
 		await s.replica();

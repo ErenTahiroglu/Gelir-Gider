@@ -85,13 +85,25 @@ export type BehaviorFeatureName = (typeof BEHAVIOR_FEATURE_NAMES)[number];
 export type NormalizedFeatureUnavailableReason =
 	| "ZERO_DENOMINATOR"
 	| "SOURCE_UNAVAILABLE"
-	| "NOT_AUTHORITATIVE";
+	| "NOT_AUTHORITATIVE"
+	/**
+	 * The authoritative ratio exists mathematically, but its exact integer
+	 * basis-point quotient falls outside JavaScript's safe-integer range and so
+	 * cannot be represented exactly by this Behavior Engine numeric output
+	 * contract. It is NEVER clamped, rounded, approximated, turned into
+	 * Infinity, or silently zeroed -- the derived feature is simply unavailable
+	 * for this observation (feature-level, like ZERO_DENOMINATOR; the checkpoint
+	 * stays compatible and every raw authoritative field is unchanged).
+	 */
+	| "OUT_OF_SAFE_INTEGER_RANGE";
 
 export type NormalizedFeature =
 	| { available: true; valueBp: number }
 	| { available: false; reason: NormalizedFeatureUnavailableReason };
 
 const BP_SCALE = 10_000n;
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE = BigInt(Number.MIN_SAFE_INTEGER);
 
 function centsOrNull(v: string | null | undefined): bigint | null {
 	if (typeof v !== "string") return null;
@@ -108,13 +120,28 @@ function centsOrNull(v: string | null | undefined): bigint | null {
  * `SOURCE_UNAVAILABLE`; a non-positive denominator is `ZERO_DENOMINATOR`
  * (never `Infinity` / `NaN` / an inferred `0`). A genuine `0` numerator over a
  * positive denominator is a real available `0`.
+ *
+ * The exact quotient is computed AND range-checked as a BigInt BEFORE any
+ * `Number(...)` conversion: if it exceeds JavaScript's safe-integer range the
+ * feature is `OUT_OF_SAFE_INTEGER_RANGE` -- the contract is "exact integer
+ * basis points" over the full accepted money domain, so an inexact float is
+ * never published. Every `available: true` result is therefore a
+ * `Number.isSafeInteger` value.
  */
 function divBp(num: bigint | null, den: bigint | null): NormalizedFeature {
 	if (num === null || den === null) {
 		return { available: false, reason: "SOURCE_UNAVAILABLE" };
 	}
 	if (den <= 0n) return { available: false, reason: "ZERO_DENOMINATOR" };
-	return { available: true, valueBp: Number((num * BP_SCALE) / den) };
+	const exactBp = (num * BP_SCALE) / den;
+	if (exactBp > MAX_SAFE || exactBp < MIN_SAFE) {
+		return { available: false, reason: "OUT_OF_SAFE_INTEGER_RANGE" };
+	}
+	const valueBp = Number(exactBp);
+	if (!Number.isSafeInteger(valueBp)) {
+		return { available: false, reason: "OUT_OF_SAFE_INTEGER_RANGE" };
+	}
+	return { available: true, valueBp };
 }
 
 /**

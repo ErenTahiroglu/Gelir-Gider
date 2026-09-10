@@ -829,3 +829,137 @@ describe("assembleBudgetV2BehaviorProfile -- guards & determinism", () => {
 		).toThrow(/exact checkpointAt/);
 	});
 });
+
+describe("Checkpoint 6A.1 -- basis-point safe-integer exactness closure", () => {
+	// currentObligations cents / realizedIncome cents; with realizedIncome
+	// "100.00" (10_000 cents) the exact bp quotient == currentObligations cents.
+	const MAX = Number.MAX_SAFE_INTEGER; // 9_007_199_254_740_991
+	const centsToMoney = (cents: bigint) => {
+		const s = (cents < 0n ? -cents : cents).toString().padStart(3, "0");
+		return `${cents < 0n ? "-" : ""}${s.slice(0, -2)}.${s.slice(-2)}`;
+	};
+	const obligationLoadOf = (
+		currentObligations: string,
+		realizedIncome = "100.00",
+	) =>
+		normalizeBehaviorFeatures(
+			extractBehaviorEngineCheckpointObservation(
+				mkReport({
+					paymentEventId: "pe-1",
+					checkpointAt: "2026-09-15T00:00:00.000Z",
+					periodMonth: "2026-09-01",
+					realizedIncome,
+					currentObligations,
+				}),
+			),
+		).obligationLoadBp;
+
+	it("A: a normal ratio still produces the same exact bp result", () => {
+		expect(obligationLoadOf("50.00", "100.00")).toEqual({
+			available: true,
+			valueBp: 5000,
+		});
+	});
+
+	it("B: exact quotient == Number.MAX_SAFE_INTEGER -> available, exact safe integer", () => {
+		const f = obligationLoadOf(centsToMoney(BigInt(MAX))); // 90071992547409.91
+		expect(f).toEqual({ available: true, valueBp: MAX });
+		if (f.available) expect(Number.isSafeInteger(f.valueBp)).toBe(true);
+	});
+
+	it("C: exact quotient == MAX_SAFE_INTEGER + 1 -> unavailable OUT_OF_SAFE_INTEGER_RANGE", () => {
+		expect(obligationLoadOf(centsToMoney(BigInt(MAX) + 1n))).toEqual({
+			available: false,
+			reason: "OUT_OF_SAFE_INTEGER_RANGE",
+		});
+	});
+
+	it("D: no Number conversion is published before the range decision (result carries no valueBp)", () => {
+		// MAX+2 would silently round to MAX+1 under a premature Number() cast.
+		const f = obligationLoadOf(centsToMoney(BigInt(MAX) + 2n));
+		expect(f.available).toBe(false);
+		expect("valueBp" in f).toBe(false);
+		if (!f.available) expect(f.reason).toBe("OUT_OF_SAFE_INTEGER_RANGE");
+	});
+
+	it("G: genuine zero over a positive denominator remains available 0", () => {
+		expect(obligationLoadOf("0.00", "100.00")).toEqual({
+			available: true,
+			valueBp: 0,
+		});
+	});
+
+	it("H: zero denominator remains ZERO_DENOMINATOR", () => {
+		expect(obligationLoadOf("50.00", "0.00")).toEqual({
+			available: false,
+			reason: "ZERO_DENOMINATOR",
+		});
+	});
+
+	it("E/F: an out-of-range observation is excluded from median/MAD, counted missing, and named in coverageReasons", () => {
+		const at0 = "2026-12-01T00:00:00.000Z";
+		const mk = (id: string, minusDays: number, currentObligations: string) =>
+			snap({
+				paymentEventId: id,
+				checkpointAt: iso(at0, minusDays),
+				periodMonth: "2026-12-01",
+				realizedIncome: "100.00",
+				currentObligations,
+			});
+		const p = assembleBudgetV2BehaviorProfile({
+			throughPaymentEventId: "t",
+			snapshots: [
+				mk("t", 0, "20.00"), // 2000 bp
+				mk("a", 5, "40.00"), // 4000 bp
+				mk("b", 10, centsToMoney(BigInt(MAX) + 1n)), // out of range
+			],
+		});
+		const s = p.windows.DAYS_30.features.obligationLoadBp;
+		expect(s.windowObservationCount).toBe(3);
+		expect(s.validCount).toBe(2);
+		expect(s.missingCount).toBe(1);
+		// only [2000, 4000] contribute; nearest-rank median rank ceil(0.5*2)=1 -> 2000
+		expect(s.median).toBe(2000);
+		expect(s.mad).toBe(0); // |2000-2000|, |4000-2000| -> [0,2000] -> rank 1 -> 0
+		expect(s.coverageReasons).toContain("OUT_OF_SAFE_INTEGER_RANGE");
+		// the checkpoint itself stays compatible -- only the derived feature is unavailable
+		expect(p.dataQuality.compatibleSnapshotCount).toBe(3);
+		expect(p.dataQuality.incompatibleSnapshotCount).toBe(0);
+		expect(p.dataQuality.featureCoverageAllHistory.obligationLoadBp).toEqual({
+			validCount: 2,
+			missingCount: 1,
+		});
+	});
+
+	it("I: no available normalized feature is ever NaN / Infinity / a non-safe-integer", () => {
+		const feats = normalizeBehaviorFeatures(
+			extractBehaviorEngineCheckpointObservation(
+				mkReport({
+					paymentEventId: "pe-1",
+					checkpointAt: "2026-09-15T00:00:00.000Z",
+					periodMonth: "2026-09-01",
+					realizedIncome: "100.00",
+					currentObligations: centsToMoney(BigInt(MAX) + 5n),
+					basicLivingFunding: "30.00",
+					trueSurplus: "70.00",
+					discretionarySpend: "10.00",
+					emergencyCurrentBalance: "5.00",
+					emergencyTarget: "20.00",
+					food: { total: "800.00", outside: "600.00", home: "200.00" },
+				}),
+			),
+		);
+		for (const f of Object.values(feats)) {
+			if (f.available) {
+				expect(Number.isNaN(f.valueBp)).toBe(false);
+				expect(Number.isFinite(f.valueBp)).toBe(true);
+				expect(Number.isSafeInteger(f.valueBp)).toBe(true);
+			}
+		}
+		// the deliberately huge ratio is the unavailable one
+		expect(feats.obligationLoadBp).toEqual({
+			available: false,
+			reason: "OUT_OF_SAFE_INTEGER_RANGE",
+		});
+	});
+});
