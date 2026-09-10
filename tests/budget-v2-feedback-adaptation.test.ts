@@ -114,6 +114,67 @@ describe("computeFeedbackRateBp -- exact integer arithmetic (Sections 14, 30.AO,
 	it("clamps into [0, 10000]", () => {
 		expect(computeFeedbackRateBp(9, 4)).toBe(10000); // clamped, cannot exceed 100%
 	});
+
+	// 6D.2 -- exact BigInt ratio: `numerator * 10000` can blow past
+	// Number.MAX_SAFE_INTEGER even when both inputs are individually safe.
+	it("6D.2/D: the large safe-integer counterexample is exactly 9998, never 9999", () => {
+		const numerator = 9006298534814525;
+		const validInstanceCount = 9007199254739999;
+		expect(Number.isSafeInteger(numerator)).toBe(true);
+		expect(Number.isSafeInteger(validInstanceCount)).toBe(true);
+		expect(numerator).toBeLessThanOrEqual(validInstanceCount);
+		// exact floor(numerator * 10000 / validInstanceCount)
+		const exact = Number(
+			(BigInt(numerator) * 10_000n) / BigInt(validInstanceCount),
+		);
+		expect(exact).toBe(9998);
+		expect(computeFeedbackRateBp(numerator, validInstanceCount)).toBe(9998);
+		expect(computeFeedbackRateBp(numerator, validInstanceCount)).not.toBe(9999);
+	});
+
+	it("6D.2/E: numerator == denominator == MAX_SAFE_INTEGER -> exactly 10000", () => {
+		const m = Number.MAX_SAFE_INTEGER;
+		expect(computeFeedbackRateBp(m, m)).toBe(10000);
+	});
+
+	it("6D.2/F: large safe numerator/denominator near MAX_SAFE_INTEGER stays exact", () => {
+		const cases: Array<[number, number, number]> = [
+			[9007199254740990, 9007199254740991, 9999], // floor(9999.99..)
+			[4503599627370495, 9007199254740991, 4999], // ~half -> floor(4999.99..)
+			[1, Number.MAX_SAFE_INTEGER, 0],
+			[9006298534814525, 9007199254739999, 9998],
+		];
+		for (const [n, d, want] of cases) {
+			const exact = Number((BigInt(n) * 10_000n) / BigInt(d));
+			expect(computeFeedbackRateBp(n, d)).toBe(exact);
+			expect(computeFeedbackRateBp(n, d)).toBe(want);
+		}
+	});
+
+	it("6D.2/G+H: unsafe / zero-denominator inputs retain fail-safe 0", () => {
+		expect(computeFeedbackRateBp(Number.MAX_SAFE_INTEGER + 2, 4)).toBe(0);
+		expect(computeFeedbackRateBp(4, Number.MAX_SAFE_INTEGER + 2)).toBe(0);
+		expect(computeFeedbackRateBp(2.5, 4)).toBe(0);
+		expect(computeFeedbackRateBp(3, 0)).toBe(0);
+		expect(computeFeedbackRateBp(0, 4)).toBe(0);
+	});
+
+	it("6D.2/I: no valid result is NaN / Infinity / non-safe integer", () => {
+		const inputs: Array<[number, number]> = [
+			[3, 4],
+			[1, 3],
+			[9006298534814525, 9007199254739999],
+			[Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+			[9007199254740990, 9007199254740991],
+			[7, 9007199254740991],
+		];
+		for (const [n, d] of inputs) {
+			const bp = computeFeedbackRateBp(n, d);
+			expect(Number.isSafeInteger(bp)).toBe(true);
+			expect(bp).toBeGreaterThanOrEqual(0);
+			expect(bp).toBeLessThanOrEqual(10000);
+		}
+	});
 });
 
 // ---------------------------------------------------------------------------

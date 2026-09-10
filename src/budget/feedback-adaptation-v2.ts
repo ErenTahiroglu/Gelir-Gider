@@ -212,6 +212,11 @@ export interface BudgetV2AdaptiveAttentionResult {
  * Section 14: exact integer basis-point feedback rates. MODIFY stays in the
  * denominator (validInstanceCount) but contributes to neither numerator.
  * No floating-point probabilities; result is a bounded, safe integer in [0, 10000].
+ *
+ * The ratio itself is computed in BigInt: `numerator * 10000` can exceed
+ * Number.MAX_SAFE_INTEGER even when `numerator` and `validInstanceCount` are
+ * each individually safe integers, so an IEEE-754 intermediate could be off by
+ * a basis point. BigInt truncating division gives the exact floor.
  */
 export function computeFeedbackRateBp(
 	numerator: number,
@@ -225,9 +230,11 @@ export function computeFeedbackRateBp(
 	) {
 		return 0;
 	}
-	const bp = Math.floor((numerator * 10000) / validInstanceCount);
-	if (!Number.isFinite(bp) || bp < 0) return 0;
-	return bp > 10000 ? 10000 : bp;
+	// Exact integer floor(numerator * 10000 / validInstanceCount) -- no float.
+	const exactBp = (BigInt(numerator) * 10_000n) / BigInt(validInstanceCount);
+	if (exactBp <= 0n) return 0;
+	if (exactBp >= 10_000n) return 10_000;
+	return Number(exactBp);
 }
 
 /**
