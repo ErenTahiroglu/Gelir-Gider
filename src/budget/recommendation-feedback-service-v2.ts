@@ -708,69 +708,63 @@ export async function createBudgetV2RecommendationFeedback(
 
 			frozenRec = activeRec;
 
-			// Insert immutable recommendation instance
-			try {
-				const inserted = await tx
-					.insert(budgetV2RecommendationInstances)
-					.values({
-						userId,
-						checkpointSnapshotId: snapshot.id,
-						paymentEventId: throughPaymentEventId,
-						recommendationId: activeRec.recommendationId,
-						recommendationKind: activeRec.kind,
-						recommendationScope: activeRec.scope,
-						recommendationEngineVersion: reviewSet.engineVersion,
-						behaviorEngineVersion:
-							reviewSet.generatedFrom.behaviorEngineVersion,
-						observationContractVersion:
-							reviewSet.generatedFrom.observationContractVersion,
-						priority: activeRec.priority,
-						recommendationJson: activeRec,
-						recommendationFingerprint: activeRec.recommendationFingerprint,
-						capturedAt: occurredAt,
-					})
-					.returning();
+			// Insert immutable recommendation instance using transaction-safe onConflictDoNothing
+			const insertedInsts = await tx
+				.insert(budgetV2RecommendationInstances)
+				.values({
+					userId,
+					checkpointSnapshotId: snapshot.id,
+					paymentEventId: throughPaymentEventId,
+					recommendationId: activeRec.recommendationId,
+					recommendationKind: activeRec.kind,
+					recommendationScope: activeRec.scope,
+					recommendationEngineVersion: reviewSet.engineVersion,
+					behaviorEngineVersion: reviewSet.generatedFrom.behaviorEngineVersion,
+					observationContractVersion:
+						reviewSet.generatedFrom.observationContractVersion,
+					priority: activeRec.priority,
+					recommendationJson: activeRec,
+					recommendationFingerprint: activeRec.recommendationFingerprint,
+					capturedAt: occurredAt,
+				})
+				.onConflictDoNothing({
+					target: [
+						budgetV2RecommendationInstances.userId,
+						budgetV2RecommendationInstances.recommendationId,
+					],
+				})
+				.returning();
 
-				const [inst] = inserted;
-				if (!inst) {
+			const [inst] = insertedInsts;
+			if (inst) {
+				instance = inst;
+			} else {
+				// Concurrently created: re-fetch inside the still-healthy transaction
+				const refetchedInsts = await tx
+					.select()
+					.from(budgetV2RecommendationInstances)
+					.where(
+						and(
+							eq(budgetV2RecommendationInstances.userId, userId),
+							eq(
+								budgetV2RecommendationInstances.recommendationId,
+								activeRec.recommendationId,
+							),
+						),
+					)
+					.for("update")
+					.limit(1);
+
+				const [refetchedInst] = refetchedInsts;
+				if (!refetchedInst) {
 					throw new BudgetError(
 						"BUDGET_REVISION_CONFLICT",
-						"failed to insert recommendation instance",
+						"concurrent creation conflict on recommendation instance",
 					);
 				}
-				instance = inst;
-			} catch (err: unknown) {
-				if (
-					isUniqueViolationOnConstraint(err, "bv2recinst_user_rec_id_idx") ||
-					isUniqueViolationOnConstraint(err, "bv2recinst_user_semantic_idx")
-				) {
-					// Instance was concurrently created; re-fetch and verify
-					const refetchedInsts = await tx
-						.select()
-						.from(budgetV2RecommendationInstances)
-						.where(
-							and(
-								eq(budgetV2RecommendationInstances.userId, userId),
-								eq(
-									budgetV2RecommendationInstances.recommendationId,
-									activeRec.recommendationId,
-								),
-							),
-						)
-						.limit(1);
-					const [refetchedInst] = refetchedInsts;
-					if (refetchedInst) {
-						await verifyStoredBudgetV2RecommendationInstance(refetchedInst);
-						instance = refetchedInst;
-					} else {
-						throw new BudgetError(
-							"BUDGET_REVISION_CONFLICT",
-							"concurrent creation conflict on recommendation instance",
-						);
-					}
-				} else {
-					throw err;
-				}
+				await verifyStoredBudgetV2RecommendationInstance(refetchedInst);
+				instance = refetchedInst;
+				frozenRec = instance.recommendationJson as BudgetV2Recommendation;
 			}
 		}
 
@@ -810,50 +804,74 @@ export async function createBudgetV2RecommendationFeedback(
 					revisionFingerprint,
 					occurredAt,
 				})
+				.onConflictDoNothing({
+					target: [
+						budgetV2RecommendationFeedbackRevisions.userId,
+						budgetV2RecommendationFeedbackRevisions.idempotencyKey,
+					],
+				})
 				.returning();
 
 			const [rev] = insertedRevs;
-			if (!rev) {
-				throw new BudgetError(
-					"BUDGET_REVISION_CONFLICT",
-					"failed to insert feedback revision",
-				);
+			if (rev) {
+				return {
+					instance,
+					revision: formatRevisionResult(rev),
+				};
 			}
 
-			return {
-				instance,
-				revision: formatRevisionResult(rev),
-			};
-		} catch (err: unknown) {
-			if (isUniqueViolationOnConstraint(err, "bv2recfb_user_idempotency_idx")) {
-				// Concurrently inserted under this idempotency key: re-fetch and check exact command identity
-				const raceRevs = await tx
+			// Idempotency collision: re-read the winning revision inside the healthy transaction
+			const raceRevs = await tx
+				.select()
+				.from(budgetV2RecommendationFeedbackRevisions)
+				.where(
+					and(
+						eq(budgetV2RecommendationFeedbackRevisions.userId, userId),
+						eq(
+							budgetV2RecommendationFeedbackRevisions.idempotencyKey,
+							idempotencyKey,
+						),
+					),
+				)
+				.limit(1);
+
+			const [raceRev] = raceRevs;
+			if (raceRev) {
+				const raceInstRows = await tx
 					.select()
-					.from(budgetV2RecommendationFeedbackRevisions)
+					.from(budgetV2RecommendationInstances)
 					.where(
-						and(
-							eq(budgetV2RecommendationFeedbackRevisions.userId, userId),
-							eq(
-								budgetV2RecommendationFeedbackRevisions.idempotencyKey,
-								idempotencyKey,
-							),
+						eq(
+							budgetV2RecommendationInstances.id,
+							raceRev.recommendationInstanceId,
 						),
 					)
 					.limit(1);
-				const [raceRev] = raceRevs;
-				if (raceRev) {
+
+				const [raceInst] = raceInstRows;
+				if (raceInst) {
+					await verifyStoredBudgetV2RecommendationInstance(raceInst);
 					await verifyStoredBudgetV2RecommendationFeedbackRevision(raceRev);
-					const sameRec = instance.recommendationId === recommendationId;
+
+					const winnerFrozenRec =
+						raceInst.recommendationJson as BudgetV2Recommendation;
+					const normalizedRetryMod = validateAndNormalizeModification(
+						decision,
+						input.modification,
+						winnerFrozenRec,
+					);
+
+					const sameRec = raceInst.recommendationId === recommendationId;
 					const samePaymentEvent =
-						instance.paymentEventId === throughPaymentEventId;
+						raceInst.paymentEventId === throughPaymentEventId;
 					const sameFingerprint =
 						expectedRecommendationFingerprint ===
-						instance.recommendationFingerprint;
+						raceInst.recommendationFingerprint;
 					const sameDecision = raceRev.decision === decision;
 					const sameOp = raceRev.operation === "CREATE";
 					const sameMod =
 						canonicalJsonStringify(raceRev.modificationJson ?? null) ===
-						canonicalJsonStringify(normalizedMod ?? null);
+						canonicalJsonStringify(normalizedRetryMod ?? null);
 					const sameOccurredAt =
 						new Date(raceRev.occurredAt).getTime() === occurredAt.getTime();
 
@@ -867,18 +885,22 @@ export async function createBudgetV2RecommendationFeedback(
 						sameOccurredAt
 					) {
 						return {
-							instance,
+							instance: raceInst,
 							revision: formatRevisionResult(raceRev),
 						};
 					}
 				}
-				throw new BudgetError(
-					"BUDGET_IDEMPOTENCY_CONFLICT",
-					`idempotency key '${idempotencyKey}' already exists`,
-				);
 			}
 
-			if (isUniqueViolationOnConstraint(err, "bv2recfb_instance_rev_no_idx")) {
+			throw new BudgetError(
+				"BUDGET_IDEMPOTENCY_CONFLICT",
+				`idempotency key '${idempotencyKey}' already used with different payload`,
+			);
+		} catch (err: unknown) {
+			if (
+				isUniqueViolationOnConstraint(err, "bv2recfb_instance_rev_no_idx") ||
+				isUniqueViolationOnConstraint(err, "bv2recfb_prev_idx")
+			) {
 				throw new BudgetError(
 					"BUDGET_REVISION_CONFLICT",
 					"feedback revision conflict for recommendation instance",
@@ -1170,46 +1192,71 @@ export async function updateBudgetV2RecommendationFeedback(
 					revisionFingerprint,
 					occurredAt,
 				})
+				.onConflictDoNothing({
+					target: [
+						budgetV2RecommendationFeedbackRevisions.userId,
+						budgetV2RecommendationFeedbackRevisions.idempotencyKey,
+					],
+				})
 				.returning();
 
 			const [rev] = insertedRevs;
-			if (!rev) {
-				throw new BudgetError(
-					"BUDGET_REVISION_CONFLICT",
-					"failed to insert feedback revision",
-				);
+			if (rev) {
+				return {
+					instance,
+					revision: formatRevisionResult(rev),
+				};
 			}
 
-			return {
-				instance,
-				revision: formatRevisionResult(rev),
-			};
-		} catch (err: unknown) {
-			if (isUniqueViolationOnConstraint(err, "bv2recfb_user_idempotency_idx")) {
-				const raceRevs = await tx
+			// Idempotency collision: re-read the winning revision inside the healthy transaction
+			const raceRevs = await tx
+				.select()
+				.from(budgetV2RecommendationFeedbackRevisions)
+				.where(
+					and(
+						eq(budgetV2RecommendationFeedbackRevisions.userId, userId),
+						eq(
+							budgetV2RecommendationFeedbackRevisions.idempotencyKey,
+							idempotencyKey,
+						),
+					),
+				)
+				.limit(1);
+
+			const [raceRev] = raceRevs;
+			if (raceRev) {
+				const raceInstRows = await tx
 					.select()
-					.from(budgetV2RecommendationFeedbackRevisions)
+					.from(budgetV2RecommendationInstances)
 					.where(
-						and(
-							eq(budgetV2RecommendationFeedbackRevisions.userId, userId),
-							eq(
-								budgetV2RecommendationFeedbackRevisions.idempotencyKey,
-								idempotencyKey,
-							),
+						eq(
+							budgetV2RecommendationInstances.id,
+							raceRev.recommendationInstanceId,
 						),
 					)
 					.limit(1);
-				const [raceRev] = raceRevs;
-				if (raceRev) {
+
+				const [raceInst] = raceInstRows;
+				if (raceInst) {
+					await verifyStoredBudgetV2RecommendationInstance(raceInst);
 					await verifyStoredBudgetV2RecommendationFeedbackRevision(raceRev);
-					const sameRec = instance.recommendationId === recommendationId;
+
+					const winnerFrozenRec =
+						raceInst.recommendationJson as BudgetV2Recommendation;
+					const normalizedRetryMod = validateAndNormalizeModification(
+						decision,
+						input.modification,
+						winnerFrozenRec,
+					);
+
+					const sameRec = raceInst.recommendationId === recommendationId;
 					const sameExpectedRevision =
 						raceRev.revisionNo - 1 === expectedRevisionNo;
 					const sameDecision = raceRev.decision === decision;
 					const sameOp = raceRev.operation === "UPDATE";
 					const sameMod =
 						canonicalJsonStringify(raceRev.modificationJson ?? null) ===
-						canonicalJsonStringify(normalizedMod ?? null);
+						canonicalJsonStringify(normalizedRetryMod ?? null);
 					const sameOccurredAt =
 						new Date(raceRev.occurredAt).getTime() === occurredAt.getTime();
 
@@ -1222,17 +1269,18 @@ export async function updateBudgetV2RecommendationFeedback(
 						sameOccurredAt
 					) {
 						return {
-							instance,
+							instance: raceInst,
 							revision: formatRevisionResult(raceRev),
 						};
 					}
 				}
-				throw new BudgetError(
-					"BUDGET_IDEMPOTENCY_CONFLICT",
-					`idempotency key '${idempotencyKey}' already exists`,
-				);
 			}
 
+			throw new BudgetError(
+				"BUDGET_IDEMPOTENCY_CONFLICT",
+				`idempotency key '${idempotencyKey}' already used with different payload`,
+			);
+		} catch (err: unknown) {
 			if (
 				isUniqueViolationOnConstraint(err, "bv2recfb_instance_rev_no_idx") ||
 				isUniqueViolationOnConstraint(err, "bv2recfb_prev_idx")
@@ -1341,6 +1389,6 @@ export async function getLatestBudgetV2RecommendationFeedback(params: {
 }): Promise<BudgetV2RecommendationFeedbackAsOfResult> {
 	return getBudgetV2RecommendationFeedbackAsOf({
 		...params,
-		asOf: new Date(8640000000000000), // Max Date
+		asOf: new Date("9999-12-31T23:59:59.999Z"),
 	});
 }

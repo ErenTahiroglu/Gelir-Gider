@@ -9929,6 +9929,434 @@ async function resolverRuntime6C1() {
 	}
 }
 
+// ============================================================================
+// PHASE 6C.2: TRANSACTION-SAFE IDEMPOTENCY COLLISION CLOSURE
+// ============================================================================
+
+async function resolverRuntime6C2() {
+	console.log(
+		"\n== PHASE 6C.2: TRANSACTION-SAFE IDEMPOTENCY COLLISION CLOSURE ==",
+	);
+
+	const {
+		createBudgetV2RecommendationFeedback,
+		updateBudgetV2RecommendationFeedback,
+		getBudgetV2RecommendationFeedbackAsOf,
+		getLatestBudgetV2RecommendationFeedback,
+	} = await import("../src/budget/recommendation-feedback-service-v2.ts");
+	const { buildBudgetV2RecommendationReviewSet } = await import(
+		"../src/budget/behavior-recommendations-review-v2.ts"
+	);
+	const { createCheckpointTriggerCard } = await import(
+		"../src/budget/checkpoint-trigger-card-v2.ts"
+	);
+	const { maybeEnqueueBudgetV2CheckpointRequest } = await import(
+		"../src/budget/checkpoint-request-v2.ts"
+	);
+	const { processPendingBudgetV2CheckpointRequests } = await import(
+		"../src/budget/checkpoint-processor-v2.ts"
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+
+	const at = (iso: string) => new Date(iso);
+	const SEP5 = "2026-09-05 00:00:00+00";
+	const RECON = at("2026-09-06T00:00:00Z");
+
+	const eqC = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+
+	let seq6c2 = 0;
+	const persistCheckpoint = async (s: S, payIso: string) => {
+		seq6c2++;
+		const sid = `86c20000-0000-4000-8000-0000000006c${seq6c2}`;
+		const amount = "500.00";
+		await s.replica();
+		const r1 = await s.mkStmt(sid, amount, 3 + seq6c2);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: `rc-6c2-${seq6c2}`,
+			occurredAt: RECON,
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe, r } = await s.mkPay(sid, r1, amount, 2, payIso);
+		await s.origin();
+		await s.db.transaction((tx: S) =>
+			maybeEnqueueBudgetV2CheckpointRequest({
+				tx,
+				userId: U1,
+				statementId: sid,
+				creditCardId: s.CARD,
+				paymentEventId: pe,
+				payRevisionId: r,
+				occurredAt: at(payIso.replace(" ", "T").replace("+00", "Z")),
+			}),
+		);
+		await processPendingBudgetV2CheckpointRequests({ db: s.db });
+		return { pe, sid };
+	};
+
+	// --- Suite 1: Cross-Anchor (Cross-Checkpoint) Concurrent Same-Key CREATE ---
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-6c2-1",
+			occurredAt: at("2026-08-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		await s.origin();
+
+		// Two distinct checkpoints
+		const cp1 = await persistCheckpoint(s, "2026-09-08 00:00:00+00");
+		const cp2 = await persistCheckpoint(s, "2026-09-15 00:00:00+00");
+
+		const reviewSet1 = await buildBudgetV2RecommendationReviewSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cp1.pe,
+		});
+		const reviewSet2 = await buildBudgetV2RecommendationReviewSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cp2.pe,
+		});
+
+		const rec1 = reviewSet1.recommendations[0]!;
+		const rec2 = reviewSet2.recommendations[0]!;
+
+		// Submit CREATE feedback concurrently with the SAME idempotencyKey but different recommendations/anchors
+		const crossAnchorResults = await Promise.allSettled([
+			createBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				throughPaymentEventId: cp1.pe,
+				recommendationId: rec1.recommendationId,
+				expectedRecommendationFingerprint: rec1.recommendationFingerprint,
+				decision: "ACCEPT",
+				idempotencyKey: "fb-cross-anchor-key-1",
+				occurredAt: at("2026-09-15T12:00:00Z"),
+			}),
+			createBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				throughPaymentEventId: cp2.pe,
+				recommendationId: rec2.recommendationId,
+				expectedRecommendationFingerprint: rec2.recommendationFingerprint,
+				decision: "IGNORE",
+				idempotencyKey: "fb-cross-anchor-key-1",
+				occurredAt: at("2026-09-15T12:00:00Z"),
+			}),
+		]);
+
+		const fulfilled = crossAnchorResults.filter((r) => r.status === "fulfilled");
+		const rejected = crossAnchorResults.filter((r) => r.status === "rejected");
+
+		eqC(
+			fulfilled.length,
+			1,
+			"6C.2/A: exactly one winner in cross-checkpoint concurrent same-key CREATE",
+		);
+		eqC(
+			rejected.length,
+			1,
+			"6C.2/A: exactly one rejected in cross-checkpoint concurrent same-key CREATE",
+		);
+
+		const rejectedResult = rejected[0] as PromiseRejectedResult;
+		const err = rejectedResult?.reason as S;
+
+		eqC(
+			err?.code,
+			"BUDGET_IDEMPOTENCY_CONFLICT",
+			"6C.2/A: loser gets well-classified BUDGET_IDEMPOTENCY_CONFLICT",
+		);
+
+		const errMsg = String(err?.message || "");
+		const isRawError =
+			/23505|duplicate key|unique constraint|25P02|current transaction is aborted/i.test(
+				errMsg,
+			);
+		eqC(
+			isRawError,
+			false,
+			"6C.2/D,E: no raw 23505 or 25P02 / aborted transaction error emitted",
+		);
+
+		// Verify exactly one revision exists with this idempotency key
+		const revsInDb = await s.q(
+			`select count(*)::int as c from budget_v2_recommendation_feedback_revisions where user_id = $1 and idempotency_key = $2`,
+			[U1, "fb-cross-anchor-key-1"],
+		);
+		eqC(
+			revsInDb.rows[0].c,
+			1,
+			"6C.2/B: exactly one revision exists durably under the shared idempotency key",
+		);
+
+		// Winning revision can be queried and verified cleanly
+		const winnerRev = (fulfilled[0] as PromiseFulfilledResult<any>).value;
+		const latestWinner = await getLatestBudgetV2RecommendationFeedback({
+			db: s.db,
+			userId: U1,
+			recommendationId: winnerRev.instance.recommendationId,
+		});
+		eqC(
+			latestWinner.feedback?.id,
+			winnerRev.revision.id,
+			"6C.2/B: winner's feedback revision is intact and readable",
+		);
+
+		await s.close();
+	}
+
+	// --- Suite 2: Cross-Instance Concurrent Same-Key UPDATE ---
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-6c2-2",
+			occurredAt: at("2026-08-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		await s.origin();
+
+		const cp1 = await persistCheckpoint(s, "2026-09-08 00:00:00+00");
+		const cp2 = await persistCheckpoint(s, "2026-09-15 00:00:00+00");
+
+		const reviewSet1 = await buildBudgetV2RecommendationReviewSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cp1.pe,
+		});
+		const reviewSet2 = await buildBudgetV2RecommendationReviewSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cp2.pe,
+		});
+
+		const rec1 = reviewSet1.recommendations[0]!;
+		const rec2 = reviewSet2.recommendations[0]!;
+
+		// Create initial feedback revisions for both instances (distinct keys)
+		await createBudgetV2RecommendationFeedback(s.db, {
+			userId: U1,
+			throughPaymentEventId: cp1.pe,
+			recommendationId: rec1.recommendationId,
+			expectedRecommendationFingerprint: rec1.recommendationFingerprint,
+			decision: "ACCEPT",
+			idempotencyKey: "fb-inst-init-1",
+			occurredAt: at("2026-09-15T10:00:00Z"),
+		});
+		await createBudgetV2RecommendationFeedback(s.db, {
+			userId: U1,
+			throughPaymentEventId: cp2.pe,
+			recommendationId: rec2.recommendationId,
+			expectedRecommendationFingerprint: rec2.recommendationFingerprint,
+			decision: "ACCEPT",
+			idempotencyKey: "fb-inst-init-2",
+			occurredAt: at("2026-09-15T10:00:00Z"),
+		});
+
+		// Submit concurrent UPDATEs with SAME idempotencyKey across different instances
+		const crossUpdateResults = await Promise.allSettled([
+			updateBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				recommendationId: rec1.recommendationId,
+				expectedRevisionNo: 1,
+				decision: "MODIFY",
+				modification: {
+					type: "NOTE_ONLY",
+					note: "Update instance 1",
+				},
+				idempotencyKey: "fb-cross-inst-upd-key",
+				occurredAt: at("2026-09-15T12:00:00Z"),
+			}),
+			updateBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				recommendationId: rec2.recommendationId,
+				expectedRevisionNo: 1,
+				decision: "IGNORE",
+				idempotencyKey: "fb-cross-inst-upd-key",
+				occurredAt: at("2026-09-15T12:00:00Z"),
+			}),
+		]);
+
+		const fulfilledUpd = crossUpdateResults.filter(
+			(r) => r.status === "fulfilled",
+		);
+		const rejectedUpd = crossUpdateResults.filter(
+			(r) => r.status === "rejected",
+		);
+
+		eqC(
+			fulfilledUpd.length,
+			1,
+			"6C.2/C: exactly one winner in cross-instance concurrent same-key UPDATE",
+		);
+		eqC(
+			rejectedUpd.length,
+			1,
+			"6C.2/C: exactly one rejected in cross-instance concurrent same-key UPDATE",
+		);
+
+		const rejectedUpdResult = rejectedUpd[0] as PromiseRejectedResult;
+		const updErr = rejectedUpdResult?.reason as S;
+
+		eqC(
+			updErr?.code,
+			"BUDGET_IDEMPOTENCY_CONFLICT",
+			"6C.2/C: loser gets well-classified BUDGET_IDEMPOTENCY_CONFLICT",
+		);
+
+		const updErrMsg = String(updErr?.message || "");
+		const isRawUpdError =
+			/23505|duplicate key|unique constraint|25P02|current transaction is aborted/i.test(
+				updErrMsg,
+			);
+		eqC(
+			isRawUpdError,
+			false,
+			"6C.2/D,E: cross-instance update race emits no raw 23505 or 25P02",
+		);
+
+		// Check both revision histories are clean and linear
+		const f1 = await getLatestBudgetV2RecommendationFeedback({
+			db: s.db,
+			userId: U1,
+			recommendationId: rec1.recommendationId,
+		});
+		const f2 = await getLatestBudgetV2RecommendationFeedback({
+			db: s.db,
+			userId: U1,
+			recommendationId: rec2.recommendationId,
+		});
+
+		// One is revision 2, one remains revision 1
+		const revNos = [f1.feedback?.revisionNo, f2.feedback?.revisionNo].sort();
+		eqC(revNos[0], 1, "6C.2/C: loser instance cleanly remains at revision 1");
+		eqC(revNos[1], 2, "6C.2/C: winner instance advanced to revision 2");
+
+		await s.close();
+	}
+
+	// --- Suite 3: Concurrent Identical Same-Key Retries ---
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-6c2-3",
+			occurredAt: at("2026-08-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		await s.origin();
+
+		const cp = await persistCheckpoint(s, "2026-09-15 00:00:00+00");
+
+		const reviewSet = await buildBudgetV2RecommendationReviewSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cp.pe,
+		});
+
+		const rec = reviewSet.recommendations[0]!;
+
+		// 1. Concurrent identical same-key CREATE
+		const [c1, c2] = await Promise.all([
+			createBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				throughPaymentEventId: cp.pe,
+				recommendationId: rec.recommendationId,
+				expectedRecommendationFingerprint: rec.recommendationFingerprint,
+				decision: "ACCEPT",
+				idempotencyKey: "fb-same-create-race",
+				occurredAt: at("2026-09-15T11:00:00Z"),
+			}),
+			createBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				throughPaymentEventId: cp.pe,
+				recommendationId: rec.recommendationId,
+				expectedRecommendationFingerprint: rec.recommendationFingerprint,
+				decision: "ACCEPT",
+				idempotencyKey: "fb-same-create-race",
+				occurredAt: at("2026-09-15T11:00:00Z"),
+			}),
+		]);
+
+		eqC(
+			c1.revision.id,
+			c2.revision.id,
+			"6C.2/F: concurrent identical same-key CREATE returns exact same revision",
+		);
+
+		// 2. Concurrent identical same-key UPDATE
+		const [u1, u2] = await Promise.all([
+			updateBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				recommendationId: rec.recommendationId,
+				expectedRevisionNo: 1,
+				decision: "MODIFY",
+				modification: {
+					type: "NOTE_ONLY",
+					note: "Identical update retry",
+				},
+				idempotencyKey: "fb-same-upd-race",
+				occurredAt: at("2026-09-15T13:00:00Z"),
+			}),
+			updateBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				recommendationId: rec.recommendationId,
+				expectedRevisionNo: 1,
+				decision: "MODIFY",
+				modification: {
+					type: "NOTE_ONLY",
+					note: "Identical update retry",
+				},
+				idempotencyKey: "fb-same-upd-race",
+				occurredAt: at("2026-09-15T13:00:00Z"),
+			}),
+		]);
+
+		eqC(
+			u1.revision.id,
+			u2.revision.id,
+			"6C.2/F: concurrent identical same-key UPDATE returns exact same revision",
+		);
+
+		await s.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -9948,7 +10376,9 @@ if (probed) {
 	await resolverRuntime6B();
 	await resolverRuntime6C();
 	await resolverRuntime6C1();
+	await resolverRuntime6C2();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
+
 
