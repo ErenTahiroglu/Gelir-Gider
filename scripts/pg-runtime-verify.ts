@@ -11407,6 +11407,550 @@ async function resolverRuntime6D() {
 	}
 }
 
+async function resolverRuntime7A() {
+	console.log(
+		"\n== PHASE 7A: PRODUCT INTEGRATION BOUNDARY -- Decision Center read model (drizzle / PGlite) ==",
+	);
+
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+	const { maybeEnqueueBudgetV2CheckpointRequest } = await import(
+		"../src/budget/checkpoint-request-v2.ts"
+	);
+	const { processPendingBudgetV2CheckpointRequests } = await import(
+		"../src/budget/checkpoint-processor-v2.ts"
+	);
+	const { createCheckpointTriggerCard } = await import(
+		"../src/budget/checkpoint-trigger-card-v2.ts"
+	);
+	const { buildBudgetV2RecommendationReviewSet } = await import(
+		"../src/budget/behavior-recommendations-review-v2.ts"
+	);
+	const { buildBudgetV2BehaviorProfile } = await import(
+		"../src/budget/behavior-profile-v2.ts"
+	);
+	const {
+		createBudgetV2RecommendationFeedback,
+		updateBudgetV2RecommendationFeedback,
+	} = await import("../src/budget/recommendation-feedback-service-v2.ts");
+	const {
+		BUDGET_V2_PRODUCT_API_VERSION,
+		BudgetV2DecisionCenterError,
+		buildBudgetV2CheckpointTimeline,
+		buildBudgetV2DecisionCenterView,
+	} = await import("../src/budget/decision-center-v2.ts");
+
+	const at = (iso: string) => new Date(iso);
+	const canon = (v: unknown) => JSON.stringify(v);
+	const eqD = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+	const countRows = async (s: S, table: string) =>
+		(
+			await s.q(`select count(*)::int as n from ${table} where user_id = $1`, [
+				U1,
+			])
+		).rows[0].n as number;
+
+	let seq7a = 0;
+	const persistCheckpointAtDate = async (
+		s: S,
+		payIso: string,
+		reconIso: string,
+		amount = "500.00",
+	) => {
+		seq7a++;
+		const sid = `87a00000-0000-4000-8000-0000000${seq7a.toString().padStart(5, "0")}`;
+		await s.replica();
+		const r1 = await s.mkStmt(sid, amount, (seq7a % 12) + 1);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: `rc-7a-${seq7a}`,
+			occurredAt: at(reconIso),
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe, r } = await s.mkPay(sid, r1, amount, 2, payIso);
+		await s.origin();
+		await s.db.transaction((tx: S) =>
+			maybeEnqueueBudgetV2CheckpointRequest({
+				tx,
+				userId: U1,
+				statementId: sid,
+				creditCardId: s.CARD,
+				paymentEventId: pe,
+				payRevisionId: r,
+				occurredAt: at(payIso.replace(" ", "T").replace("+00", "Z")),
+			}),
+		);
+		await processPendingBudgetV2CheckpointRequests({ db: s.db });
+		return { pe, sid };
+	};
+
+	const SWEEP = "UNUSED_DISCRETIONARY_SWEEP_REVIEW";
+	const findSweep = (items: Array<{ recommendation: { kind: string } }>) =>
+		items.find((i) => i.recommendation.kind === SWEEP);
+
+	// =====================================================================
+	// Suite 1 -- timeline + Decision Center composition, temporal scopes,
+	//            historical/live immunity, current-feedback separation
+	// =====================================================================
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-7a-1",
+			occurredAt: at("2026-07-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-08-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-09-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-10-01 00:00:00+00");
+		await s.origin();
+
+		const RC = "2026-07-25T00:00:00Z";
+		const c1 = await persistCheckpointAtDate(s, "2026-08-05 00:00:00+00", RC);
+		const c2 = await persistCheckpointAtDate(s, "2026-08-19 00:00:00+00", RC);
+		const cT = await persistCheckpointAtDate(s, "2026-09-26 00:00:00+00", RC);
+		const cU = await persistCheckpointAtDate(s, "2026-10-04 00:00:00+00", RC);
+
+		// ---- B: timeline returns ONLY this user's checkpoints, metadata only
+		const timeline = await buildBudgetV2CheckpointTimeline({
+			db: s.db,
+			userId: U1,
+		});
+		eqD(
+			timeline.apiVersion,
+			BUDGET_V2_PRODUCT_API_VERSION,
+			"7A/5: timeline carries the product API version",
+		);
+		eqD(timeline.checkpoints.length, 4, "7A/B: timeline lists all 4 persisted checkpoints");
+		eqD(
+			canon(timeline.checkpoints.map((c) => c.paymentEventId)),
+			canon([cU.pe, cT.pe, c2.pe, c1.pe]),
+			"7A/7: timeline ordered checkpointAt DESC",
+		);
+		eqD(
+			canon(timeline.checkpoints.map((c) => c.checkpointAt)),
+			canon([
+				"2026-10-04T00:00:00.000Z",
+				"2026-09-26T00:00:00.000Z",
+				"2026-08-19T00:00:00.000Z",
+				"2026-08-05T00:00:00.000Z",
+			]),
+			"7A/7: timeline checkpointAt values are the persisted instants, newest first",
+		);
+		chkD(
+			timeline.checkpoints.every(
+				(c) =>
+					canon(Object.keys(c).sort()) ===
+					canon(["checkpointAt", "paymentEventId", "periodMonth"]),
+			),
+			"7A/C: every timeline row is bounded metadata (no report JSON)",
+		);
+		chkD(
+			!canon(timeline).includes("trueSurplus") &&
+				!canon(timeline).includes("reportJson") &&
+				!canon(timeline).includes("\"mtd\""),
+			"7A/C: timeline payload contains no frozen-report fields",
+		);
+		eqD(
+			timeline.sharedMaxCheckpointAt,
+			false,
+			"7A/19: no shared max checkpointAt in this history",
+		);
+
+		const bogusTimeline = await buildBudgetV2CheckpointTimeline({
+			db: s.db,
+			userId: U_BOGUS,
+		});
+		eqD(
+			bogusTimeline.checkpoints.length,
+			0,
+			"7A/B: another user's timeline is empty (cross-user isolation)",
+		);
+
+		// ---- limit validation
+		let limitThrew = "";
+		try {
+			await buildBudgetV2CheckpointTimeline({
+				db: s.db,
+				userId: U1,
+				limit: 0,
+			});
+		} catch (e) {
+			limitThrew = (e as { code?: string }).code ?? "";
+		}
+		eqD(
+			limitThrew,
+			"BUDGET_V2_PRODUCT_INVALID_INPUT",
+			"7A/D: a malformed limit is rejected by the facade",
+		);
+		const limited = await buildBudgetV2CheckpointTimeline({
+			db: s.db,
+			userId: U1,
+			limit: 2,
+		});
+		eqD(limited.checkpoints.length, 2, "7A/D: a bounded limit is honoured");
+
+		// ---- E/I/J/K/L/M: Decision Center for an explicit owned checkpoint
+		const view = await buildBudgetV2DecisionCenterView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		eqD(view.apiVersion, BUDGET_V2_PRODUCT_API_VERSION, "7A/5: view API version");
+		eqD(view.target.paymentEventId, cT.pe, "7A/E: view targets the explicit paymentEventId");
+		eqD(
+			view.checkpoint.temporalScope,
+			"FROZEN_AT_CHECKPOINT",
+			"7A/I: checkpoint report scope is FROZEN_AT_CHECKPOINT",
+		);
+		eqD(
+			view.behavior.temporalScope,
+			"AS_OF_CHECKPOINT",
+			"7A/J: behavior scope is AS_OF_CHECKPOINT",
+		);
+		eqD(
+			view.recommendations.generationScope,
+			"AS_OF_CHECKPOINT",
+			"7A/K: recommendation generation scope is AS_OF_CHECKPOINT",
+		);
+		eqD(
+			view.recommendations.adaptationScope,
+			"AS_OF_CHECKPOINT",
+			"7A/L: adaptation scope is AS_OF_CHECKPOINT",
+		);
+		eqD(
+			view.recommendations.feedbackStatusScope,
+			"CURRENT",
+			"7A/M: feedback review status scope is CURRENT",
+		);
+
+		// ---- I: frozen report is exactly the persisted report_json
+		const stored = (
+			await s.q(
+				"select report_json from budget_v2_checkpoint_snapshots where payment_event_id = $1",
+				[cT.pe],
+			)
+		).rows[0].report_json;
+		eqD(
+			canon(view.checkpoint.report),
+			canon(stored),
+			"7A/I: view.checkpoint.report === persisted frozen report_json",
+		);
+
+		// ---- J: behavior profile === 6A builder output for the same target
+		const profile = await buildBudgetV2BehaviorProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		eqD(
+			canon(view.behavior.profile),
+			canon(profile),
+			"7A/J: view.behavior.profile === buildBudgetV2BehaviorProfile output",
+		);
+
+		// ---- AI: 6B order / priority / count preserved through the adapted view
+		const baseSet = await buildBudgetV2RecommendationReviewSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		eqD(
+			canon(
+				view.recommendations.view.items.map((i) => i.recommendation.recommendationId),
+			),
+			canon(baseSet.recommendations.map((r) => r.recommendationId)),
+			"7A/AI: adapted view keeps the exact 6B recommendation order",
+		);
+		eqD(
+			canon(view.recommendations.view.items.map((i) => i.recommendation.priority)),
+			canon(baseSet.recommendations.map((r) => r.priority)),
+			"7A/AI: adapted view keeps the exact 6B priorities",
+		);
+		chkD(
+			view.recommendations.view.items.length <= 3,
+			"7A/AJ: adapted view never exceeds the 6B max-3",
+		);
+
+		// ---- F/G: unknown / cross-user target -> NOT_FOUND (indistinguishable)
+		let nfThrew = "";
+		try {
+			await buildBudgetV2DecisionCenterView({
+				db: s.db,
+				userId: U1,
+				throughPaymentEventId: "90000000-0000-4000-8000-00000000dead",
+			});
+		} catch (e) {
+			nfThrew = (e as { code?: string }).code ?? "";
+		}
+		eqD(
+			nfThrew,
+			"BUDGET_V2_CHECKPOINT_NOT_FOUND",
+			"7A/G: an unknown paymentEventId is a typed not-found",
+		);
+		let xuThrew = "";
+		try {
+			await buildBudgetV2DecisionCenterView({
+				db: s.db,
+				userId: U_BOGUS,
+				throughPaymentEventId: cT.pe,
+			});
+		} catch (e) {
+			xuThrew = (e as { code?: string }).code ?? "";
+		}
+		eqD(
+			xuThrew,
+			"BUDGET_V2_CHECKPOINT_NOT_FOUND",
+			"7A/F: another user's checkpoint is not-found, not a distinct error",
+		);
+		chkD(
+			new BudgetV2DecisionCenterError(
+				"BUDGET_V2_CHECKPOINT_NOT_FOUND",
+				"x",
+			) instanceof Error,
+			"7A/16: BudgetV2DecisionCenterError is a real Error subclass",
+		);
+
+		// ---- N: a later live-financial mutation cannot change historical truth
+		const v1 = canon(
+			await buildBudgetV2DecisionCenterView({
+				db: s.db,
+				userId: U1,
+				throughPaymentEventId: cT.pe,
+			}),
+		);
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "999999.00", "2026-09-15 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "888888.00", "2026-10-20 00:00:00+00");
+		await s.origin();
+		const v2 = canon(
+			await buildBudgetV2DecisionCenterView({
+				db: s.db,
+				userId: U1,
+				throughPaymentEventId: cT.pe,
+			}),
+		);
+		eqD(v1, v2, "7A/N: live income/card mutation does not alter the historical Decision Center");
+
+		// ---- O/P/U/V: CURRENT feedback status changes; history/adaptation do not
+		const finTables = [
+			"canonical_transactions",
+			"credit_card_liability_events",
+			"income_receipts",
+			"budget_v2_surplus_use_attribution_revisions",
+		];
+		const finTablesBefore: number[] = [];
+		for (const t of finTables) finTablesBefore.push(await countRows(s, t));
+
+		const before = await buildBudgetV2DecisionCenterView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		const sweepBefore = findSweep(before.recommendations.view.items);
+		chkD(!!sweepBefore, "7A/O: the sweep recommendation is shown at cT");
+		eqD(sweepBefore?.status, "UNRESPONDED", "7A/O: it starts UNRESPONDED");
+
+		const recId = sweepBefore?.recommendation.recommendationId as string;
+		const fpr = sweepBefore?.recommendation.recommendationFingerprint as string;
+		const createRes = await createBudgetV2RecommendationFeedback(s.db, {
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+			recommendationId: recId,
+			expectedRecommendationFingerprint: fpr,
+			decision: "ACCEPT",
+			idempotencyKey: "fb-7a-1",
+			occurredAt: at("2026-09-27T10:00:00Z"),
+		});
+		eqD(createRes.revision.revisionNo, 1, "7A/P: CREATE feedback through the service succeeds (rev 1)");
+
+		const after = await buildBudgetV2DecisionCenterView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		eqD(
+			canon(after.checkpoint),
+			canon(before.checkpoint),
+			"7A/O: frozen checkpoint report unchanged after later feedback",
+		);
+		eqD(
+			canon(after.behavior),
+			canon(before.behavior),
+			"7A/O: behavior profile unchanged after later feedback",
+		);
+		eqD(
+			canon(after.recommendations.view.feedbackPreferenceProfile),
+			canon(before.recommendations.view.feedbackPreferenceProfile),
+			"7A/O: learned feedback adaptation unchanged after later feedback",
+		);
+		eqD(
+			canon(
+				after.recommendations.view.items.map((i) => i.feedbackAdaptation),
+			),
+			canon(
+				before.recommendations.view.items.map((i) => i.feedbackAdaptation),
+			),
+			"7A/O: per-item adaptation unchanged after later feedback",
+		);
+		eqD(
+			findSweep(after.recommendations.view.items)?.status,
+			"ACCEPT",
+			"7A/O: only the CURRENT review status flips to ACCEPT",
+		);
+
+		// ---- U: UPDATE appends a revision; the current status follows it
+		const updRes = await updateBudgetV2RecommendationFeedback(s.db, {
+			userId: U1,
+			recommendationId: recId,
+			expectedRevisionNo: 1,
+			decision: "IGNORE",
+			idempotencyKey: "fb-7a-2",
+			occurredAt: at("2026-09-28T10:00:00Z"),
+		});
+		eqD(updRes.revision.revisionNo, 2, "7A/U: UPDATE feedback appends revision 2");
+		const afterUpd = await buildBudgetV2DecisionCenterView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cT.pe,
+		});
+		eqD(
+			findSweep(afterUpd.recommendations.view.items)?.status,
+			"IGNORE",
+			"7A/U: current status follows the latest revision",
+		);
+
+		// ---- V: a stale expectedRevisionNo is rejected
+		let staleThrew = "";
+		try {
+			await updateBudgetV2RecommendationFeedback(s.db, {
+				userId: U1,
+				recommendationId: recId,
+				expectedRevisionNo: 1,
+				decision: "ACCEPT",
+				idempotencyKey: "fb-7a-3",
+				occurredAt: at("2026-09-29T10:00:00Z"),
+			});
+		} catch (e) {
+			staleThrew = (e as { code?: string }).code ?? "";
+		}
+		eqD(
+			staleThrew,
+			"BUDGET_REVISION_CONFLICT",
+			"7A/V: a stale expectedRevisionNo is a revision conflict",
+		);
+
+		// ---- AC/AD/AE: no financial execution through the feedback lifecycle
+		const finTablesAfter: number[] = [];
+		for (const t of finTables) finTablesAfter.push(await countRows(s, t));
+		eqD(
+			canon(finTablesAfter),
+			canon(finTablesBefore),
+			"7A/AC-AD: ACCEPT/IGNORE feedback creates no canonical/ledger/settlement/attribution row",
+		);
+
+		// ---- AE: an IGNORE never removes the recommendation from a later checkpoint
+		const laterView = await buildBudgetV2DecisionCenterView({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: cU.pe,
+		});
+		chkD(
+			!!findSweep(laterView.recommendations.view.items),
+			"7A/AE: an IGNORE on an earlier checkpoint never suppresses a later checkpoint's recommendation",
+		);
+
+		await s.close();
+	}
+
+	// =====================================================================
+	// Suite 2 -- corrupt persisted snapshot fails the Decision Center closed
+	// =====================================================================
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-7a-2",
+			occurredAt: at("2026-07-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-08-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-09-01 00:00:00+00");
+		await s.origin();
+		const cx = await persistCheckpointAtDate(
+			s,
+			"2026-09-20 00:00:00+00",
+			"2026-07-25T00:00:00Z",
+		);
+
+		await s.replica();
+		await s.q(
+			`update budget_v2_checkpoint_snapshots
+			   set report_json = jsonb_set(report_json, '{mtd,budget,policyOutput,trueSurplus}', '"999999.00"'::jsonb)
+			 where payment_event_id = $1`,
+			[cx.pe],
+		);
+		await s.origin();
+
+		let cvThrew = "";
+		try {
+			await buildBudgetV2DecisionCenterView({
+				db: s.db,
+				userId: U1,
+				throughPaymentEventId: cx.pe,
+			});
+		} catch (e) {
+			cvThrew = (e as { code?: string }).code ?? "";
+		}
+		eqD(
+			cvThrew,
+			"BUDGET_CHECKPOINT_SNAPSHOT_CORRUPT",
+			"7A/H: a tampered persisted snapshot fails the Decision Center closed",
+		);
+
+		let tlThrew = "";
+		try {
+			await buildBudgetV2CheckpointTimeline({ db: s.db, userId: U1 });
+		} catch (e) {
+			tlThrew = (e as { code?: string }).code ?? "";
+		}
+		eqD(
+			tlThrew,
+			"BUDGET_CHECKPOINT_SNAPSHOT_CORRUPT",
+			"7A/H: the timeline also fails closed on a corrupt row (never a silent drop)",
+		);
+
+		await s.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -11428,6 +11972,7 @@ if (probed) {
 	await resolverRuntime6C1();
 	await resolverRuntime6C2();
 	await resolverRuntime6D();
+	await resolverRuntime7A();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

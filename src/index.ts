@@ -17,6 +17,7 @@ import {
 } from "./config/env";
 import { createDatabase } from "./db/client";
 import { authRouter } from "./http/auth-routes";
+import { budgetV2Router } from "./http/budget-v2-routes";
 import type { RequestIdVariables } from "./http/security-middleware";
 import {
 	requestIdMiddleware,
@@ -88,6 +89,7 @@ app.get("/ready", async (c) => {
 });
 
 app.route("/auth", authRouter);
+app.route("/budget-v2", budgetV2Router);
 
 app.notFound((c) => {
 	return c.json(
