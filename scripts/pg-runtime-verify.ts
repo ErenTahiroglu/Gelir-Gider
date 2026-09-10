@@ -8655,6 +8655,189 @@ async function resolverRuntime6A() {
 	}
 }
 
+async function resolverRuntime6B() {
+	console.log(
+		"\n== PHASE 6B: DETERMINISTIC RECOMMENDATION ENGINE -- persisted-profile authority ==",
+	);
+	const { reconcileStatement } = await import(
+		"../src/credit-cards/statement-reconciliation.ts"
+	);
+	const { maybeEnqueueBudgetV2CheckpointRequest } = await import(
+		"../src/budget/checkpoint-request-v2.ts"
+	);
+	const { processPendingBudgetV2CheckpointRequests } = await import(
+		"../src/budget/checkpoint-processor-v2.ts"
+	);
+	const { createCheckpointTriggerCard } = await import(
+		"../src/budget/checkpoint-trigger-card-v2.ts"
+	);
+	const { buildBudgetV2BehaviorProfile } = await import(
+		"../src/budget/behavior-profile-v2.ts"
+	);
+	const { buildBudgetV2RecommendationSet, generateBudgetV2Recommendations } =
+		await import("../src/budget/behavior-recommendations-v2.ts");
+	const { canonicalJsonStringify } = await import(
+		"../src/budget/checkpoint-canonical-v2.ts"
+	);
+
+	const RECON = new Date("2026-09-01T00:00:00Z");
+	const at = (iso: string) => new Date(iso);
+	const SEP5 = "2026-09-05 00:00:00+00";
+	const eqB = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `-> got ${JSON.stringify(a)} want ${JSON.stringify(b)}`);
+	const chkB = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	// biome-ignore lint/suspicious/noExplicitAny: test scaffolding
+	type S = any;
+
+	let seq = 0;
+	const persistCheckpoint = async (s: S, payIso: string) => {
+		seq++;
+		const sid = `86b00000-0000-4000-8000-0000000006b${seq}`;
+		const amount = "400.00";
+		await s.replica();
+		const r1 = await s.mkStmt(sid, amount, 3 + seq);
+		await s.origin();
+		await reconcileStatement({
+			db: s.db,
+			userId: U1,
+			statementId: sid,
+			statementRevisionId: r1,
+			idempotencyKey: `rc-6b-${seq}`,
+			occurredAt: RECON,
+			components: [
+				{
+					componentType: "ADJUSTMENT",
+					amount,
+					ownership: "PERSONAL",
+					adjustmentKind: "OTHER",
+				},
+			],
+		});
+		await s.replica();
+		const { pe, r } = await s.mkPay(sid, r1, amount, 2, payIso);
+		await s.origin();
+		await s.db.transaction((tx: S) =>
+			maybeEnqueueBudgetV2CheckpointRequest({
+				tx,
+				userId: U1,
+				statementId: sid,
+				creditCardId: s.CARD,
+				paymentEventId: pe,
+				payRevisionId: r,
+				occurredAt: at(payIso.replace(" ", "T").replace("+00", "Z")),
+			}),
+		);
+		await processPendingBudgetV2CheckpointRequests({ db: s.db });
+		return { pe, sid };
+	};
+
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-6b",
+			occurredAt: at("2026-08-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", SEP5);
+		await s.origin();
+
+		await persistCheckpoint(s, "2026-09-08 00:00:00+00");
+		const b = await persistCheckpoint(s, "2026-09-15 00:00:00+00");
+
+		const set1 = await buildBudgetV2RecommendationSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		eqB(
+			set1.engineVersion,
+			"budget-v2-recommendation-engine-v1",
+			"6B: the recommendation set is pinned to recommendation-engine v1",
+		);
+		eqB(
+			set1.generatedFrom.behaviorEngineVersion,
+			"budget-v2-behavior-engine-v1",
+			"6B: provenance records the Behavior Engine version it was generated from",
+		);
+		eqB(
+			set1.through.paymentEventId,
+			b.pe,
+			"6B: the recommendation set is anchored on the target persisted checkpoint",
+		);
+		chkB(
+			set1.recommendationCount === set1.recommendations.length &&
+				set1.recommendationCount <= 3 &&
+				set1.eligibleCandidateCount >= set1.recommendationCount &&
+				set1.suppressedCount ===
+					set1.eligibleCandidateCount - set1.recommendationCount,
+			"6B: max-3 shown; eligible / shown / suppressed counts are consistent",
+		);
+		chkB(
+			set1.recommendations.every(
+				(r) =>
+					r.requiresUserApproval === true &&
+					r.automaticExecution === false &&
+					r.mutatesPolicy === false &&
+					r.proposedAction.action.startsWith("REVIEW_") &&
+					r.recommendationId ===
+						`budget-v2-rec:v1:${b.pe}:${r.kind}:${r.scope}`,
+			),
+			"6B/AG-AI+AF: every recommendation is review-only, non-executing, non-mutating, with a deterministic composite id",
+		);
+
+		// -- AJ: the set builder is exactly (build profile) -> (pure generate) --
+		const profile = await buildBudgetV2BehaviorProfile({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		const fp = canonicalJsonStringify(set1);
+		eqB(
+			canonicalJsonStringify(generateBudgetV2Recommendations(profile)),
+			fp,
+			"6B/AJ: buildBudgetV2RecommendationSet performs no work beyond profile construction + the pure generator",
+		);
+
+		// -- AD + AE + item 16: historical immunity to later live mutation ------
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "500000.00", SEP5);
+		await s.q(
+			`update credit_card_liability_event_revisions set amount = '9999.00' where user_id = $1`,
+			[U1],
+		);
+		await s.origin();
+		const set2 = await buildBudgetV2RecommendationSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		eqB(
+			canonicalJsonStringify(set2),
+			fp,
+			"6B/AD+AE: the historical recommendation set is byte-identical after a large unrelated live mutation",
+		);
+		const set3 = await buildBudgetV2RecommendationSet({
+			db: s.db,
+			userId: U1,
+			throughPaymentEventId: b.pe,
+		});
+		eqB(
+			canonicalJsonStringify(set3),
+			fp,
+			"6B: the same target yields a deterministically identical recommendation set",
+		);
+		await s.close();
+	}
+}
+
 
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
@@ -8672,6 +8855,7 @@ if (probed) {
 	await resolverRuntime5B();
 	await resolverRuntime5B1();
 	await resolverRuntime6A();
+	await resolverRuntime6B();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
