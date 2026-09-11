@@ -13989,6 +13989,587 @@ async function resolverRuntime7B2R2() {
 	}
 }
 
+async function resolverRuntime7B3() {
+	console.log("\n--- Phase 7B.3: Credit Cards Product HTTP Surface & Cross-User Runtime Proof ---");
+	const pg = new PGlite();
+	await pg.exec("create extension if not exists \"pgcrypto\";");
+	await pg.exec("create extension if not exists \"uuid-ossp\";");
+
+	// Run migration chain 0000..0071
+	for (let i = 0; i <= 71; i++) {
+		const prefix = String(i).padStart(4, "0");
+		const file = (await import("node:fs")).readdirSync(migDir).find((f) => f.startsWith(prefix));
+		if (!file) throw new Error(`Missing migration for prefix ${prefix}`);
+		const sql = (await import("node:fs")).readFileSync(path.join(migDir, file), "utf8");
+		await pg.exec(sql);
+	}
+
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const db = drizzle(pg);
+
+	setDatabaseFactoryOverrideForTest(() => db);
+
+	try {
+		const testEnv: AppEnv = {
+			DATABASE_URL: "postgres://fake-pglite/db",
+			WEBAUTHN_RP_ID: "localhost",
+			WEBAUTHN_RP_NAME: "Gelir Gider Test",
+			WEBAUTHN_ORIGIN: "http://localhost:8787",
+		};
+
+		const USER_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+		const USER_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+		// Seed genuine User A and User B in the SAME database
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now()), ($2, 'User B', 'TRY', 'Europe/Istanbul', now())",
+			[USER_A, USER_B],
+		);
+
+		const { token: tokenA } = await createSession({ db, userId: USER_A });
+		const { token: tokenB } = await createSession({ db, userId: USER_B });
+
+		const httpCall = async (
+			path: string,
+			opts: {
+				method: string;
+				body?: unknown;
+				token?: string;
+				idempotencyKey?: string;
+				origin?: string;
+			},
+		) => {
+			const headers: Record<string, string> = {};
+			if (opts.token) {
+				headers.Cookie = `__Host-gg_session=${opts.token}`;
+			}
+			if (opts.origin !== undefined) {
+				headers.Origin = opts.origin;
+			} else if (opts.method !== "GET" && opts.method !== "HEAD") {
+				headers.Origin = "http://localhost:8787";
+			}
+			if (opts.idempotencyKey) {
+				headers["Idempotency-Key"] = opts.idempotencyKey;
+			}
+			if (opts.body !== undefined) {
+				headers["Content-Type"] = "application/json";
+			}
+			const res = await app.request(
+				path,
+				{
+					method: opts.method,
+					headers,
+					body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+				},
+				testEnv,
+			);
+			let json: any = null;
+			try {
+				json = await res.json();
+			} catch {
+				// no-op
+			}
+			return { status: res.status, json, headers: res.headers };
+		};
+
+		// 1. User A Provisions funding accounts (Bank Asset + Initial 10,000.00 TRY Deposit)
+		const bankAccountRes = await httpCall("/ledger/accounts", {
+			method: "POST",
+			token: tokenA,
+			body: {
+				code: "BANK_ASSET",
+				name: "User A Bank Account",
+				accountType: "ASSET",
+			},
+		});
+		eqD(bankAccountRes.status, 200, "7B.3/1: User A funding account creation returns 200");
+		const bankAccountId = bankAccountRes.json?.accountId;
+		chkD(typeof bankAccountId === "string" && bankAccountId.length > 0, "7B.3/1: valid bankAccountId returned");
+
+		const salaryAccountRes = await httpCall("/ledger/accounts", {
+			method: "POST",
+			token: tokenA,
+			body: {
+				code: "SALARY_INC",
+				name: "User A Salary",
+				accountType: "INCOME",
+			},
+		});
+		eqD(salaryAccountRes.status, 200, "7B.3/1: User A salary account creation returns 200");
+		const salaryAccountId = salaryAccountRes.json?.accountId;
+
+		const sourceRes = await httpCall("/income/sources", {
+			method: "POST",
+			token: tokenA,
+			body: {
+				code: "tech_salary",
+				name: "Tech Corp",
+				nature: "REGULAR",
+				referenceMethod: "FIXED_MONTHLY",
+				expectedMonthlyAmount: "10000.00",
+				incomeLedgerAccountId: salaryAccountId,
+				activeFrom: "2026-01-01",
+			},
+		});
+		eqD(sourceRes.status, 200, "7B.3/1: User A income source returns 200");
+		const sourceId = sourceRes.json?.sourceId;
+
+		const receiptRes = await httpCall("/income/receipts", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-init-deposit-1",
+			body: {
+				sourceId,
+				receivedAt: "2026-09-01T10:00:00.000Z",
+				amount: "10000.00",
+				destinationAccountId: bankAccountId,
+				note: "Initial Bank Balance",
+			},
+		});
+		eqD(receiptRes.status, 200, "7B.3/1: User A income receipt deposited 10000.00 TRY into bankAccount");
+
+		const bankBalInitial = await httpCall(`/ledger/accounts/${bankAccountId}/balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(bankBalInitial.json?.balance, "10000.00", "7B.3/1: User A bank balance is verified 10000.00 TRY");
+
+		// Seed Midas account for User A
+		const midasAccId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+		await pg.query(
+			"insert into midas_accounts (id, user_id, ledger_account_id) values ($1, $2, $3)",
+			[midasAccId, USER_A, bankAccountId],
+		);
+
+		// 2. User A Creates Credit Card via POST /credit-cards
+		const cardCreateRes = await httpCall("/credit-cards", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-card-create-1",
+			body: {
+				code: "BONUS_CARD",
+				displayName: "Garanti Bonus",
+				issuer: "Garanti BBVA",
+				statementDay: 15,
+				dueDay: 25,
+				creditLimit: "50000.00",
+				lastFour: "1234",
+				occurredAt: "2026-09-01T12:00:00.000Z",
+			},
+		});
+		eqD(cardCreateRes.status, 200, "7B.3/2: POST /credit-cards returns 200");
+		const cardId = cardCreateRes.json?.cardId;
+		chkD(typeof cardId === "string" && cardId.length > 0, "7B.3/2: valid cardId returned");
+		eqD(cardCreateRes.json?.revisionNo, 1, "7B.3/2: initial revisionNo is 1");
+		eqD(cardCreateRes.json?.status, "ACTIVE", "7B.3/2: card status is ACTIVE");
+
+		// 3. User A Lists & Reads Card via HTTP
+		const listCardsRes = await httpCall("/credit-cards", { method: "GET", token: tokenA });
+		eqD(listCardsRes.status, 200, "7B.3/3: GET /credit-cards returns 200");
+		eqD(listCardsRes.json?.cards?.length, 1, "7B.3/3: User A has 1 credit card");
+		eqD(listCardsRes.json?.cards[0].code, "BONUS_CARD", "7B.3/3: listed card code is BONUS_CARD");
+
+		const getCardRes = await httpCall(`/credit-cards/${cardId}`, { method: "GET", token: tokenA });
+		eqD(getCardRes.status, 200, "7B.3/3: GET /credit-cards/:id returns 200");
+		eqD(getCardRes.json?.card?.cardId, cardId, "7B.3/3: correct card record returned");
+
+		// 4. User A Updates Card with OCC (expectedRevisionNo = 1)
+		const updateCardRes = await httpCall(`/credit-cards/${cardId}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-card-update-1",
+			body: {
+				expectedRevisionNo: 1,
+				displayName: "Garanti Bonus Platinum",
+				issuer: "Garanti BBVA",
+				statementDay: 15,
+				dueDay: 25,
+				creditLimit: "60000.00",
+				lastFour: "1234",
+				changeReason: "Limit upgrade",
+				occurredAt: "2026-09-02T10:00:00.000Z",
+			},
+		});
+		eqD(updateCardRes.status, 200, "7B.3/4: POST /credit-cards/:id updates card with OCC (200)");
+		eqD(updateCardRes.json?.revisionNo, 2, "7B.3/4: updated revisionNo is 2");
+
+		// 5. User A Records an Unshared Purchase via HTTP POST /credit-cards/:cardId/purchases
+		const purchaseCreateRes = await httpCall(`/credit-cards/${cardId}/purchases`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-purch-create-1",
+			body: {
+				amount: "2000.00",
+				purchaseCategory: "MANDATORY_EXPENSE",
+				merchant: "Supermarket Migros",
+				description: "Monthly Groceries",
+				occurredAt: "2026-09-05T15:00:00.000Z",
+			},
+		});
+		eqD(purchaseCreateRes.status, 200, "7B.3/5: POST /credit-cards/:cardId/purchases returns 200");
+		const eventId = purchaseCreateRes.json?.eventId;
+		chkD(typeof eventId === "string" && eventId.length > 0, "7B.3/5: valid purchase eventId returned");
+		eqD(purchaseCreateRes.json?.status, "POSTED", "7B.3/5: purchase status is POSTED");
+		eqD(purchaseCreateRes.json?.snapshot?.amount, "2000.00", "7B.3/5: purchase amount is 2000.00");
+
+		// 6. User A Reads & Lists Purchases via HTTP
+		const listPurchasesRes = await httpCall(`/credit-cards/${cardId}/purchases`, { method: "GET", token: tokenA });
+		eqD(listPurchasesRes.status, 200, "7B.3/6: GET /credit-cards/:cardId/purchases returns 200");
+		eqD(listPurchasesRes.json?.purchases?.length, 1, "7B.3/6: 1 purchase listed");
+
+		const getPurchaseRes = await httpCall(`/credit-cards/${cardId}/purchases/${eventId}`, { method: "GET", token: tokenA });
+		eqD(getPurchaseRes.status, 200, "7B.3/6: GET /credit-cards/:cardId/purchases/:id returns 200");
+		eqD(getPurchaseRes.json?.purchase?.eventId, eventId, "7B.3/6: purchase record matches eventId");
+
+		// 7. User A Updates Purchase with OCC (expectedRevisionNo = 1) -> 2500.00
+		const updatePurchaseRes = await httpCall(`/credit-cards/${cardId}/purchases/${eventId}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-purch-update-1",
+			body: {
+				expectedRevisionNo: 1,
+				amount: "2500.00",
+				purchaseCategory: "MANDATORY_EXPENSE",
+				merchant: "Supermarket Migros",
+				description: "Monthly Groceries + Electronics",
+				occurredAt: "2026-09-05T16:00:00.000Z",
+			},
+		});
+		eqD(updatePurchaseRes.status, 200, "7B.3/7: POST /credit-cards/:cardId/purchases/:id updates purchase (200)");
+		eqD(updatePurchaseRes.json?.revisionNo, 2, "7B.3/7: purchase revisionNo is 2");
+		eqD(updatePurchaseRes.json?.snapshot?.amount, "2500.00", "7B.3/7: updated amount is 2500.00");
+
+		// 8. User A Creates Statement via POST /credit-cards/:cardId/statements
+		const stmtCreateRes = await httpCall(`/credit-cards/${cardId}/statements`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-stmt-create-1",
+			body: {
+				midasAccountId: midasAccId,
+				cycleMonth: "2026-09",
+				statementAmount: "2500.00",
+				reservePlacement: "OUTSIDE_MIDAS",
+				occurredAt: "2026-09-15T10:00:00.000Z",
+			},
+		});
+		eqD(stmtCreateRes.status, 200, "7B.3/8: POST /credit-cards/:cardId/statements returns 200");
+		const statementId = stmtCreateRes.json?.statementId;
+		chkD(typeof statementId === "string" && statementId.length > 0, "7B.3/8: valid statementId returned");
+		eqD(stmtCreateRes.json?.status, "OPEN", "7B.3/8: statement status is OPEN");
+		eqD(stmtCreateRes.json?.revisionNo, 1, "7B.3/8: statement revisionNo is 1");
+		const stmtRevId = stmtCreateRes.json?.revisionId;
+
+		// 9. Inspect Payment Readiness via GET /credit-cards/:cardId/statements/:id/readiness
+		const readinessRes = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/readiness`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(readinessRes.status, 200, "7B.3/9: GET readiness returns 200");
+		eqD(readinessRes.json?.readiness?.isExactMatch, true, "7B.3/9: readiness isExactMatch is true");
+		eqD(readinessRes.json?.readiness?.isLiabilityCovered, true, "7B.3/9: readiness isLiabilityCovered is true");
+		eqD(readinessRes.json?.readiness?.totalPostedPurchases, "2500.00", "7B.3/9: totalPostedPurchases matches 2500.00");
+
+		// 10. Persist Explicit Reconciliation via POST /credit-cards/:cardId/statements/:id/reconcile
+		const reconRes = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/reconcile`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-recon-1",
+			body: {
+				statementRevisionId: stmtRevId,
+				components: [
+					{
+						componentNo: 1,
+						componentType: "PURCHASE",
+						amount: "2500.00",
+						ownership: "PERSONAL",
+						purchaseEventId: eventId,
+					},
+				],
+				occurredAt: "2026-09-15T12:00:00.000Z",
+			},
+		});
+		eqD(reconRes.status, 200, "7B.3/10: POST explicit reconciliation returns 200");
+		eqD(reconRes.json?.revision?.reconciledStatementAmount, "2500.00", "7B.3/10: reconciledStatementAmount is 2500.00");
+		eqD(reconRes.json?.revision?.sealed, true, "7B.3/10: reconciliation revision is sealed");
+
+		const getReconRes = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/reconciliation`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getReconRes.status, 200, "7B.3/10: GET reconciliation returns 200");
+		eqD(getReconRes.json?.reconciliation?.status, "RECONCILED", "7B.3/10: reconciliation status is RECONCILED");
+		eqD(getReconRes.json?.reconciliation?.personalAmount, "2500.00", "7B.3/10: personalAmount is 2500.00");
+
+		// 11. Statement Payment via POST /credit-cards/:cardId/statements/:id/pay
+		const payRes = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/pay`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-pay-stmt-1",
+			body: {
+				expectedRevisionNo: 1,
+				paymentAmount: "2500.00",
+				outsidePaymentAssetAccountId: bankAccountId,
+				occurredAt: "2026-09-20T10:00:00.000Z",
+			},
+		});
+		eqD(payRes.status, 200, "7B.3/11: POST /credit-cards/:cardId/statements/:id/pay returns 200");
+		eqD(payRes.json?.status, "PAID", "7B.3/11: resulting statement status is PAID");
+		eqD(payRes.json?.paymentAmount, "2500.00", "7B.3/11: paymentAmount is 2500.00");
+		chkD(typeof payRes.json?.journalEntryId === "string", "7B.3/11: journalEntryId created");
+
+		// Verify Bank balance decreased from 10000.00 to 7500.00
+		const bankBalAfterPay = await httpCall(`/ledger/accounts/${bankAccountId}/balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(bankBalAfterPay.json?.balance, "7500.00", "7B.3/11: bank balance after payment is exact 7500.00 TRY");
+
+		// 12. Idempotency Replay & Conflict on Payment
+		const payReplayRes = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/pay`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-pay-stmt-1",
+			body: {
+				expectedRevisionNo: 1,
+				paymentAmount: "2500.00",
+				outsidePaymentAssetAccountId: bankAccountId,
+				occurredAt: "2026-09-20T10:00:00.000Z",
+			},
+		});
+		eqD(payReplayRes.status, 200, "7B.3/12: exact payment replay returns 200");
+		eqD(payReplayRes.json?.idempotentReplay, true, "7B.3/12: payment replay returns idempotentReplay = true");
+
+		const payConflictRes = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/pay`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-pay-stmt-1",
+			body: {
+				expectedRevisionNo: 1,
+				paymentAmount: "1000.00",
+				outsidePaymentAssetAccountId: bankAccountId,
+				occurredAt: "2026-09-20T10:00:00.000Z",
+			},
+		});
+		eqD(payConflictRes.status, 409, "7B.3/12: conflicting payment replay returns 409");
+
+		// Stale OCC payment attempt
+		const payStaleRes = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/pay`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-pay-stmt-stale",
+			body: {
+				expectedRevisionNo: 1,
+				paymentAmount: "2500.00",
+				outsidePaymentAssetAccountId: bankAccountId,
+				occurredAt: "2026-09-20T10:00:00.000Z",
+			},
+		});
+		eqD(payStaleRes.status, 409, "7B.3/12: stale expectedRevisionNo on payment returns 409");
+
+		// 13. Reopen Statement Payment via POST /credit-cards/:cardId/statements/:id/reopen
+		const reopenRes = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/reopen`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-reopen-stmt-1",
+			body: {
+				expectedRevisionNo: 2,
+				reasonNote: "Customer disputed payment with bank",
+				occurredAt: "2026-09-22T10:00:00.000Z",
+			},
+		});
+		eqD(reopenRes.status, 200, "7B.3/13: POST /credit-cards/:cardId/statements/:id/reopen returns 200");
+		eqD(reopenRes.json?.status, "OPEN", "7B.3/13: statement status returned to OPEN");
+		eqD(reopenRes.json?.reopenedPaymentAmount, "2500.00", "7B.3/13: reopenedPaymentAmount is 2500.00");
+		chkD(typeof reopenRes.json?.reversalJournalEntryId === "string", "7B.3/13: reversalJournalEntryId created");
+
+		// Bank balance restored to 10000.00
+		const bankBalAfterReopen = await httpCall(`/ledger/accounts/${bankAccountId}/balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(bankBalAfterReopen.json?.balance, "10000.00", "7B.3/13: bank balance restored to exact 10000.00 TRY after reopen");
+
+		// Replay reopen safely
+		const reopenReplayRes = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/reopen`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "u1-reopen-stmt-1",
+			body: {
+				expectedRevisionNo: 2,
+				reasonNote: "Customer disputed payment with bank",
+				occurredAt: "2026-09-22T10:00:00.000Z",
+			},
+		});
+		eqD(reopenReplayRes.status, 200, "7B.3/13: exact reopen replay returns 200");
+		eqD(reopenReplayRes.json?.idempotentReplay, true, "7B.3/13: reopen replay returns idempotentReplay = true");
+
+		// 14. Same-Database Cross-User Isolation (User B cannot access User A's artifacts)
+		const u2CardGet = await httpCall(`/credit-cards/${cardId}`, { method: "GET", token: tokenB });
+		eqD(u2CardGet.status, 404, "7B.3/14: User B GET User A card returns 404");
+		eqD(u2CardGet.json?.error?.code, "CREDIT_CARD_NOT_FOUND", "7B.3/14: error is typed CREDIT_CARD_NOT_FOUND");
+
+		const u2CardUpdate = await httpCall(`/credit-cards/${cardId}`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-card-upd",
+			body: {
+				expectedRevisionNo: 2,
+				displayName: "Hacked Card",
+				issuer: "Hacker",
+				statementDay: 1,
+				dueDay: 10,
+				creditLimit: "999999.00",
+				occurredAt: "2026-09-23T10:00:00.000Z",
+			},
+		});
+		eqD(u2CardUpdate.status, 404, "7B.3/14: User B POST User A card returns 404");
+
+		const u2CardArchive = await httpCall(`/credit-cards/${cardId}/archive`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-card-arch",
+			body: {
+				expectedRevisionNo: 2,
+				changeReason: "Hacker archive",
+				occurredAt: "2026-09-23T10:00:00.000Z",
+			},
+		});
+		eqD(u2CardArchive.status, 404, "7B.3/14: User B archive User A card returns 404");
+
+		const u2StmtGet = await httpCall(`/credit-cards/${cardId}/statements/${statementId}`, { method: "GET", token: tokenB });
+		eqD(u2StmtGet.status, 404, "7B.3/14: User B GET User A statement returns 404");
+
+		const u2StmtPay = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/pay`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-stmt-pay",
+			body: {
+				expectedRevisionNo: 3,
+				paymentAmount: "2500.00",
+				outsidePaymentAssetAccountId: bankAccountId,
+				occurredAt: "2026-09-23T10:00:00.000Z",
+			},
+		});
+		eqD(u2StmtPay.status, 404, "7B.3/14: User B pay User A statement returns 404");
+
+		const u2StmtReopen = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/reopen`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-stmt-reopen",
+			body: {
+				expectedRevisionNo: 3,
+				reasonNote: "Hacker reopen",
+				occurredAt: "2026-09-23T10:00:00.000Z",
+			},
+		});
+		eqD(u2StmtReopen.status, 404, "7B.3/14: User B reopen User A statement returns 404");
+
+		const u2StmtRecon = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/reconcile`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-stmt-recon",
+			body: {
+				statementRevisionId: stmtRevId,
+				components: [
+					{
+						componentNo: 1,
+						componentType: "PURCHASE",
+						amount: "2500.00",
+						ownership: "PERSONAL",
+						purchaseEventId: eventId,
+					},
+				],
+				occurredAt: "2026-09-23T10:00:00.000Z",
+			},
+		});
+		eqD(u2StmtRecon.status, 404, "7B.3/14: User B reconcile User A statement returns 404");
+
+		const u2PurchGet = await httpCall(`/credit-cards/${cardId}/purchases/${eventId}`, { method: "GET", token: tokenB });
+		eqD(u2PurchGet.status, 404, "7B.3/14: User B GET User A purchase returns 404");
+
+		const u2PurchVoid = await httpCall(`/credit-cards/${cardId}/purchases/${eventId}/void`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-purch-void",
+			body: {
+				expectedRevisionNo: 2,
+				reasonNote: "Hacker void",
+				occurredAt: "2026-09-23T10:00:00.000Z",
+			},
+		});
+		eqD(u2PurchVoid.status, 404, "7B.3/14: User B void User A purchase returns 404");
+
+		// User B creates own card & statement, but tries to pay with User A's bank account
+		const u2CardCreate = await httpCall("/credit-cards", {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-card-1",
+			body: {
+				code: "U2_CARD",
+				displayName: "User B Card",
+				issuer: "Bank B",
+				statementDay: 1,
+				dueDay: 10,
+				creditLimit: "10000.00",
+				occurredAt: "2026-09-01T10:00:00.000Z",
+			},
+		});
+		const u2CardId = u2CardCreate.json?.cardId;
+
+		const midasAccIdB = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+		await pg.query(
+			"insert into midas_accounts (id, user_id, ledger_account_id) values ($1, $2, $3)",
+			[midasAccIdB, USER_B, bankAccountId], // intentionally testing foreign link rejection
+		);
+
+		const u2StmtCreate = await httpCall(`/credit-cards/${u2CardId}/statements`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-stmt-1",
+			body: {
+				midasAccountId: midasAccIdB,
+				cycleMonth: "2026-09",
+				statementAmount: "500.00",
+				reservePlacement: "OUTSIDE_MIDAS",
+				occurredAt: "2026-09-15T10:00:00.000Z",
+			},
+		});
+		const u2StmtId = u2StmtCreate.json?.statementId;
+
+		const u2CrossPay = await httpCall(`/credit-cards/${u2CardId}/statements/${u2StmtId}/pay`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-cross-pay-1",
+			body: {
+				expectedRevisionNo: 1,
+				paymentAmount: "500.00",
+				outsidePaymentAssetAccountId: bankAccountId, // User A's bank account
+				occurredAt: "2026-09-20T10:00:00.000Z",
+			},
+		});
+		chkD(u2CrossPay.status === 400 || u2CrossPay.status === 404, "7B.3/14: User B paying with User A bank account rejected (400/404)");
+
+		// 15. Cross-User Zero Side Effect Proof
+		const bankBalFinal = await httpCall(`/ledger/accounts/${bankAccountId}/balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(bankBalFinal.json?.balance, "10000.00", "7B.3/15: User A bank balance remains exact 10000.00 TRY after all attack attempts");
+
+		const userACardCount = (await pg.query("select count(*)::int as n from credit_cards where user_id = $1", [USER_A])).rows[0].n as number;
+		eqD(userACardCount, 1, "7B.3/15: User A has exactly 1 credit card");
+
+		const userAPurchCount = (await pg.query("select count(*)::int as n from credit_card_liability_events where user_id = $1", [USER_A])).rows[0].n as number;
+		eqD(userAPurchCount, 1, "7B.3/15: User A has exactly 1 purchase event");
+
+		const userAStmtCount = (await pg.query("select count(*)::int as n from credit_card_statements where user_id = $1", [USER_A])).rows[0].n as number;
+		eqD(userAStmtCount, 1, "7B.3/15: User A has exactly 1 statement");
+	} finally {
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -14015,6 +14596,7 @@ if (probed) {
 	await resolverRuntime7B2();
 	await resolverRuntime7B2R1();
 	await resolverRuntime7B2R2();
+	await resolverRuntime7B3();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -529,6 +529,88 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
 | `INCOME_SETTLEMENT_REVISION_CONFLICT` | 409 | Stale expectedRevisionNo on settlement revision |
 | `INCOME_LEDGER_ACCOUNT_INVALID` | 400 | Account does not exist, not owned, or wrong type/currency |
 
+### 5.8 Credit Cards Product Surface (Checkpoint 7B.3)
+
+All routes require session authentication (`__Host-gg_session` cookie) with user identity strictly bound to `c.get("auth").userId`. Mutating POST endpoints require `Origin: <WEBAUTHN_ORIGIN>` and closed bodies.
+
+#### 5.8.1 Credit Cards
+- **`GET /credit-cards`**: Bounded list of user's credit cards. Query parameters: `status` (`"ACTIVE"` | `"ARCHIVED"`), `limit` (default 50, max 100), `after` (card UUID cursor).
+- **`GET /credit-cards/:id`**: Single card record. Returns 404 for missing or another user's card.
+- **`POST /credit-cards`**: Create a new credit card.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ code, displayName, issuer, statementDay (1..31), dueDay (1..31), creditLimit, lastFour? (4 digits), note?, occurredAt }`
+  - Automatically provisions ledger links and credit card system accounts.
+- **`POST /credit-cards/:id`**: Update credit card with OCC.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, displayName, issuer, statementDay, dueDay, creditLimit, lastFour?, note?, changeReason?, occurredAt }`
+- **`POST /credit-cards/:id/archive`**: Archive credit card.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, changeReason?, occurredAt }`
+
+#### 5.8.2 Statements
+- **`GET /credit-cards/:cardId/statements`**: List statements for a card. Query parameters: `status` (`"OPEN"` | `"PAID"` | `"VOID"`), `cycleMonth` (`YYYY-MM`), `limit` (default 50, max 100), `after` (statement UUID cursor).
+- **`GET /credit-cards/:cardId/statements/:id`**: Single statement record. Returns 404 if not found or card/user mismatch.
+- **`POST /credit-cards/:cardId/statements`**: Create monthly statement.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ midasAccountId, cycleMonth ("YYYY-MM"), statementAmount, reservePlacement ("MIDAS_FUND"|"OUTSIDE_MIDAS"), note?, occurredAt }`
+- **`POST /credit-cards/:cardId/statements/:id`**: Update open statement with OCC.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, statementAmount, reservePlacement, note?, reasonNote?, occurredAt }`
+- **`POST /credit-cards/:cardId/statements/:id/void`**: Void open statement.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, reasonNote?, occurredAt }`
+
+#### 5.8.3 Statement Payment & Reopen (Economic Lifecycle)
+- **`POST /credit-cards/:cardId/statements/:id/pay`**: Execute statement payment.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, paymentAmount?, paymentMethod?, paymentAssetAccountId?, outsidePaymentAssetAccountId?, occurredAt }`
+  - Posts journal entry (DR Credit Card Liability, CR Payment Asset Account), transitions statement to `PAID`, records payment event, and enqueues Budget V2 checkpoint request.
+- **`POST /credit-cards/:cardId/statements/:id/reopen`**: Reopen statement payment (reversal).
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, reasonNote?, occurredAt }`
+  - Posts reversal journal entry, transitions statement back to `OPEN`, records reversal event.
+
+#### 5.8.4 Payment-Readiness & Reconciliation
+- **`GET /credit-cards/:cardId/statements/:id/readiness`**: Pure read-only payment-readiness calculation.
+  - Returns `{ readiness: { cardId, statementId, cycleYear, cycleMonth, statementAmount, totalPostedPurchases, postedPurchaseCount, isExactMatch, isLiabilityCovered, uncoveredAmount, currentLiveLiabilityBalance, purchases } }`.
+- **`GET /credit-cards/:cardId/statements/:id/reconciliation`**: Stored component decomposition. Optional `?asOf=` timestamp query.
+  - Returns `{ reconciliation: { statementId, status, revisionNo, statementRevisionId, reconciledStatementAmount, staleReason, components, personalAmount, externalAmountsByPerson } }`.
+- **`POST /credit-cards/:cardId/statements/:id/reconcile`**: Persist explicit statement reconciliation mutation.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ statementRevisionId, components: [ { componentNo, componentType ("PURCHASE"|"ADJUSTMENT"), amount, ownership ("PERSONAL"|"EXTERNAL_PERSON"), personId?, purchaseEventId?, purchaseSplitRevisionId?, adjustmentKind?, note? } ], expectedRevisionNo?, occurredAt? }`
+- **`POST /credit-cards/:cardId/statements/:id/reconcile/void`**: Void statement reconciliation.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, occurredAt? }`
+
+#### 5.8.5 Unshared Purchases (Product Lifecycle)
+- **`GET /credit-cards/:cardId/purchases`**: List purchases for a card. Query parameters: `status` (`"POSTED"` | `"VOID"`), `purchaseDateFrom` / `fromDate`, `purchaseDateUntil` / `toDate`, `limit`, `after`.
+- **`GET /credit-cards/:cardId/purchases/:id`**: Single purchase record.
+- **`POST /credit-cards/:cardId/purchases`**: Record an unshared purchase.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ amount, purchaseCategory ("MANDATORY_EXPENSE"|"DISCRETIONARY_EXPENSE"|"SAVING_INVESTMENT"|"DEBT_REPAYMENT"), shortTermGoalId?, merchant?, description?, installmentCount?, occurredAt }`
+- **`POST /credit-cards/:cardId/purchases/:id`** & **`POST /credit-cards/:cardId/purchases/:id/revisions`**: Update unshared purchase with OCC.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, amount, purchaseCategory, shortTermGoalId?, merchant?, description?, installmentCount?, reasonNote?, occurredAt }`
+- **`POST /credit-cards/:cardId/purchases/:id/void`**: Void unshared purchase.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, reasonNote?, occurredAt }`
+
+*Note: Shared purchases with participant splits are deferred to Checkpoint 7B.4 (People + Family).*
+
+**Credit Card Error Codes:**
+| Code | Status | Description |
+|------|--------|-------------|
+| `CREDIT_CARD_INVALID_INPUT` | 400 | Malformed parameter, invalid format, or closed-body rejection |
+| `CREDIT_CARD_NOT_FOUND` | 404 | Credit card not found or owned by another user |
+| `CREDIT_CARD_STATEMENT_NOT_FOUND` | 404 | Statement not found or card/user mismatch |
+| `CREDIT_CARD_PURCHASE_NOT_FOUND` | 404 | Purchase event not found or card/user mismatch |
+| `CREDIT_CARD_REVISION_CONFLICT` | 409 | Stale expectedRevisionNo on card mutation |
+| `CREDIT_CARD_STATEMENT_CONFLICT` | 409 | Stale expectedRevisionNo or invalid status on statement |
+| `CREDIT_CARD_PAYMENT_CONFLICT` | 409 | Stale expectedRevisionNo or invalid payment state |
+| `CREDIT_CARD_IDEMPOTENCY_CONFLICT` | 409 | Replay with different payload on same idempotency key |
+| `CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT` | 409 | Reconciliation revision conflict or component mismatch |
+| `CREDIT_CARD_CARD_ARCHIVED` | 409 | Mutation rejected because credit card is archived |
+
 ---
 
 ## 6. Exact-Money Rule
@@ -562,25 +644,6 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
 
 The underlying domain **service** code exists for all of these domains. What is missing is
 the HTTP adapter layer (route handlers, input validation, error mapping).
-
-### 7B.3 — Credit Cards
-
-```
-PLANNED  GET   /credit-cards/:id
-PLANNED  GET   /credit-cards                ?status=&limit=&after=
-PLANNED  POST  /credit-cards                (create)
-PLANNED  POST  /credit-cards/:id            (update)
-PLANNED  POST  /credit-cards/:id/archive    (archive)
-
-PLANNED  GET   /credit-cards/:cardId/statements/:id
-PLANNED  GET   /credit-cards/:cardId/statements  ?status=&cycleMonth=&limit=&after=
-PLANNED  POST  /credit-cards/:cardId/statements  (create)
-PLANNED  POST  /credit-cards/:cardId/statements/:id  (update)
-PLANNED  POST  /credit-cards/:cardId/statements/:id/void  (void)
-PLANNED  POST  /credit-cards/:cardId/statements/:id/pay   (pay)
-PLANNED  POST  /credit-cards/:cardId/statements/:id/reopen  (reopen payment)
-PLANNED  POST  /credit-cards/:cardId/statements/:id/reconcile  (reconcile)
-```
 
 ### 7B.4 — People + Family
 

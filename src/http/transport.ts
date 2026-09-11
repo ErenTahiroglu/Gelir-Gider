@@ -200,6 +200,50 @@ export const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 		"Income settlement already exists for receipt",
 	INCOME_SETTLEMENT_REVISION_CONFLICT: "Income settlement revision is stale",
 	INCOME_SETTLEMENT_CONFLICT: "Income settlement allocation conflict",
+	CREDIT_CARD_INVALID_INPUT: "Invalid credit card request",
+	CREDIT_CARD_NOT_FOUND: "Credit card not found",
+	CREDIT_CARD_NOT_ACTIVE: "Credit card is not active",
+	CREDIT_CARD_CONFLICT: "Credit card code conflict",
+	CREDIT_CARD_REVISION_CONFLICT: "Credit card revision is stale",
+	CREDIT_CARD_STATEMENT_NOT_FOUND: "Credit card statement not found",
+	CREDIT_CARD_STATEMENT_PERIOD_CONFLICT:
+		"Credit card statement period conflict",
+	CREDIT_CARD_STATEMENT_NOT_OPEN: "Credit card statement is not open",
+	CREDIT_CARD_STATEMENT_REVISION_CONFLICT:
+		"Credit card statement revision is stale",
+	CREDIT_CARD_INSUFFICIENT_MIDAS_LIQUIDITY:
+		"Insufficient Midas liquidity for reserve",
+	CREDIT_CARD_RESERVE_CONFLICT: "Credit card reserve conflict",
+	CREDIT_CARD_IDEMPOTENCY_CONFLICT:
+		"Idempotency-Key was already used with a different request",
+	CREDIT_CARD_INVALID_STATE: "Credit card invalid state transition",
+	CREDIT_CARD_PURCHASE_NOT_FOUND: "Credit card purchase not found",
+	CREDIT_CARD_PURCHASE_NOT_ACTIVE: "Credit card purchase is not active",
+	CREDIT_CARD_OPENING_BALANCE_CONFLICT: "Credit card opening balance conflict",
+	CREDIT_CARD_LEDGER_ACCOUNT_INVALID: "Invalid ledger account for credit card",
+	CREDIT_CARD_LIABILITY_SHORTFALL: "Credit card liability shortfall",
+	CREDIT_CARD_PAYMENT_NOT_FOUND: "Credit card statement payment not found",
+	CREDIT_CARD_PAYMENT_CONFLICT: "Credit card statement payment conflict",
+	CREDIT_CARD_STATEMENT_ALREADY_PAID: "Credit card statement is already paid",
+	CREDIT_CARD_STATEMENT_NOT_PAID: "Credit card statement is not paid",
+	CREDIT_CARD_CANNOT_ARCHIVE_WITH_LIABILITY:
+		"Cannot archive credit card with outstanding liability",
+	CREDIT_CARD_LEDGER_LINK_NOT_FOUND: "Credit card ledger link not found",
+	CREDIT_CARD_SYSTEM_ACCOUNT_NOT_FOUND: "Credit card system account not found",
+	CREDIT_CARD_SPLIT_NOT_FOUND: "Credit card split not found",
+	CREDIT_CARD_SPLIT_NOT_ACTIVE: "Credit card split is not active",
+	CREDIT_CARD_SPLIT_REVISION_CONFLICT: "Credit card split revision is stale",
+	CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT:
+		"Credit card split idempotency conflict",
+	CREDIT_CARD_SPLIT_CONFLICT: "Credit card split conflict",
+	CREDIT_CARD_STATEMENT_RECONCILIATION_NOT_FOUND:
+		"Statement reconciliation not found",
+	CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT:
+		"Statement reconciliation conflict",
+	CREDIT_CARD_STATEMENT_RECONCILIATION_NOT_BALANCED:
+		"Statement reconciliation is not balanced",
+	CREDIT_CARD_STATEMENT_RECONCILIATION_IDEMPOTENCY_CONFLICT:
+		"Statement reconciliation idempotency conflict",
 	INVALID_ORIGIN: "Invalid request origin",
 	UNAUTHENTICATED: "Authentication required",
 	NOT_FOUND: "Route not found",
