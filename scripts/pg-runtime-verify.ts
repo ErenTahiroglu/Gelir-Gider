@@ -13499,7 +13499,7 @@ async function resolverRuntime7B2R1() {
 
 async function resolverRuntime7B2R2() {
 	console.log(
-		"\n== PHASE 7B.2-R2: PERMANENT HTTP->DB FRESH-USER PROOF & CONCURRENT PRODUCT-ACCOUNT CREATION CLOSURE (PGlite / Drizzle / Hono) ==",
+		"\n== PHASE 7B.2-R2/R3: PERMANENT HTTP->DB FRESH-USER PROOF & SAME-DATABASE TENANT ISOLATION (PGlite / Drizzle / Hono) ==",
 	);
 	const { drizzle } = await import("drizzle-orm/pglite");
 	const eqD = (a: unknown, b: unknown, name: string) =>
@@ -13511,414 +13511,482 @@ async function resolverRuntime7B2R2() {
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
 	await applyChain(pg, 71);
+	// Drop test-only singleton constraint in disposable DB so User A and User B can coexist in the same database
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
 	// Set database factory override so Hono route handlers resolve our in-memory PGlite instance
 	setDatabaseFactoryOverrideForTest(() => db);
 
-	const testEnv: AppEnv = {
-		DATABASE_URL: "postgres://fake-pglite/db",
-		WEBAUTHN_RP_ID: "localhost",
-		WEBAUTHN_RP_NAME: "Gelir Gider Test",
-		WEBAUTHN_ORIGIN: "http://localhost:8787",
-	};
+	try {
+		const testEnv: AppEnv = {
+			DATABASE_URL: "postgres://fake-pglite/db",
+			WEBAUTHN_RP_ID: "localhost",
+			WEBAUTHN_RP_NAME: "Gelir Gider Test",
+			WEBAUTHN_ORIGIN: "http://localhost:8787",
+		};
 
-	const USER_A = "44444444-4444-4444-8444-444444444444";
+		const USER_A = "44444444-4444-4444-8444-444444444444";
+		const USER_B = "55555555-5555-4555-8555-555555555555";
 
-	// Seed genuine User A (singleton user for db)
-	await pg.query(
-		"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now())",
-		[USER_A],
-	);
-
-	// Create genuine session for User A
-	const { token: tokenA } = await createSession({ db, userId: USER_A });
-
-	// Generic HTTP request helper executing against the real Hono app
-	const httpCall = async (
-		path: string,
-		opts: {
-			method: string;
-			body?: unknown;
-			token?: string;
-			idempotencyKey?: string;
-			origin?: string;
-		},
-	) => {
-		const headers: Record<string, string> = {};
-		if (opts.token) {
-			headers.Cookie = `__Host-gg_session=${opts.token}`;
-		}
-		if (opts.origin !== undefined) {
-			headers.Origin = opts.origin;
-		} else if (opts.method !== "GET" && opts.method !== "HEAD") {
-			headers.Origin = "http://localhost:8787";
-		}
-		if (opts.idempotencyKey) {
-			headers["Idempotency-Key"] = opts.idempotencyKey;
-		}
-		if (opts.body !== undefined) {
-			headers["Content-Type"] = "application/json";
-		}
-		const res = await app.request(
-			path,
-			{
-				method: opts.method,
-				headers,
-				body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-			},
-			testEnv,
+		// Seed genuine User A and User B in the SAME database
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now()), ($2, 'User B', 'TRY', 'Europe/Istanbul', now())",
+			[USER_A, USER_B],
 		);
-		let json: any = null;
-		try {
-			json = await res.json();
-		} catch {
-			// no-op
-		}
-		return { status: res.status, json, headers: res.headers };
-	};
 
-	// 1. Fresh user begins with ZERO accounts via HTTP
-	const initialGet = await httpCall("/ledger/accounts", {
-		method: "GET",
-		token: tokenA,
-	});
-	eqD(initialGet.status, 200, "7B.2-R2/1: fresh user GET /ledger/accounts returns 200");
-	eqD(initialGet.json?.accounts?.length, 0, "7B.2-R2/1: fresh user starts with exactly 0 accounts");
+		// Create genuine sessions for both User A and User B
+		const { token: tokenA } = await createSession({ db, userId: USER_A });
+		const { token: tokenB } = await createSession({ db, userId: USER_B });
 
-	// 2. Real HTTP POST ASSET account
-	const createAssetRes = await httpCall("/ledger/accounts", {
-		method: "POST",
-		token: tokenA,
-		body: {
-			code: "CASH",
-			name: "Main Cash Wallet",
-			accountType: "ASSET",
-		},
-	});
-	eqD(createAssetRes.status, 200, "7B.2-R2/2: POST /ledger/accounts for ASSET returns 200");
-	eqD(createAssetRes.json?.code, "USR_CASH", "7B.2-R2/2: stored and returned code has USR_ prefix (USR_CASH)");
-	eqD(createAssetRes.json?.accountType, "ASSET", "7B.2-R2/2: accountType is ASSET");
-	eqD(createAssetRes.json?.normalBalance, "DEBIT", "7B.2-R2/2: normalBalance is server-derived DEBIT");
-	eqD(createAssetRes.json?.currency, "TRY", "7B.2-R2/2: currency is server-derived TRY");
-	eqD(createAssetRes.json?.idempotentReplay, false, "7B.2-R2/2: idempotentReplay is false for new account");
-	const cashAccountId = createAssetRes.json?.accountId;
-	chkD(typeof cashAccountId === "string" && cashAccountId.length > 0, "7B.2-R2/2: valid cash accountId returned");
+		// Generic HTTP request helper executing against the real Hono app
+		const httpCall = async (
+			path: string,
+			opts: {
+				method: string;
+				body?: unknown;
+				token?: string;
+				idempotencyKey?: string;
+				origin?: string;
+			},
+		) => {
+			const headers: Record<string, string> = {};
+			if (opts.token) {
+				headers.Cookie = `__Host-gg_session=${opts.token}`;
+			}
+			if (opts.origin !== undefined) {
+				headers.Origin = opts.origin;
+			} else if (opts.method !== "GET" && opts.method !== "HEAD") {
+				headers.Origin = "http://localhost:8787";
+			}
+			if (opts.idempotencyKey) {
+				headers["Idempotency-Key"] = opts.idempotencyKey;
+			}
+			if (opts.body !== undefined) {
+				headers["Content-Type"] = "application/json";
+			}
+			const res = await app.request(
+				path,
+				{
+					method: opts.method,
+					headers,
+					body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+				},
+				testEnv,
+			);
+			let json: any = null;
+			try {
+				json = await res.json();
+			} catch {
+				// no-op
+			}
+			return { status: res.status, json, headers: res.headers };
+		};
 
-	// 3. Real HTTP POST INCOME account
-	const createIncomeRes = await httpCall("/ledger/accounts", {
-		method: "POST",
-		token: tokenA,
-		body: {
-			code: "SALARY",
-			name: "Primary Salary",
-			accountType: "INCOME",
-		},
-	});
-	eqD(createIncomeRes.status, 200, "7B.2-R2/3: POST /ledger/accounts for INCOME returns 200");
-	eqD(createIncomeRes.json?.code, "USR_SALARY", "7B.2-R2/3: stored and returned code has USR_ prefix (USR_SALARY)");
-	eqD(createIncomeRes.json?.accountType, "INCOME", "7B.2-R2/3: accountType is INCOME");
-	eqD(createIncomeRes.json?.normalBalance, "CREDIT", "7B.2-R2/3: normalBalance is server-derived CREDIT");
-	eqD(createIncomeRes.json?.currency, "TRY", "7B.2-R2/3: currency is server-derived TRY");
-	eqD(createIncomeRes.json?.idempotentReplay, false, "7B.2-R2/3: idempotentReplay is false for new account");
-	const salaryAccountId = createIncomeRes.json?.accountId;
-	chkD(typeof salaryAccountId === "string" && salaryAccountId.length > 0, "7B.2-R2/3: valid salary accountId returned");
+		// 1. Fresh user begins with ZERO accounts via HTTP
+		const initialGet = await httpCall("/ledger/accounts", {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(initialGet.status, 200, "7B.2-R2/1: fresh user GET /ledger/accounts returns 200");
+		eqD(initialGet.json?.accounts?.length, 0, "7B.2-R2/1: fresh user starts with exactly 0 accounts");
 
-	// 4. HTTP Zero-Financial-Effect Proof (immediately after the 2 account creates, before source / receipt)
-	const qCount = async (tbl: string) =>
-		(await pg.query(`select count(*)::int as n from ${tbl} where user_id = $1`, [USER_A])).rows[0].n as number;
-	eqD(await qCount("canonical_transactions"), 0, "7B.2-R2/4: zero canonical transactions created");
-	eqD(await qCount("transaction_revisions"), 0, "7B.2-R2/4: zero transaction revisions created");
-	eqD(await qCount("journal_entries"), 0, "7B.2-R2/4: zero journal entries created");
-	const jlCount = (await pg.query(
-		"select count(*)::int as n from journal_lines jl join journal_entries je on jl.journal_entry_id = je.id where je.user_id = $1",
-		[USER_A],
-	)).rows[0].n as number;
-	eqD(jlCount, 0, "7B.2-R2/4: zero journal lines created");
-	eqD(await qCount("income_receipts"), 0, "7B.2-R2/4: zero income receipts created");
-	eqD(await qCount("income_entitlements"), 0, "7B.2-R2/4: zero income entitlements created");
-	eqD(await qCount("income_settlement_batches"), 0, "7B.2-R2/4: zero income settlement batches created");
-	eqD(await qCount("monthly_budget_v2_plans"), 0, "7B.2-R2/4: zero budget plans created");
-
-	const cashBalInit = await httpCall(`/ledger/accounts/${cashAccountId}/balance`, {
-		method: "GET",
-		token: tokenA,
-	});
-	const salBalInit = await httpCall(`/ledger/accounts/${salaryAccountId}/balance`, {
-		method: "GET",
-		token: tokenA,
-	});
-	eqD(cashBalInit.json?.balance, "0.00", "7B.2-R2/4: initial cash balance via HTTP is exactly 0.00");
-	eqD(salBalInit.json?.balance, "0.00", "7B.2-R2/4: initial salary balance via HTTP is exactly 0.00");
-
-	// 5. HTTP Natural Replay and Conflicting Replay Proof
-	const exactReplayRes = await httpCall("/ledger/accounts", {
-		method: "POST",
-		token: tokenA,
-		body: {
-			code: "CASH",
-			name: "Main Cash Wallet",
-			accountType: "ASSET",
-		},
-	});
-	eqD(exactReplayRes.status, 200, "7B.2-R2/5: exact replay POST /ledger/accounts returns 200");
-	eqD(exactReplayRes.json?.idempotentReplay, true, "7B.2-R2/5: exact replay returns idempotentReplay = true");
-	eqD(exactReplayRes.json?.accountId, cashAccountId, "7B.2-R2/5: exact replay resolves identical accountId");
-	eqD(exactReplayRes.json?.code, "USR_CASH", "7B.2-R2/5: exact replay code is USR_CASH");
-
-	const conflictNameRes = await httpCall("/ledger/accounts", {
-		method: "POST",
-		token: tokenA,
-		body: {
-			code: "CASH",
-			name: "Changed Name Wallet",
-			accountType: "ASSET",
-		},
-	});
-	eqD(conflictNameRes.status, 409, "7B.2-R2/5: same alias changed name returns 409");
-	eqD(conflictNameRes.json?.error?.code, "LEDGER_ACCOUNT_CODE_CONFLICT", "7B.2-R2/5: changed name returns LEDGER_ACCOUNT_CODE_CONFLICT");
-
-	const conflictTypeRes = await httpCall("/ledger/accounts", {
-		method: "POST",
-		token: tokenA,
-		body: {
-			code: "CASH",
-			name: "Main Cash Wallet",
-			accountType: "INCOME",
-		},
-	});
-	eqD(conflictTypeRes.status, 409, "7B.2-R2/5: same alias changed accountType returns 409");
-	eqD(conflictTypeRes.json?.error?.code, "LEDGER_ACCOUNT_CODE_CONFLICT", "7B.2-R2/5: changed accountType returns LEDGER_ACCOUNT_CODE_CONFLICT");
-
-	// 6. Real HTTP POST Income Source Creation referencing the created INCOME account
-	const createSourceRes = await httpCall("/income/sources", {
-		method: "POST",
-		token: tokenA,
-		body: {
-			code: "job_primary",
-			name: "Primary Engineering Job",
-			nature: "REGULAR",
-			referenceMethod: "FIXED_MONTHLY",
-			expectedMonthlyAmount: "65000.00",
-			incomeLedgerAccountId: salaryAccountId,
-			activeFrom: "2026-01-01",
-		},
-	});
-	eqD(createSourceRes.status, 200, "7B.2-R2/6: POST /income/sources returns 200");
-	const sourceId = createSourceRes.json?.sourceId;
-	chkD(typeof sourceId === "string" && sourceId.length > 0, "7B.2-R2/6: valid income sourceId returned");
-	eqD(createSourceRes.json?.incomeLedgerAccountId, salaryAccountId, "7B.2-R2/6: income source bound to created INCOME account");
-
-	// 7. Real HTTP POST Income Receipt Creation referencing the created ASSET account
-	const createReceiptRes = await httpCall("/income/receipts", {
-		method: "POST",
-		token: tokenA,
-		idempotencyKey: "rec-fresh-http-proof-1",
-		body: {
-			sourceId,
-			receivedAt: "2026-09-05T10:00:00.000Z",
-			amount: "65000.00",
-			destinationAccountId: cashAccountId,
-			note: "September Salary",
-		},
-	});
-	eqD(createReceiptRes.status, 200, "7B.2-R2/7: POST /income/receipts returns 200");
-	eqD(createReceiptRes.json?.idempotentReplay, false, "7B.2-R2/7: receipt creation idempotentReplay is false");
-	const receiptId = createReceiptRes.json?.receipt?.incomeReceiptId;
-	chkD(typeof receiptId === "string" && receiptId.length > 0, "7B.2-R2/7: valid receiptId returned");
-
-	// 8. Resulting balances via HTTP GET /ledger/accounts
-	const finalAccountsRes = await httpCall("/ledger/accounts", {
-		method: "GET",
-		token: tokenA,
-	});
-	eqD(finalAccountsRes.status, 200, "7B.2-R2/8: GET /ledger/accounts returns 200");
-	const cashInList = finalAccountsRes.json?.accounts?.find((a: any) => a.code === "USR_CASH");
-	const salInList = finalAccountsRes.json?.accounts?.find((a: any) => a.code === "USR_SALARY");
-	chkD(cashInList !== undefined, "7B.2-R2/8: USR_CASH exists in accounts list");
-	chkD(salInList !== undefined, "7B.2-R2/8: USR_SALARY exists in accounts list");
-	eqD(cashInList?.balance, "65000.00", "7B.2-R2/8: USR_CASH ASSET / DEBIT balance is exactly 65000.00");
-	eqD(salInList?.balance, "65000.00", "7B.2-R2/8: USR_SALARY INCOME / CREDIT balance is exactly 65000.00");
-
-	// 9. CONCURRENT IDENTICAL CREATE — MANDATORY (Promise.all race)
-	const [raceExactA, raceExactB] = await Promise.all([
-		httpCall("/ledger/accounts", {
+		// 2. Real HTTP POST ASSET account
+		const createAssetRes = await httpCall("/ledger/accounts", {
 			method: "POST",
 			token: tokenA,
 			body: {
-				code: "RACE_EXACT",
-				name: "Concurrent Exact Account",
+				code: "CASH",
+				name: "Main Cash Wallet",
 				accountType: "ASSET",
 			},
-		}),
-		httpCall("/ledger/accounts", {
+		});
+		eqD(createAssetRes.status, 200, "7B.2-R2/2: POST /ledger/accounts for ASSET returns 200");
+		eqD(createAssetRes.json?.code, "USR_CASH", "7B.2-R2/2: stored and returned code has USR_ prefix (USR_CASH)");
+		eqD(createAssetRes.json?.accountType, "ASSET", "7B.2-R2/2: accountType is ASSET");
+		eqD(createAssetRes.json?.normalBalance, "DEBIT", "7B.2-R2/2: normalBalance is server-derived DEBIT");
+		eqD(createAssetRes.json?.currency, "TRY", "7B.2-R2/2: currency is server-derived TRY");
+		eqD(createAssetRes.json?.idempotentReplay, false, "7B.2-R2/2: idempotentReplay is false for new account");
+		const cashAccountId = createAssetRes.json?.accountId;
+		chkD(typeof cashAccountId === "string" && cashAccountId.length > 0, "7B.2-R2/2: valid cash accountId returned");
+
+		// 3. Real HTTP POST INCOME account
+		const createIncomeRes = await httpCall("/ledger/accounts", {
 			method: "POST",
 			token: tokenA,
 			body: {
-				code: "RACE_EXACT",
-				name: "Concurrent Exact Account",
-				accountType: "ASSET",
+				code: "SALARY",
+				name: "Primary Salary",
+				accountType: "INCOME",
 			},
-		}),
-	]);
-	eqD(raceExactA.status, 200, "7B.2-R2/9: concurrent exact create caller A returns 200");
-	eqD(raceExactB.status, 200, "7B.2-R2/9: concurrent exact create caller B returns 200");
-	eqD(raceExactA.json?.code, "USR_RACE_EXACT", "7B.2-R2/9: caller A code is USR_RACE_EXACT");
-	eqD(raceExactB.json?.code, "USR_RACE_EXACT", "7B.2-R2/9: caller B code is USR_RACE_EXACT");
-	eqD(raceExactA.json?.accountId, raceExactB.json?.accountId, "7B.2-R2/9: both concurrent callers resolve the SAME accountId");
-	const exactReplays = [raceExactA.json?.idempotentReplay, raceExactB.json?.idempotentReplay];
-	chkD(
-		exactReplays.includes(false) && exactReplays.includes(true),
-		"7B.2-R2/9: exactly one caller is new create (false) and other is idempotent replay (true)",
-	);
-	const raceExactDbCount = (await pg.query(
-		"select count(*)::int as n from ledger_accounts where user_id = $1 and code = 'USR_RACE_EXACT'",
-		[USER_A],
-	)).rows[0].n as number;
-	eqD(raceExactDbCount, 1, "7B.2-R2/9: exactly ONE ledger_accounts row persisted for USR_RACE_EXACT");
+		});
+		eqD(createIncomeRes.status, 200, "7B.2-R2/3: POST /ledger/accounts for INCOME returns 200");
+		eqD(createIncomeRes.json?.code, "USR_SALARY", "7B.2-R2/3: stored and returned code has USR_ prefix (USR_SALARY)");
+		eqD(createIncomeRes.json?.accountType, "INCOME", "7B.2-R2/3: accountType is INCOME");
+		eqD(createIncomeRes.json?.normalBalance, "CREDIT", "7B.2-R2/3: normalBalance is server-derived CREDIT");
+		eqD(createIncomeRes.json?.currency, "TRY", "7B.2-R2/3: currency is server-derived TRY");
+		eqD(createIncomeRes.json?.idempotentReplay, false, "7B.2-R2/3: idempotentReplay is false for new account");
+		const salaryAccountId = createIncomeRes.json?.accountId;
+		chkD(typeof salaryAccountId === "string" && salaryAccountId.length > 0, "7B.2-R2/3: valid salary accountId returned");
 
-	// 10. CONCURRENT CONFLICTING CREATE — MANDATORY (Promise.all race)
-	const [raceConfA, raceConfB] = await Promise.all([
-		httpCall("/ledger/accounts", {
+		// 4. HTTP Zero-Financial-Effect Proof (immediately after the 2 account creates, before source / receipt)
+		const qCount = async (tbl: string) =>
+			(await pg.query(`select count(*)::int as n from ${tbl} where user_id = $1`, [USER_A])).rows[0].n as number;
+		eqD(await qCount("canonical_transactions"), 0, "7B.2-R2/4: zero canonical transactions created");
+		eqD(await qCount("transaction_revisions"), 0, "7B.2-R2/4: zero transaction revisions created");
+		eqD(await qCount("journal_entries"), 0, "7B.2-R2/4: zero journal entries created");
+		const jlCount = (await pg.query(
+			"select count(*)::int as n from journal_lines jl join journal_entries je on jl.journal_entry_id = je.id where je.user_id = $1",
+			[USER_A],
+		)).rows[0].n as number;
+		eqD(jlCount, 0, "7B.2-R2/4: zero journal lines created");
+		eqD(await qCount("income_receipts"), 0, "7B.2-R2/4: zero income receipts created");
+		eqD(await qCount("income_entitlements"), 0, "7B.2-R2/4: zero income entitlements created");
+		eqD(await qCount("income_settlement_batches"), 0, "7B.2-R2/4: zero income settlement batches created");
+		eqD(await qCount("monthly_budget_v2_plans"), 0, "7B.2-R2/4: zero budget plans created");
+
+		const cashBalInit = await httpCall(`/ledger/accounts/${cashAccountId}/balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		const salBalInit = await httpCall(`/ledger/accounts/${salaryAccountId}/balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(cashBalInit.json?.balance, "0.00", "7B.2-R2/4: initial cash balance via HTTP is exactly 0.00");
+		eqD(salBalInit.json?.balance, "0.00", "7B.2-R2/4: initial salary balance via HTTP is exactly 0.00");
+
+		// 5. HTTP Natural Replay and Conflicting Replay Proof
+		const exactReplayRes = await httpCall("/ledger/accounts", {
 			method: "POST",
 			token: tokenA,
 			body: {
-				code: "RACE_CONF",
-				name: "Definition A",
+				code: "CASH",
+				name: "Main Cash Wallet",
 				accountType: "ASSET",
 			},
-		}),
-		httpCall("/ledger/accounts", {
+		});
+		eqD(exactReplayRes.status, 200, "7B.2-R2/5: exact replay POST /ledger/accounts returns 200");
+		eqD(exactReplayRes.json?.idempotentReplay, true, "7B.2-R2/5: exact replay returns idempotentReplay = true");
+		eqD(exactReplayRes.json?.accountId, cashAccountId, "7B.2-R2/5: exact replay resolves identical accountId");
+		eqD(exactReplayRes.json?.code, "USR_CASH", "7B.2-R2/5: exact replay code is USR_CASH");
+
+		const conflictNameRes = await httpCall("/ledger/accounts", {
 			method: "POST",
 			token: tokenA,
 			body: {
-				code: "RACE_CONF",
-				name: "Definition B",
+				code: "CASH",
+				name: "Changed Name Wallet",
 				accountType: "ASSET",
 			},
-		}),
-	]);
-	const raceConfStatuses = [raceConfA.status, raceConfB.status].sort();
-	eqD(raceConfStatuses[0], 200, "7B.2-R2/10: concurrent conflicting create winner returns 200");
-	eqD(raceConfStatuses[1], 409, "7B.2-R2/10: concurrent conflicting create loser returns 409");
-	const loserJson = raceConfA.status === 409 ? raceConfA.json : raceConfB.json;
-	eqD(loserJson?.error?.code, "LEDGER_ACCOUNT_CODE_CONFLICT", "7B.2-R2/10: loser receives typed LEDGER_ACCOUNT_CODE_CONFLICT");
-	const raceConfDbCount = (await pg.query(
-		"select count(*)::int as n from ledger_accounts where user_id = $1 and code = 'USR_RACE_CONF'",
-		[USER_A],
-	)).rows[0].n as number;
-	eqD(raceConfDbCount, 1, "7B.2-R2/10: exactly ONE ledger_accounts row persisted for USR_RACE_CONF");
+		});
+		eqD(conflictNameRes.status, 409, "7B.2-R2/5: same alias changed name returns 409");
+		eqD(conflictNameRes.json?.error?.code, "LEDGER_ACCOUNT_CODE_CONFLICT", "7B.2-R2/5: changed name returns LEDGER_ACCOUNT_CODE_CONFLICT");
 
-	// 11. Database Usability After Races
-	const postRaceRes = await httpCall("/ledger/accounts", {
-		method: "POST",
-		token: tokenA,
-		body: {
-			code: "POST_RACE",
-			name: "Post Race Usable Account",
-			accountType: "ASSET",
-		},
-	});
-	eqD(postRaceRes.status, 200, "7B.2-R2/11: subsequent account creation succeeds (database remains fully usable post-race)");
-	eqD(postRaceRes.json?.code, "USR_POST_RACE", "7B.2-R2/11: post-race account created as USR_POST_RACE");
+		const conflictTypeRes = await httpCall("/ledger/accounts", {
+			method: "POST",
+			token: tokenA,
+			body: {
+				code: "CASH",
+				name: "Main Cash Wallet",
+				accountType: "INCOME",
+			},
+		});
+		eqD(conflictTypeRes.status, 409, "7B.2-R2/5: same alias changed accountType returns 409");
+		eqD(conflictTypeRes.json?.error?.code, "LEDGER_ACCOUNT_CODE_CONFLICT", "7B.2-R2/5: changed accountType returns LEDGER_ACCOUNT_CODE_CONFLICT");
 
-	// 12. Cross-User HTTP Isolation (User B vs User A)
-	const pgB = new PGlite();
-	await pgB.query("SET timezone='UTC'");
-	await applyChain(pgB, 71);
-	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
-	const dbB = drizzle(pgB as any) as any;
-	const USER_B = "55555555-5555-4555-8555-555555555555";
-	await pgB.query(
-		"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User B', 'TRY', 'Europe/Istanbul', now())",
-		[USER_B],
-	);
-	const { token: tokenB } = await createSession({ db: dbB, userId: USER_B });
+		// 6. Real HTTP POST Income Source Creation referencing the created INCOME account
+		const createSourceRes = await httpCall("/income/sources", {
+			method: "POST",
+			token: tokenA,
+			body: {
+				code: "job_primary",
+				name: "Primary Engineering Job",
+				nature: "REGULAR",
+				referenceMethod: "FIXED_MONTHLY",
+				expectedMonthlyAmount: "65000.00",
+				incomeLedgerAccountId: salaryAccountId,
+				activeFrom: "2026-01-01",
+			},
+		});
+		eqD(createSourceRes.status, 200, "7B.2-R2/6: POST /income/sources returns 200");
+		const sourceId = createSourceRes.json?.sourceId;
+		chkD(typeof sourceId === "string" && sourceId.length > 0, "7B.2-R2/6: valid income sourceId returned");
+		eqD(createSourceRes.json?.incomeLedgerAccountId, salaryAccountId, "7B.2-R2/6: income source bound to created INCOME account");
 
-	// Switch database factory override to dbB for User B requests
-	setDatabaseFactoryOverrideForTest(() => dbB);
+		// 7. Real HTTP POST Income Receipt Creation referencing the created ASSET account
+		const createReceiptRes = await httpCall("/income/receipts", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rec-fresh-http-proof-1",
+			body: {
+				sourceId,
+				receivedAt: "2026-09-05T10:00:00.000Z",
+				amount: "65000.00",
+				destinationAccountId: cashAccountId,
+				note: "September Salary",
+			},
+		});
+		eqD(createReceiptRes.status, 200, "7B.2-R2/7: POST /income/receipts returns 200");
+		eqD(createReceiptRes.json?.idempotentReplay, false, "7B.2-R2/7: receipt creation idempotentReplay is false");
+		const receiptId = createReceiptRes.json?.receipt?.incomeReceiptId;
+		chkD(typeof receiptId === "string" && receiptId.length > 0, "7B.2-R2/7: valid receiptId returned");
 
-	const u2ReadBalRes = await httpCall(`/ledger/accounts/${cashAccountId}/balance`, {
-		method: "GET",
-		token: tokenB,
-	});
-	eqD(u2ReadBalRes.status, 404, "7B.2-R2/12: User B reading User A balance returns 404");
-	eqD(u2ReadBalRes.json?.error?.code, "LEDGER_ACCOUNT_NOT_FOUND", "7B.2-R2/12: error code is LEDGER_ACCOUNT_NOT_FOUND without existence disclosure");
+		// 8. Resulting balances via HTTP GET /ledger/accounts
+		const finalAccountsRes = await httpCall("/ledger/accounts", {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(finalAccountsRes.status, 200, "7B.2-R2/8: GET /ledger/accounts returns 200");
+		const cashInList = finalAccountsRes.json?.accounts?.find((a: any) => a.code === "USR_CASH");
+		const salInList = finalAccountsRes.json?.accounts?.find((a: any) => a.code === "USR_SALARY");
+		chkD(cashInList !== undefined, "7B.2-R2/8: USR_CASH exists in accounts list");
+		chkD(salInList !== undefined, "7B.2-R2/8: USR_SALARY exists in accounts list");
+		eqD(cashInList?.balance, "65000.00", "7B.2-R2/8: USR_CASH ASSET / DEBIT balance is exactly 65000.00");
+		eqD(salInList?.balance, "65000.00", "7B.2-R2/8: USR_SALARY INCOME / CREDIT balance is exactly 65000.00");
 
-	const u2CreateSourceRes = await httpCall("/income/sources", {
-		method: "POST",
-		token: tokenB,
-		body: {
-			code: "u2_source",
-			name: "User B Job",
-			nature: "REGULAR",
-			referenceMethod: "FIXED_MONTHLY",
-			expectedMonthlyAmount: "30000.00",
-			incomeLedgerAccountId: salaryAccountId, // User A's account
-			activeFrom: "2026-01-01",
-		},
-	});
-	eqD(u2CreateSourceRes.status, 400, "7B.2-R2/12: User B creating source referencing User A account returns 400");
-	eqD(u2CreateSourceRes.json?.error?.code, "INCOME_LEDGER_ACCOUNT_INVALID", "7B.2-R2/12: error code is INCOME_LEDGER_ACCOUNT_INVALID");
+		// 9. PGlite In-Process Smoke Check (Non-Authoritative Race Smoke Test)
+		const [raceExactA, raceExactB] = await Promise.all([
+			httpCall("/ledger/accounts", {
+				method: "POST",
+				token: tokenA,
+				body: {
+					code: "RACE_EXACT",
+					name: "Concurrent Exact Account",
+					accountType: "ASSET",
+				},
+			}),
+			httpCall("/ledger/accounts", {
+				method: "POST",
+				token: tokenA,
+				body: {
+					code: "RACE_EXACT",
+					name: "Concurrent Exact Account",
+					accountType: "ASSET",
+				},
+			}),
+		]);
+		eqD(raceExactA.status, 200, "7B.2-R2/9: PGlite smoke test exact create caller A returns 200");
+		eqD(raceExactB.status, 200, "7B.2-R2/9: PGlite smoke test exact create caller B returns 200");
+		eqD(raceExactA.json?.code, "USR_RACE_EXACT", "7B.2-R2/9: caller A code is USR_RACE_EXACT");
+		eqD(raceExactB.json?.code, "USR_RACE_EXACT", "7B.2-R2/9: caller B code is USR_RACE_EXACT");
+		eqD(raceExactA.json?.accountId, raceExactB.json?.accountId, "7B.2-R2/9: both callers resolve the SAME accountId");
+		const exactReplays = [raceExactA.json?.idempotentReplay, raceExactB.json?.idempotentReplay];
+		chkD(
+			exactReplays.includes(false) && exactReplays.includes(true),
+			"7B.2-R2/9: exactly one caller is new create (false) and other is idempotent replay (true)",
+		);
+		const raceExactDbCount = (await pg.query(
+			"select count(*)::int as n from ledger_accounts where user_id = $1 and code = 'USR_RACE_EXACT'",
+			[USER_A],
+		)).rows[0].n as number;
+		eqD(raceExactDbCount, 1, "7B.2-R2/9: exactly ONE ledger_accounts row persisted for USR_RACE_EXACT");
 
-	const u2CreateReceiptRes = await httpCall("/income/receipts", {
-		method: "POST",
-		token: tokenB,
-		idempotencyKey: "u2-rec-1",
-		body: {
-			sourceId: "66666666-6666-4666-8666-666666666666",
-			receivedAt: "2026-09-05T10:00:00.000Z",
-			amount: "30000.00",
-			destinationAccountId: cashAccountId, // User A's account
-			note: "Cross User Receipt Attempt",
-		},
-	});
-	eqD(u2CreateReceiptRes.status, 404, "7B.2-R2/12: User B creating receipt referencing unowned/unknown source returns 404");
+		// 10. PGlite In-Process Conflicting Smoke Check (Non-Authoritative Race Smoke Test)
+		const [raceConfA, raceConfB] = await Promise.all([
+			httpCall("/ledger/accounts", {
+				method: "POST",
+				token: tokenA,
+				body: {
+					code: "RACE_CONF",
+					name: "Definition A",
+					accountType: "ASSET",
+				},
+			}),
+			httpCall("/ledger/accounts", {
+				method: "POST",
+				token: tokenA,
+				body: {
+					code: "RACE_CONF",
+					name: "Definition B",
+					accountType: "ASSET",
+				},
+			}),
+		]);
+		const raceConfStatuses = [raceConfA.status, raceConfB.status].sort();
+		eqD(raceConfStatuses[0], 200, "7B.2-R2/10: PGlite smoke test conflicting create winner returns 200");
+		eqD(raceConfStatuses[1], 409, "7B.2-R2/10: PGlite smoke test conflicting create loser returns 409");
+		const loserJson = raceConfA.status === 409 ? raceConfA.json : raceConfB.json;
+		eqD(loserJson?.error?.code, "LEDGER_ACCOUNT_CODE_CONFLICT", "7B.2-R2/10: loser receives typed LEDGER_ACCOUNT_CODE_CONFLICT");
+		const raceConfDbCount = (await pg.query(
+			"select count(*)::int as n from ledger_accounts where user_id = $1 and code = 'USR_RACE_CONF'",
+			[USER_A],
+		)).rows[0].n as number;
+		eqD(raceConfDbCount, 1, "7B.2-R2/10: exactly ONE ledger_accounts row persisted for USR_RACE_CONF");
 
-	// Switch back to db for remaining User A assertions
-	setDatabaseFactoryOverrideForTest(() => db);
-	await pgB.close();
+		// 11. Database Usability After Races
+		const postRaceRes = await httpCall("/ledger/accounts", {
+			method: "POST",
+			token: tokenA,
+			body: {
+				code: "POST_RACE",
+				name: "Post Race Usable Account",
+				accountType: "ASSET",
+			},
+		});
+		eqD(postRaceRes.status, 200, "7B.2-R2/11: subsequent account creation succeeds (database remains fully usable post-race)");
+		eqD(postRaceRes.json?.code, "USR_POST_RACE", "7B.2-R2/11: post-race account created as USR_POST_RACE");
 
-	// 13. System Namespace Protection
-	const sysAliasRes = await httpCall("/ledger/accounts", {
-		method: "POST",
-		token: tokenA,
-		body: {
-			code: "SYS_CC_MANDATORY_EXP",
-			name: "Fake CC Expense",
-			accountType: "ASSET",
-		},
-	});
-	eqD(sysAliasRes.status, 200, "7B.2-R2/13: POST with system-like code returns 200");
-	eqD(sysAliasRes.json?.code, "USR_SYS_CC_MANDATORY_EXP", "7B.2-R2/13: code stored safely in USR_ namespace (USR_SYS_CC_MANDATORY_EXP)");
-	const rawSysCount = (await pg.query(
-		"select count(*)::int as n from ledger_accounts where user_id = $1 and code = 'SYS_CC_MANDATORY_EXP'",
-		[USER_A],
-	)).rows[0].n as number;
-	eqD(rawSysCount, 0, "7B.2-R2/13: raw SYS_CC_MANDATORY_EXP code was not occupied");
-	const ccLinksCount = (await pg.query(
-		"select count(*)::int as n from credit_card_ledger_links where ledger_account_id = $1",
-		[sysAliasRes.json?.accountId],
-	)).rows[0].n as number;
-	eqD(ccLinksCount, 0, "7B.2-R2/13: product account creation does not mutate credit_card_ledger_links");
+		// 12. SAME-DATABASE Cross-User HTTP Isolation (User B vs User A in the SAME database instance)
+		// User A's rows (cashAccountId, salaryAccountId, sourceId, receiptId) physically exist in db.
+		// User B performs requests against the exact same db instance without switching databases.
 
-	// 14. Generic Write Surface Remains Absent (404)
-	const test404 = async (path: string, method = "POST") => {
-		const res = await httpCall(path, { method, token: tokenA, body: {} });
-		eqD(res.status, 404, `7B.2-R2/14: ${method} ${path} is not exposed (404)`);
-	};
-	await test404("/transactions");
-	await test404("/transactions/11111111-1111-4111-8111-111111111111/revisions");
-	await test404("/transactions/11111111-1111-4111-8111-111111111111/void");
-	await test404("/ledger/post");
-	await test404("/ledger/entries");
-	await test404("/ledger/journal");
-	await test404("/ledger/reverse");
+		// 13. User B Read Isolation: User B cannot read User A's account balance
+		const u2ReadBalRes = await httpCall(`/ledger/accounts/${cashAccountId}/balance`, {
+			method: "GET",
+			token: tokenB,
+		});
+		eqD(u2ReadBalRes.status, 404, "7B.2-R3/13: User B reading User A balance in same DB returns 404");
+		eqD(u2ReadBalRes.json?.error?.code, "LEDGER_ACCOUNT_NOT_FOUND", "7B.2-R3/13: error code is LEDGER_ACCOUNT_NOT_FOUND without disclosing User A row");
 
-	// Clean up database test seam and close DB
-	setDatabaseFactoryOverrideForTest(null);
-	await pg.close();
+		// 14. User B Income-Source Account Isolation: User B cannot use User A's INCOME account
+		const u2CreateSourceRes = await httpCall("/income/sources", {
+			method: "POST",
+			token: tokenB,
+			body: {
+				code: "u2_source_foreign",
+				name: "User B Job",
+				nature: "REGULAR",
+				referenceMethod: "FIXED_MONTHLY",
+				expectedMonthlyAmount: "30000.00",
+				incomeLedgerAccountId: salaryAccountId, // User A's real account physically in same DB
+				activeFrom: "2026-01-01",
+			},
+		});
+		eqD(u2CreateSourceRes.status, 400, "7B.2-R3/14: User B creating source referencing User A account returns 400");
+		eqD(u2CreateSourceRes.json?.error?.code, "INCOME_LEDGER_ACCOUNT_INVALID", "7B.2-R3/14: error code is INCOME_LEDGER_ACCOUNT_INVALID");
+
+		// 15. User B Receipt Destination Isolation: User B cannot use User A's ASSET account as receipt destination
+		// First create User B's own valid INCOME account and Income Source
+		const u2CreateSalRes = await httpCall("/ledger/accounts", {
+			method: "POST",
+			token: tokenB,
+			body: {
+				code: "SALARY_B",
+				name: "User B Salary Account",
+				accountType: "INCOME",
+			},
+		});
+		eqD(u2CreateSalRes.status, 200, "7B.2-R3/15: User B creates own valid INCOME account");
+		const salIdB = u2CreateSalRes.json?.accountId;
+
+		const u2CreateOwnSourceRes = await httpCall("/income/sources", {
+			method: "POST",
+			token: tokenB,
+			body: {
+				code: "u2_source_own",
+				name: "User B Valid Job",
+				nature: "REGULAR",
+				referenceMethod: "FIXED_MONTHLY",
+				expectedMonthlyAmount: "30000.00",
+				incomeLedgerAccountId: salIdB,
+				activeFrom: "2026-01-01",
+			},
+		});
+		eqD(u2CreateOwnSourceRes.status, 200, "7B.2-R3/15: User B creates own valid Income Source");
+		const sourceIdB = u2CreateOwnSourceRes.json?.sourceId;
+
+		// User B attempts receipt using own sourceIdB but User A's real cashAccountId as destination
+		const u2CrossDestReceiptRes = await httpCall("/income/receipts", {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-rec-cross-dest-1",
+			body: {
+				sourceId: sourceIdB,
+				receivedAt: "2026-09-05T10:00:00.000Z",
+				amount: "30000.00",
+				destinationAccountId: cashAccountId, // User A's real ASSET account in same DB
+				note: "User B stealing User A cash account",
+			},
+		});
+		eqD(u2CrossDestReceiptRes.status, 400, "7B.2-R3/15: User B receipt with User A destination account returns 400");
+		eqD(u2CrossDestReceiptRes.json?.error?.code, "INCOME_DESTINATION_ACCOUNT_INVALID", "7B.2-R3/15: error is typed INCOME_DESTINATION_ACCOUNT_INVALID");
+
+		// 16. User B Foreign Source Isolation: User B attempts receipt using User A's actual sourceId
+		const u2CrossSourceReceiptRes = await httpCall("/income/receipts", {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-rec-cross-source-1",
+			body: {
+				sourceId: sourceId, // User A's real sourceId physically in same DB
+				receivedAt: "2026-09-05T10:00:00.000Z",
+				amount: "30000.00",
+				destinationAccountId: cashAccountId,
+				note: "User B using User A source",
+			},
+		});
+		eqD(u2CrossSourceReceiptRes.status, 404, "7B.2-R3/16: User B receipt with User A source returns 404");
+		eqD(u2CrossSourceReceiptRes.json?.error?.code, "INCOME_SOURCE_NOT_FOUND", "7B.2-R3/16: error is typed INCOME_SOURCE_NOT_FOUND");
+
+		// 17. Cross-User Zero Side Effect Proof:
+		// User A balances remain untouched at exact 65000.00
+		const cashBalFinal = await httpCall(`/ledger/accounts/${cashAccountId}/balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		const salBalFinal = await httpCall(`/ledger/accounts/${salaryAccountId}/balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(cashBalFinal.json?.balance, "65000.00", "7B.2-R3/17: User A cash balance remains exact 65000.00");
+		eqD(salBalFinal.json?.balance, "65000.00", "7B.2-R3/17: User A salary balance remains exact 65000.00");
+
+		// Zero invalid receipts/journals persisted for User B
+		const u2ReceiptCount = (await pg.query(
+			"select count(*)::int as n from income_receipts where user_id = $1",
+			[USER_B],
+		)).rows[0].n as number;
+		eqD(u2ReceiptCount, 0, "7B.2-R3/17: User B has exactly ZERO persisted income receipts");
+
+		const u2JournalCount = (await pg.query(
+			"select count(*)::int as n from journal_entries where user_id = $1",
+			[USER_B],
+		)).rows[0].n as number;
+		eqD(u2JournalCount, 0, "7B.2-R3/17: User B has exactly ZERO persisted journal entries");
+
+		// 18. System Namespace Protection
+		const sysAliasRes = await httpCall("/ledger/accounts", {
+			method: "POST",
+			token: tokenA,
+			body: {
+				code: "SYS_CC_MANDATORY_EXP",
+				name: "Fake CC Expense",
+				accountType: "ASSET",
+			},
+		});
+		eqD(sysAliasRes.status, 200, "7B.2-R2/18: POST with system-like code returns 200");
+		eqD(sysAliasRes.json?.code, "USR_SYS_CC_MANDATORY_EXP", "7B.2-R2/18: code stored safely in USR_ namespace (USR_SYS_CC_MANDATORY_EXP)");
+		const rawSysCount = (await pg.query(
+			"select count(*)::int as n from ledger_accounts where user_id = $1 and code = 'SYS_CC_MANDATORY_EXP'",
+			[USER_A],
+		)).rows[0].n as number;
+		eqD(rawSysCount, 0, "7B.2-R2/18: raw SYS_CC_MANDATORY_EXP code was not occupied");
+		const ccLinksCount = (await pg.query(
+			"select count(*)::int as n from credit_card_ledger_links where ledger_account_id = $1",
+			[sysAliasRes.json?.accountId],
+		)).rows[0].n as number;
+		eqD(ccLinksCount, 0, "7B.2-R2/18: product account creation does not mutate credit_card_ledger_links");
+
+		// 19. Generic Write Surface Remains Absent (404)
+		const test404 = async (path: string, method = "POST") => {
+			const res = await httpCall(path, { method, token: tokenA, body: {} });
+			eqD(res.status, 404, `7B.2-R2/19: ${method} ${path} is not exposed (404)`);
+		};
+		await test404("/transactions");
+		await test404("/transactions/11111111-1111-4111-8111-111111111111/revisions");
+		await test404("/transactions/11111111-1111-4111-8111-111111111111/void");
+		await test404("/ledger/post");
+		await test404("/ledger/entries");
+		await test404("/ledger/journal");
+		await test404("/ledger/reverse");
+	} finally {
+		// Clean up database test seam and close DB
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
 }
 
 const probed = await probe();
