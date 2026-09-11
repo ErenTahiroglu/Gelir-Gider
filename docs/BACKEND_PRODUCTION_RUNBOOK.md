@@ -26,7 +26,7 @@ Every release candidate must pass all validation gates locally and in CI before 
    ```bash
    npm run check
    ```
-   Runs `cf-typegen`, `typecheck`, `lint`, `format:check`, and `test` (170 test suites, 2190+ tests).
+   Runs `cf-typegen`, `typecheck`, `lint`, `format:check`, and `test` (171 test suites, 2205+ tests).
 
 2. **PostgreSQL Runtime Verification (PGlite):**
    ```bash
@@ -60,18 +60,18 @@ Every release candidate must pass all validation gates locally and in CI before 
 
 | Variable | Type | Secret? | Description / Requirements |
 | :--- | :--- | :--- | :--- |
-| `DATABASE_URL` | String | **YES** | PostgreSQL connection string (Neon pooler/direct connection). Format: `postgresql://...` |
-| `WEBAUTHN_RP_ID` | String | No | Relying Party ID for WebAuthn passkey operations (e.g. `gelir-gider.app` or `localhost`). |
-| `WEBAUTHN_RP_NAME` | String | No | Human-readable Relying Party Name (e.g. `Gelir Gider`). |
-| `WEBAUTHN_ORIGIN` | String | No | Authorized origin for WebAuthn ceremony and Same-Origin CSRF guard (e.g. `https://gelir-gider.app`). |
-| `BOOTSTRAP_TOKEN_HASH` | String | **YES** | Hex-encoded SHA-256 hash of the single-use bootstrap administrative token for passkey enrollment. |
-| `BACKUP_ENCRYPTION_KEY` | String | **YES** | Base64url-encoded 32-byte (256-bit) AES key for database backup encryption at rest. |
-| `BACKUP_ENCRYPTION_KEY_ID` | String | No | Identifier key version for backup encryption (default: `v1`). |
-| `BACKUP_BUCKET` | Binding | No | Cloudflare R2 bucket binding mapped to `gelir-gider-backups`. |
+| `DATABASE_URL` | String | **YES** | PostgreSQL connection string (Neon pooler/direct connection, `sslmode=require`). Format: `postgresql://...` |
+| `WEBAUTHN_RP_ID` | String | No | Relying Party ID for WebAuthn passkey operations (domain name, e.g., `gelir-gider.app` or `localhost`). |
+| `WEBAUTHN_RP_NAME` | String | No | Human-readable Relying Party Name (e.g., `Gelir Gider`). |
+| `WEBAUTHN_ORIGIN` | String | No | Authorized origin for WebAuthn ceremony and Same-Origin CSRF guard (e.g., `https://gelir-gider.app` or `http://localhost:8787`). |
+| `BOOTSTRAP_TOKEN_HASH` | String | **YES** | Hex-encoded SHA-256 hash of single-use bootstrap administrative token for passkey enrollment (64 lowercase hex characters). |
+| `WEB_PUSH_VAPID_SUBJECT` | String | No | Web Push VAPID contact URI (required when push delivery is used; trimmed non-empty `mailto:<address>` or `https://...` URL). |
+| `WEB_PUSH_VAPID_PUBLIC_KEY` | String | No | 65-byte uncompressed P-256 public key (strict unpadded base64url). |
+| `WEB_PUSH_VAPID_PRIVATE_KEY` | String | **YES** | 32-byte P-256 private scalar (strict unpadded base64url). |
+| `BACKUP_ENCRYPTION_KEY` | String | **YES** | 32-byte AES-256-GCM symmetric encryption key (strict unpadded base64url). |
+| `BACKUP_ENCRYPTION_KEY_ID` | String | No | Optional key generation identifier tag (defaults to `v1`; 1–64 chars, letters/digits/underscore/hyphen only). |
 | `AUTH_RATE_LIMITER` | Binding | No | Cloudflare Worker Rate Limiter binding for authentication routes. |
-| `WEB_PUSH_VAPID_PUBLIC_KEY` | String | No | NIST P-256 base64url-encoded public key for Web Push notifications. |
-| `WEB_PUSH_VAPID_PRIVATE_KEY` | String | **YES** | NIST P-256 PKCS#8 base64url-encoded private key for Web Push signing. |
-| `WEB_PUSH_CONTACT_EMAIL` | String | No | Contact email for push service mailto subject (e.g. `admin@gelir-gider.app`). |
+| `BACKUP_BUCKET` | Binding | No | Cloudflare R2 bucket binding mapped to `gelir-gider-backups`. |
 
 ---
 
@@ -183,6 +183,7 @@ Restore Flow:
 2. **Web Push VAPID Key Rotation:**
    - Generate new P-256 key pair.
    - Update `WEB_PUSH_VAPID_PUBLIC_KEY` and `WEB_PUSH_VAPID_PRIVATE_KEY` secrets.
+   - Update `WEB_PUSH_VAPID_SUBJECT` contact URI if needed.
    - Notify client for push subscription refresh.
 
 3. **Backup Encryption Key Rotation:**
@@ -220,7 +221,7 @@ The application origin is read from `WEBAUTHN_ORIGIN` config — never hard-code
 
 | Component | Status | Notes |
 | :--- | :--- | :--- |
-| **BACKEND CORE** | **READY** | All domain calculations, invariants, and tests passing. |
+| **BACKEND CORE** | **READY** | All domain calculations, invariants, and tests passing (2205 tests). |
 | **FINANCIAL DOMAIN SERVICES** | **READY** | Implemented as internal TypeScript domain services (see 7B.0 inventory). |
 | **DATABASE MIGRATIONS** | **READY through 0071** | 72 migration files verified and immutable. |
 | **AUTH CORE** | **READY** | WebAuthn / Passkey, session cookies, rate limiter, recovery. |
