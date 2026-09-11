@@ -1466,6 +1466,29 @@ creditCardRouter.get("/:cardId/purchases/:id", async (c) => {
 	}
 });
 
+function normalizePurchaseCategoryForDomain(
+	raw: unknown,
+):
+	| "MANDATORY"
+	| "DISCRETIONARY"
+	| "SHORT_TERM_PURCHASE"
+	| "UNCLASSIFIED"
+	| null {
+	if (typeof raw !== "string") return null;
+	const trimmed = raw.trim().toUpperCase();
+	if (trimmed === "MANDATORY" || trimmed === "MANDATORY_EXPENSE")
+		return "MANDATORY";
+	if (
+		trimmed === "DISCRETIONARY" ||
+		trimmed === "DISCRETIONARY_SPEND" ||
+		trimmed === "DISCRETIONARY_EXPENSE"
+	)
+		return "DISCRETIONARY";
+	if (trimmed === "SHORT_TERM_PURCHASE") return "SHORT_TERM_PURCHASE";
+	if (trimmed === "UNCLASSIFIED") return "UNCLASSIFIED";
+	return null;
+}
+
 /**
  * POST /credit-cards/:cardId/purchases
  * Records a new unshared purchase on a credit card.
@@ -1507,12 +1530,8 @@ creditCardRouter.post("/:cardId/purchases", async (c) => {
 	if (typeof amount !== "string" || !/^\d+\.\d{2}$/.test(amount)) {
 		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 	}
-	if (
-		purchaseCategory !== "MANDATORY_EXPENSE" &&
-		purchaseCategory !== "DISCRETIONARY_EXPENSE" &&
-		purchaseCategory !== "SAVING_INVESTMENT" &&
-		purchaseCategory !== "DEBT_REPAYMENT"
-	) {
+	const normCat = normalizePurchaseCategoryForDomain(purchaseCategory);
+	if (!normCat) {
 		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 	}
 	if (shortTermGoalId !== undefined && shortTermGoalId !== null) {
@@ -1551,7 +1570,7 @@ creditCardRouter.post("/:cardId/purchases", async (c) => {
 			userId: auth.userId,
 			cardId,
 			amount,
-			purchaseCategory,
+			purchaseCategory: normCat,
 			shortTermGoalId: shortTermGoalId ?? null,
 			merchant: merchant ? merchant.trim() : null,
 			description: description ? description.trim() : null,
@@ -1620,12 +1639,8 @@ async function handleUpdatePurchase(c: Context<CreditCardEnv>) {
 	if (typeof amount !== "string" || !/^\d+\.\d{2}$/.test(amount)) {
 		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 	}
-	if (
-		purchaseCategory !== "MANDATORY_EXPENSE" &&
-		purchaseCategory !== "DISCRETIONARY_EXPENSE" &&
-		purchaseCategory !== "SAVING_INVESTMENT" &&
-		purchaseCategory !== "DEBT_REPAYMENT"
-	) {
+	const normCat = normalizePurchaseCategoryForDomain(purchaseCategory);
+	if (!normCat) {
 		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 	}
 	if (shortTermGoalId !== undefined && shortTermGoalId !== null) {
@@ -1678,7 +1693,7 @@ async function handleUpdatePurchase(c: Context<CreditCardEnv>) {
 			eventId,
 			expectedRevisionNo,
 			amount,
-			purchaseCategory,
+			purchaseCategory: normCat,
 			shortTermGoalId: shortTermGoalId ?? null,
 			merchant: merchant ? merchant.trim() : null,
 			description: description ? description.trim() : null,

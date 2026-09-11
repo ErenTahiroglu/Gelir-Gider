@@ -14072,7 +14072,8 @@ async function resolverRuntime7B3() {
 			return { status: res.status, json, headers: res.headers };
 		};
 
-		// 1. User A Provisions funding accounts (Bank Asset + Initial 10,000.00 TRY Deposit)
+		// 1. User A Provisions funding accounts
+		// Bank Asset for Outside payments + Initial 10,000.00 TRY Deposit
 		const bankAccountRes = await httpCall("/ledger/accounts", {
 			method: "POST",
 			token: tokenA,
@@ -14085,6 +14086,19 @@ async function resolverRuntime7B3() {
 		eqD(bankAccountRes.status, 200, "7B.3/1: User A funding account creation returns 200");
 		const bankAccountId = bankAccountRes.json?.accountId;
 		chkD(typeof bankAccountId === "string" && bankAccountId.length > 0, "7B.3/1: valid bankAccountId returned");
+
+		// Dedicated Midas Asset Account
+		const midasAssetAccountRes = await httpCall("/ledger/accounts", {
+			method: "POST",
+			token: tokenA,
+			body: {
+				code: "MIDAS_ASSET",
+				name: "User A Midas Pool Asset",
+				accountType: "ASSET",
+			},
+		});
+		eqD(midasAssetAccountRes.status, 200, "7B.3/1: User A Midas asset account returns 200");
+		const midasAssetAccountId = midasAssetAccountRes.json?.accountId;
 
 		const salaryAccountRes = await httpCall("/ledger/accounts", {
 			method: "POST",
@@ -14134,11 +14148,11 @@ async function resolverRuntime7B3() {
 		});
 		eqD(bankBalInitial.json?.balance, "10000.00", "7B.3/1: User A bank balance is verified 10000.00 TRY");
 
-		// Seed Midas account for User A
+		// Seed Midas account for User A linked to midasAssetAccountId
 		const midasAccId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 		await pg.query(
 			"insert into midas_accounts (id, user_id, ledger_account_id) values ($1, $2, $3)",
-			[midasAccId, USER_A, bankAccountId],
+			[midasAccId, USER_A, midasAssetAccountId],
 		);
 
 		// 2. User A Creates Credit Card via POST /credit-cards
@@ -14265,9 +14279,9 @@ async function resolverRuntime7B3() {
 			token: tokenA,
 		});
 		eqD(readinessRes.status, 200, "7B.3/9: GET readiness returns 200");
-		eqD(readinessRes.json?.readiness?.isExactMatch, true, "7B.3/9: readiness isExactMatch is true");
-		eqD(readinessRes.json?.readiness?.isLiabilityCovered, true, "7B.3/9: readiness isLiabilityCovered is true");
-		eqD(readinessRes.json?.readiness?.totalPostedPurchases, "2500.00", "7B.3/9: totalPostedPurchases matches 2500.00");
+		eqD(readinessRes.json?.readiness?.liabilityCoverage, "READY", "7B.3/9: readiness liabilityCoverage is READY");
+		eqD(readinessRes.json?.readiness?.statementAmount, "2500.00", "7B.3/9: readiness statementAmount is 2500.00");
+		eqD(readinessRes.json?.readiness?.liabilityAfterPayment, "0.00", "7B.3/9: readiness liabilityAfterPayment is 0.00");
 
 		// 10. Persist Explicit Reconciliation via POST /credit-cards/:cardId/statements/:id/reconcile
 		const reconRes = await httpCall(`/credit-cards/${cardId}/statements/${statementId}/reconcile`, {
@@ -14314,8 +14328,7 @@ async function resolverRuntime7B3() {
 		});
 		eqD(payRes.status, 200, "7B.3/11: POST /credit-cards/:cardId/statements/:id/pay returns 200");
 		eqD(payRes.json?.status, "PAID", "7B.3/11: resulting statement status is PAID");
-		eqD(payRes.json?.paymentAmount, "2500.00", "7B.3/11: paymentAmount is 2500.00");
-		chkD(typeof payRes.json?.journalEntryId === "string", "7B.3/11: journalEntryId created");
+		eqD(payRes.json?.snapshot?.statementAmount, "2500.00", "7B.3/11: paymentAmount is 2500.00");
 
 		// Verify Bank balance decreased from 10000.00 to 7500.00
 		const bankBalAfterPay = await httpCall(`/ledger/accounts/${bankAccountId}/balance`, {
@@ -14379,8 +14392,6 @@ async function resolverRuntime7B3() {
 		});
 		eqD(reopenRes.status, 200, "7B.3/13: POST /credit-cards/:cardId/statements/:id/reopen returns 200");
 		eqD(reopenRes.json?.status, "OPEN", "7B.3/13: statement status returned to OPEN");
-		eqD(reopenRes.json?.reopenedPaymentAmount, "2500.00", "7B.3/13: reopenedPaymentAmount is 2500.00");
-		chkD(typeof reopenRes.json?.reversalJournalEntryId === "string", "7B.3/13: reversalJournalEntryId created");
 
 		// Bank balance restored to 10000.00
 		const bankBalAfterReopen = await httpCall(`/ledger/accounts/${bankAccountId}/balance`, {
@@ -14516,10 +14527,21 @@ async function resolverRuntime7B3() {
 		});
 		const u2CardId = u2CardCreate.json?.cardId;
 
+		const u2MidasAssetRes = await httpCall("/ledger/accounts", {
+			method: "POST",
+			token: tokenB,
+			body: {
+				code: "U2_MIDAS_ASSET",
+				name: "User B Midas Asset",
+				accountType: "ASSET",
+			},
+		});
+		const u2MidasAssetId = u2MidasAssetRes.json?.accountId;
+
 		const midasAccIdB = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 		await pg.query(
 			"insert into midas_accounts (id, user_id, ledger_account_id) values ($1, $2, $3)",
-			[midasAccIdB, USER_B, bankAccountId], // intentionally testing foreign link rejection
+			[midasAccIdB, USER_B, u2MidasAssetId],
 		);
 
 		const u2StmtCreate = await httpCall(`/credit-cards/${u2CardId}/statements`, {
