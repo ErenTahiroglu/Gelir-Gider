@@ -177,8 +177,6 @@ All routes require:
 | `GET` | `/transactions/:transactionId` | Single canonical transaction current effective state |
 | `GET` | `/transactions/:transactionId/revisions` | Keyset-paginated revision audit history (`limit`, `beforeRevisionNo`) |
 
-*Direct manual transaction mutation (`POST /transactions`, `POST /transactions/:id/revisions`, `POST /transactions/:id/void`): NOT YET EXPOSED — PRODUCT SEMANTICS MUST BE DOMAIN-SAFE.*
-
 ### 4.5 Ledger (`/ledger/*`)
 
 All routes are **READ-ONLY**. Raw journal write endpoints (`/ledger/entries`, `/ledger/post`, `/ledger/journal`, `/ledger/reverse`) are **not exposed** and do not exist on the HTTP surface.
@@ -191,6 +189,36 @@ All routes require:
 |--------|------|-------------|
 | `GET` | `/ledger/accounts` | List of ledger account balances (`includeArchived`, `asOf`) |
 | `GET` | `/ledger/accounts/:accountId/balance` | Single ledger account balance (`asOf`) |
+
+### 4.6 Income (`/income/*`)
+
+Specialized domain for income management (sources, monthly entitlements, realized receipts, attribution settlements, and baseline monthly reference income). All mutating endpoints are guarded with `sameOriginMutationGuard()` and require session authentication.
+
+All routes require:
+- Session authentication (`__Host-gg_session` cookie)
+- User identity derived **strictly** from session (`c.get("auth").userId`)
+- Mutating methods (POST) require `Origin: <WEBAUTHN_ORIGIN>` and closed bodies.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/income/sources` | Keyset-paginated list of income sources (`limit`, `includeArchived`, `beforeCreatedAt`, `beforeSourceId`) |
+| `GET` | `/income/sources/:sourceId` | Single income source detail |
+| `POST` | `/income/sources` | Create income source with natural-key replay against `(userId, code)` |
+| `POST` | `/income/sources/:sourceId/archive` | State-idempotently archive an income source |
+| `GET` | `/income/entitlements` | Keyset-paginated list of income entitlements (`sourceId`, `periodMonthFrom`, `periodMonthUntil`, `overdueAsOf`, `limit`, `beforePeriodMonth`, `beforeEntitlementId`) |
+| `GET` | `/income/entitlements/:entitlementId` | Single income entitlement detail (`overdueAsOf`) |
+| `POST` | `/income/entitlements` | Create expected monthly entitlement (`Idempotency-Key` required; creates audit transaction with ZERO ledger movement) |
+| `POST` | `/income/entitlements/:entitlementId/revisions` | Revise expected monthly entitlement (`Idempotency-Key`, `expectedRevisionNo` required) |
+| `POST` | `/income/entitlements/:entitlementId/void` | Void expected monthly entitlement (`Idempotency-Key`, `expectedRevisionNo` required; blocked if active settlements exist) |
+| `GET` | `/income/receipts` | Keyset-paginated list of realized income receipts (`sourceId`, `from`, `to`, `includeVoided`, `limit`, `beforeReceivedAt`, `beforeIncomeReceiptId`) |
+| `GET` | `/income/receipts/:incomeReceiptId` | Single realized income receipt detail |
+| `POST` | `/income/receipts` | Create realized cash receipt (`Idempotency-Key` required; posts atomic double-entry journal effect) |
+| `POST` | `/income/receipts/:incomeReceiptId/revisions` | Revise realized cash receipt (`Idempotency-Key`, `expectedRevisionNo` required; reverses old journal and posts corrected journal atomically) |
+| `POST` | `/income/receipts/:incomeReceiptId/void` | Void realized cash receipt (`Idempotency-Key`, `expectedRevisionNo` required; reverses journal effect; blocked if active settlements exist) |
+| `GET` | `/income/receipts/:incomeReceiptId/settlement` | Get receipt settlement breakdown and allocations |
+| `POST` | `/income/receipts/:incomeReceiptId/settlement` | Create receipt-to-entitlement settlement attribution (`Idempotency-Key` required; ZERO ledger movement) |
+| `POST` | `/income/receipts/:incomeReceiptId/settlement/revisions` | Revise settlement attribution / clear with `allocations: []` (`Idempotency-Key`, `expectedRevisionNo` required) |
+| `GET` | `/income/reference` | Calculate baseline monthly reference income (`asOf=YYYY-MM-DD`; NOT realized cash) |
 
 ---
 
@@ -374,16 +402,86 @@ Returns `200 OK` with `{ "transactionId": "uuid", "revisions": [...], "nextCurso
 - Query parameters: `asOf` (optional UTC ISO instant)
 - Response (`200 OK`): `{ "accountId": "uuid", "currency": "TRY", "normalBalance": "DEBIT|CREDIT", "balance": "150.75", "asOf": "2026-09-10T12:00:00.000Z" }`
 
-**Transaction & Ledger Error Codes:**
+### 5.7 Income Product Surface (Checkpoint 7B.2)
+
+All routes require session authentication (`__Host-gg_session` cookie) with user identity strictly bound to `c.get("auth").userId`. Mutating POST endpoints require `Origin: <WEBAUTHN_ORIGIN>` and closed bodies.
+
+#### 5.7.1 Income Sources
+- **`GET /income/sources`**: Keyset pagination with `limit` (default 50, max 100), `includeArchived` (strict `"true"` | `"false"`), `beforeCreatedAt` (ISO UTC instant), and `beforeSourceId` (UUID). Ordered `createdAt DESC, id DESC`.
+- **`GET /income/sources/:sourceId`**: Single source detail. Returns 404 for missing or other user's source.
+- **`POST /income/sources`**: Create income source with **natural-key replay** against `(userId, normalized code)`.
+  - Body (closed): `{ code, name, nature ("REGULAR"|"EXTRA"|"SUPPORT"), referenceMethod ("FIXED_MONTHLY"|"SEASONAL_ANNUALIZED"|"ROLLING_MEDIAN"|"EXCLUDED"), expectedMonthlyAmount?, seasonalMonthsPerYear?, rollingMedianMonths?, incomeLedgerAccountId, activeFrom ("YYYY-MM-DD"), activeUntil? }`
+  - Replay semantics: First valid create -> `idempotentReplay: false`. Exact retry with identical definition -> `idempotentReplay: true`. Different definition with same code -> `409 INCOME_SOURCE_CODE_CONFLICT`.
+  - Account validation: `incomeLedgerAccountId` must belong to the user, have `accountType: "INCOME"`, `normalBalance: "CREDIT"`, matching currency, and unarchived.
+- **`POST /income/sources/:sourceId/archive`**: State-idempotent archive. Repeated calls return the archived source safely.
+
+#### 5.7.2 Income Entitlements
+- **`GET /income/entitlements`**: Keyset pagination with `limit` (default 50, max 100), `sourceId`, `periodMonthFrom`, `periodMonthUntil`, `overdueAsOf` (`YYYY-MM-DD`), `beforePeriodMonth`, `beforeEntitlementId`. Ordered `periodMonth DESC, id DESC`.
+- **`GET /income/entitlements/:entitlementId`**: Single entitlement detail with optional `overdueAsOf=YYYY-MM-DD`.
+- **`POST /income/entitlements`**: Create monthly entitlement.
+  - Header: `Idempotency-Key` (required).
+  - Body: `{ sourceId, periodMonth ("YYYY-MM-01"), amount, expectedReceiptOn? ("YYYY-MM-DD"), note? }`
+  - Zero ledger movement: creates canonical audit transaction only (NO journal entry, NO ledger movement).
+- **`POST /income/entitlements/:entitlementId/revisions`**: Revise entitlement.
+  - Header: `Idempotency-Key`.
+  - Body: `{ expectedRevisionNo, amount, expectedReceiptOn?, note?, reasonNote? }`
+- **`POST /income/entitlements/:entitlementId/void`**: Void entitlement.
+  - Header: `Idempotency-Key`.
+  - Body: `{ expectedRevisionNo, reasonNote? }`
+  - Blocked with `409 INCOME_SETTLEMENT_CONFLICT` if active settlement allocations exist.
+
+#### 5.7.3 Realized Income Receipts
+- **`GET /income/receipts`**: Keyset pagination with `limit` (default 50, max 100), `sourceId`, `from`, `to` (UTC ISO instants), `includeVoided` (strict `"true"` | `"false"`), `beforeReceivedAt`, `beforeIncomeReceiptId`. Ordered `receivedAt DESC, id DESC`.
+- **`GET /income/receipts/:incomeReceiptId`**: Single realized receipt detail.
+- **`POST /income/receipts`**: Authoritative cash entry.
+  - Header: `Idempotency-Key`.
+  - Body: `{ sourceId, receivedAt (UTC ISO instant), amount, destinationAccountId, note? }`
+  - Accounting effect: Atomically creates canonical transaction + posts DEBIT `destinationAccountId` (ASSET) and CREDIT `source.incomeLedgerAccountId` (INCOME).
+- **`POST /income/receipts/:incomeReceiptId/revisions`**: Revise realized receipt.
+  - Header: `Idempotency-Key`.
+  - Body: `{ expectedRevisionNo, receivedAt, amount, destinationAccountId, note?, reasonNote? }`
+  - Atomically reverses old journal entry and posts corrected journal entry.
+- **`POST /income/receipts/:incomeReceiptId/void`**: Void realized receipt.
+  - Header: `Idempotency-Key`.
+  - Body: `{ expectedRevisionNo, reasonNote? }`
+  - Reverses active journal entry. Blocked with `409 INCOME_SETTLEMENT_CONFLICT` if active settlement allocations exist.
+
+#### 5.7.4 Receipt-to-Entitlement Settlements
+- **`GET /income/receipts/:incomeReceiptId/settlement`**: Returns `{ incomeReceiptId, receiptAmount, allocatedAmount, unallocatedAmount, revisionNo, allocations: [ { entitlementId, periodMonth, entitlementAmount, allocatedAmount, entitlementOutstandingAfterAllReceipts } ] }`.
+- **`POST /income/receipts/:incomeReceiptId/settlement`**: Create settlement attribution.
+  - Header: `Idempotency-Key`.
+  - Body: `{ allocations: [ { entitlementId, amount } ], note? }`
+  - Enforces receipt cap, per-entitlement caps, and source compatibility. Zero ledger movement.
+- **`POST /income/receipts/:incomeReceiptId/settlement/revisions`**: Revise settlement attribution.
+  - Header: `Idempotency-Key`.
+  - Body: `{ expectedRevisionNo, allocations: [ { entitlementId, amount } ], note?, reasonNote? }`
+  - Passing `allocations: []` clears allocations, which allows subsequent voiding of the receipt or entitlement.
+
+#### 5.7.5 Monthly Reference Income
+- **`GET /income/reference?asOf=YYYY-MM-DD`**: Calculates baseline reference income.
+  - Response: `{ asOf, currency, total, sources: [ { sourceId, code, name, nature, referenceMethod, referenceAmount } ] }`
+  - Reference income is a baseline calculation and is NOT realized income or cash received.
+
+**Income Error Codes:**
 | Code | Status | Description |
 |------|--------|-------------|
-| `TRANSACTION_INVALID_INPUT` | 400 | Malformed query parameter or invalid format |
-| `TRANSACTION_NOT_FOUND` | 404 | Transaction not found or not owned by authenticated user |
-| `LEDGER_INVALID_INPUT` | 400 | Malformed query parameter or invalid format |
-| `LEDGER_ACCOUNT_NOT_FOUND` | 404 | Ledger account not found or not owned by user |
-| `UNAUTHENTICATED` | 401 | No valid session cookie |
-| `NOT_FOUND` | 404 | Route does not exist |
-| `INTERNAL_ERROR` | 500 | Unexpected server error |
+| `INCOME_INVALID_INPUT` | 400 | Malformed parameter, invalid format, or closed-body rejection |
+| `INCOME_SOURCE_NOT_FOUND` | 404 | Income source not found or owned by another user |
+| `INCOME_ENTITLEMENT_NOT_FOUND` | 404 | Income entitlement not found or owned by another user |
+| `INCOME_RECEIPT_NOT_FOUND` | 404 | Income receipt not found or owned by another user |
+| `INCOME_SETTLEMENT_NOT_FOUND` | 404 | Income settlement batch not found |
+| `INCOME_SOURCE_CODE_CONFLICT` | 409 | Income source code exists with different definition |
+| `INCOME_SOURCE_ARCHIVED` | 409 | Mutation rejected because income source is archived |
+| `INCOME_IDEMPOTENCY_CONFLICT` | 409 | Replay with different payload on same idempotency key |
+| `INCOME_ENTITLEMENT_PERIOD_CONFLICT` | 409 | Entitlement already exists for same source and periodMonth |
+| `INCOME_ENTITLEMENT_REVISION_CONFLICT`| 409 | Stale expectedRevisionNo on entitlement revision/void |
+| `INCOME_ENTITLEMENT_ALREADY_VOIDED` | 409 | Cannot mutate an already voided entitlement |
+| `INCOME_RECEIPT_REVISION_CONFLICT` | 409 | Stale expectedRevisionNo on receipt revision/void |
+| `INCOME_RECEIPT_ALREADY_VOIDED` | 409 | Cannot mutate an already voided receipt |
+| `INCOME_SETTLEMENT_CONFLICT` | 409 | Settlement cap exceeded or active settlement blocks void |
+| `INCOME_SETTLEMENT_ALREADY_EXISTS` | 409 | Settlement batch exists; use revision endpoint |
+| `INCOME_SETTLEMENT_REVISION_CONFLICT` | 409 | Stale expectedRevisionNo on settlement revision |
+| `INCOME_LEDGER_ACCOUNT_INVALID` | 400 | Account does not exist, not owned, or wrong type/currency |
 
 ---
 
@@ -418,30 +516,6 @@ Returns `200 OK` with `{ "transactionId": "uuid", "revisions": [...], "nextCurso
 
 The underlying domain **service** code exists for all of these domains. What is missing is
 the HTTP adapter layer (route handlers, input validation, error mapping).
-
-### 7B.2 — Income
-
-```
-PLANNED  GET   /income/sources/:id
-PLANNED  GET   /income/sources              ?limit=&after=
-PLANNED  POST  /income/sources              (create)
-PLANNED  POST  /income/sources/:id/archive  (archive)
-
-PLANNED  GET   /income/entitlements/:id
-PLANNED  GET   /income/entitlements         ?sourceId=&limit=&after=
-PLANNED  POST  /income/entitlements         (create)
-PLANNED  POST  /income/entitlements/:id/revise  (revise)
-PLANNED  POST  /income/entitlements/:id/void    (void)
-
-PLANNED  GET   /income/receipts/:id
-PLANNED  GET   /income/receipts             ?limit=&after=
-PLANNED  POST  /income/receipts             (create)
-PLANNED  POST  /income/receipts/:id/revise  (revise)
-PLANNED  POST  /income/receipts/:id/void    (void)
-
-PLANNED  GET   /income/reference            ?month=YYYY-MM
-PLANNED  POST  /income/settlements          (create or revise)
-```
 
 ### 7B.3 — Credit Cards
 

@@ -680,8 +680,15 @@ export async function reviseIncomeReceipt(
 
 		if (!prevRev) {
 			throw new IncomeError(
-				"INCOME_RECEIPT_INVALID_STATE",
+				"INCOME_RECEIPT_REVISION_CONFLICT",
 				`Expected revision ${expectedRevisionNo} not found for income receipt`,
+			);
+		}
+
+		if (prevRev.operation === "VOID") {
+			throw new IncomeError(
+				"INCOME_RECEIPT_ALREADY_VOIDED",
+				"Cannot revise an already VOIDED income receipt",
 			);
 		}
 
@@ -743,6 +750,18 @@ export async function reviseIncomeReceipt(
 					"INCOME_IDEMPOTENCY_CONFLICT",
 					"Income receipt revision replayed with changed parameters",
 				);
+			}
+			if (
+				err instanceof CanonicalTransactionError &&
+				err.code === "TRANSACTION_REVISION_CONFLICT"
+			) {
+				throw new IncomeError("INCOME_RECEIPT_REVISION_CONFLICT", err.message);
+			}
+			if (
+				err instanceof CanonicalTransactionError &&
+				err.code === "TRANSACTION_ALREADY_VOIDED"
+			) {
+				throw new IncomeError("INCOME_RECEIPT_ALREADY_VOIDED", err.message);
 			}
 			if (
 				err instanceof CanonicalTransactionError &&
@@ -919,8 +938,15 @@ export async function voidIncomeReceiptInTransaction(
 
 		if (!prevRev) {
 			throw new IncomeError(
-				"INCOME_RECEIPT_INVALID_STATE",
+				"INCOME_RECEIPT_REVISION_CONFLICT",
 				`Expected revision ${expectedRevisionNo} not found for income receipt`,
+			);
+		}
+
+		if (prevRev.operation === "VOID") {
+			throw new IncomeError(
+				"INCOME_RECEIPT_ALREADY_VOIDED",
+				"Cannot void an already VOIDED income receipt",
 			);
 		}
 
@@ -956,6 +982,18 @@ export async function voidIncomeReceiptInTransaction(
 					"INCOME_IDEMPOTENCY_CONFLICT",
 					"Income receipt void replayed with conflict",
 				);
+			}
+			if (
+				err instanceof CanonicalTransactionError &&
+				err.code === "TRANSACTION_REVISION_CONFLICT"
+			) {
+				throw new IncomeError("INCOME_RECEIPT_REVISION_CONFLICT", err.message);
+			}
+			if (
+				err instanceof CanonicalTransactionError &&
+				err.code === "TRANSACTION_ALREADY_VOIDED"
+			) {
+				throw new IncomeError("INCOME_RECEIPT_ALREADY_VOIDED", err.message);
 			}
 			throw err;
 		}

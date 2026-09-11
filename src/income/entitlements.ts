@@ -593,14 +593,14 @@ export async function reviseIncomeEntitlement(
 
 		if (!prevRev) {
 			throw new IncomeError(
-				"INCOME_ENTITLEMENT_INVALID_STATE",
+				"INCOME_ENTITLEMENT_REVISION_CONFLICT",
 				`Expected revision ${expectedRevisionNo} not found for entitlement`,
 			);
 		}
 
 		if (prevRev.operation === "VOID") {
 			throw new IncomeError(
-				"INCOME_ENTITLEMENT_INVALID_STATE",
+				"INCOME_ENTITLEMENT_ALREADY_VOIDED",
 				"Cannot revise an already VOIDED income entitlement",
 			);
 		}
@@ -652,6 +652,21 @@ export async function reviseIncomeEntitlement(
 					"INCOME_IDEMPOTENCY_CONFLICT",
 					"Income entitlement revision replayed with changed parameters",
 				);
+			}
+			if (
+				err instanceof CanonicalTransactionError &&
+				err.code === "TRANSACTION_REVISION_CONFLICT"
+			) {
+				throw new IncomeError(
+					"INCOME_ENTITLEMENT_REVISION_CONFLICT",
+					err.message,
+				);
+			}
+			if (
+				err instanceof CanonicalTransactionError &&
+				err.code === "TRANSACTION_ALREADY_VOIDED"
+			) {
+				throw new IncomeError("INCOME_ENTITLEMENT_ALREADY_VOIDED", err.message);
 			}
 			throw err;
 		}
@@ -877,14 +892,14 @@ export async function voidIncomeEntitlement(
 
 		if (!prevRev) {
 			throw new IncomeError(
-				"INCOME_ENTITLEMENT_INVALID_STATE",
+				"INCOME_ENTITLEMENT_REVISION_CONFLICT",
 				`Expected revision ${expectedRevisionNo} not found for entitlement`,
 			);
 		}
 
 		if (prevRev.operation === "VOID") {
 			throw new IncomeError(
-				"INCOME_ENTITLEMENT_INVALID_STATE",
+				"INCOME_ENTITLEMENT_ALREADY_VOIDED",
 				"Cannot void an already VOIDED income entitlement",
 			);
 		}
@@ -924,6 +939,21 @@ export async function voidIncomeEntitlement(
 					"INCOME_IDEMPOTENCY_CONFLICT",
 					"Income entitlement void replayed with changed parameters",
 				);
+			}
+			if (
+				err instanceof CanonicalTransactionError &&
+				err.code === "TRANSACTION_REVISION_CONFLICT"
+			) {
+				throw new IncomeError(
+					"INCOME_ENTITLEMENT_REVISION_CONFLICT",
+					err.message,
+				);
+			}
+			if (
+				err instanceof CanonicalTransactionError &&
+				err.code === "TRANSACTION_ALREADY_VOIDED"
+			) {
+				throw new IncomeError("INCOME_ENTITLEMENT_ALREADY_VOIDED", err.message);
 			}
 			throw err;
 		}

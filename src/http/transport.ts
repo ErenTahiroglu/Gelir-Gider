@@ -177,6 +177,28 @@ export const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	LEDGER_CURRENCY_MISMATCH: "Ledger currency mismatch",
 	LEDGER_ENTRY_NOT_FOUND: "Ledger entry not found",
 	LEDGER_ALREADY_REVERSED: "Ledger entry has already been reversed",
+	INCOME_INVALID_INPUT: "Invalid income request",
+	INCOME_SOURCE_NOT_FOUND: "Income source not found",
+	INCOME_SOURCE_ARCHIVED: "Income source is archived",
+	INCOME_SOURCE_CODE_CONFLICT: "Income source code conflict",
+	INCOME_LEDGER_ACCOUNT_INVALID: "Invalid ledger account for income source",
+	INCOME_DESTINATION_ACCOUNT_INVALID:
+		"Invalid destination account for income receipt",
+	INCOME_RECEIPT_NOT_FOUND: "Income receipt not found",
+	INCOME_RECEIPT_REVISION_CONFLICT: "Income receipt revision is stale",
+	INCOME_RECEIPT_ALREADY_VOIDED: "Income receipt is already voided",
+	INCOME_IDEMPOTENCY_CONFLICT:
+		"Idempotency-Key was already used with a different income request",
+	INCOME_ENTITLEMENT_NOT_FOUND: "Income entitlement not found",
+	INCOME_ENTITLEMENT_PERIOD_CONFLICT:
+		"Income entitlement period already exists for source",
+	INCOME_ENTITLEMENT_REVISION_CONFLICT: "Income entitlement revision is stale",
+	INCOME_ENTITLEMENT_ALREADY_VOIDED: "Income entitlement is already voided",
+	INCOME_SETTLEMENT_NOT_FOUND: "Income settlement not found",
+	INCOME_SETTLEMENT_ALREADY_EXISTS:
+		"Income settlement already exists for receipt",
+	INCOME_SETTLEMENT_REVISION_CONFLICT: "Income settlement revision is stale",
+	INCOME_SETTLEMENT_CONFLICT: "Income settlement allocation conflict",
 	INVALID_ORIGIN: "Invalid request origin",
 	UNAUTHENTICATED: "Authentication required",
 	NOT_FOUND: "Route not found",

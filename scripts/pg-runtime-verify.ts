@@ -38,7 +38,41 @@ import {
 	listCanonicalTransactions,
 	listBoundedCanonicalTransactionRevisions,
 } from "../src/transactions/product-read-v2.ts";
-import { getCanonicalTransaction } from "../src/transactions/service.ts";
+import {
+	createIncomeSource,
+	archiveIncomeSource,
+	getIncomeSource,
+	listIncomeSources,
+} from "../src/income/sources.ts";
+import { createIncomeSourceWithNaturalReplay } from "../src/income/product-source-v2.ts";
+import {
+	createIncomeEntitlement,
+	reviseIncomeEntitlement,
+	voidIncomeEntitlement,
+	getIncomeEntitlement,
+	listIncomeEntitlements,
+} from "../src/income/entitlements.ts";
+import {
+	createIncomeReceipt,
+	reviseIncomeReceipt,
+	voidIncomeReceipt,
+	getIncomeReceipt,
+	listIncomeReceipts,
+} from "../src/income/receipts.ts";
+import {
+	createIncomeSettlement,
+	reviseIncomeSettlement,
+	getIncomeReceiptSettlement,
+} from "../src/income/settlements.ts";
+import { getMonthlyReferenceIncome } from "../src/income/reference.ts";
+import {
+	listBoundedIncomeSources,
+	listBoundedIncomeEntitlements,
+	listBoundedIncomeReceipts,
+	PRODUCT_INCOME_HTTP_SOURCE_TYPE,
+	INCOME_USER_EDIT_REASON_CODE,
+	INCOME_USER_VOID_REASON_CODE,
+} from "../src/income/product-read-v2.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const migDir = path.join(root, "migrations");
@@ -12593,7 +12627,7 @@ async function resolverRuntime7B1() {
 	// 13. Cross-User Isolation
 	let u2ReadThrew = "";
 	try {
-		await getCanonicalTransaction({
+		await listBoundedCanonicalTransactionRevisions({
 			db,
 			userId: U2,
 			transactionId: createRes1.transactionId,
@@ -12629,6 +12663,605 @@ async function resolverRuntime7B1() {
 	await s.close();
 }
 
+async function resolverRuntime7B2() {
+	console.log(
+		"\n== PHASE 7B.2: INCOME PRODUCT SURFACE & DOMAIN ACCOUNTING (PGlite / Drizzle) ==",
+	);
+	const eqD = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+		: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	const s = await make4bScenario();
+	const db = s.db;
+	const U2 = "22222222-2222-4222-8222-222222222222";
+
+	// 1. Provision ledger accounts for U1
+	const cash1 = await createLedgerAccount({
+		db,
+		userId: U1,
+		code: "CASH_TRY_U1",
+		name: "Cash TRY U1",
+		accountType: "ASSET",
+	});
+	const salaryAcc1 = await createLedgerAccount({
+		db,
+		userId: U1,
+		code: "INC_SALARY_U1",
+		name: "Salary Income U1",
+		accountType: "INCOME",
+	});
+	const bonusAcc1 = await createLedgerAccount({
+		db,
+		userId: U1,
+		code: "INC_BONUS_U1",
+		name: "Bonus Income U1",
+		accountType: "INCOME",
+	});
+	const expenseAcc1 = await createLedgerAccount({
+		db,
+		userId: U1,
+		code: "EXP_GENERAL_U1",
+		name: "General Expense U1",
+		accountType: "EXPENSE",
+	});
+
+	// 2. Read-Only Proofs: zero writes on empty/initial read queries
+	const countTotalRows = async () => {
+		const r1 = (await s.q(`select count(*)::int as n from income_sources`)).rows[0].n as number;
+		const r2 = (await s.q(`select count(*)::int as n from income_entitlements`)).rows[0].n as number;
+		const r3 = (await s.q(`select count(*)::int as n from income_receipts`)).rows[0].n as number;
+		const r4 = (await s.q(`select count(*)::int as n from income_settlement_batches`)).rows[0].n as number;
+		const r5 = (await s.q(`select count(*)::int as n from journal_entries`)).rows[0].n as number;
+		return r1 + r2 + r3 + r4 + r5;
+	};
+
+	const rowsBeforeReads = await countTotalRows();
+	await listBoundedIncomeSources({ db, userId: U1, limit: 10 });
+	await listBoundedIncomeEntitlements({ db, userId: U1, limit: 10 });
+	await listBoundedIncomeReceipts({ db, userId: U1, limit: 10 });
+	await getMonthlyReferenceIncome({ db, userId: U1, asOf: "2026-09-11" });
+	const rowsAfterReads = await countTotalRows();
+	eqD(rowsBeforeReads, rowsAfterReads, "7B.2/1: GET list and reference endpoints perform zero database writes");
+
+	// 3. Source Creation Validation & Natural-Key Replay
+	let badAccThrew = "";
+	try {
+		await createIncomeSourceWithNaturalReplay({
+			db,
+			userId: U1,
+			code: "INVALID_ACC",
+			name: "Invalid Account Source",
+			nature: "REGULAR",
+			referenceMethod: "FIXED_MONTHLY",
+			expectedMonthlyAmount: "10000.00",
+			incomeLedgerAccountId: expenseAcc1.id, // EXPENSE account instead of INCOME
+			activeFrom: "2026-01-01",
+		});
+	} catch (e) {
+		badAccThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(badAccThrew, "INCOME_LEDGER_ACCOUNT_INVALID", "7B.2/2: non-INCOME account rejected for income source");
+
+	let crossAccThrew = "";
+	try {
+		await createIncomeSourceWithNaturalReplay({
+			db,
+			userId: U1,
+			code: "CROSS_ACC",
+			name: "Cross Account Source",
+			nature: "REGULAR",
+			referenceMethod: "FIXED_MONTHLY",
+			expectedMonthlyAmount: "10000.00",
+			incomeLedgerAccountId: U2, // non-existent/cross account ID
+			activeFrom: "2026-01-01",
+		});
+	} catch (e) {
+		crossAccThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(crossAccThrew, "INCOME_LEDGER_ACCOUNT_INVALID", "7B.2/2: other user's account rejected for income source");
+
+	// Create valid source S1
+	const s1 = await createIncomeSourceWithNaturalReplay({
+		db,
+		userId: U1,
+		code: "salary_main",
+		name: "Main Salary",
+		nature: "REGULAR",
+		referenceMethod: "FIXED_MONTHLY",
+		expectedMonthlyAmount: "50000.00",
+		incomeLedgerAccountId: salaryAcc1.id,
+		activeFrom: "2026-01-01",
+	});
+	eqD(s1.idempotentReplay, false, "7B.2/3: first source create returns idempotentReplay = false");
+	eqD(s1.incomeSource.code, "SALARY_MAIN", "7B.2/3: source code is normalized to uppercase");
+
+	// Natural key exact replay with same parameters
+	const s1Replay = await createIncomeSourceWithNaturalReplay({
+		db,
+		userId: U1,
+		code: "salary_main",
+		name: "Main Salary",
+		nature: "REGULAR",
+		referenceMethod: "FIXED_MONTHLY",
+		expectedMonthlyAmount: "50000.00",
+		incomeLedgerAccountId: salaryAcc1.id,
+		activeFrom: "2026-01-01",
+	});
+	eqD(s1Replay.idempotentReplay, true, "7B.2/3: exact natural retry returns idempotentReplay = true");
+	eqD(s1Replay.incomeSource.id, s1.incomeSource.id, "7B.2/3: replay returns identical source ID");
+
+	// Same code with changed definition -> conflict
+	let conflictThrew = "";
+	try {
+		await createIncomeSourceWithNaturalReplay({
+			db,
+			userId: U1,
+			code: "salary_main",
+			name: "Different Salary Name",
+			nature: "REGULAR",
+			referenceMethod: "FIXED_MONTHLY",
+			expectedMonthlyAmount: "60000.00",
+			incomeLedgerAccountId: salaryAcc1.id,
+			activeFrom: "2026-01-01",
+		});
+	} catch (e) {
+		conflictThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(conflictThrew, "INCOME_SOURCE_CODE_CONFLICT", "7B.2/3: same code with changed definition throws INCOME_SOURCE_CODE_CONFLICT");
+
+	// Create bonus source S2 (EXTRA, EXCLUDED)
+	const s2 = await createIncomeSourceWithNaturalReplay({
+		db,
+		userId: U1,
+		code: "bonus_q3",
+		name: "Q3 Bonus",
+		nature: "EXTRA",
+		referenceMethod: "EXCLUDED",
+		incomeLedgerAccountId: bonusAcc1.id,
+		activeFrom: "2026-07-01",
+		activeUntil: "2026-09-30",
+	});
+	eqD(s2.incomeSource.nature, "EXTRA", "7B.2/4: extra bonus source created");
+
+	// Source archive
+	const s2Archived = await archiveIncomeSource({ db, userId: U1, sourceId: s2.incomeSource.id });
+	chkD(s2Archived.archivedAt !== null, "7B.2/5: source archive sets archivedAt");
+
+	// Archive idempotency
+	const s2ArchiveAgain = await archiveIncomeSource({ db, userId: U1, sourceId: s2.incomeSource.id });
+	eqD(s2ArchiveAgain.archivedAt?.toISOString(), s2Archived.archivedAt?.toISOString(), "7B.2/5: archive exact retry is state-idempotent");
+
+	// Archived regular source cannot receive fresh mutations
+	const sArchReg = await createIncomeSourceWithNaturalReplay({
+		db,
+		userId: U1,
+		code: "arch_reg_source",
+		name: "Archived Reg Source",
+		nature: "REGULAR",
+		referenceMethod: "FIXED_MONTHLY",
+		expectedMonthlyAmount: "1000.00",
+		incomeLedgerAccountId: salaryAcc1.id,
+		activeFrom: "2026-01-01",
+	});
+	await archiveIncomeSource({ db, userId: U1, sourceId: sArchReg.incomeSource.id });
+
+	let archEntThrew = "";
+	try {
+		await createIncomeEntitlement({
+			db,
+			userId: U1,
+			sourceId: sArchReg.incomeSource.id,
+			idempotencyKey: "ent-arch-1",
+			periodMonth: "2026-09-01",
+			amount: "10000.00",
+			provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "ent-arch-1" },
+		});
+	} catch (e) {
+		archEntThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(archEntThrew, "INCOME_SOURCE_ARCHIVED", "7B.2/5: archived source rejects fresh entitlement create");
+
+	// 4. Entitlement Proofs (Zero Ledger Movement)
+	const journalsBeforeEnt = (await s.q(`select count(*)::int as n from journal_entries`)).rows[0].n as number;
+
+	const ent1 = await createIncomeEntitlement({
+		db,
+		userId: U1,
+		sourceId: s1.incomeSource.id,
+		idempotencyKey: "ent-7b2-1",
+		periodMonth: "2026-09-01",
+		amount: "50000.00",
+		expectedReceiptOn: "2026-09-05",
+		note: "September Salary Entitlement",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "ent-7b2-1" },
+	});
+	eqD(ent1.idempotentReplay, false, "7B.2/6: entitlement create first run is not a replay");
+	eqD(ent1.incomeEntitlement.revisionNo, 1, "7B.2/6: entitlement initial revisionNo = 1");
+	eqD(ent1.incomeEntitlement.amount, "50000.00", "7B.2/6: entitlement amount is exact string 50000.00");
+
+	const journalsAfterEnt = (await s.q(`select count(*)::int as n from journal_entries`)).rows[0].n as number;
+	eqD(journalsBeforeEnt, journalsAfterEnt, "7B.2/6: entitlement create creates ZERO journal entries");
+
+	// Entitlement exact replay
+	const ent1Replay = await createIncomeEntitlement({
+		db,
+		userId: U1,
+		sourceId: s1.incomeSource.id,
+		idempotencyKey: "ent-7b2-1",
+		periodMonth: "2026-09-01",
+		amount: "50000.00",
+		expectedReceiptOn: "2026-09-05",
+		note: "September Salary Entitlement",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "ent-7b2-1" },
+	});
+	eqD(ent1Replay.idempotentReplay, true, "7B.2/6: exact entitlement retry returns idempotentReplay = true");
+	eqD(ent1Replay.incomeEntitlement.entitlementId, ent1.incomeEntitlement.entitlementId, "7B.2/6: replay returns matching entitlement ID");
+
+	// Same key changed payload -> conflict
+	let entIdemConflict = "";
+	try {
+		await createIncomeEntitlement({
+			db,
+			userId: U1,
+			sourceId: s1.incomeSource.id,
+			idempotencyKey: "ent-7b2-1",
+			periodMonth: "2026-09-01",
+			amount: "60000.00",
+			provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "ent-7b2-1" },
+		});
+	} catch (e) {
+		entIdemConflict = (e as { code?: string }).code ?? "";
+	}
+	eqD(entIdemConflict, "INCOME_IDEMPOTENCY_CONFLICT", "7B.2/6: entitlement same key changed payload throws INCOME_IDEMPOTENCY_CONFLICT");
+
+	// Period uniqueness conflict
+	let periodConflict = "";
+	try {
+		await createIncomeEntitlement({
+			db,
+			userId: U1,
+			sourceId: s1.incomeSource.id,
+			idempotencyKey: "ent-7b2-diff-key",
+			periodMonth: "2026-09-01",
+			amount: "50000.00",
+			provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "ent-7b2-diff-key" },
+		});
+	} catch (e) {
+		periodConflict = (e as { code?: string }).code ?? "";
+	}
+	eqD(periodConflict, "INCOME_ENTITLEMENT_PERIOD_CONFLICT", "7B.2/6: duplicate period for same source throws INCOME_ENTITLEMENT_PERIOD_CONFLICT");
+
+	// Entitlement revise with OCC
+	const entRev1 = await reviseIncomeEntitlement({
+		db,
+		userId: U1,
+		entitlementId: ent1.incomeEntitlement.entitlementId,
+		expectedRevisionNo: 1,
+		idempotencyKey: "ent-rev-1",
+		amount: "55000.00",
+		expectedReceiptOn: "2026-09-05",
+		note: "September Salary Adjusted",
+		reasonCode: INCOME_USER_EDIT_REASON_CODE,
+		reasonNote: "Pay raise adjustment",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "ent-rev-1" },
+	});
+	eqD(entRev1.incomeEntitlement.revisionNo, 2, "7B.2/7: entitlement revision increases revisionNo to 2");
+	eqD(entRev1.incomeEntitlement.amount, "55000.00", "7B.2/7: revised entitlement amount is 55000.00");
+
+	// Stale OCC revision
+	let staleEntRev = "";
+	try {
+		await reviseIncomeEntitlement({
+			db,
+			userId: U1,
+			entitlementId: ent1.incomeEntitlement.entitlementId,
+			expectedRevisionNo: 1, // Stale! Current is 2
+			idempotencyKey: "ent-rev-stale",
+			amount: "60000.00",
+			reasonCode: INCOME_USER_EDIT_REASON_CODE,
+			provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "ent-rev-stale" },
+		});
+	} catch (e) {
+		staleEntRev = (e as { code?: string }).code ?? "";
+	}
+	eqD(staleEntRev, "INCOME_ENTITLEMENT_REVISION_CONFLICT", "7B.2/7: stale expectedRevisionNo throws INCOME_ENTITLEMENT_REVISION_CONFLICT");
+
+	// overdueAsOf test
+	const entNotOverdue = await getIncomeEntitlement({
+		db,
+		userId: U1,
+		entitlementId: ent1.incomeEntitlement.entitlementId,
+		asOf: "2026-09-04",
+	});
+	eqD(entNotOverdue.overdue, false, "7B.2/8: entitlement before expectedReceiptOn is not overdue");
+
+	const entOverdue = await getIncomeEntitlement({
+		db,
+		userId: U1,
+		entitlementId: ent1.incomeEntitlement.entitlementId,
+		asOf: "2026-09-06",
+	});
+	eqD(entOverdue.overdue, true, "7B.2/8: entitlement after expectedReceiptOn is overdue");
+
+	// 5. Receipt Accounting Proofs (Atomic Double-Entry)
+	const rec1 = await createIncomeReceipt({
+		db,
+		userId: U1,
+		sourceId: s1.incomeSource.id,
+		idempotencyKey: "rec-7b2-1",
+		receivedAt: new Date("2026-09-05T10:00:00.000Z"),
+		amount: "55000.00",
+		destinationAccountId: cash1.id,
+		note: "September Salary Received",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "rec-7b2-1" },
+	});
+	eqD(rec1.idempotentReplay, false, "7B.2/9: initial receipt create is not a replay");
+	eqD(rec1.incomeReceipt.revisionNo, 1, "7B.2/9: receipt initial revisionNo = 1");
+
+	// Verify ledger effect: DEBIT Asset Cash (+55000.00), CREDIT Income Salary (+55000.00)
+	const bCashPostRec = await getLedgerAccountBalance({ db, userId: U1, accountId: cash1.id });
+	const bSalaryPostRec = await getLedgerAccountBalance({ db, userId: U1, accountId: salaryAcc1.id });
+	eqD(bCashPostRec.balance, "55000.00", "7B.2/9: cash asset balance increased by exact receipt amount 55000.00");
+	eqD(bSalaryPostRec.balance, "55000.00", "7B.2/9: salary income balance credited by exact receipt amount 55000.00");
+
+	// Receipt exact replay
+	const rec1Replay = await createIncomeReceipt({
+		db,
+		userId: U1,
+		sourceId: s1.incomeSource.id,
+		idempotencyKey: "rec-7b2-1",
+		receivedAt: new Date("2026-09-05T10:00:00.000Z"),
+		amount: "55000.00",
+		destinationAccountId: cash1.id,
+		note: "September Salary Received",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "rec-7b2-1" },
+	});
+	eqD(rec1Replay.idempotentReplay, true, "7B.2/10: exact receipt retry returns idempotentReplay = true");
+	const bCashPostReplay = await getLedgerAccountBalance({ db, userId: U1, accountId: cash1.id });
+	eqD(bCashPostReplay.balance, "55000.00", "7B.2/10: receipt replay does not double-post ledger balance");
+
+	// Revise receipt: amount changes from 55000.00 to 60000.00
+	const recRev1 = await reviseIncomeReceipt({
+		db,
+		userId: U1,
+		incomeReceiptId: rec1.incomeReceipt.incomeReceiptId,
+		expectedRevisionNo: 1,
+		idempotencyKey: "rec-rev-1",
+		receivedAt: new Date("2026-09-05T10:00:00.000Z"),
+		amount: "60000.00",
+		destinationAccountId: cash1.id,
+		note: "September Salary + Extra",
+		reasonCode: INCOME_USER_EDIT_REASON_CODE,
+		reasonNote: "Correction of receipt amount",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "rec-rev-1" },
+	});
+	eqD(recRev1.incomeReceipt.revisionNo, 2, "7B.2/11: receipt revision increases revisionNo to 2");
+
+	// Verify ledger updated atomically: old 55000 reversed, new 60000 posted
+	const bCashPostRev = await getLedgerAccountBalance({ db, userId: U1, accountId: cash1.id });
+	const bSalaryPostRev = await getLedgerAccountBalance({ db, userId: U1, accountId: salaryAcc1.id });
+	eqD(bCashPostRev.balance, "60000.00", "7B.2/11: cash asset balance updated to exact 60000.00");
+	eqD(bSalaryPostRev.balance, "60000.00", "7B.2/11: salary income balance updated to exact 60000.00");
+
+	// 6. Settlement Proofs (Zero Ledger Movement, Cap Enforcement, Clearing)
+	const journalsBeforeSet = (await s.q(`select count(*)::int as n from journal_entries`)).rows[0].n as number;
+
+	const set1 = await createIncomeSettlement({
+		db,
+		userId: U1,
+		incomeReceiptId: rec1.incomeReceipt.incomeReceiptId,
+		idempotencyKey: "set-7b2-1",
+		allocations: [
+			{
+				entitlementId: ent1.incomeEntitlement.entitlementId,
+				amount: "55000.00",
+			},
+		],
+		note: "Attributing 55000 to September Entitlement",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "set-7b2-1" },
+	});
+	eqD(set1.idempotentReplay, false, "7B.2/12: initial settlement create is not a replay");
+	eqD(set1.settlement.revisionNo, 1, "7B.2/12: settlement initial revisionNo = 1");
+
+	const journalsAfterSet = (await s.q(`select count(*)::int as n from journal_entries`)).rows[0].n as number;
+	eqD(journalsBeforeSet, journalsAfterSet, "7B.2/12: settlement creates ZERO journal entries");
+
+	// Verify entitlement status is SETTLED
+	const entSettled = await getIncomeEntitlement({ db, userId: U1, entitlementId: ent1.incomeEntitlement.entitlementId });
+	eqD(entSettled.settlementStatus, "SETTLED", "7B.2/12: entitlement status became SETTLED");
+	eqD(entSettled.allocatedAmount, "55000.00", "7B.2/12: entitlement allocated amount is 55000.00");
+	eqD(entSettled.outstandingAmount, "0.00", "7B.2/12: entitlement outstanding amount is 0.00");
+
+	// Verify receipt settlement read
+	const recSettlement = await getIncomeReceiptSettlement({ db, userId: U1, incomeReceiptId: rec1.incomeReceipt.incomeReceiptId });
+	eqD(recSettlement.allocatedAmount, "55000.00", "7B.2/12: receipt allocated amount is 55000.00");
+	eqD(recSettlement.unallocatedAmount, "5000.00", "7B.2/12: receipt unallocated amount is 5000.00 (60000 - 55000)");
+
+	// Settlement exact replay
+	const set1Replay = await createIncomeSettlement({
+		db,
+		userId: U1,
+		incomeReceiptId: rec1.incomeReceipt.incomeReceiptId,
+		idempotencyKey: "set-7b2-1",
+		allocations: [
+			{
+				entitlementId: ent1.incomeEntitlement.entitlementId,
+				amount: "55000.00",
+			},
+		],
+		note: "Attributing 55000 to September Entitlement",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "set-7b2-1" },
+	});
+	eqD(set1Replay.idempotentReplay, true, "7B.2/13: exact settlement retry returns idempotentReplay = true");
+
+	// Same key changed payload -> conflict
+	let setConflictThrew = "";
+	try {
+		await createIncomeSettlement({
+			db,
+			userId: U1,
+			incomeReceiptId: rec1.incomeReceipt.incomeReceiptId,
+			idempotencyKey: "set-7b2-1",
+			allocations: [
+				{
+					entitlementId: ent1.incomeEntitlement.entitlementId,
+					amount: "10000.00",
+				},
+			],
+			provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "set-7b2-1" },
+		});
+	} catch (e) {
+		setConflictThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(setConflictThrew, "INCOME_IDEMPOTENCY_CONFLICT", "7B.2/13: same key changed settlement allocations throws INCOME_IDEMPOTENCY_CONFLICT");
+
+	// Active settlement blocks voiding entitlement and receipt
+	let voidEntBlocked = "";
+	try {
+		await voidIncomeEntitlement({
+			db,
+			userId: U1,
+			entitlementId: ent1.incomeEntitlement.entitlementId,
+			expectedRevisionNo: 2,
+			idempotencyKey: "void-ent-blocked",
+			reasonCode: INCOME_USER_VOID_REASON_CODE,
+			provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "void-ent-blocked" },
+		});
+	} catch (e) {
+		voidEntBlocked = (e as { code?: string }).code ?? "";
+	}
+	eqD(voidEntBlocked, "INCOME_SETTLEMENT_CONFLICT", "7B.2/14: void entitlement blocked when active settlement exists");
+
+	let voidRecBlocked = "";
+	try {
+		await voidIncomeReceipt({
+			db,
+			userId: U1,
+			incomeReceiptId: rec1.incomeReceipt.incomeReceiptId,
+			expectedRevisionNo: 2,
+			idempotencyKey: "void-rec-blocked",
+			reasonCode: INCOME_USER_VOID_REASON_CODE,
+			provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "void-rec-blocked" },
+		});
+	} catch (e) {
+		voidRecBlocked = (e as { code?: string }).code ?? "";
+	}
+	eqD(voidRecBlocked, "INCOME_SETTLEMENT_CONFLICT", "7B.2/14: void receipt blocked when active settlement exists");
+
+	// Revise settlement with allocations: [] to CLEAR
+	const setClear = await reviseIncomeSettlement({
+		db,
+		userId: U1,
+		incomeReceiptId: rec1.incomeReceipt.incomeReceiptId,
+		expectedRevisionNo: 1,
+		idempotencyKey: "set-clear-1",
+		allocations: [],
+		reasonCode: INCOME_USER_EDIT_REASON_CODE,
+		reasonNote: "Clear settlement allocations",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "set-clear-1" },
+	});
+	eqD(setClear.settlement.revisionNo, 2, "7B.2/15: settlement revision with empty allocations increments revisionNo to 2");
+
+	const entCleared = await getIncomeEntitlement({ db, userId: U1, entitlementId: ent1.incomeEntitlement.entitlementId });
+	eqD(entCleared.settlementStatus, "OPEN", "7B.2/15: entitlement settlementStatus restored to OPEN");
+	eqD(entCleared.allocatedAmount, "0.00", "7B.2/15: entitlement allocatedAmount restored to 0.00");
+	eqD(entCleared.outstandingAmount, "55000.00", "7B.2/15: entitlement outstandingAmount restored to 55000.00");
+
+	// Now void entitlement
+	const voidEntRes = await voidIncomeEntitlement({
+		db,
+		userId: U1,
+		entitlementId: ent1.incomeEntitlement.entitlementId,
+		expectedRevisionNo: 2,
+		idempotencyKey: "void-ent-ok",
+		reasonCode: INCOME_USER_VOID_REASON_CODE,
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "void-ent-ok" },
+	});
+	eqD(voidEntRes.incomeEntitlement.status, "VOIDED", "7B.2/16: entitlement void succeeds after settlement clear");
+	eqD(voidEntRes.incomeEntitlement.revisionNo, 3, "7B.2/16: void entitlement revisionNo = 3");
+
+	// Now void receipt
+	const voidRecRes = await voidIncomeReceipt({
+		db,
+		userId: U1,
+		incomeReceiptId: rec1.incomeReceipt.incomeReceiptId,
+		expectedRevisionNo: 2,
+		idempotencyKey: "void-rec-ok",
+		reasonCode: INCOME_USER_VOID_REASON_CODE,
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "void-rec-ok" },
+	});
+	eqD(voidRecRes.incomeReceipt.status, "VOIDED", "7B.2/17: receipt void succeeds after settlement clear");
+
+	// Verify ledger effect reversed: Cash balance is back to 0.00, Salary balance is 0.00
+	const bCashPostVoid = await getLedgerAccountBalance({ db, userId: U1, accountId: cash1.id });
+	const bSalaryPostVoid = await getLedgerAccountBalance({ db, userId: U1, accountId: salaryAcc1.id });
+	eqD(bCashPostVoid.balance, "0.00", "7B.2/17: cash asset balance reversed to 0.00 after receipt void");
+	eqD(bSalaryPostVoid.balance, "0.00", "7B.2/17: salary income balance reversed to 0.00 after receipt void");
+
+	// 7. Monthly Reference Income Calculations
+	// Provision additional source for seasonal
+	const seasonalAcc = await createLedgerAccount({
+		db,
+		userId: U1,
+		code: "INC_SEASONAL_U1",
+		name: "Seasonal Income",
+		accountType: "INCOME",
+	});
+	await createIncomeSourceWithNaturalReplay({
+		db,
+		userId: U1,
+		code: "seasonal_bonus",
+		name: "Seasonal Bonus",
+		nature: "REGULAR",
+		referenceMethod: "SEASONAL_ANNUALIZED",
+		expectedMonthlyAmount: "12000.00",
+		seasonalMonthsPerYear: 6, // 12000 * 6 / 12 = 6000.00
+		incomeLedgerAccountId: seasonalAcc.id,
+		activeFrom: "2026-01-01",
+	});
+
+	const refRes = await getMonthlyReferenceIncome({
+		db,
+		userId: U1,
+		asOf: "2026-09-12",
+	});
+	eqD(refRes.currency, "TRY", "7B.2/18: reference income currency is TRY");
+	// REG1: 20000.00 (from scenario base), S1: 50000.00 (FIXED), Seasonal: 6000.00 (12000 * 6 / 12) -> Total = 76000.00
+	eqD(refRes.total, "76000.00", "7B.2/18: reference income total is exact decimal string 76000.00");
+
+	// 8. Cross-User Isolation
+	let u2SourceThrew = "";
+	try {
+		await getIncomeSource({ db, userId: U2, sourceId: s1.incomeSource.id });
+	} catch (e) {
+		u2SourceThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(u2SourceThrew, "INCOME_SOURCE_NOT_FOUND", "7B.2/19: U2 reading U1 income source throws INCOME_SOURCE_NOT_FOUND");
+
+	let u2EntThrew = "";
+	try {
+		await getIncomeEntitlement({ db, userId: U2, entitlementId: ent1.incomeEntitlement.entitlementId });
+	} catch (e) {
+		u2EntThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(u2EntThrew, "INCOME_ENTITLEMENT_NOT_FOUND", "7B.2/19: U2 reading U1 entitlement throws INCOME_ENTITLEMENT_NOT_FOUND");
+
+	let u2RecThrew = "";
+	try {
+		await getIncomeReceipt({ db, userId: U2, incomeReceiptId: rec1.incomeReceipt.incomeReceiptId });
+	} catch (e) {
+		u2RecThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(u2RecThrew, "INCOME_RECEIPT_NOT_FOUND", "7B.2/19: U2 reading U1 receipt throws INCOME_RECEIPT_NOT_FOUND");
+
+	const u2Sources = await listBoundedIncomeSources({ db, userId: U2 });
+	eqD(u2Sources.sources.length, 0, "7B.2/19: U2 source list contains zero U1 sources");
+
+	await s.close();
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -12652,6 +13285,7 @@ if (probed) {
 	await resolverRuntime6D();
 	await resolverRuntime7A();
 	await resolverRuntime7B1();
+	await resolverRuntime7B2();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

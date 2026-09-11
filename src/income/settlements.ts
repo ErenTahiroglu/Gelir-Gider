@@ -219,7 +219,7 @@ export async function createIncomeSettlement(
 
 		if (!latestReceiptRev || latestReceiptRev.operation === "VOID") {
 			throw new IncomeError(
-				"INCOME_RECEIPT_INVALID_STATE",
+				"INCOME_RECEIPT_ALREADY_VOIDED",
 				"Cannot settle against a non-existent or VOIDED income receipt",
 			);
 		}
@@ -238,7 +238,19 @@ export async function createIncomeSettlement(
 			);
 		}
 
-		// 4. Validate each target entitlement (ownership, same source, not void, entitlement cap)
+		// 4. Check existing batch for this receipt (needed for idempotent replay and excludeBatchId)
+		const [existingBatch] = await tx
+			.select()
+			.from(incomeSettlementBatches)
+			.where(
+				and(
+					eq(incomeSettlementBatches.incomeReceiptId, receipt.id),
+					eq(incomeSettlementBatches.userId, userId),
+				),
+			)
+			.limit(1);
+
+		// 5. Validate each target entitlement (ownership, same source, not void, entitlement cap)
 		const entBreakdown: IncomeReceiptSettlementAllocationItem[] = [];
 
 		for (const alloc of normalizedAllocations) {
@@ -281,7 +293,7 @@ export async function createIncomeSettlement(
 
 			if (!latestEntRev || latestEntRev.operation === "VOID") {
 				throw new IncomeError(
-					"INCOME_ENTITLEMENT_INVALID_STATE",
+					"INCOME_ENTITLEMENT_ALREADY_VOIDED",
 					`Cannot allocate to non-existent or VOIDED entitlement "${alloc.entitlementId}"`,
 				);
 			}
@@ -291,6 +303,7 @@ export async function createIncomeSettlement(
 					tx,
 					userId,
 					ent.id,
+					existingBatch?.id,
 				);
 
 			const thisAllocCents = parseMoneyString(alloc.amount).cents;
@@ -318,18 +331,6 @@ export async function createIncomeSettlement(
 				),
 			});
 		}
-
-		// 5. Check existing batch for this receipt
-		const [existingBatch] = await tx
-			.select()
-			.from(incomeSettlementBatches)
-			.where(
-				and(
-					eq(incomeSettlementBatches.incomeReceiptId, receipt.id),
-					eq(incomeSettlementBatches.userId, userId),
-				),
-			)
-			.limit(1);
 
 		const canonicalPayload: Record<string, unknown> = {
 			incomeReceiptId: receipt.id,
@@ -556,7 +557,7 @@ export async function reviseIncomeSettlement(
 
 		if (!prevBatchRev) {
 			throw new IncomeError(
-				"INCOME_SETTLEMENT_NOT_FOUND",
+				"INCOME_SETTLEMENT_REVISION_CONFLICT",
 				`Expected settlement revision ${expectedRevisionNo} not found`,
 			);
 		}
@@ -595,7 +596,7 @@ export async function reviseIncomeSettlement(
 
 		if (!latestReceiptRev || latestReceiptRev.operation === "VOID") {
 			throw new IncomeError(
-				"INCOME_RECEIPT_INVALID_STATE",
+				"INCOME_RECEIPT_ALREADY_VOIDED",
 				"Cannot revise settlement for a non-existent or VOIDED income receipt",
 			);
 		}
@@ -657,7 +658,7 @@ export async function reviseIncomeSettlement(
 
 			if (!latestEntRev || latestEntRev.operation === "VOID") {
 				throw new IncomeError(
-					"INCOME_ENTITLEMENT_INVALID_STATE",
+					"INCOME_ENTITLEMENT_ALREADY_VOIDED",
 					`Cannot allocate to non-existent or VOIDED entitlement "${alloc.entitlementId}"`,
 				);
 			}
@@ -725,6 +726,15 @@ export async function reviseIncomeSettlement(
 				throw new IncomeError(
 					"INCOME_IDEMPOTENCY_CONFLICT",
 					"Settlement revision replayed with changed parameters",
+				);
+			}
+			if (
+				err instanceof CanonicalTransactionError &&
+				err.code === "TRANSACTION_REVISION_CONFLICT"
+			) {
+				throw new IncomeError(
+					"INCOME_SETTLEMENT_REVISION_CONFLICT",
+					err.message,
 				);
 			}
 			throw err;

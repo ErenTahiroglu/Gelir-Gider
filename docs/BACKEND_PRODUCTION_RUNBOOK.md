@@ -232,7 +232,8 @@ The application origin is read from `WEBAUTHN_ORIGIN` config — never hard-code
 | **AUTH HTTP ADAPTER** | **READY** | `/auth/*` routes complete and tested. |
 | **BUDGET V2 HTTP ADAPTER** | **READY** | `/budget-v2/*` routes complete, CSRF-guarded, and tested. |
 | **TRANSACTIONS & LEDGER READ HTTP ADAPTER** | **READY (Checkpoint 7B.1-R1)** | `/transactions` and `/ledger` read-only HTTP endpoints complete, tested, and guarded. Generic mutation routes remain unexposed to prevent domain bypass. |
-| **FINANCIAL HTTP PRODUCT SURFACE** | **IN PROGRESS** | Domain services exist; HTTP adapters for income/credit-cards/people/rewards/campaigns/short-term-goals/midas/long-term/month-close/notifications/imports being built in 7B.2–7B.9. |
+| **INCOME HTTP ADAPTER** | **READY (Checkpoint 7B.2)** | `/income/*` product endpoints (sources, entitlements, receipts, settlements, reference) complete, tested, same-origin guarded, and domain-authoritative. |
+| **FINANCIAL HTTP PRODUCT SURFACE** | **IN PROGRESS** | Domain services exist; HTTP adapters for credit-cards/people/rewards/campaigns/short-term-goals/midas/long-term/month-close/notifications/imports being built in 7B.3–7B.9. |
 | **PRE-FRONTEND BACKEND CODE FREEZE** | **NOT YET COMPLETE** | In progress under Checkpoint 7B (7B.2–7B.9 financial HTTP surface). |
 | **LIVE R2 DRILL** | **BLOCKED — TEST BUCKET UNAVAILABLE** | Unit & mock tests green; live drill deferred. |
 | **LIVE RESTORE DRILL** | **BLOCKED — DISPOSABLE DATABASE UNAVAILABLE** | Restore logic verified with empty-target checks. |

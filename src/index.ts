@@ -18,6 +18,7 @@ import {
 import { createDatabase } from "./db/client";
 import { authRouter } from "./http/auth-routes";
 import { budgetV2Router } from "./http/budget-v2-routes";
+import { incomeRouter } from "./http/income-routes";
 import { ledgerRouter } from "./http/ledger-routes";
 import type { RequestIdVariables } from "./http/security-middleware";
 import {
@@ -94,6 +95,7 @@ app.route("/auth", authRouter);
 app.route("/budget-v2", budgetV2Router);
 app.route("/transactions", transactionsRouter);
 app.route("/ledger", ledgerRouter);
+app.route("/income", incomeRouter);
 
 app.notFound((c) => {
 	return c.json(
