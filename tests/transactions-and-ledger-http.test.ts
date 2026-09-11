@@ -2,15 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as ledgerBalancesModule from "../src/ledger/balances";
 import { LedgerError } from "../src/ledger/errors";
 import { CanonicalTransactionError } from "../src/transactions/errors";
-import * as lifecycleModule from "../src/transactions/ledger-lifecycle";
 import * as productReadModule from "../src/transactions/product-read-v2";
 import * as txServiceModule from "../src/transactions/service";
 
 const U1 = "11111111-1111-4111-8111-111111111111";
 const TX_ID = "22222222-2222-4222-8222-222222222222";
-const REV_ID = "33333333-3333-4333-8333-333333333333";
 const ACC_ID1 = "44444444-4444-4444-8444-444444444444";
-const ACC_ID2 = "55555555-5555-4555-8555-555555555555";
 
 vi.mock("../src/http/auth-middleware", async (importOriginal) => {
 	const actual =
@@ -61,7 +58,7 @@ interface ErrBody {
 	error: { code: string; message: string };
 }
 
-describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1)", () => {
+describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1-R1 Read-Only)", () => {
 	beforeEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -97,23 +94,8 @@ describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1)", () => 
 				mockEnv,
 			);
 			expect(res.status).toBe(401);
-		});
-
-		it("rejects unauthenticated POST /transactions", async () => {
-			const res = await app.request(
-				"/transactions",
-				{
-					method: "POST",
-					headers: {
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "test-key",
-					},
-					body: JSON.stringify({}),
-				},
-				mockEnv,
-			);
-			expect(res.status).toBe(401);
+			const body = (await res.json()) as ErrBody;
+			expect(body.error.code).toBe("UNAUTHENTICATED");
 		});
 
 		it("rejects unauthenticated GET /ledger/accounts", async () => {
@@ -123,6 +105,8 @@ describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1)", () => 
 				mockEnv,
 			);
 			expect(res.status).toBe(401);
+			const body = (await res.json()) as ErrBody;
+			expect(body.error.code).toBe("UNAUTHENTICATED");
 		});
 
 		it("rejects unauthenticated GET /ledger/accounts/:id/balance", async () => {
@@ -132,80 +116,100 @@ describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1)", () => 
 				mockEnv,
 			);
 			expect(res.status).toBe(401);
+			const body = (await res.json()) as ErrBody;
+			expect(body.error.code).toBe("UNAUTHENTICATED");
 		});
 	});
 
-	// --- B. Same-Origin Mutation Guard ---
-	describe("Same-origin mutation guard", () => {
-		it("rejects POST /transactions without Origin", async () => {
+	// --- B. Generic Financial Mutation Routes Not Exposed (No Domain Bypass) ---
+	describe("Generic Financial Mutation Routes Are Not Exposed", () => {
+		it("returns 404 for POST /transactions (no generic manual create endpoint)", async () => {
 			const res = await app.request(
 				"/transactions",
 				{
 					method: "POST",
 					headers: {
 						Cookie: COOKIE,
+						Origin: ORIGIN,
 						"Content-Type": "application/json",
 						"Idempotency-Key": "test-key",
 					},
-					body: JSON.stringify({}),
+					body: JSON.stringify({
+						kind: "EXPENSE",
+						occurredAt: OCCURRED_AT,
+						payload: {},
+					}),
 				},
 				mockEnv,
 			);
-			expect(res.status).toBe(403);
+			expect(res.status).toBe(404);
 			const body = (await res.json()) as ErrBody;
-			expect(body.error.code).toBe("INVALID_ORIGIN");
+			expect(body.error.code).toBe("NOT_FOUND");
 		});
 
-		it("rejects POST /transactions with mismatched Origin", async () => {
-			const res = await app.request(
-				"/transactions",
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: "https://evil.com",
-						"Content-Type": "application/json",
-						"Idempotency-Key": "test-key",
-					},
-					body: JSON.stringify({}),
-				},
-				mockEnv,
-			);
-			expect(res.status).toBe(403);
-		});
-
-		it("rejects POST /transactions/:id/revisions without Origin", async () => {
+		it("returns 404 for POST /transactions/:id/revisions (no generic revise endpoint)", async () => {
 			const res = await app.request(
 				`/transactions/${TX_ID}/revisions`,
 				{
 					method: "POST",
 					headers: {
 						Cookie: COOKIE,
+						Origin: ORIGIN,
 						"Content-Type": "application/json",
 						"Idempotency-Key": "test-key",
 					},
-					body: JSON.stringify({}),
+					body: JSON.stringify({
+						expectedRevisionNo: 1,
+						occurredAt: OCCURRED_AT,
+						payload: {},
+					}),
 				},
 				mockEnv,
 			);
-			expect(res.status).toBe(403);
+			expect(res.status).toBe(404);
+			const body = (await res.json()) as ErrBody;
+			expect(body.error.code).toBe("NOT_FOUND");
 		});
 
-		it("rejects POST /transactions/:id/void without Origin", async () => {
+		it("returns 404 for POST /transactions/:id/void (no generic void endpoint)", async () => {
 			const res = await app.request(
 				`/transactions/${TX_ID}/void`,
 				{
 					method: "POST",
 					headers: {
 						Cookie: COOKIE,
+						Origin: ORIGIN,
 						"Content-Type": "application/json",
 						"Idempotency-Key": "test-key",
+					},
+					body: JSON.stringify({
+						expectedRevisionNo: 1,
+					}),
+				},
+				mockEnv,
+			);
+			expect(res.status).toBe(404);
+			const body = (await res.json()) as ErrBody;
+			expect(body.error.code).toBe("NOT_FOUND");
+		});
+
+		it("returns 404 for any POST /ledger routes (no raw journal write API)", async () => {
+			const res = await app.request(
+				"/ledger/entries",
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
 					},
 					body: JSON.stringify({}),
 				},
 				mockEnv,
 			);
-			expect(res.status).toBe(403);
+			expect(res.status).toBe(404);
+			const body = (await res.json()) as ErrBody;
+			expect(body.error.code).toBe("NOT_FOUND");
 		});
 	});
 
@@ -303,7 +307,7 @@ describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1)", () => 
 		it("returns 200 with effective transaction state", async () => {
 			vi.spyOn(txServiceModule, "getCanonicalTransaction").mockResolvedValue({
 				transactionId: TX_ID,
-				kind: "MANUAL_EXPENSE",
+				kind: "EXPENSE",
 				status: "ACTIVE",
 				revisionNo: 2,
 				occurredAt: new Date(OCCURRED_AT),
@@ -325,7 +329,7 @@ describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1)", () => 
 			const body = await res.json();
 			expect(body).toEqual({
 				transactionId: TX_ID,
-				kind: "MANUAL_EXPENSE",
+				kind: "EXPENSE",
 				status: "ACTIVE",
 				revisionNo: 2,
 				occurredAt: OCCURRED_AT,
@@ -419,431 +423,7 @@ describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1)", () => 
 		});
 	});
 
-	// --- F. POST /transactions (Create) ---
-	describe("POST /transactions", () => {
-		const validPayload = {
-			kind: "MANUAL_EXPENSE",
-			occurredAt: OCCURRED_AT,
-			payload: { description: "Groceries" },
-			ledger: {
-				memo: "Supermarket shopping",
-				lines: [
-					{
-						accountId: ACC_ID1,
-						side: "DEBIT",
-						amount: "150.00",
-					},
-					{
-						accountId: ACC_ID2,
-						side: "CREDIT",
-						amount: "150.00",
-					},
-				],
-			},
-		};
-
-		it("creates a transaction and returns 200 with operation result", async () => {
-			vi.spyOn(
-				lifecycleModule,
-				"createCanonicalTransactionWithLedger",
-			).mockResolvedValue({
-				transactionId: TX_ID,
-				revisionId: REV_ID,
-				revisionNo: 1,
-				operation: "CREATE",
-				idempotentReplay: false,
-				ledger: {
-					appliedJournalEntryId: "entry-1",
-					reversalJournalEntryId: null,
-				},
-			});
-
-			const res = await app.request(
-				"/transactions",
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "idem-key-1",
-					},
-					body: JSON.stringify(validPayload),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(200);
-			const body = await res.json();
-			expect(body).toEqual({
-				transactionId: TX_ID,
-				revisionId: REV_ID,
-				revisionNo: 1,
-				operation: "CREATE",
-				idempotentReplay: false,
-			});
-		});
-
-		it("rejects domain-owned / reserved kinds at the boundary", async () => {
-			const reservedKinds = [
-				"INCOME_RECEIPT",
-				"CREDIT_CARD_PURCHASE",
-				"PERSON_PAYABLE_EXPENSE",
-				"REWARD_ACCOUNT_CREDIT",
-				"LONG_TERM_INVESTMENT_SEND",
-				"MONTHLY_BUDGET_PLAN",
-				"UNAUTHORIZED_KIND",
-			];
-
-			for (const kind of reservedKinds) {
-				const res = await app.request(
-					"/transactions",
-					{
-						method: "POST",
-						headers: {
-							Cookie: COOKIE,
-							Origin: ORIGIN,
-							"Content-Type": "application/json",
-							"Idempotency-Key": "idem-key-1",
-						},
-						body: JSON.stringify({
-							...validPayload,
-							kind,
-						}),
-					},
-					mockEnv,
-				);
-
-				expect(res.status).toBe(400);
-				const body = (await res.json()) as ErrBody;
-				expect(body.error.code).toBe("TRANSACTION_INVALID_INPUT");
-			}
-		});
-
-		it("rejects client-supplied userId in body", async () => {
-			const res = await app.request(
-				"/transactions",
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "idem-key-1",
-					},
-					body: JSON.stringify({
-						...validPayload,
-						userId: "00000000-0000-0000-0000-000000000000",
-					}),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(400);
-		});
-
-		it("rejects numeric JSON money in ledger lines", async () => {
-			const res = await app.request(
-				"/transactions",
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "idem-key-1",
-					},
-					body: JSON.stringify({
-						...validPayload,
-						ledger: {
-							lines: [
-								{ accountId: ACC_ID1, side: "DEBIT", amount: 150.0 },
-								{ accountId: ACC_ID2, side: "CREDIT", amount: 150.0 },
-							],
-						},
-					}),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(400);
-		});
-
-		it("rejects missing Idempotency-Key header", async () => {
-			const res = await app.request(
-				"/transactions",
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-					},
-					body: JSON.stringify(validPayload),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(400);
-		});
-
-		it("maps TRANSACTION_IDEMPOTENCY_CONFLICT to 409", async () => {
-			vi.spyOn(
-				lifecycleModule,
-				"createCanonicalTransactionWithLedger",
-			).mockRejectedValue(
-				new CanonicalTransactionError(
-					"TRANSACTION_IDEMPOTENCY_CONFLICT",
-					"conflict",
-				),
-			);
-
-			const res = await app.request(
-				"/transactions",
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "idem-key-1",
-					},
-					body: JSON.stringify(validPayload),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(409);
-			const body = (await res.json()) as ErrBody;
-			expect(body.error.code).toBe("TRANSACTION_IDEMPOTENCY_CONFLICT");
-		});
-
-		it("maps LEDGER_UNBALANCED to 400", async () => {
-			vi.spyOn(
-				lifecycleModule,
-				"createCanonicalTransactionWithLedger",
-			).mockRejectedValue(new LedgerError("LEDGER_UNBALANCED", "unbalanced"));
-
-			const res = await app.request(
-				"/transactions",
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "idem-key-1",
-					},
-					body: JSON.stringify(validPayload),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(400);
-			const body = (await res.json()) as ErrBody;
-			expect(body.error.code).toBe("LEDGER_UNBALANCED");
-		});
-	});
-
-	// --- G. POST /transactions/:id/revisions (Update) ---
-	describe("POST /transactions/:transactionId/revisions", () => {
-		const validUpdatePayload = {
-			expectedRevisionNo: 1,
-			occurredAt: OCCURRED_AT,
-			payload: { description: "Updated groceries" },
-			reasonNote: "Price correction",
-			ledger: {
-				memo: "Supermarket price correction",
-				lines: [
-					{
-						accountId: ACC_ID1,
-						side: "DEBIT",
-						amount: "160.00",
-					},
-					{
-						accountId: ACC_ID2,
-						side: "CREDIT",
-						amount: "160.00",
-					},
-				],
-			},
-		};
-
-		it("updates a transaction and returns 200", async () => {
-			vi.spyOn(
-				lifecycleModule,
-				"reviseCanonicalTransactionWithLedger",
-			).mockResolvedValue({
-				transactionId: TX_ID,
-				revisionId: REV_ID,
-				revisionNo: 2,
-				operation: "UPDATE",
-				idempotentReplay: false,
-				ledger: {
-					appliedJournalEntryId: "entry-2",
-					reversalJournalEntryId: "entry-1-rev",
-				},
-			});
-
-			const res = await app.request(
-				`/transactions/${TX_ID}/revisions`,
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "idem-key-rev-2",
-					},
-					body: JSON.stringify(validUpdatePayload),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(200);
-			const body = await res.json();
-			expect(body).toEqual({
-				transactionId: TX_ID,
-				revisionId: REV_ID,
-				revisionNo: 2,
-				operation: "UPDATE",
-				idempotentReplay: false,
-			});
-		});
-
-		it("maps OCC conflict (TRANSACTION_REVISION_CONFLICT) to 409", async () => {
-			vi.spyOn(
-				lifecycleModule,
-				"reviseCanonicalTransactionWithLedger",
-			).mockRejectedValue(
-				new CanonicalTransactionError("TRANSACTION_REVISION_CONFLICT", "stale"),
-			);
-
-			const res = await app.request(
-				`/transactions/${TX_ID}/revisions`,
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "idem-key-rev-2",
-					},
-					body: JSON.stringify(validUpdatePayload),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(409);
-			const body = (await res.json()) as ErrBody;
-			expect(body.error.code).toBe("TRANSACTION_REVISION_CONFLICT");
-		});
-
-		it("maps TRANSACTION_ALREADY_VOIDED to 409", async () => {
-			vi.spyOn(
-				lifecycleModule,
-				"reviseCanonicalTransactionWithLedger",
-			).mockRejectedValue(
-				new CanonicalTransactionError(
-					"TRANSACTION_ALREADY_VOIDED",
-					"already voided",
-				),
-			);
-
-			const res = await app.request(
-				`/transactions/${TX_ID}/revisions`,
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "idem-key-rev-2",
-					},
-					body: JSON.stringify(validUpdatePayload),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(409);
-			const body = (await res.json()) as ErrBody;
-			expect(body.error.code).toBe("TRANSACTION_ALREADY_VOIDED");
-		});
-	});
-
-	// --- H. POST /transactions/:id/void (Void) ---
-	describe("POST /transactions/:transactionId/void", () => {
-		const validVoidPayload = {
-			expectedRevisionNo: 2,
-			reasonNote: "Accidental transaction duplicate",
-		};
-
-		it("voids a transaction and returns 200", async () => {
-			vi.spyOn(
-				lifecycleModule,
-				"voidCanonicalTransactionWithLedger",
-			).mockResolvedValue({
-				transactionId: TX_ID,
-				revisionId: REV_ID,
-				revisionNo: 3,
-				operation: "VOID",
-				idempotentReplay: false,
-				ledger: {
-					appliedJournalEntryId: null,
-					reversalJournalEntryId: "entry-2-rev",
-				},
-			});
-
-			const res = await app.request(
-				`/transactions/${TX_ID}/void`,
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "idem-key-void",
-					},
-					body: JSON.stringify(validVoidPayload),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(200);
-			const body = await res.json();
-			expect(body).toEqual({
-				transactionId: TX_ID,
-				revisionId: REV_ID,
-				revisionNo: 3,
-				operation: "VOID",
-				idempotentReplay: false,
-			});
-		});
-
-		it("rejects unknown field in void body (closed body)", async () => {
-			const res = await app.request(
-				`/transactions/${TX_ID}/void`,
-				{
-					method: "POST",
-					headers: {
-						Cookie: COOKIE,
-						Origin: ORIGIN,
-						"Content-Type": "application/json",
-						"Idempotency-Key": "idem-key-void",
-					},
-					body: JSON.stringify({
-						...validVoidPayload,
-						extraField: true,
-					}),
-				},
-				mockEnv,
-			);
-
-			expect(res.status).toBe(400);
-		});
-	});
-
-	// --- I. GET /ledger/accounts ---
+	// --- F. GET /ledger/accounts ---
 	describe("GET /ledger/accounts", () => {
 		it("returns 200 with list of account balances", async () => {
 			vi.spyOn(
@@ -908,7 +488,7 @@ describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1)", () => 
 		});
 	});
 
-	// --- J. GET /ledger/accounts/:accountId/balance ---
+	// --- G. GET /ledger/accounts/:accountId/balance ---
 	describe("GET /ledger/accounts/:accountId/balance", () => {
 		it("returns 200 with exact single account balance", async () => {
 			vi.spyOn(
@@ -978,7 +558,7 @@ describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1)", () => 
 		});
 	});
 
-	// --- K. Security & Error Sanitization ---
+	// --- H. Security & Error Sanitization ---
 	describe("Security headers and error sanitization", () => {
 		it("preserves X-Request-Id on responses", async () => {
 			const res = await app.request(

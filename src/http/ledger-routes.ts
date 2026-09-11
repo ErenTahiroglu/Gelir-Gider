@@ -40,8 +40,6 @@ function mapDomainError(c: Context<LedgerEnv>, err: unknown) {
 				return fail(c, "LEDGER_CURRENCY_MISMATCH", 400);
 			case "LEDGER_ENTRY_NOT_FOUND":
 				return fail(c, "LEDGER_ENTRY_NOT_FOUND", 404);
-			case "LEDGER_INCOMPLETE_STATE":
-			case "LEDGER_USER_NOT_FOUND":
 			default:
 				return fail(c, "INTERNAL_ERROR", 500);
 		}

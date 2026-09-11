@@ -164,24 +164,28 @@ All routes require:
 
 ### 4.4 Transactions (`/transactions/*`)
 
+All exposed routes are **READ-ONLY** in Checkpoint 7B.1-R1.
+Generic mutation routes (`POST /transactions`, `POST /transactions/:transactionId/revisions`, `POST /transactions/:transactionId/void`) are **NOT IMPLEMENTED / NOT YET EXPOSED** at the HTTP boundary. Specialized financial domains (Income, Credit Cards, People, Rewards, Campaigns, Goals, Midas, Long-Term Investment, Month-Close, Imports) retain strict mutation authority over their own transactions and ledger accounts to prevent domain bypass.
+
 All routes require:
 - Session authentication (`__Host-gg_session` cookie)
-- `Origin: <WEBAUTHN_ORIGIN>` on mutating methods (`POST`)
 - User identity derived **strictly** from session (`c.get("auth").userId`)
-- Mutating endpoints accept only direct/manual transaction kinds from the allowlist (`EXPENSE`, `INCOME`, `TRANSFER`, `MANUAL_EXPENSE`, `MANUAL_INCOME`, `MANUAL_TRANSFER`). Domain-owned kinds (such as credit card, income receipt, goal, campaign, midas, month-close) are rejected at the HTTP boundary (`400 TRANSACTION_INVALID_INPUT`).
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/transactions` | Keyset-paginated list of current effective transactions (`limit`, `status`, `kind`, `beforeOccurredAt`, `beforeTransactionId`) |
 | `GET` | `/transactions/:transactionId` | Single canonical transaction current effective state |
 | `GET` | `/transactions/:transactionId/revisions` | Keyset-paginated revision audit history (`limit`, `beforeRevisionNo`) |
-| `POST` | `/transactions` | Creates a manual canonical transaction with atomic ledger posting |
-| `POST` | `/transactions/:transactionId/revisions` | Appends a revision with atomic journal correction / replacement |
-| `POST` | `/transactions/:transactionId/void` | Voids a transaction with atomic journal reversal |
+
+*Direct manual transaction mutation (`POST /transactions`, `POST /transactions/:id/revisions`, `POST /transactions/:id/void`): NOT YET EXPOSED — PRODUCT SEMANTICS MUST BE DOMAIN-SAFE.*
 
 ### 4.5 Ledger (`/ledger/*`)
 
 All routes are **READ-ONLY**. Raw journal write endpoints (`/ledger/entries`, `/ledger/post`, `/ledger/journal`, `/ledger/reverse`) are **not exposed** and do not exist on the HTTP surface.
+
+All routes require:
+- Session authentication (`__Host-gg_session` cookie)
+- User identity derived **strictly** from session (`c.get("auth").userId`)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -316,7 +320,7 @@ All error responses (4xx and 5xx) use this envelope:
 | `NOT_FOUND` | 404 | Route does not exist |
 | `INTERNAL_ERROR` | 500 | Unexpected server error |
 
-### 5.6 Transactions & Ledger Request/Response Conventions
+### 5.6 Transactions & Ledger Read Conventions (Checkpoint 7B.1-R1)
 
 #### 5.6.1 GET /transactions
 
@@ -333,7 +337,7 @@ All error responses (4xx and 5xx) use this envelope:
   "transactions": [
     {
       "transactionId": "uuid",
-      "kind": "MANUAL_EXPENSE",
+      "kind": "EXPENSE",
       "status": "ACTIVE",
       "revisionNo": 1,
       "occurredAt": "2026-09-10T12:00:00.000Z",
@@ -358,77 +362,28 @@ Returns `200 OK` with the single current effective transaction object, or `404 T
 - `beforeRevisionNo`: optional integer `>= 1`
 Returns `200 OK` with `{ "transactionId": "uuid", "revisions": [...], "nextCursor": { "beforeRevisionNo": number } | null }`.
 
-#### 5.6.4 POST /transactions
-- Headers: `Origin: <WEBAUTHN_ORIGIN>`, `Idempotency-Key: <key>`, `Cookie: __Host-gg_session=...`
-- Closed Body:
-```json
-{
-  "kind": "EXPENSE | INCOME | TRANSFER | MANUAL_EXPENSE | MANUAL_INCOME | MANUAL_TRANSFER",
-  "occurredAt": "2026-09-10T12:00:00.000Z",
-  "payload": { "key": "value" },
-  "ledger": {
-    "memo": "Optional memo",
-    "lines": [
-      { "accountId": "uuid", "side": "DEBIT", "amount": "150.75", "memo": "Line memo" },
-      { "accountId": "uuid", "side": "CREDIT", "amount": "150.75" }
-    ]
-  }
-}
-```
-- Response (`200 OK`): `{ "transactionId": "uuid", "revisionNo": 1, "operation": "CREATE", "idempotentReplay": boolean }`
+#### 5.6.4 Direct Manual Mutations (POST /transactions, POST /transactions/:id/revisions, POST /transactions/:id/void)
+- **Status:** `NOT IMPLEMENTED / NOT YET EXPOSED` (Returns `404 NOT_FOUND`).
+- Specialized domains retain mutation authority.
 
-#### 5.6.5 POST /transactions/:transactionId/revisions
-- Headers: `Origin: <WEBAUTHN_ORIGIN>`, `Idempotency-Key: <key>`, `Cookie: __Host-gg_session=...`
-- Closed Body:
-```json
-{
-  "expectedRevisionNo": 1,
-  "occurredAt": "2026-09-10T12:00:00.000Z",
-  "payload": { "key": "value" },
-  "reasonNote": "Optional note",
-  "ledger": {
-    "memo": "Updated memo",
-    "lines": [
-      { "accountId": "uuid", "side": "DEBIT", "amount": "200.00" },
-      { "accountId": "uuid", "side": "CREDIT", "amount": "200.00" }
-    ]
-  }
-}
-```
-- Response (`200 OK`): `{ "transactionId": "uuid", "revisionNo": 2, "operation": "UPDATE", "idempotentReplay": boolean }`
-
-#### 5.6.6 POST /transactions/:transactionId/void
-- Headers: `Origin: <WEBAUTHN_ORIGIN>`, `Idempotency-Key: <key>`, `Cookie: __Host-gg_session=...`
-- Closed Body:
-```json
-{
-  "expectedRevisionNo": 2,
-  "reasonNote": "Optional note"
-}
-```
-- Response (`200 OK`): `{ "transactionId": "uuid", "revisionNo": 3, "operation": "VOID", "idempotentReplay": boolean }`
-
-#### 5.6.7 GET /ledger/accounts
+#### 5.6.5 GET /ledger/accounts
 - Query parameters: `includeArchived` (strict boolean `"true"` | `"false"`), `asOf` (optional UTC ISO instant)
-- Response (`200 OK`): `{ "accounts": [ { "id": "uuid", "code": "...", "name": "...", "accountType": "...", "normalBalance": "DEBIT|CREDIT", "currency": "TRY", "balance": "150.75", "isArchived": false, ... } ] }`
+- Response (`200 OK`): `{ "accounts": [ { "accountId": "uuid", "code": "...", "name": "...", "accountType": "...", "normalBalance": "DEBIT|CREDIT", "currency": "TRY", "balance": "150.75", "archived": false } ] }`
 
-#### 5.6.8 GET /ledger/accounts/:accountId/balance
+#### 5.6.6 GET /ledger/accounts/:accountId/balance
 - Query parameters: `asOf` (optional UTC ISO instant)
 - Response (`200 OK`): `{ "accountId": "uuid", "currency": "TRY", "normalBalance": "DEBIT|CREDIT", "balance": "150.75", "asOf": "2026-09-10T12:00:00.000Z" }`
 
 **Transaction & Ledger Error Codes:**
 | Code | Status | Description |
 |------|--------|-------------|
-| `TRANSACTION_INVALID_INPUT` | 400 | Malformed body, disallowed transaction kind, numeric money, or invalid parameter |
+| `TRANSACTION_INVALID_INPUT` | 400 | Malformed query parameter or invalid format |
 | `TRANSACTION_NOT_FOUND` | 404 | Transaction not found or not owned by authenticated user |
-| `TRANSACTION_IDEMPOTENCY_CONFLICT` | 409 | Idempotency-Key re-used with different payload |
-| `TRANSACTION_REVISION_CONFLICT` | 409 | OCC mismatch on `expectedRevisionNo` |
-| `TRANSACTION_ALREADY_VOIDED` | 409 | Transaction is already voided |
-| `LEDGER_INVALID_INPUT` | 400 | Malformed ledger query or line parameters |
+| `LEDGER_INVALID_INPUT` | 400 | Malformed query parameter or invalid format |
 | `LEDGER_ACCOUNT_NOT_FOUND` | 404 | Ledger account not found or not owned by user |
-| `LEDGER_UNBALANCED` | 400 | Debit and Credit amounts do not balance |
-| `LEDGER_IDEMPOTENCY_CONFLICT` | 409 | Duplicate journal idempotency key |
-| `LEDGER_CURRENCY_MISMATCH` | 400 | Multi-currency lines in single entry |
+| `UNAUTHENTICATED` | 401 | No valid session cookie |
+| `NOT_FOUND` | 404 | Route does not exist |
+| `INTERNAL_ERROR` | 500 | Unexpected server error |
 
 ---
 
