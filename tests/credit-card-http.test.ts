@@ -830,8 +830,8 @@ describe("Credit Cards Product HTTP Surface (Checkpoint 7B.3)", () => {
 			);
 			expect(res.status).toBe(200);
 			const body = (await res.json()) as JsonAny;
-			expect(body.readiness.isExactMatch).toBe(true);
-			expect(body.readiness.isLiabilityCovered).toBe(true);
+			expect(body.readiness.liabilityCoverage).toBe("READY");
+			expect(body.readiness.statementAmount).toBe("1250.00");
 		});
 
 		it("POST /credit-cards/:cardId/statements/:id/reconcile stores explicit decomposition", async () => {

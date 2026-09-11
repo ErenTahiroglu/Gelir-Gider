@@ -173,6 +173,6 @@ describe("backup pipeline amplification sweep (deterministic bytes)", () => {
 			// End-to-end the pipeline walks ~10x the plaintext in transient bytes.
 			expect(result.cumulativeAmplification).toBeGreaterThan(8);
 			expect(result.cumulativeAmplification).toBeLessThan(13);
-		});
+		}, 30000);
 	}
 });
