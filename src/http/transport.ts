@@ -172,6 +172,7 @@ export const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	LEDGER_INVALID_INPUT: "Invalid ledger request",
 	LEDGER_ACCOUNT_NOT_FOUND: "Ledger account not found",
 	LEDGER_ACCOUNT_ARCHIVED: "Ledger account is archived",
+	LEDGER_ACCOUNT_CODE_CONFLICT: "Ledger account code conflict",
 	LEDGER_UNBALANCED: "Ledger entry is not balanced",
 	LEDGER_IDEMPOTENCY_CONFLICT: "Ledger command idempotency conflict",
 	LEDGER_CURRENCY_MISMATCH: "Ledger currency mismatch",

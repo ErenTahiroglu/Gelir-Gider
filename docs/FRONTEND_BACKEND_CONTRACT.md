@@ -179,16 +179,18 @@ All routes require:
 
 ### 4.5 Ledger (`/ledger/*`)
 
-All routes are **READ-ONLY**. Raw journal write endpoints (`/ledger/entries`, `/ledger/post`, `/ledger/journal`, `/ledger/reverse`) are **not exposed** and do not exist on the HTTP surface.
+Exposes safe **ledger account definition metadata provisioning** (`POST /ledger/accounts`) and bounded balance reads (`GET /ledger/accounts`, `GET /ledger/accounts/:accountId/balance`). Raw journal write endpoints (`/ledger/entries`, `/ledger/post`, `/ledger/journal`, `/ledger/reverse`) and transaction mutations remain **strictly forbidden** and do not exist on the HTTP surface.
 
 All routes require:
 - Session authentication (`__Host-gg_session` cookie)
 - User identity derived **strictly** from session (`c.get("auth").userId`)
+- Mutating methods (`POST`) require `sameOriginMutationGuard()` with `Origin: <WEBAUTHN_ORIGIN>` and strict closed bodies.
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/ledger/accounts` | List of ledger account balances (`includeArchived`, `asOf`) |
 | `GET` | `/ledger/accounts/:accountId/balance` | Single ledger account balance (`asOf`) |
+| `POST` | `/ledger/accounts` | Safe product ledger account provisioning (`ASSET` \| `INCOME`) with natural-key replay |
 
 ### 4.6 Income (`/income/*`)
 
@@ -401,6 +403,50 @@ Returns `200 OK` with `{ "transactionId": "uuid", "revisions": [...], "nextCurso
 #### 5.6.6 GET /ledger/accounts/:accountId/balance
 - Query parameters: `asOf` (optional UTC ISO instant)
 - Response (`200 OK`): `{ "accountId": "uuid", "currency": "TRY", "normalBalance": "DEBIT|CREDIT", "balance": "150.75", "asOf": "2026-09-10T12:00:00.000Z" }`
+
+#### 5.6.7 POST /ledger/accounts (Checkpoint 7B.2-R1)
+- **Purpose:** Safe product-level ledger account definition creation. Required for fresh users to provision accounts needed by Income (or other product surfaces) without direct DB or internal service intervention.
+- **Allowed Account Types:** Strictly `"ASSET"` | `"INCOME"`. (`"LIABILITY"`, `"EQUITY"`, `"EXPENSE"` are rejected at this boundary).
+- **Derived Domain Values:**
+  - `normalBalance`: Derived by domain as `DEBIT` for `ASSET`, `CREDIT` for `INCOME`.
+  - `currency`: Derived from authenticated user's base currency (`users.currency`).
+- **Namespace Protection:**
+  - Client provides alias `code` (1..60 characters, alphanumeric/underscore).
+  - Server prepends `USR_` prefix, guaranteeing stored code is `USR_<ALIAS>` (5..64 characters, satisfying `^[A-Z][A-Z0-9_]{1,63}$`) and strictly disjoint from system namespaces (`SYS_*`, `CC_*`, `PRCV_*`, `PPAY_*`).
+- **Body (Strictly Closed):**
+  ```json
+  {
+    "code": "CASH",
+    "name": "Main Cash Wallet",
+    "accountType": "ASSET"
+  }
+  ```
+  Reject `userId`, `currency`, `normalBalance`, `balance`, `openingBalance`, `amount`, `debit`, `credit`, `journal`, etc.
+- **Natural-Key Replay Contract:**
+  - First create -> `idempotentReplay: false`.
+  - Exact retry (same normalized code, name, accountType) -> `idempotentReplay: true`, resolves existing account.
+  - Same code with changed definition (name or accountType) -> `409 LEDGER_ACCOUNT_CODE_CONFLICT`.
+- **Zero Financial Effect:**
+  - Changes ONLY ledger account metadata. Creates ZERO canonical transactions, transaction revisions, journal entries, or journal lines. Initial account balance is `"0.00"`.
+- **Response (`200 OK`):**
+  ```json
+  {
+    "accountId": "44444444-4444-4444-8444-444444444444",
+    "code": "USR_CASH",
+    "name": "Main Cash Wallet",
+    "accountType": "ASSET",
+    "normalBalance": "DEBIT",
+    "currency": "TRY",
+    "archived": false,
+    "idempotentReplay": false
+  }
+  ```
+- **Fresh-User Income Setup Sequence:**
+  1. `POST /ledger/accounts` with `{ "code": "CASH", "name": "Cash Wallet", "accountType": "ASSET" }` -> returns `accountId` (`ASSET`/`DEBIT`).
+  2. `POST /ledger/accounts` with `{ "code": "SALARY", "name": "Salary Income", "accountType": "INCOME" }` -> returns `accountId` (`INCOME`/`CREDIT`).
+  3. `POST /income/sources` referencing `incomeLedgerAccountId` from step 2.
+  4. `POST /income/receipts` referencing `destinationAccountId` from step 1.
+- **Account Archive Status:** `ACCOUNT ARCHIVE — NOT YET EXPOSED`. Active Income Source references and cross-domain dependencies require comprehensive reference validation before exposing an archive HTTP endpoint.
 
 ### 5.7 Income Product Surface (Checkpoint 7B.2)
 

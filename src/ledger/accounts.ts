@@ -174,7 +174,7 @@ export async function createLedgerAccountInTransaction({
 	}
 }
 
-function mapLedgerAccountRow(row: {
+export function mapLedgerAccountRow(row: {
 	id: string;
 	userId: string;
 	code: string;

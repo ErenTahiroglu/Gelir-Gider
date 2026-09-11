@@ -23,6 +23,10 @@ import { allocatePersonalBudgetV2 } from "../src/budget/policy-v2.ts";
 import { buildBudgetV2CanonicalPayload } from "../src/budget/payload-v2.ts";
 import { createLedgerAccount } from "../src/ledger/accounts.ts";
 import {
+	createProductLedgerAccount,
+	PRODUCT_LEDGER_ACCOUNT_PREFIX,
+} from "../src/ledger/product-accounts.ts";
+import {
 	getLedgerAccountBalance,
 	listLedgerAccountBalances,
 } from "../src/ledger/balances.ts";
@@ -13262,6 +13266,233 @@ async function resolverRuntime7B2() {
 	await s.close();
 }
 
+async function resolverRuntime7B2R1() {
+	console.log(
+		"\n== PHASE 7B.2-R1: SAFE PRODUCT LEDGER ACCOUNT PROVISIONING & FRESH USER INCOME USABILITY (PGlite / Drizzle) ==",
+	);
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const eqD = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+		: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 71);
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
+
+	const FRESH_U = "33333333-3333-4333-8333-333333333333";
+	const U2 = "22222222-2222-4222-8222-222222222222";
+
+	// Seed fresh user in users table (auth domain only)
+	await pg.query(
+		"insert into users (id, display_name, currency, timezone) values ($1,'Fresh User','TRY','Europe/Istanbul')",
+		[FRESH_U],
+	);
+
+	// A. Fresh user begins with ZERO accounts
+	const initialAccounts = await listLedgerAccountBalances({ db, userId: FRESH_U });
+	eqD(initialAccounts.length, 0, "7B.2-R1/1: fresh authenticated user starts with exactly 0 ledger accounts");
+
+	// B. Product ASSET creation via public product boundary
+	const assetRes = await createProductLedgerAccount({
+		db,
+		userId: FRESH_U,
+		code: "cash",
+		name: "Main Cash Wallet",
+		accountType: "ASSET",
+	});
+	eqD(assetRes.idempotentReplay, false, "7B.2-R1/2: initial ASSET creation is not an idempotent replay");
+	eqD(assetRes.account.code, "USR_CASH", "7B.2-R1/2: ASSET account stored with USR_ prefix");
+	eqD(assetRes.account.accountType, "ASSET", "7B.2-R1/2: ASSET accountType confirmed");
+	eqD(assetRes.account.normalBalance, "DEBIT", "7B.2-R1/2: ASSET normalBalance derived as DEBIT");
+	eqD(assetRes.account.currency, "TRY", "7B.2-R1/2: currency derived from user currency (TRY)");
+
+	// C. Product INCOME creation via public product boundary
+	const incomeRes = await createProductLedgerAccount({
+		db,
+		userId: FRESH_U,
+		code: "salary",
+		name: "Primary Salary",
+		accountType: "INCOME",
+	});
+	eqD(incomeRes.idempotentReplay, false, "7B.2-R1/3: initial INCOME creation is not an idempotent replay");
+	eqD(incomeRes.account.code, "USR_SALARY", "7B.2-R1/3: INCOME account stored with USR_ prefix");
+	eqD(incomeRes.account.accountType, "INCOME", "7B.2-R1/3: INCOME accountType confirmed");
+	eqD(incomeRes.account.normalBalance, "CREDIT", "7B.2-R1/3: INCOME normalBalance derived as CREDIT");
+	eqD(incomeRes.account.currency, "TRY", "7B.2-R1/3: currency derived from user currency (TRY)");
+
+	// D. Zero initial balances
+	const bCashInit = await getLedgerAccountBalance({ db, userId: FRESH_U, accountId: assetRes.account.id });
+	const bSalaryInit = await getLedgerAccountBalance({ db, userId: FRESH_U, accountId: incomeRes.account.id });
+	eqD(bCashInit.balance, "0.00", "7B.2-R1/4: initial ASSET balance is exactly 0.00");
+	eqD(bSalaryInit.balance, "0.00", "7B.2-R1/4: initial INCOME balance is exactly 0.00");
+
+	// E. Zero financial side effects from account creation
+	const qCount = async (tbl: string) =>
+		(await pg.query(`select count(*)::int as n from ${tbl} where user_id = $1`, [FRESH_U])).rows[0].n as number;
+	eqD(await qCount("canonical_transactions"), 0, "7B.2-R1/5: zero canonical transactions created");
+	eqD(await qCount("transaction_revisions"), 0, "7B.2-R1/5: zero transaction revisions created");
+	eqD(await qCount("journal_entries"), 0, "7B.2-R1/5: zero journal entries created");
+	eqD(await qCount("income_receipts"), 0, "7B.2-R1/5: zero income receipts created");
+	eqD(await qCount("income_entitlements"), 0, "7B.2-R1/5: zero income entitlements created");
+	eqD(await qCount("monthly_budget_v2_plans"), 0, "7B.2-R1/5: zero budget plans created");
+
+	// F. Natural-key exact replay
+	const assetReplay = await createProductLedgerAccount({
+		db,
+		userId: FRESH_U,
+		code: "cash",
+		name: "Main Cash Wallet",
+		accountType: "ASSET",
+	});
+	eqD(assetReplay.idempotentReplay, true, "7B.2-R1/6: exact ASSET replay returns idempotentReplay = true");
+	eqD(assetReplay.account.id, assetRes.account.id, "7B.2-R1/6: exact replay resolves identical account ID");
+
+	const incomeReplay = await createProductLedgerAccount({
+		db,
+		userId: FRESH_U,
+		code: "salary",
+		name: "Primary Salary",
+		accountType: "INCOME",
+	});
+	eqD(incomeReplay.idempotentReplay, true, "7B.2-R1/6: exact INCOME replay returns idempotentReplay = true");
+	eqD(incomeReplay.account.id, incomeRes.account.id, "7B.2-R1/6: exact replay resolves identical account ID");
+
+	// G. Same code changed definition -> conflict (409)
+	let conflictNameThrew = "";
+	try {
+		await createProductLedgerAccount({
+			db,
+			userId: FRESH_U,
+			code: "cash",
+			name: "Different Cash Name",
+			accountType: "ASSET",
+		});
+	} catch (e) {
+		conflictNameThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(conflictNameThrew, "LEDGER_ACCOUNT_CODE_CONFLICT", "7B.2-R1/7: same code changed name throws LEDGER_ACCOUNT_CODE_CONFLICT");
+
+	let conflictTypeThrew = "";
+	try {
+		await createProductLedgerAccount({
+			db,
+			userId: FRESH_U,
+			code: "cash",
+			name: "Main Cash Wallet",
+			accountType: "INCOME",
+		});
+	} catch (e) {
+		conflictTypeThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(conflictTypeThrew, "LEDGER_ACCOUNT_CODE_CONFLICT", "7B.2-R1/7: same code changed accountType throws LEDGER_ACCOUNT_CODE_CONFLICT");
+
+	// H. System namespace cannot be preempted
+	const fakeSysRes = await createProductLedgerAccount({
+		db,
+		userId: FRESH_U,
+		code: "SYS_CC_MANDATORY_EXP",
+		name: "Fake System Account",
+		accountType: "ASSET",
+	});
+	eqD(fakeSysRes.account.code, "USR_SYS_CC_MANDATORY_EXP", "7B.2-R1/8: client code mimicking system account is safely isolated under USR_ namespace");
+	chkD(fakeSysRes.account.code !== "SYS_CC_MANDATORY_EXP", "7B.2-R1/8: client cannot claim true system account code");
+
+	// Verify credit card mapping tables remain zero/unaltered
+	const ccLinksCount = (await pg.query(`select count(*)::int as n from credit_card_ledger_links where ledger_account_id = $1`, [fakeSysRes.account.id])).rows[0].n as number;
+	const ccSysCount = (await pg.query(`select count(*)::int as n from credit_card_system_accounts where ledger_account_id = $1`, [fakeSysRes.account.id])).rows[0].n as number;
+	eqD(ccLinksCount, 0, "7B.2-R1/8: product account cannot alter credit_card_ledger_links");
+	eqD(ccSysCount, 0, "7B.2-R1/8: product account cannot alter credit_card_system_accounts");
+
+	// I. Cross-user isolation
+	let u2CreateThrew = "";
+	try {
+		await createProductLedgerAccount({
+			db,
+			userId: U2,
+			code: "cash",
+			name: "U2 Cash Wallet",
+			accountType: "ASSET",
+		});
+	} catch (e) {
+		u2CreateThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(u2CreateThrew, "LEDGER_USER_NOT_FOUND", "7B.2-R1/9: non-existent/isolated user cannot create product account");
+
+	let u2ReadFreshThrew = "";
+	try {
+		await getLedgerAccountBalance({ db, userId: U2, accountId: assetRes.account.id });
+	} catch (e) {
+		u2ReadFreshThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(u2ReadFreshThrew, "LEDGER_ACCOUNT_NOT_FOUND", "7B.2-R1/9: U2 cannot read fresh user account balance");
+
+	// J. Fresh-User End-to-End Income Flow (No DB / internal direct provisioning)
+	// 1. Create Income Source using created INCOME account
+	const freshSource = await createIncomeSourceWithNaturalReplay({
+		db,
+		userId: FRESH_U,
+		code: "job_primary",
+		name: "Primary Engineering Job",
+		nature: "REGULAR",
+		referenceMethod: "FIXED_MONTHLY",
+		expectedMonthlyAmount: "65000.00",
+		incomeLedgerAccountId: incomeRes.account.id,
+		activeFrom: "2026-01-01",
+	});
+	eqD(freshSource.idempotentReplay, false, "7B.2-R1/10: fresh user creates Income Source referencing product-created INCOME account");
+	eqD(freshSource.incomeSource.incomeLedgerAccountId, incomeRes.account.id, "7B.2-R1/10: income source references created INCOME account");
+
+	// 2. Create Income Receipt using created ASSET account
+	const freshReceipt = await createIncomeReceipt({
+		db,
+		userId: FRESH_U,
+		sourceId: freshSource.incomeSource.id,
+		idempotencyKey: "rec-fresh-proof-1",
+		receivedAt: new Date("2026-09-05T10:00:00.000Z"),
+		amount: "65000.00",
+		destinationAccountId: assetRes.account.id,
+		note: "First Salary",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "rec-fresh-proof-1" },
+	});
+	eqD(freshReceipt.idempotentReplay, false, "7B.2-R1/11: fresh user creates Income Receipt referencing product-created ASSET account");
+
+	// 3. Verify exact double-entry accounting
+	const bCashPostRec = await getLedgerAccountBalance({ db, userId: FRESH_U, accountId: assetRes.account.id });
+	const bSalaryPostRec = await getLedgerAccountBalance({ db, userId: FRESH_U, accountId: incomeRes.account.id });
+	eqD(bCashPostRec.balance, "65000.00", "7B.2-R1/12: ASSET account balance DEBIT increased by exact 65000.00");
+	eqD(bSalaryPostRec.balance, "65000.00", "7B.2-R1/12: INCOME account balance CREDIT increased by exact 65000.00");
+
+	// 4. Verify listLedgerAccountBalances
+	const finalAccounts = await listLedgerAccountBalances({ db, userId: FRESH_U });
+	eqD(finalAccounts.length, 3, "7B.2-R1/13: fresh user has 3 product accounts (CASH, SALARY, FAKE_SYS)");
+	const cashAccInList = finalAccounts.find((a) => a.code === "USR_CASH");
+	const salAccInList = finalAccounts.find((a) => a.code === "USR_SALARY");
+	chkD(cashAccInList !== undefined && cashAccInList.balance === "65000.00", "7B.2-R1/13: USR_CASH in balance list is 65000.00");
+	chkD(salAccInList !== undefined && salAccInList.balance === "65000.00", "7B.2-R1/13: USR_SALARY in balance list is 65000.00");
+
+	// 5. Receipt exact replay produces no duplicate journal
+	const freshReceiptReplay = await createIncomeReceipt({
+		db,
+		userId: FRESH_U,
+		sourceId: freshSource.incomeSource.id,
+		idempotencyKey: "rec-fresh-proof-1",
+		receivedAt: new Date("2026-09-05T10:00:00.000Z"),
+		amount: "65000.00",
+		destinationAccountId: assetRes.account.id,
+		note: "First Salary",
+		provenance: { type: PRODUCT_INCOME_HTTP_SOURCE_TYPE, ref: "rec-fresh-proof-1" },
+	});
+	eqD(freshReceiptReplay.idempotentReplay, true, "7B.2-R1/14: exact receipt replay returns idempotentReplay = true");
+	const bCashPostReplay = await getLedgerAccountBalance({ db, userId: FRESH_U, accountId: assetRes.account.id });
+	eqD(bCashPostReplay.balance, "65000.00", "7B.2-R1/14: receipt replay does not alter ledger balance");
+
+	await pg.close();
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -13286,6 +13517,7 @@ if (probed) {
 	await resolverRuntime7A();
 	await resolverRuntime7B1();
 	await resolverRuntime7B2();
+	await resolverRuntime7B2R1();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
