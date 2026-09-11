@@ -13990,22 +13990,22 @@ async function resolverRuntime7B2R2() {
 }
 
 async function resolverRuntime7B3() {
-	console.log("\n--- Phase 7B.3: Credit Cards Product HTTP Surface & Cross-User Runtime Proof ---");
-	const pg = new PGlite();
-	await pg.exec("create extension if not exists \"pgcrypto\";");
-	await pg.exec("create extension if not exists \"uuid-ossp\";");
-
-	// Run migration chain 0000..0071
-	for (let i = 0; i <= 71; i++) {
-		const prefix = String(i).padStart(4, "0");
-		const file = (await import("node:fs")).readdirSync(migDir).find((f) => f.startsWith(prefix));
-		if (!file) throw new Error(`Missing migration for prefix ${prefix}`);
-		const sql = (await import("node:fs")).readFileSync(path.join(migDir, file), "utf8");
-		await pg.exec(sql);
-	}
-
+	console.log("\n== PHASE 7B.3: CREDIT CARDS PRODUCT HTTP SURFACE & CROSS-USER RUNTIME PROOF (PGlite / Drizzle / Hono) ==");
 	const { drizzle } = await import("drizzle-orm/pglite");
-	const db = drizzle(pg);
+	const eqD = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 71);
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
 
 	setDatabaseFactoryOverrideForTest(() => db);
 
