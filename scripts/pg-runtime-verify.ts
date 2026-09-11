@@ -11440,6 +11440,9 @@ async function resolverRuntime7A() {
 		buildBudgetV2CheckpointTimeline,
 		buildBudgetV2DecisionCenterView,
 	} = await import("../src/budget/decision-center-v2.ts");
+	const { calculateCheckpointReportFingerprint } = await import(
+		"../src/budget/checkpoint-canonical-v2.ts"
+	);
 
 	const at = (iso: string) => new Date(iso);
 	const canon = (v: unknown) => JSON.stringify(v);
@@ -11945,6 +11948,131 @@ async function resolverRuntime7A() {
 			tlThrew,
 			"BUDGET_CHECKPOINT_SNAPSHOT_CORRUPT",
 			"7A/H: the timeline also fails closed on a corrupt row (never a silent drop)",
+		);
+
+		await s.close();
+	}
+
+	// =====================================================================
+	// Suite 3 (7B.0) -- sharedMaxCheckpointAt reflects the TRUE persisted
+	//                   maximum, independent of the requested `limit`
+	// =====================================================================
+	{
+		const s = await make4bScenario();
+		await createCheckpointTriggerCard({
+			db: s.db,
+			userId: U1,
+			creditCardId: s.CARD,
+			status: "ENABLED",
+			sourceKind: "USER_APPROVED",
+			idempotencyKey: "tc-7b0-1",
+			occurredAt: at("2026-07-01T00:00:00Z"),
+		});
+		await s.replica();
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-08-01 00:00:00+00");
+		await s.mkReceipt(s.gid(), s.REG1, "20000.00", "2026-09-01 00:00:00+00");
+		await s.origin();
+		const cEarly = await persistCheckpointAtDate(
+			s,
+			"2026-08-05 00:00:00+00",
+			"2026-07-25T00:00:00Z",
+		);
+		const cMax = await persistCheckpointAtDate(
+			s,
+			"2026-09-26 00:00:00+00",
+			"2026-07-25T00:00:00Z",
+		);
+
+		// Negative control: with all-distinct instants a ?limit=1 read must not
+		// spuriously report a shared maximum.
+		const tlDistinct = await buildBudgetV2CheckpointTimeline({
+			db: s.db,
+			userId: U1,
+			limit: 1,
+		});
+		eqD(tlDistinct.checkpoints.length, 1, "7B.0/1: ?limit=1 returns a single row");
+		eqD(
+			tlDistinct.sharedMaxCheckpointAt,
+			false,
+			"7B.0/1: distinct maxima -> sharedMaxCheckpointAt false at ?limit=1",
+		);
+
+		// Fabricate a SECOND persisted snapshot sharing cMax's exact checkpointAt
+		// (a state the per-period processor guard normally prevents, but which
+		// the read model must still handle without designating one row "latest").
+		// The clone is internally consistent and fingerprint-valid.
+		const maxRow = (
+			await s.q(
+				`select request_id, period_month, checkpoint_at, previous_checkpoint_snapshot_id,
+				        previous_checkpoint_at, report_schema_version, report_json, report_fingerprint
+				   from budget_v2_checkpoint_snapshots where payment_event_id = $1`,
+				[cMax.pe],
+			)
+		).rows[0];
+		const dupPe = "01111111-0000-4000-8000-00000000d0a1";
+		const dupId = "01111111-0000-4000-8000-00000000d0a2";
+		const dupReq = "01111111-0000-4000-8000-00000000d0a3";
+		const dupReport = JSON.parse(JSON.stringify(maxRow.report_json));
+		dupReport.checkpoint.paymentEventId = dupPe;
+		const dupFp = await calculateCheckpointReportFingerprint(dupReport);
+		await s.replica();
+		await s.q(
+			`insert into budget_v2_checkpoint_snapshots
+			   (id,user_id,request_id,payment_event_id,period_month,checkpoint_at,
+			    previous_checkpoint_snapshot_id,previous_checkpoint_at,
+			    report_schema_version,report_json,report_fingerprint)
+			 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			[
+				dupId,
+				U1,
+				dupReq,
+				dupPe,
+				maxRow.period_month,
+				maxRow.checkpoint_at,
+				maxRow.previous_checkpoint_snapshot_id,
+				maxRow.previous_checkpoint_at,
+				maxRow.report_schema_version,
+				JSON.stringify(dupReport),
+				dupFp,
+			],
+		);
+		await s.origin();
+
+		const tlLimit1 = await buildBudgetV2CheckpointTimeline({
+			db: s.db,
+			userId: U1,
+			limit: 1,
+		});
+		eqD(
+			tlLimit1.checkpoints.length,
+			1,
+			"7B.0/1: ?limit=1 still returns a single row when the max is shared",
+		);
+		eqD(
+			tlLimit1.sharedMaxCheckpointAt,
+			true,
+			"7B.0/1: a shared true maximum is reported even at ?limit=1 (not derived from the page)",
+		);
+
+		const tlAll = await buildBudgetV2CheckpointTimeline({
+			db: s.db,
+			userId: U1,
+		});
+		eqD(tlAll.checkpoints.length, 3, "7B.0/1: full read lists all three rows");
+		eqD(
+			tlAll.sharedMaxCheckpointAt,
+			true,
+			"7B.0/1: full read agrees the maximum is shared",
+		);
+		chkD(
+			tlAll.checkpoints[0]?.checkpointAt === "2026-09-26T00:00:00.000Z" &&
+				tlAll.checkpoints[1]?.checkpointAt === "2026-09-26T00:00:00.000Z" &&
+				tlAll.checkpoints[2]?.checkpointAt === "2026-08-05T00:00:00.000Z",
+			"7B.0/1: the two shared-instant rows sort ahead of the earlier one",
+		);
+		chkD(
+			cEarly.pe !== cMax.pe,
+			"7B.0/1: earlier checkpoint remains a distinct persisted row",
 		);
 
 		await s.close();

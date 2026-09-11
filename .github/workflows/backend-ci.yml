@@ -29,6 +29,9 @@ jobs:
       - name: Run Quality Gate (Typegen, Typecheck, Lint, Format, Unit Tests)
         run: npm run check
 
+      - name: PostgreSQL Runtime Verification (PGlite)
+        run: npm run test:pg
+
       - name: Cloudflare Worker Bundle & Deploy Dry-Run
         run: npx wrangler deploy --dry-run
 
@@ -36,6 +39,8 @@ jobs:
         run: npm audit --audit-level=high
 
       - name: Verify Schema Drift
+        env:
+          DATABASE_URL: "postgres://dummy:dummy@localhost:5432/dummy"
         run: npx drizzle-kit generate
 
       - name: Ensure Clean Working Tree

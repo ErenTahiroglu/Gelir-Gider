@@ -26,21 +26,29 @@ Every release candidate must pass all validation gates locally and in CI before 
    ```bash
    npm run check
    ```
-   Runs `cf-typegen`, `typecheck`, `lint`, `format:check`, and `test` (137 test suites, 1740+ tests).
+   Runs `cf-typegen`, `typecheck`, `lint`, `format:check`, and `test` (170 test suites, 2178+ tests).
 
-2. **Schema Drift Check:**
+2. **PostgreSQL Runtime Verification (PGlite):**
    ```bash
-   npx drizzle-kit generate
+   npm run test:pg
+   ```
+   Runs the complete disposable PGlite migration chain (0000–0071) and all domain runtime
+   regression suites including the 7B.0 `sharedMaxCheckpointAt` correctness suite. This is a
+   **required CI gate** — not local-report-only.
+
+3. **Schema Drift Check:**
+   ```bash
+   DATABASE_URL="postgres://dummy:dummy@localhost:5432/dummy" npx drizzle-kit generate
    ```
    **Expected Output:** `No schema changes, nothing to migrate`
 
-3. **Cloudflare Worker Dry-Run:**
+4. **Cloudflare Worker Dry-Run:**
    ```bash
    npx wrangler deploy --dry-run
    ```
    Verifies bundle compilation, size limits, syntax, and binding mappings without modifying remote infrastructure.
 
-4. **Dependency Audit:**
+5. **Dependency Audit:**
    ```bash
    npm audit --audit-level=high
    ```
@@ -116,15 +124,15 @@ The Worker defines two automated cron triggers in `wrangler.jsonc`:
 ## 7. Database Migration Procedure
 
 1. **Immutability:**
-   - Migrations `0000` through `0060` are strictly immutable.
-   - Any new database changes must be added forward-only as new sequential migration files (e.g., `0061_...sql`).
+   - Migrations `0000` through `0071` are strictly immutable.
+   - Any new database changes must be added forward-only as new sequential migration files (e.g., `0072_...sql`).
 
 2. **Application Flow:**
    - Execute migration runner or apply migrations against target PostgreSQL instance.
    - Always verify journal integrity: `_journal.json` version, sequence indices, and timestamps must match migration files.
    - Execute schema drift check to confirm zero discrepancies between Drizzle schema definitions and migrations:
      ```bash
-     npx drizzle-kit generate
+     DATABASE_URL="postgres://dummy:dummy@localhost:5432/dummy" npx drizzle-kit generate
      ```
 
 ---
@@ -196,18 +204,38 @@ Restore Flow:
 
 ---
 
-## 13. Release Status Classification
+## 13. Same-Origin Architecture (Locked — Checkpoint 7B.0)
+
+The backend is locked to a **single Cloudflare Worker, single origin** architecture:
+
+- One Worker (`gelir-gider-api`) serves both API routes and (future) static frontend assets
+- Hono routes (`/auth`, `/budget-v2`, and future domain routers) all on the same origin
+- **No Vercel/Render adapter; no separate API origin; no permissive CORS**
+- Every cookie-authenticated unsafe HTTP method (POST/PUT/PATCH/DELETE) must carry an `Origin` header matching `WEBAUTHN_ORIGIN`
+- Safe methods (GET/HEAD/OPTIONS) are untouched by the origin guard
+- `SameSite=Strict` on the session cookie provides defence-in-depth against cross-site sends
+- The same-origin guard is NOT a CORS mechanism; it adds no `Access-Control-*` headers
+
+The application origin is read from `WEBAUTHN_ORIGIN` config — never hard-coded — preserving local development testability.
+
+---
+
+## 14. Release Status Classification
 
 | Component | Status | Notes |
 | :--- | :--- | :--- |
-| **BACKEND CORE** | **READY** | All domain calculations, invariants, and tests passing. |
-| **FINANCIAL DOMAIN SERVICES** | **READY** | Implemented as internal TypeScript domain services. |
-| **DATABASE MIGRATIONS** | **READY through 0060** | 61 migration files verified and immutable. |
+| **BACKEND CORE** | **READY** | All domain calculations, invariants, and tests passing (2178 tests). |
+| **FINANCIAL DOMAIN SERVICES** | **READY** | Implemented as internal TypeScript domain services (see 7B.0 inventory). |
+| **DATABASE MIGRATIONS** | **READY through 0071** | 72 migration files verified and immutable. |
 | **AUTH CORE** | **READY** | WebAuthn / Passkey, session cookies, rate limiter, recovery. |
 | **SCHEDULED NOTIFICATIONS** | **READY** | Push notification queue and VAPID transport. |
 | **BACKUP / RESTORE CODE** | **READY** | AES-256-GCM streaming encryption and retention logic. |
+| **HTTP TRANSPORT HELPERS** | **READY** | Shared transport layer (7B.0): UUID, instant, idempotency, origin guard. |
+| **AUTH HTTP ADAPTER** | **READY** | `/auth/*` routes complete and tested. |
+| **BUDGET V2 HTTP ADAPTER** | **READY** | `/budget-v2/*` routes complete, CSRF-guarded, and tested. |
+| **FINANCIAL HTTP PRODUCT SURFACE** | **IN PROGRESS** | Domain services exist; HTTP adapters for transactions/ledger/income/credit-cards/people/rewards/campaigns/short-term-goals/midas/long-term/month-close/notifications/imports being built in 7B.1–7B.9. |
+| **PRE-FRONTEND BACKEND CODE FREEZE** | **NOT YET COMPLETE** | In progress under Checkpoint 7B (7B.1–7B.9 financial HTTP surface). |
 | **LIVE R2 DRILL** | **BLOCKED — TEST BUCKET UNAVAILABLE** | Unit & mock tests green; live drill deferred. |
 | **LIVE RESTORE DRILL** | **BLOCKED — DISPOSABLE DATABASE UNAVAILABLE** | Restore logic verified with empty-target checks. |
-| **FINANCIAL HTTP ADAPTERS** | **DEFERRED TO FRONTEND INTEGRATION** | Intentionally deferred to match exact UI needs. |
 | **FINAL FRONTEND DOMAIN / WEBAUTHN ORIGIN** | **DEFERRED** | Awaiting production web frontend provisioning. |
 | **FULL APPLICATION PRODUCTION CUTOVER** | **DEFERRED** | Deferred pending frontend domain & integration. |

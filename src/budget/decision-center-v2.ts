@@ -68,9 +68,12 @@ export interface BudgetV2CheckpointTimeline {
 	apiVersion: string;
 	limit: number;
 	/**
-	 * True when two or more RETURNED rows share the maximum `checkpointAt`
-	 * instant. The product must not silently designate a single row as uniquely
-	 * "latest" in that case (Section 5 / 19).
+	 * True when two or more of the authenticated user's persisted checkpoints
+	 * share the maximum `checkpointAt` instant. Computed over the FULL persisted
+	 * history, independent of the requested `limit` -- so a `?limit=1` request
+	 * still reports `true` when the newest instant is shared. The product must
+	 * not silently designate a single row as uniquely "latest" in that case
+	 * (Section 5 / 19).
 	 */
 	sharedMaxCheckpointAt: boolean;
 	checkpoints: BudgetV2CheckpointTimelineEntry[];
@@ -119,6 +122,23 @@ export async function buildBudgetV2CheckpointTimeline(params: {
 		)
 		.limit(limit);
 
+	// `sharedMaxCheckpointAt` must reflect the TRUE maximum across the user's
+	// entire persisted history, not merely the (possibly `limit`-truncated)
+	// page above. The two newest `checkpointAt` values are enough to decide it
+	// and the read stays bounded to two rows regardless of `limit`.
+	const newestTwo = await params.db
+		.select({ checkpointAt: budgetV2CheckpointSnapshots.checkpointAt })
+		.from(budgetV2CheckpointSnapshots)
+		.where(eq(budgetV2CheckpointSnapshots.userId, userId))
+		.orderBy(desc(budgetV2CheckpointSnapshots.checkpointAt))
+		.limit(2);
+	const newest = newestTwo[0];
+	const secondNewest = newestTwo[1];
+	const sharedMaxCheckpointAt =
+		newest !== undefined &&
+		secondNewest !== undefined &&
+		newest.checkpointAt.getTime() === secondNewest.checkpointAt.getTime();
+
 	const checkpoints: BudgetV2CheckpointTimelineEntry[] = [];
 	for (const row of rows) {
 		await verifyStoredCheckpointSnapshot({
@@ -136,11 +156,6 @@ export async function buildBudgetV2CheckpointTimeline(params: {
 			periodMonth: row.periodMonth,
 		});
 	}
-
-	const maxCheckpointAt = checkpoints[0]?.checkpointAt ?? null;
-	const sharedMaxCheckpointAt =
-		maxCheckpointAt !== null &&
-		checkpoints.filter((c) => c.checkpointAt === maxCheckpointAt).length > 1;
 
 	return {
 		apiVersion: BUDGET_V2_PRODUCT_API_VERSION,

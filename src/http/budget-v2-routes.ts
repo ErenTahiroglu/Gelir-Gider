@@ -21,14 +21,26 @@ import { createDatabase } from "../db/client";
 import type { AuthVariables } from "./auth-middleware";
 import { requireAuthenticatedSession } from "./auth-middleware";
 import type { RequestIdVariables } from "./security-middleware";
+import {
+	errorEnvelope,
+	HEX64_RE,
+	hasOnlyKeys,
+	parseBoundedLimit,
+	parseCanonicalInstant,
+	readIdempotencyKey,
+	readJsonObject,
+	sameOriginMutationGuard,
+	UUID_RE,
+} from "./transport";
 
 /**
- * PERSONAL_BUDGET_V2 -- PRODUCT INTEGRATION BOUNDARY (Checkpoint 7A).
+ * PERSONAL_BUDGET_V2 -- PRODUCT INTEGRATION BOUNDARY (Checkpoint 7A; shared
+ * transport helpers + same-origin guard adopted in 7B.0).
  *
  * A thin authenticated HTTP adapter over the existing verified Budget V2
  * domain. Every route here:
  *
- *   - runs behind `requireAuthenticatedSession`
+ *   - runs behind `sameOriginMutationGuard()` + `requireAuthenticatedSession`
  *   - derives the user ONLY from `c.get("auth").userId` -- never from the
  *     body, query string, path, or a header
  *   - validates the CLOSED transport schema, then delegates to an existing
@@ -50,37 +62,13 @@ export const budgetV2Router = new Hono<BudgetV2Env>();
 
 const BODY_LIMIT_BYTES = 64 * 1024; // 64 KiB -- feedback bodies are tiny
 
-const CANONICAL_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-const UUID_RE =
-	/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const FINGERPRINT_RE = /^[0-9a-f]{64}$/;
+const TIMELINE_DEFAULT_LIMIT = 50;
+const TIMELINE_MAX_LIMIT = 100;
+
 const DECISIONS: ReadonlySet<string> = new Set(["ACCEPT", "MODIFY", "IGNORE"]);
 
-// --- bounded, sanitized error surface -------------------------------------
-
-const SAFE_MESSAGES: Record<string, string> = {
-	BUDGET_INVALID_INPUT: "Invalid request",
-	BUDGET_CHECKPOINT_NOT_FOUND: "Checkpoint not found",
-	BUDGET_RECOMMENDATION_NOT_FOUND: "Recommendation not found",
-	BUDGET_RECOMMENDATION_NOT_ACTIVE: "Recommendation is not active",
-	BUDGET_RECOMMENDATION_STALE: "Recommendation has changed since it was shown",
-	BUDGET_IDEMPOTENCY_CONFLICT:
-		"Idempotency-Key was already used with a different request",
-	BUDGET_REVISION_CONFLICT: "Feedback revision is stale",
-	INTERNAL_ERROR: "Internal server error",
-};
-
-function errorBody(code: string) {
-	return {
-		error: {
-			code,
-			message: SAFE_MESSAGES[code] ?? SAFE_MESSAGES.INTERNAL_ERROR,
-		},
-	};
-}
-
 function fail(c: Context<BudgetV2Env>, code: string, status: number) {
-	return c.json(errorBody(code), status as 400);
+	return c.json(errorEnvelope(code), status as 400);
 }
 
 /**
@@ -117,69 +105,11 @@ function mapDomainError(c: Context<BudgetV2Env>, err: unknown) {
 	return fail(c, "INTERNAL_ERROR", 500);
 }
 
-// --- transport validation helpers ---------------------------------------
-
-function isJsonContentType(value: string | undefined): boolean {
-	if (!value) return false;
-	return value.split(";", 1)[0]?.trim().toLowerCase() === "application/json";
-}
-
-async function readJsonObject(
-	c: Context<BudgetV2Env>,
-): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false }> {
-	if (!isJsonContentType(c.req.header("content-type"))) return { ok: false };
-	let parsed: unknown;
-	try {
-		parsed = await c.req.json();
-	} catch {
-		return { ok: false };
-	}
-	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-		return { ok: false };
-	}
-	return { ok: true, value: parsed as Record<string, unknown> };
-}
-
-function hasOnlyKeys(obj: Record<string, unknown>, allowed: string[]): boolean {
-	return Object.keys(obj).every((k) => allowed.includes(k));
-}
-
-/**
- * The Idempotency-Key comes ONLY from the header and is passed through
- * verbatim -- trim-preserving, matching the domain rule
- * (`btrim(key) = key AND length BETWEEN 1 AND 128`). No server-generated
- * fallback.
- */
-function readIdempotencyKey(
-	c: Context<BudgetV2Env>,
-): { ok: true; key: string } | { ok: false } {
-	const raw = c.req.header("Idempotency-Key");
-	if (typeof raw !== "string") return { ok: false };
-	if (raw !== raw.trim()) return { ok: false };
-	if (raw.length < 1 || raw.length > 128) return { ok: false };
-	return { ok: true, key: raw };
-}
-
-/**
- * The client supplies `occurredAt` as ONE canonical UTC representation
- * (`YYYY-MM-DDTHH:mm:ss.sssZ`). It is part of exact command identity, so the
- * route never substitutes `new Date()`; a non-canonical or invalid value is a
- * 400, never a silent replacement.
- */
-function parseCanonicalInstant(value: unknown): Date | null {
-	if (typeof value !== "string" || !CANONICAL_INSTANT_RE.test(value)) {
-		return null;
-	}
-	const d = new Date(value);
-	if (Number.isNaN(d.getTime()) || d.toISOString() !== value) return null;
-	return d;
-}
-
-function parseModification(value: unknown):
+function parseModification(
+	value: unknown,
+):
 	| { ok: true; modification: BudgetV2RecommendationModification | null }
-	| {
-			ok: false;
-	  } {
+	| { ok: false } {
 	if (value === undefined || value === null) {
 		return { ok: true, modification: null };
 	}
@@ -210,12 +140,13 @@ function feedbackResponseBody(
 
 // --- middleware --------------------------------------------------------
 
+budgetV2Router.use("*", sameOriginMutationGuard());
 budgetV2Router.use("*", requireAuthenticatedSession);
 budgetV2Router.post(
 	"*",
 	bodyLimit({
 		maxSize: BODY_LIMIT_BYTES,
-		onError: (c) => c.json(errorBody("BUDGET_INVALID_INPUT"), 400),
+		onError: (c) => c.json(errorEnvelope("BUDGET_INVALID_INPUT"), 400),
 	}),
 );
 
@@ -223,18 +154,21 @@ budgetV2Router.post(
 
 budgetV2Router.get("/checkpoints", async (c) => {
 	const rawLimit = c.req.query("limit");
-	if (rawLimit !== undefined && !/^[0-9]+$/.test(rawLimit)) {
-		return fail(c, "BUDGET_INVALID_INPUT", 400);
-	}
+	const limit = parseBoundedLimit(rawLimit, {
+		defaultLimit: TIMELINE_DEFAULT_LIMIT,
+		maxLimit: TIMELINE_MAX_LIMIT,
+	});
+	if (!limit.ok) return fail(c, "BUDGET_INVALID_INPUT", 400);
 
 	const db = createDatabase(getDatabaseUrl(c.env));
 	try {
 		const timeline = await buildBudgetV2CheckpointTimeline({
 			db,
 			userId: c.get("auth").userId,
-			...(rawLimit !== undefined
-				? { limit: Number.parseInt(rawLimit, 10) }
-				: {}),
+			// Only pass `limit` when the client explicitly provided a value --
+			// omitting it lets the domain use its own internal default, and
+			// keeps the call-site faithful to the test contract.
+			...(rawLimit !== undefined ? { limit: limit.limit } : {}),
 		});
 		return c.json(timeline, 200);
 	} catch (err) {
@@ -298,7 +232,7 @@ budgetV2Router.post(
 		}
 
 		const fingerprint = body.expectedRecommendationFingerprint;
-		if (typeof fingerprint !== "string" || !FINGERPRINT_RE.test(fingerprint)) {
+		if (typeof fingerprint !== "string" || !HEX64_RE.test(fingerprint)) {
 			return fail(c, "BUDGET_INVALID_INPUT", 400);
 		}
 		if (typeof body.decision !== "string" || !DECISIONS.has(body.decision)) {

@@ -59,6 +59,8 @@ const REC =
 const FP = "a".repeat(64);
 const OCCURRED_AT = "2026-09-10T12:34:56.789Z";
 const COOKIE = "__Host-gg_session=valid-token";
+// Must match mockEnv.WEBAUTHN_ORIGIN -- the same-origin guard reads it.
+const ORIGIN = "http://localhost:8787";
 
 const mockEnv = {
 	DATABASE_URL: "postgresql://user:password@example.invalid/db",
@@ -119,11 +121,14 @@ describe("Budget V2 product boundary -- authentication", () => {
 	});
 
 	it("A: rejects a feedback POST without a session cookie (401)", async () => {
+		// The same-origin guard passes (Origin header present); the auth gate
+		// runs second and rejects because there is no session cookie.
 		const res = await app.request(
 			`/budget-v2/checkpoints/${PE}/recommendations/${REC}/feedback`,
 			{
 				method: "POST",
 				headers: {
+					Origin: ORIGIN,
 					"content-type": "application/json",
 					"Idempotency-Key": "idem-1",
 				},
@@ -136,6 +141,53 @@ describe("Budget V2 product boundary -- authentication", () => {
 			mockEnv,
 		);
 		expect(res.status).toBe(401);
+	});
+
+	it("7B.0/CSRF: a POST without Origin is rejected 403 INVALID_ORIGIN before auth", async () => {
+		// The guard runs before requireAuthenticatedSession; a request with no
+		// Origin (or a wrong one) must never reach the domain layer.
+		const res = await app.request(
+			`/budget-v2/checkpoints/${PE}/recommendations/${REC}/feedback`,
+			{
+				method: "POST",
+				headers: {
+					Cookie: COOKIE,
+					"content-type": "application/json",
+					"Idempotency-Key": "idem-1",
+				},
+				body: JSON.stringify({
+					expectedRecommendationFingerprint: FP,
+					decision: "ACCEPT",
+					occurredAt: OCCURRED_AT,
+				}),
+			},
+			mockEnv,
+		);
+		expect(res.status).toBe(403);
+		expect(((await res.json()) as ErrBody).error.code).toBe("INVALID_ORIGIN");
+	});
+
+	it("7B.0/CSRF: a POST with wrong Origin is rejected 403 INVALID_ORIGIN", async () => {
+		const res = await app.request(
+			`/budget-v2/checkpoints/${PE}/recommendations/${REC}/feedback`,
+			{
+				method: "POST",
+				headers: {
+					Cookie: COOKIE,
+					Origin: "https://attacker.example.com",
+					"content-type": "application/json",
+					"Idempotency-Key": "idem-1",
+				},
+				body: JSON.stringify({
+					expectedRecommendationFingerprint: FP,
+					decision: "ACCEPT",
+					occurredAt: OCCURRED_AT,
+				}),
+			},
+			mockEnv,
+		);
+		expect(res.status).toBe(403);
+		expect(((await res.json()) as ErrBody).error.code).toBe("INVALID_ORIGIN");
 	});
 });
 
@@ -234,6 +286,36 @@ describe("Budget V2 product boundary -- checkpoint timeline", () => {
 			"paymentEventId",
 			"periodMonth",
 		]);
+	});
+
+	it("7B.0: serializes sharedMaxCheckpointAt=true through a ?limit=1 request", async () => {
+		const spy = vi
+			.spyOn(decisionCenterModule, "buildBudgetV2CheckpointTimeline")
+			.mockResolvedValue({
+				apiVersion: "budget-v2-product-api-v1",
+				limit: 1,
+				sharedMaxCheckpointAt: true,
+				checkpoints: [
+					{
+						paymentEventId: PE,
+						checkpointAt: "2026-09-10T00:00:00.000Z",
+						periodMonth: "2026-09-01",
+					},
+				],
+			});
+		const res = await app.request(
+			"/budget-v2/checkpoints?limit=1",
+			{ method: "GET", headers: { Cookie: COOKIE } },
+			mockEnv,
+		);
+		expect(res.status).toBe(200);
+		expect(spy.mock.calls[0]?.[0]).toMatchObject({ limit: 1 });
+		const body = (await res.json()) as {
+			sharedMaxCheckpointAt: boolean;
+			checkpoints: unknown[];
+		};
+		expect(body.sharedMaxCheckpointAt).toBe(true);
+		expect(body.checkpoints).toHaveLength(1);
 	});
 
 	it("AH: request-id + security headers are present on a /budget-v2 response", async () => {
@@ -377,6 +459,7 @@ describe("Budget V2 product boundary -- CREATE feedback", () => {
 	};
 	const headers = {
 		Cookie: COOKIE,
+		Origin: ORIGIN,
 		"content-type": "application/json",
 		"Idempotency-Key": "idem-1",
 	};
@@ -518,6 +601,7 @@ describe("Budget V2 product boundary -- CREATE feedback", () => {
 		for (const key of variants) {
 			const h: Record<string, string> = {
 				Cookie: COOKIE,
+				Origin: ORIGIN,
 				"content-type": "application/json",
 			};
 			if (key !== undefined) h["Idempotency-Key"] = key;
@@ -619,7 +703,11 @@ describe("Budget V2 product boundary -- CREATE feedback", () => {
 			url,
 			{
 				method: "POST",
-				headers: { Cookie: COOKIE, "Idempotency-Key": "idem-1" },
+				headers: {
+					Cookie: COOKIE,
+					Origin: ORIGIN,
+					"Idempotency-Key": "idem-1",
+				},
 				body: JSON.stringify(goodBody),
 			},
 			mockEnv,
@@ -659,6 +747,7 @@ describe("Budget V2 product boundary -- UPDATE feedback", () => {
 	const url = `/budget-v2/recommendations/${REC}/feedback/revisions`;
 	const headers = {
 		Cookie: COOKIE,
+		Origin: ORIGIN,
 		"content-type": "application/json",
 		"Idempotency-Key": "idem-2",
 	};
