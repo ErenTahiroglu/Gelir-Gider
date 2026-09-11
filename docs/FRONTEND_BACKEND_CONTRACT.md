@@ -162,6 +162,32 @@ All routes require:
 | `POST` | `/budget-v2/checkpoints/:paymentEventId/recommendations/:recommendationId/feedback` | Creates recommendation feedback (first revision) |
 | `POST` | `/budget-v2/recommendations/:recommendationId/feedback/revisions` | Appends a new revision to existing recommendation feedback |
 
+### 4.4 Transactions (`/transactions/*`)
+
+All routes require:
+- Session authentication (`__Host-gg_session` cookie)
+- `Origin: <WEBAUTHN_ORIGIN>` on mutating methods (`POST`)
+- User identity derived **strictly** from session (`c.get("auth").userId`)
+- Mutating endpoints accept only direct/manual transaction kinds from the allowlist (`EXPENSE`, `INCOME`, `TRANSFER`, `MANUAL_EXPENSE`, `MANUAL_INCOME`, `MANUAL_TRANSFER`). Domain-owned kinds (such as credit card, income receipt, goal, campaign, midas, month-close) are rejected at the HTTP boundary (`400 TRANSACTION_INVALID_INPUT`).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/transactions` | Keyset-paginated list of current effective transactions (`limit`, `status`, `kind`, `beforeOccurredAt`, `beforeTransactionId`) |
+| `GET` | `/transactions/:transactionId` | Single canonical transaction current effective state |
+| `GET` | `/transactions/:transactionId/revisions` | Keyset-paginated revision audit history (`limit`, `beforeRevisionNo`) |
+| `POST` | `/transactions` | Creates a manual canonical transaction with atomic ledger posting |
+| `POST` | `/transactions/:transactionId/revisions` | Appends a revision with atomic journal correction / replacement |
+| `POST` | `/transactions/:transactionId/void` | Voids a transaction with atomic journal reversal |
+
+### 4.5 Ledger (`/ledger/*`)
+
+All routes are **READ-ONLY**. Raw journal write endpoints (`/ledger/entries`, `/ledger/post`, `/ledger/journal`, `/ledger/reverse`) are **not exposed** and do not exist on the HTTP surface.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/ledger/accounts` | List of ledger account balances (`includeArchived`, `asOf`) |
+| `GET` | `/ledger/accounts/:accountId/balance` | Single ledger account balance (`asOf`) |
+
 ---
 
 ## 5. Budget V2 Request/Response Conventions
@@ -290,6 +316,120 @@ All error responses (4xx and 5xx) use this envelope:
 | `NOT_FOUND` | 404 | Route does not exist |
 | `INTERNAL_ERROR` | 500 | Unexpected server error |
 
+### 5.6 Transactions & Ledger Request/Response Conventions
+
+#### 5.6.1 GET /transactions
+
+**Query parameters:**
+- `limit`: integer string, 1–100 (default: 50)
+- `status`: optional string, `ACTIVE` | `VOIDED`
+- `kind`: optional canonical kind format (`/^[A-Z][A-Z0-9_]{0,63}$/`)
+- `beforeOccurredAt`: optional canonical UTC instant string (`YYYY-MM-DDTHH:mm:ss.sssZ`)
+- `beforeTransactionId`: optional UUID string (must be supplied if `beforeOccurredAt` is supplied, and vice versa)
+
+**Response shape** (`200 OK`):
+```json
+{
+  "transactions": [
+    {
+      "transactionId": "uuid",
+      "kind": "MANUAL_EXPENSE",
+      "status": "ACTIVE",
+      "revisionNo": 1,
+      "occurredAt": "2026-09-10T12:00:00.000Z",
+      "payload": { "merchant": "Market" },
+      "createdAt": "2026-09-10T12:00:00.000Z",
+      "latestRevisionCreatedAt": "2026-09-10T12:00:00.000Z"
+    }
+  ],
+  "nextCursor": {
+    "beforeOccurredAt": "2026-09-10T12:00:00.000Z",
+    "beforeTransactionId": "uuid"
+  }
+}
+```
+*Note: `nextCursor` is `null` when no further page exists. Sorting is `occurredAt DESC, transactionId DESC`.*
+
+#### 5.6.2 GET /transactions/:transactionId
+Returns `200 OK` with the single current effective transaction object, or `404 TRANSACTION_NOT_FOUND` if not found / owned by another user.
+
+#### 5.6.3 GET /transactions/:transactionId/revisions
+- `limit`: integer string, 1–100 (default: 50)
+- `beforeRevisionNo`: optional integer `>= 1`
+Returns `200 OK` with `{ "transactionId": "uuid", "revisions": [...], "nextCursor": { "beforeRevisionNo": number } | null }`.
+
+#### 5.6.4 POST /transactions
+- Headers: `Origin: <WEBAUTHN_ORIGIN>`, `Idempotency-Key: <key>`, `Cookie: __Host-gg_session=...`
+- Closed Body:
+```json
+{
+  "kind": "EXPENSE | INCOME | TRANSFER | MANUAL_EXPENSE | MANUAL_INCOME | MANUAL_TRANSFER",
+  "occurredAt": "2026-09-10T12:00:00.000Z",
+  "payload": { "key": "value" },
+  "ledger": {
+    "memo": "Optional memo",
+    "lines": [
+      { "accountId": "uuid", "side": "DEBIT", "amount": "150.75", "memo": "Line memo" },
+      { "accountId": "uuid", "side": "CREDIT", "amount": "150.75" }
+    ]
+  }
+}
+```
+- Response (`200 OK`): `{ "transactionId": "uuid", "revisionNo": 1, "operation": "CREATE", "idempotentReplay": boolean }`
+
+#### 5.6.5 POST /transactions/:transactionId/revisions
+- Headers: `Origin: <WEBAUTHN_ORIGIN>`, `Idempotency-Key: <key>`, `Cookie: __Host-gg_session=...`
+- Closed Body:
+```json
+{
+  "expectedRevisionNo": 1,
+  "occurredAt": "2026-09-10T12:00:00.000Z",
+  "payload": { "key": "value" },
+  "reasonNote": "Optional note",
+  "ledger": {
+    "memo": "Updated memo",
+    "lines": [
+      { "accountId": "uuid", "side": "DEBIT", "amount": "200.00" },
+      { "accountId": "uuid", "side": "CREDIT", "amount": "200.00" }
+    ]
+  }
+}
+```
+- Response (`200 OK`): `{ "transactionId": "uuid", "revisionNo": 2, "operation": "UPDATE", "idempotentReplay": boolean }`
+
+#### 5.6.6 POST /transactions/:transactionId/void
+- Headers: `Origin: <WEBAUTHN_ORIGIN>`, `Idempotency-Key: <key>`, `Cookie: __Host-gg_session=...`
+- Closed Body:
+```json
+{
+  "expectedRevisionNo": 2,
+  "reasonNote": "Optional note"
+}
+```
+- Response (`200 OK`): `{ "transactionId": "uuid", "revisionNo": 3, "operation": "VOID", "idempotentReplay": boolean }`
+
+#### 5.6.7 GET /ledger/accounts
+- Query parameters: `includeArchived` (strict boolean `"true"` | `"false"`), `asOf` (optional UTC ISO instant)
+- Response (`200 OK`): `{ "accounts": [ { "id": "uuid", "code": "...", "name": "...", "accountType": "...", "normalBalance": "DEBIT|CREDIT", "currency": "TRY", "balance": "150.75", "isArchived": false, ... } ] }`
+
+#### 5.6.8 GET /ledger/accounts/:accountId/balance
+- Query parameters: `asOf` (optional UTC ISO instant)
+- Response (`200 OK`): `{ "accountId": "uuid", "currency": "TRY", "normalBalance": "DEBIT|CREDIT", "balance": "150.75", "asOf": "2026-09-10T12:00:00.000Z" }`
+
+**Transaction & Ledger Error Codes:**
+| Code | Status | Description |
+|------|--------|-------------|
+| `TRANSACTION_INVALID_INPUT` | 400 | Malformed body, disallowed transaction kind, numeric money, or invalid parameter |
+| `TRANSACTION_NOT_FOUND` | 404 | Transaction not found or not owned by authenticated user |
+| `TRANSACTION_IDEMPOTENCY_CONFLICT` | 409 | Idempotency-Key re-used with different payload |
+| `TRANSACTION_REVISION_CONFLICT` | 409 | OCC mismatch on `expectedRevisionNo` |
+| `TRANSACTION_ALREADY_VOIDED` | 409 | Transaction is already voided |
+| `LEDGER_INVALID_INPUT` | 400 | Malformed ledger query or line parameters |
+| `LEDGER_ACCOUNT_NOT_FOUND` | 404 | Ledger account not found or not owned by user |
+| `LEDGER_UNBALANCED` | 400 | Debit and Credit amounts do not balance |
+| `LEDGER_IDEMPOTENCY_CONFLICT` | 409 | Duplicate journal idempotency key |
+| `LEDGER_CURRENCY_MISMATCH` | 400 | Multi-currency lines in single entry |
+
 ---
 
 ## 6. Exact-Money Rule
@@ -323,16 +463,6 @@ All error responses (4xx and 5xx) use this envelope:
 
 The underlying domain **service** code exists for all of these domains. What is missing is
 the HTTP adapter layer (route handlers, input validation, error mapping).
-
-### 7B.1 — Transactions + Ledger (read model)
-
-```
-PLANNED  GET  /transactions/:id
-PLANNED  GET  /transactions/:id/revisions
-PLANNED  GET  /transactions           ?limit=&after=
-PLANNED  GET  /ledger/accounts/:id/balance
-PLANNED  GET  /ledger/accounts        ?limit=&after=
-```
 
 ### 7B.2 — Income
 

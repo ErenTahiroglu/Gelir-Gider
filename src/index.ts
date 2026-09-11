@@ -18,11 +18,13 @@ import {
 import { createDatabase } from "./db/client";
 import { authRouter } from "./http/auth-routes";
 import { budgetV2Router } from "./http/budget-v2-routes";
+import { ledgerRouter } from "./http/ledger-routes";
 import type { RequestIdVariables } from "./http/security-middleware";
 import {
 	requestIdMiddleware,
 	securityHeadersMiddleware,
 } from "./http/security-middleware";
+import { transactionsRouter } from "./http/transactions-routes";
 import { runNotificationScheduler } from "./notifications/scheduler";
 import { WebPushTransport } from "./notifications/web-push";
 import { logOperationalEvent } from "./observability/logger";
@@ -90,6 +92,8 @@ app.get("/ready", async (c) => {
 
 app.route("/auth", authRouter);
 app.route("/budget-v2", budgetV2Router);
+app.route("/transactions", transactionsRouter);
+app.route("/ledger", ledgerRouter);
 
 app.notFound((c) => {
 	return c.json(

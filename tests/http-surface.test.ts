@@ -28,9 +28,7 @@ describe("Production HTTP Surface & Routing Boundaries", () => {
 	});
 
 	it("returns structured 404 for arbitrary or unmounted financial paths", async () => {
-		const financialPaths = [
-			"/ledger",
-			"/transactions",
+		const unmountedFinancialPaths = [
 			"/accounts",
 			"/budget",
 			"/income",
@@ -46,7 +44,7 @@ describe("Production HTTP Surface & Routing Boundaries", () => {
 			"/api/v1/finance",
 		];
 
-		for (const path of financialPaths) {
+		for (const path of unmountedFinancialPaths) {
 			const res = await app.request(path);
 			expect(res.status).toBe(404);
 			const json = (await res.json()) as {
@@ -54,6 +52,14 @@ describe("Production HTTP Surface & Routing Boundaries", () => {
 			};
 			expect(json.error.code).toBe("NOT_FOUND");
 			expect(json.error.message).toBe("Route not found");
+		}
+	});
+
+	it("ensures mounted 7B.1 financial domain routes reject unauthenticated requests", async () => {
+		const mounted7B1Paths = ["/transactions", "/ledger/accounts"];
+		for (const path of mounted7B1Paths) {
+			const res = await app.request(path);
+			expect(res.status).toBe(401);
 		}
 	});
 

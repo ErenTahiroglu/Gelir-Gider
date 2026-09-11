@@ -21,6 +21,24 @@ import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { allocatePersonalBudgetV2 } from "../src/budget/policy-v2.ts";
 import { buildBudgetV2CanonicalPayload } from "../src/budget/payload-v2.ts";
+import { createLedgerAccount } from "../src/ledger/accounts.ts";
+import {
+	getLedgerAccountBalance,
+	listLedgerAccountBalances,
+} from "../src/ledger/balances.ts";
+import {
+	createCanonicalTransactionWithLedger,
+	reviseCanonicalTransactionWithLedger,
+	voidCanonicalTransactionWithLedger,
+} from "../src/transactions/ledger-lifecycle.ts";
+import {
+	PRODUCT_HTTP_SOURCE_TYPE,
+	USER_EDIT_REASON_CODE,
+	USER_VOID_REASON_CODE,
+	listCanonicalTransactions,
+	listBoundedCanonicalTransactionRevisions,
+} from "../src/transactions/product-read-v2.ts";
+import { getCanonicalTransaction } from "../src/transactions/service.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const migDir = path.join(root, "migrations");
@@ -12079,6 +12097,538 @@ async function resolverRuntime7A() {
 	}
 }
 
+async function resolverRuntime7B1() {
+	console.log(
+		"\n== PHASE 7B.1: TRANSACTIONS + LEDGER PRODUCT BOUNDARY (PGlite / Drizzle) ==",
+	);
+	const eqD = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	const s = await make4bScenario();
+	const db = s.db;
+	const U2 = "22222222-2222-4222-8222-222222222222";
+
+	// 1. Provision ledger accounts for U1
+	const cash1 = await createLedgerAccount({
+		db,
+		userId: U1,
+		code: "CASH_U1",
+		name: "Cash U1",
+		accountType: "ASSET",
+	});
+	const food1 = await createLedgerAccount({
+		db,
+		userId: U1,
+		code: "FOOD_U1",
+		name: "Food U1",
+		accountType: "EXPENSE",
+	});
+
+	// Check ledger balances start at 0.00
+	const bInitCash1 = await getLedgerAccountBalance({
+		db,
+		userId: U1,
+		accountId: cash1.id,
+	});
+	eqD(
+		bInitCash1.balance,
+		"0.00",
+		"7B.1/1: initial ledger account balance is exact 0.00",
+	);
+
+	// 2. CREATE canonical transaction with ledger effect (Debit Expense, Credit Asset)
+	const t1 = new Date("2026-09-10T12:00:00.000Z");
+	const createRes1 = await createCanonicalTransactionWithLedger({
+		db,
+		userId: U1,
+		kind: "MANUAL_EXPENSE",
+		idempotencyKey: "tx-7b1-idem-1",
+		occurredAt: t1,
+		payload: { merchant: "Grocery Store", category: "Food" },
+		source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: "tx-7b1-idem-1" },
+		ledger: {
+			memo: "Weekly groceries",
+			lines: [
+				{ accountId: food1.id, side: "DEBIT", amount: "150.75" },
+				{ accountId: cash1.id, side: "CREDIT", amount: "150.75" },
+			],
+		},
+	});
+
+	eqD(
+		createRes1.operation,
+		"CREATE",
+		"7B.1/2: create operation result is CREATE",
+	);
+	eqD(createRes1.revisionNo, 1, "7B.1/2: initial revisionNo is 1");
+	eqD(
+		createRes1.idempotentReplay,
+		false,
+		"7B.1/2: initial create is not a replay",
+	);
+	chkD(
+		createRes1.ledger.appliedJournalEntryId !== null,
+		"7B.1/2: applied journal entry ID is present",
+	);
+
+	// Verify ledger balances updated
+	const bCash1Post1 = await getLedgerAccountBalance({
+		db,
+		userId: U1,
+		accountId: cash1.id,
+	});
+	const bFood1Post1 = await getLedgerAccountBalance({
+		db,
+		userId: U1,
+		accountId: food1.id,
+	});
+	eqD(
+		bCash1Post1.balance,
+		"-150.75",
+		"7B.1/2: cash asset account balance is exactly -150.75",
+	);
+	eqD(
+		bFood1Post1.balance,
+		"150.75",
+		"7B.1/2: food expense account balance is exactly 150.75",
+	);
+
+	// 3. Exact CREATE Idempotent Replay
+	const createReplay = await createCanonicalTransactionWithLedger({
+		db,
+		userId: U1,
+		kind: "MANUAL_EXPENSE",
+		idempotencyKey: "tx-7b1-idem-1",
+		occurredAt: t1,
+		payload: { merchant: "Grocery Store", category: "Food" },
+		source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: "tx-7b1-idem-1" },
+		ledger: {
+			memo: "Weekly groceries",
+			lines: [
+				{ accountId: food1.id, side: "DEBIT", amount: "150.75" },
+				{ accountId: cash1.id, side: "CREDIT", amount: "150.75" },
+			],
+		},
+	});
+	eqD(
+		createReplay.idempotentReplay,
+		true,
+		"7B.1/3: exact retry returns idempotentReplay = true",
+	);
+	eqD(
+		createReplay.transactionId,
+		createRes1.transactionId,
+		"7B.1/3: replay returns identical transactionId",
+	);
+	eqD(
+		createReplay.revisionId,
+		createRes1.revisionId,
+		"7B.1/3: replay returns identical revisionId",
+	);
+
+	// 4. Same key / changed payload -> conflict
+	let conflictThrew = "";
+	try {
+		await createCanonicalTransactionWithLedger({
+			db,
+			userId: U1,
+			kind: "MANUAL_EXPENSE",
+			idempotencyKey: "tx-7b1-idem-1",
+			occurredAt: t1,
+			payload: { merchant: "Different Store" },
+			source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: "tx-7b1-idem-1" },
+			ledger: {
+				lines: [
+					{ accountId: food1.id, side: "DEBIT", amount: "150.75" },
+					{ accountId: cash1.id, side: "CREDIT", amount: "150.75" },
+				],
+			},
+		});
+	} catch (e) {
+		conflictThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(
+		conflictThrew,
+		"TRANSACTION_IDEMPOTENCY_CONFLICT",
+		"7B.1/4: same key with different payload throws TRANSACTION_IDEMPOTENCY_CONFLICT",
+	);
+
+	// 5. Unbalanced lines validation -> atomicity rollback (no partial rows)
+	const countTxBefore = (
+		await s.q(
+			`select count(*)::int as n from canonical_transactions where user_id = $1`,
+			[U1],
+		)
+	).rows[0].n as number;
+	let unbalThrew = "";
+	try {
+		await createCanonicalTransactionWithLedger({
+			db,
+			userId: U1,
+			kind: "MANUAL_EXPENSE",
+			idempotencyKey: "tx-7b1-unbal",
+			occurredAt: t1,
+			payload: { test: true },
+			source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: "tx-7b1-unbal" },
+			ledger: {
+				lines: [
+					{ accountId: food1.id, side: "DEBIT", amount: "100.00" },
+					{ accountId: cash1.id, side: "CREDIT", amount: "90.00" },
+				],
+			},
+		});
+	} catch (e) {
+		unbalThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(
+		unbalThrew,
+		"TRANSACTION_LEDGER_EFFECT_INVALID",
+		"7B.1/5: unbalanced ledger lines throw TRANSACTION_LEDGER_EFFECT_INVALID",
+	);
+	const countTxAfter = (
+		await s.q(
+			`select count(*)::int as n from canonical_transactions where user_id = $1`,
+			[U1],
+		)
+	).rows[0].n as number;
+	eqD(
+		countTxBefore,
+		countTxAfter,
+		"7B.1/5: unbalanced failure leaves no partial canonical transaction rows",
+	);
+
+	// 6. UPDATE transaction with ledger correction (amount revised from 150.75 to 200.00)
+	const t2 = new Date("2026-09-10T14:00:00.000Z");
+	const updateRes = await reviseCanonicalTransactionWithLedger({
+		db,
+		userId: U1,
+		transactionId: createRes1.transactionId,
+		expectedRevisionNo: 1,
+		idempotencyKey: "tx-7b1-rev-2",
+		occurredAt: t2,
+		payload: {
+			merchant: "Grocery Store",
+			category: "Food",
+			amount: "200.00",
+		},
+		reasonCode: USER_EDIT_REASON_CODE,
+		reasonNote: "Included extra supplies",
+		source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: "tx-7b1-rev-2" },
+		ledger: {
+			memo: "Weekly groceries adjusted",
+			lines: [
+				{ accountId: food1.id, side: "DEBIT", amount: "200.00" },
+				{ accountId: cash1.id, side: "CREDIT", amount: "200.00" },
+			],
+		},
+	});
+	eqD(
+		updateRes.operation,
+		"UPDATE",
+		"7B.1/6: update operation result is UPDATE",
+	);
+	eqD(updateRes.revisionNo, 2, "7B.1/6: revisionNo is incremented to 2");
+	chkD(
+		updateRes.ledger.appliedJournalEntryId !== null,
+		"7B.1/6: new applied journal entry ID present",
+	);
+	chkD(
+		updateRes.ledger.reversalJournalEntryId !== null,
+		"7B.1/6: reversal journal entry ID present",
+	);
+
+	// Verify ledger balances updated to exactly 200.00
+	const bCash1Post2 = await getLedgerAccountBalance({
+		db,
+		userId: U1,
+		accountId: cash1.id,
+	});
+	const bFood1Post2 = await getLedgerAccountBalance({
+		db,
+		userId: U1,
+		accountId: food1.id,
+	});
+	eqD(
+		bCash1Post2.balance,
+		"-200.00",
+		"7B.1/6: cash balance reflects reversal + new posting (-200.00)",
+	);
+	eqD(
+		bFood1Post2.balance,
+		"200.00",
+		"7B.1/6: food balance reflects reversal + new posting (200.00)",
+	);
+
+	// 7. OCC Stale revision conflict on UPDATE
+	let occThrew = "";
+	try {
+		await reviseCanonicalTransactionWithLedger({
+			db,
+			userId: U1,
+			transactionId: createRes1.transactionId,
+			expectedRevisionNo: 1, // Stale!
+			idempotencyKey: "tx-7b1-rev-stale",
+			occurredAt: t2,
+			payload: { test: true },
+			reasonCode: USER_EDIT_REASON_CODE,
+			source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: "tx-7b1-rev-stale" },
+			ledger: {
+				lines: [
+					{ accountId: food1.id, side: "DEBIT", amount: "300.00" },
+					{ accountId: cash1.id, side: "CREDIT", amount: "300.00" },
+				],
+			},
+		});
+	} catch (e) {
+		occThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(
+		occThrew,
+		"TRANSACTION_REVISION_CONFLICT",
+		"7B.1/7: stale expectedRevisionNo throws TRANSACTION_REVISION_CONFLICT",
+	);
+
+	// 8. UPDATE exact idempotent replay
+	const updateReplay = await reviseCanonicalTransactionWithLedger({
+		db,
+		userId: U1,
+		transactionId: createRes1.transactionId,
+		expectedRevisionNo: 1,
+		idempotencyKey: "tx-7b1-rev-2",
+		occurredAt: t2,
+		payload: {
+			merchant: "Grocery Store",
+			category: "Food",
+			amount: "200.00",
+		},
+		reasonCode: USER_EDIT_REASON_CODE,
+		reasonNote: "Included extra supplies",
+		source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: "tx-7b1-rev-2" },
+		ledger: {
+			memo: "Weekly groceries adjusted",
+			lines: [
+				{ accountId: food1.id, side: "DEBIT", amount: "200.00" },
+				{ accountId: cash1.id, side: "CREDIT", amount: "200.00" },
+			],
+		},
+	});
+	eqD(
+		updateReplay.idempotentReplay,
+		true,
+		"7B.1/8: exact update retry returns idempotentReplay = true",
+	);
+	eqD(
+		updateReplay.revisionId,
+		updateRes.revisionId,
+		"7B.1/8: update replay returns matching revisionId",
+	);
+
+	// 9. VOID transaction with ledger reversal
+	const voidRes = await voidCanonicalTransactionWithLedger({
+		db,
+		userId: U1,
+		transactionId: createRes1.transactionId,
+		expectedRevisionNo: 2,
+		idempotencyKey: "tx-7b1-void-3",
+		reasonCode: USER_VOID_REASON_CODE,
+		reasonNote: "Returned items",
+		source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: "tx-7b1-void-3" },
+	});
+	eqD(voidRes.operation, "VOID", "7B.1/9: void operation result is VOID");
+	eqD(voidRes.revisionNo, 3, "7B.1/9: void revisionNo is 3");
+	eqD(
+		voidRes.ledger.appliedJournalEntryId,
+		null,
+		"7B.1/9: void has null appliedJournalEntryId",
+	);
+	chkD(
+		voidRes.ledger.reversalJournalEntryId !== null,
+		"7B.1/9: void produces reversal journal entry",
+	);
+
+	// Verify ledger balances restored to 0.00
+	const bCash1PostVoid = await getLedgerAccountBalance({
+		db,
+		userId: U1,
+		accountId: cash1.id,
+	});
+	const bFood1PostVoid = await getLedgerAccountBalance({
+		db,
+		userId: U1,
+		accountId: food1.id,
+	});
+	eqD(
+		bCash1PostVoid.balance,
+		"0.00",
+		"7B.1/9: cash balance restored to 0.00 after VOID",
+	);
+	eqD(
+		bFood1PostVoid.balance,
+		"0.00",
+		"7B.1/9: food balance restored to 0.00 after VOID",
+	);
+
+	// 10. VOID exact replay vs fresh VOID rejection
+	const voidReplay = await voidCanonicalTransactionWithLedger({
+		db,
+		userId: U1,
+		transactionId: createRes1.transactionId,
+		expectedRevisionNo: 2,
+		idempotencyKey: "tx-7b1-void-3",
+		reasonCode: USER_VOID_REASON_CODE,
+		reasonNote: "Returned items",
+		source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: "tx-7b1-void-3" },
+	});
+	eqD(
+		voidReplay.idempotentReplay,
+		true,
+		"7B.1/10: void retry returns idempotentReplay = true",
+	);
+
+	let secondVoidThrew = "";
+	try {
+		await voidCanonicalTransactionWithLedger({
+			db,
+			userId: U1,
+			transactionId: createRes1.transactionId,
+			expectedRevisionNo: 3,
+			idempotencyKey: "tx-7b1-void-4",
+			reasonCode: USER_VOID_REASON_CODE,
+			source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: "tx-7b1-void-4" },
+		});
+	} catch (e) {
+		secondVoidThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(
+		secondVoidThrew,
+		"TRANSACTION_ALREADY_VOIDED",
+		"7B.1/10: second fresh void throws TRANSACTION_ALREADY_VOIDED",
+	);
+
+	// 11. Exact Money Preservation (0.01, 0.10, 10.99, 999999.99)
+	const exactAmounts = ["0.01", "0.10", "10.99", "999999.99"];
+	for (let i = 0; i < exactAmounts.length; i++) {
+		const amt = exactAmounts[i]!;
+		const tExact = new Date(`2026-09-11T1${i}:00:00.000Z`);
+		await createCanonicalTransactionWithLedger({
+			db,
+			userId: U1,
+			kind: "EXPENSE",
+			idempotencyKey: `tx-exact-${i}`,
+			occurredAt: tExact,
+			payload: { amount: amt },
+			source: { type: PRODUCT_HTTP_SOURCE_TYPE, ref: `tx-exact-${i}` },
+			ledger: {
+				lines: [
+					{ accountId: food1.id, side: "DEBIT", amount: amt },
+					{ accountId: cash1.id, side: "CREDIT", amount: amt },
+				],
+			},
+		});
+		const balExact = await getLedgerAccountBalance({
+			db,
+			userId: U1,
+			accountId: food1.id,
+			asOf: tExact,
+		});
+		chkD(
+			typeof balExact.balance === "string" &&
+				!balExact.balance.includes("e") &&
+				!balExact.balance.includes("NaN"),
+			`7B.1/11: exact money string preserved for ${amt}`,
+		);
+	}
+
+	// 12. Keyset Pagination & Read-Only proofs
+	const rowsBeforeList = (
+		await s.q(`select count(*)::int as n from transaction_revisions`)
+	).rows[0].n as number;
+	const listRes = await listCanonicalTransactions({
+		db,
+		userId: U1,
+		limit: 2,
+	});
+	eqD(
+		listRes.transactions.length,
+		2,
+		"7B.1/12: keyset pagination returns requested page limit",
+	);
+	chkD(
+		listRes.nextCursor !== null,
+		"7B.1/12: nextCursor is present when more rows exist",
+	);
+
+	const page2 = await listCanonicalTransactions({
+		db,
+		userId: U1,
+		limit: 2,
+		beforeOccurredAt: new Date(listRes.nextCursor!.beforeOccurredAt),
+		beforeTransactionId: listRes.nextCursor!.beforeTransactionId,
+	});
+	eqD(
+		page2.transactions.length,
+		2,
+		"7B.1/12: page 2 returns next 2 items without duplicates",
+	);
+	chkD(
+		page2.transactions[0]!.transactionId !==
+			listRes.transactions[0]!.transactionId &&
+			page2.transactions[0]!.transactionId !==
+				listRes.transactions[1]!.transactionId,
+		"7B.1/12: no overlap between consecutive pages",
+	);
+
+	const rowsAfterList = (
+		await s.q(`select count(*)::int as n from transaction_revisions`)
+	).rows[0].n as number;
+	eqD(
+		rowsBeforeList,
+		rowsAfterList,
+		"7B.1/12: read operations perform zero database writes",
+	);
+
+	// 13. Cross-User Isolation
+	let u2ReadThrew = "";
+	try {
+		await getCanonicalTransaction({
+			db,
+			userId: U2,
+			transactionId: createRes1.transactionId,
+		});
+	} catch (e) {
+		u2ReadThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(
+		u2ReadThrew,
+		"TRANSACTION_NOT_FOUND",
+		"7B.1/13: U2 reading U1 transaction throws TRANSACTION_NOT_FOUND",
+	);
+
+	let u2BalThrew = "";
+	try {
+		await getLedgerAccountBalance({ db, userId: U2, accountId: cash1.id });
+	} catch (e) {
+		u2BalThrew = (e as { code?: string }).code ?? "";
+	}
+	eqD(
+		u2BalThrew,
+		"LEDGER_ACCOUNT_NOT_FOUND",
+		"7B.1/13: U2 reading U1 ledger account throws LEDGER_ACCOUNT_NOT_FOUND",
+	);
+
+	const u2List = await listCanonicalTransactions({ db, userId: U2 });
+	eqD(
+		u2List.transactions.length,
+		0,
+		"7B.1/13: U2 transaction list contains zero U1 transactions",
+	);
+
+	await s.close();
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -12101,9 +12651,7 @@ if (probed) {
 	await resolverRuntime6C2();
 	await resolverRuntime6D();
 	await resolverRuntime7A();
+	await resolverRuntime7B1();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
-
-
-
