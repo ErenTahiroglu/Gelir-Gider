@@ -351,7 +351,9 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 		});
 
 		it("GET /people/:id returns 404 when not found", async () => {
-			vi.spyOn(peopleModule, "getPerson").mockResolvedValue(null);
+			vi.spyOn(peopleModule, "getPerson").mockResolvedValue(
+			null as unknown as import("../src/people/people").PersonReadModel,
+		);
 
 			const res = await app.request(
 				`/people/${PERSON_ID}`,
