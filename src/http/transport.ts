@@ -244,6 +244,22 @@ export const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 		"Statement reconciliation is not balanced",
 	CREDIT_CARD_STATEMENT_RECONCILIATION_IDEMPOTENCY_CONFLICT:
 		"Statement reconciliation idempotency conflict",
+	PEOPLE_INVALID_INPUT: "Invalid people request",
+	PEOPLE_NOT_FOUND: "Person not found",
+	PEOPLE_NOT_ACTIVE: "Person is not active",
+	PEOPLE_REVISION_CONFLICT: "Person revision is stale",
+	PEOPLE_OBLIGATION_NOT_FOUND: "Person obligation not found",
+	PEOPLE_OBLIGATION_NOT_ACTIVE: "Person obligation is not active",
+	PEOPLE_OBLIGATION_REVISION_CONFLICT: "Person obligation revision is stale",
+	PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT: "Person obligation settlement conflict",
+	PEOPLE_OBLIGATION_OVERSETTLEMENT: "Person obligation oversettlement error",
+	PEOPLE_SETTLEMENT_NOT_FOUND: "Person settlement not found",
+	PEOPLE_IDEMPOTENCY_CONFLICT:
+		"Idempotency-Key was already used with a different request",
+	PEOPLE_LEDGER_ACCOUNT_INVALID: "Invalid ledger account for person",
+	PEOPLE_INVALID_STATE: "Person invalid state transition",
+	PEOPLE_OBLIGATION_SPLIT_MANAGED:
+		"Obligation is managed by a credit card split and cannot be modified standalone",
 	INVALID_ORIGIN: "Invalid request origin",
 	UNAUTHENTICATED: "Authentication required",
 	NOT_FOUND: "Route not found",

@@ -11,7 +11,8 @@ export type PeopleErrorCode =
 	| "PEOPLE_SETTLEMENT_NOT_FOUND"
 	| "PEOPLE_IDEMPOTENCY_CONFLICT"
 	| "PEOPLE_LEDGER_ACCOUNT_INVALID"
-	| "PEOPLE_INVALID_STATE";
+	| "PEOPLE_INVALID_STATE"
+	| "PEOPLE_OBLIGATION_SPLIT_MANAGED";
 
 export class PeopleError extends Error {
 	readonly code: PeopleErrorCode;

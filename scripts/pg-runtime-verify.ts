@@ -15469,6 +15469,433 @@ async function resolverRuntime7B3R2() {
 	}
 }
 
+async function resolverRuntime7B4() {
+	console.log("\n--- RESOLVER RUNTIME 7B.4 (People + Family Product HTTP Surface) ---");
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 71);
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
+	setDatabaseFactoryOverrideForTest(() => db);
+
+	try {
+		const testEnv: AppEnv = {
+			DATABASE_URL: "postgres://fake-pglite/db",
+			WEBAUTHN_RP_ID: "localhost",
+			WEBAUTHN_RP_NAME: "Gelir Gider Test",
+			WEBAUTHN_ORIGIN: "http://localhost:8787",
+		};
+
+		const USER_A = "11111111-bbbb-4bbb-8bbb-111111111111";
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now())",
+			[USER_A],
+		);
+
+		const { token: tokenA } = await createSession({ db, userId: USER_A });
+
+		const httpCall = async (
+			path: string,
+			opts: {
+				method?: string;
+				body?: unknown;
+				token?: string;
+				idempotencyKey?: string;
+				origin?: string;
+			} = {},
+		) => {
+			const headers: Record<string, string> = {};
+			if (opts.token) {
+				headers.Cookie = `__Host-gg_session=${opts.token}`;
+			}
+			if (opts.origin !== undefined) {
+				headers.Origin = opts.origin;
+			} else if (opts.method !== "GET" && opts.method !== "HEAD") {
+				headers.Origin = "http://localhost:8787";
+			}
+			if (opts.idempotencyKey) {
+				headers["Idempotency-Key"] = opts.idempotencyKey;
+			}
+			if (opts.body !== undefined) {
+				headers["Content-Type"] = "application/json";
+			}
+			const res = await app.request(
+				path,
+				{
+					method: opts.method ?? "GET",
+					headers,
+					body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+				},
+				testEnv,
+			);
+			let json: any = null;
+			try {
+				json = await res.json();
+			} catch {
+				// no-op
+			}
+			return { status: res.status, json, headers: res.headers };
+		};
+
+		// We need an asset account for receivable funding and settlements
+		const assetAcc = await createProductLedgerAccount({
+			db,
+			userId: USER_A,
+			name: "Vakifbank Checking",
+			code: "VAKIF_CHECKING",
+			type: "ASSET",
+			normalBalance: "DEBIT",
+			currency: "TRY",
+		});
+		const assetAccountId = assetAcc.id;
+
+		// =========================================================================
+		// SCENARIO A: Full Person & Receivable Lifecycle via HTTP
+		// =========================================================================
+		// 1. Create Person Alice
+		const createAliceRes = await httpCall("/people", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-alice-create-1",
+			body: {
+				displayName: "Alice",
+				relationship: "FRIEND",
+				note: "College friend",
+				occurredAt: "2026-06-01T10:00:00.000Z",
+			},
+		});
+		eqD(createAliceRes.status, 200, "7B.4-A: Create person Alice returns 200");
+		const aliceId = createAliceRes.json?.person?.personId;
+		chkD(isUuid(aliceId), "7B.4-A: Alice personId is valid UUID");
+		eqD(createAliceRes.json?.person?.displayName, "Alice", "7B.4-A: Person name is Alice");
+		eqD(createAliceRes.json?.person?.status, "ACTIVE", "7B.4-A: Person status is ACTIVE");
+		eqD(createAliceRes.json?.idempotentReplay, false, "7B.4-A: First create is not replay");
+
+		// 2. Idempotent Replay
+		const replayAliceRes = await httpCall("/people", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-alice-create-1",
+			body: {
+				displayName: "Alice",
+				relationship: "FRIEND",
+				note: "College friend",
+				occurredAt: "2026-06-01T10:00:00.000Z",
+			},
+		});
+		eqD(replayAliceRes.status, 200, "7B.4-A: Idempotent replay returns 200");
+		eqD(replayAliceRes.json?.person?.personId, aliceId, "7B.4-A: Replayed personId matches");
+		eqD(replayAliceRes.json?.idempotentReplay, true, "7B.4-A: idempotentReplay is true");
+
+		// 3. Update Person Alice
+		const updateAliceRes = await httpCall(`/people/${aliceId}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-alice-update-1",
+			body: {
+				expectedRevisionNo: 1,
+				displayName: "Alice Cooper",
+				relationship: "FRIEND",
+				note: "College friend - updated",
+				occurredAt: "2026-06-01T11:00:00.000Z",
+			},
+		});
+		eqD(updateAliceRes.status, 200, "7B.4-A: Update person returns 200");
+		eqD(updateAliceRes.json?.person?.displayName, "Alice Cooper", "7B.4-A: Updated name is Alice Cooper");
+		eqD(updateAliceRes.json?.person?.revisionNo, 2, "7B.4-A: Updated revisionNo is 2");
+
+		// 4. Record Receivable Obligation for Alice (1000.00)
+		const recOblRes = await httpCall(`/people/${aliceId}/obligations/receivable`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-alice-rec-1",
+			body: {
+				amount: "1000.00",
+				fundingAssetAccountId: assetAccountId,
+				occurredAt: "2026-06-02T10:00:00.000Z",
+				dueDate: "2026-07-01",
+				description: "Concert tickets advance",
+			},
+		});
+		eqD(recOblRes.status, 200, "7B.4-A: Record receivable returns 200");
+		const obl1Id = recOblRes.json?.obligation?.obligationId;
+		chkD(isUuid(obl1Id), "7B.4-A: Obligation ID is valid UUID");
+		eqD(recOblRes.json?.obligation?.direction, "RECEIVABLE", "7B.4-A: Obligation direction is RECEIVABLE");
+		eqD(recOblRes.json?.obligation?.principalAmount, "1000.00", "7B.4-A: Principal amount is 1000.00");
+		eqD(recOblRes.json?.obligation?.remainingAmount, "1000.00", "7B.4-A: Remaining amount is 1000.00");
+		eqD(recOblRes.json?.obligation?.status, "OPEN", "7B.4-A: Obligation status is OPEN");
+
+		// 5. GET Obligation & verify isSplitManaged: false
+		const getObl1Res = await httpCall(`/people/${aliceId}/obligations/${obl1Id}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getObl1Res.status, 200, "7B.4-A: GET obligation returns 200");
+		eqD(getObl1Res.json?.obligation?.isSplitManaged, false, "7B.4-A: isSplitManaged is false");
+
+		// 6. Partial Settlement (400.00)
+		const settle1Res = await httpCall(`/people/${aliceId}/obligations/${obl1Id}/settlements/receivable`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-alice-settle-1",
+			body: {
+				cashAmount: "400.00",
+				destinationAssetAccountId: assetAccountId,
+				occurredAt: "2026-06-05T10:00:00.000Z",
+				note: "First partial transfer",
+			},
+		});
+		eqD(settle1Res.status, 200, "7B.4-A: Partial settlement returns 200");
+		const s1Id = settle1Res.json?.settlement?.settlementId;
+		chkD(isUuid(s1Id), "7B.4-A: Settlement ID is valid UUID");
+		eqD(settle1Res.json?.settlement?.appliedAmount, "400.00", "7B.4-A: Applied amount is 400.00");
+
+		// 7. Check Obligation after partial settlement
+		const getOblAfterPartial = await httpCall(`/people/${aliceId}/obligations/${obl1Id}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getOblAfterPartial.json?.obligation?.settledAmount, "400.00", "7B.4-A: Settled amount is 400.00");
+		eqD(getOblAfterPartial.json?.obligation?.remainingAmount, "600.00", "7B.4-A: Remaining amount is 600.00");
+		eqD(getOblAfterPartial.json?.obligation?.status, "OPEN", "7B.4-A: Obligation remains OPEN");
+
+		// 8. Remaining Settlement (600.00)
+		const settle2Res = await httpCall(`/people/${aliceId}/obligations/${obl1Id}/settlements/receivable`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-alice-settle-2",
+			body: {
+				cashAmount: "600.00",
+				destinationAssetAccountId: assetAccountId,
+				occurredAt: "2026-06-10T10:00:00.000Z",
+				note: "Final transfer",
+			},
+		});
+		eqD(settle2Res.status, 200, "7B.4-A: Final settlement returns 200");
+		const s2Id = settle2Res.json?.settlement?.settlementId;
+
+		// 9. Check Obligation is now SETTLED
+		const getOblAfterFull = await httpCall(`/people/${aliceId}/obligations/${obl1Id}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getOblAfterFull.json?.obligation?.settledAmount, "1000.00", "7B.4-A: Settled amount is 1000.00");
+		eqD(getOblAfterFull.json?.obligation?.remainingAmount, "0.00", "7B.4-A: Remaining amount is 0.00");
+		eqD(getOblAfterFull.json?.obligation?.status, "SETTLED", "7B.4-A: Obligation is SETTLED");
+
+		// 10. Void Second Settlement (reopen obligation)
+		const voidS2Res = await httpCall(`/people/${aliceId}/obligations/${obl1Id}/settlements/${s2Id}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-alice-void-s2",
+			body: {
+				expectedRevisionNo: 1,
+				reason: "Payment reversed at bank",
+			},
+		});
+		eqD(voidS2Res.status, 200, "7B.4-A: Void settlement returns 200");
+		eqD(voidS2Res.json?.settlement?.status, "VOIDED", "7B.4-A: Settlement status is VOIDED");
+
+		// 11. Verify Obligation is reopened to OPEN with remaining 600.00
+		const getOblAfterVoid = await httpCall(`/people/${aliceId}/obligations/${obl1Id}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getOblAfterVoid.json?.obligation?.status, "OPEN", "7B.4-A: Obligation reopened to OPEN");
+		eqD(getOblAfterVoid.json?.obligation?.remainingAmount, "600.00", "7B.4-A: Remaining amount back to 600.00");
+
+		// =========================================================================
+		// SCENARIO B: Person & Payable Expense Lifecycle via HTTP
+		// =========================================================================
+		// 1. Create Person Bob
+		const createBobRes = await httpCall("/people", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-bob-create-1",
+			body: {
+				displayName: "Bob",
+				relationship: "FAMILY",
+				occurredAt: "2026-06-01T10:00:00.000Z",
+			},
+		});
+		eqD(createBobRes.status, 200, "7B.4-B: Create person Bob returns 200");
+		const bobId = createBobRes.json?.person?.personId;
+
+		// 2. Record Payable Expense for Bob (500.00)
+		const payOblRes = await httpCall(`/people/${bobId}/obligations/payable`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-bob-pay-1",
+			body: {
+				amount: "500.00",
+				budgetCategory: "MANDATORY_EXPENSE",
+				occurredAt: "2026-06-03T10:00:00.000Z",
+				description: "Shared electricity bill",
+			},
+		});
+		eqD(payOblRes.status, 200, "7B.4-B: Record payable obligation returns 200");
+		const obl2Id = payOblRes.json?.obligation?.obligationId;
+		eqD(payOblRes.json?.obligation?.direction, "PAYABLE", "7B.4-B: Obligation direction is PAYABLE");
+		eqD(payOblRes.json?.obligation?.principalAmount, "500.00", "7B.4-B: Principal amount is 500.00");
+
+		// 3. Update Payable Obligation amount to 600.00
+		const updPayOblRes = await httpCall(`/people/${bobId}/obligations/${obl2Id}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-bob-upd-obl",
+			body: {
+				expectedRevisionNo: 1,
+				amount: "600.00",
+				budgetCategory: "MANDATORY_EXPENSE",
+				occurredAt: "2026-06-03T11:00:00.000Z",
+				description: "Shared electricity bill + late fee",
+			},
+		});
+		eqD(updPayOblRes.status, 200, "7B.4-B: Update payable obligation returns 200");
+		eqD(updPayOblRes.json?.obligation?.principalAmount, "600.00", "7B.4-B: Updated principal is 600.00");
+		eqD(updPayOblRes.json?.obligation?.revisionNo, 2, "7B.4-B: Obligation revision is 2");
+
+		// 4. Record Payable Settlement (600.00)
+		const paySettleRes = await httpCall(`/people/${bobId}/obligations/${obl2Id}/settlements/payable`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-bob-settle-1",
+			body: {
+				amount: "600.00",
+				sourceAssetAccountId: assetAccountId,
+				occurredAt: "2026-06-08T10:00:00.000Z",
+				note: "Transferred via IBAN",
+			},
+		});
+		eqD(paySettleRes.status, 200, "7B.4-B: Record payable settlement returns 200");
+		eqD(paySettleRes.json?.settlement?.appliedAmount, "600.00", "7B.4-B: Settlement applied amount is 600.00");
+
+		// 5. Verify Obligation is SETTLED
+		const getObl2AfterSettle = await httpCall(`/people/${bobId}/obligations/${obl2Id}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getObl2AfterSettle.json?.obligation?.status, "SETTLED", "7B.4-B: Payable obligation is SETTLED");
+
+		// 6. Archive Bob
+		const archiveBobRes = await httpCall(`/people/${bobId}/archive`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-bob-archive",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-06-15T10:00:00.000Z",
+			},
+		});
+		eqD(archiveBobRes.status, 200, "7B.4-B: Archive person Bob returns 200");
+		eqD(archiveBobRes.json?.person?.status, "ARCHIVED", "7B.4-B: Bob is ARCHIVED");
+
+		// =========================================================================
+		// SCENARIO C: Split-Managed Obligation Mutation Guard Isolation
+		// =========================================================================
+		// 1. Create Person Charlie
+		const createCharlieRes = await httpCall("/people", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-charlie-create-1",
+			body: {
+				displayName: "Charlie",
+				relationship: "OTHER",
+				occurredAt: "2026-06-01T10:00:00.000Z",
+			},
+		});
+		const charlieId = createCharlieRes.json?.person?.personId;
+
+		// 2. Setup Card & Shared Purchase with Split for Charlie
+		const cardRes = await httpCall("/credit-cards", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "card-7b4-1",
+			body: {
+				code: "card_7b4_test",
+				displayName: "Card 7B4 Test",
+				issuer: "Bank 7B4",
+				statementDay: 15,
+				dueDay: 25,
+				creditLimit: "50000.00",
+				occurredAt: "2026-06-01T10:00:00.000Z",
+			},
+		});
+		const cardId = cardRes.json?.cardId;
+
+		const sharedPurchRes = await httpCall(`/credit-cards/${cardId}/purchases/shared`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "shared-purch-7b4-1",
+			body: {
+				grossAmount: "1000.00",
+				purchaseCategory: "DISCRETIONARY_SPEND",
+				occurredAt: "2026-06-04T12:00:00.000Z",
+				description: "Group dinner",
+				splitMethod: "EQUAL",
+				participants: [
+					{
+						personId: charlieId,
+						shareAmount: "500.00",
+					},
+				],
+			},
+		});
+		eqD(sharedPurchRes.status, 200, "7B.4-C: Shared purchase with split created");
+		const charlieObligationId = sharedPurchRes.json?.participants?.[0]?.personObligationId;
+		chkD(isUuid(charlieObligationId), "7B.4-C: Split participant obligation ID is valid UUID");
+
+		// 3. GET Obligation & verify isSplitManaged: true
+		const getCharlieOblRes = await httpCall(`/people/${charlieId}/obligations/${charlieObligationId}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getCharlieOblRes.status, 200, "7B.4-C: GET split obligation returns 200");
+		eqD(getCharlieOblRes.json?.obligation?.isSplitManaged, true, "7B.4-C: isSplitManaged is true");
+
+		// 4. Direct Update Attempt on Split-Managed Obligation -> 409 PEOPLE_OBLIGATION_SPLIT_MANAGED
+		const blockUpdRes = await httpCall(`/people/${charlieId}/obligations/${charlieObligationId}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-charlie-direct-upd",
+			body: {
+				expectedRevisionNo: 1,
+				amount: "600.00",
+				fundingAssetAccountId: assetAccountId,
+				occurredAt: "2026-06-04T13:00:00.000Z",
+			},
+		});
+		eqD(blockUpdRes.status, 409, "7B.4-C: Direct update of split-managed obligation blocked with 409");
+		eqD(blockUpdRes.json?.error?.code, "PEOPLE_OBLIGATION_SPLIT_MANAGED", "7B.4-C: Error code is PEOPLE_OBLIGATION_SPLIT_MANAGED");
+
+		// 5. Direct Void Attempt on Split-Managed Obligation -> 409 PEOPLE_OBLIGATION_SPLIT_MANAGED
+		const blockVoidRes = await httpCall(`/people/${charlieId}/obligations/${charlieObligationId}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-charlie-direct-void",
+			body: {
+				expectedRevisionNo: 1,
+			},
+		});
+		eqD(blockVoidRes.status, 409, "7B.4-C: Direct void of split-managed obligation blocked with 409");
+		eqD(blockVoidRes.json?.error?.code, "PEOPLE_OBLIGATION_SPLIT_MANAGED", "7B.4-C: Void error code is PEOPLE_OBLIGATION_SPLIT_MANAGED");
+
+		// 6. Verify obligation remains untouched (revision 1, amount 500.00, OPEN)
+		const getCharlieOblAfter = await httpCall(`/people/${charlieId}/obligations/${charlieObligationId}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getCharlieOblAfter.json?.obligation?.revisionNo, 1, "7B.4-C: Obligation revision remains 1");
+		eqD(getCharlieOblAfter.json?.obligation?.principalAmount, "500.00", "7B.4-C: Principal amount remains 500.00");
+		eqD(getCharlieOblAfter.json?.obligation?.status, "OPEN", "7B.4-C: Obligation status remains OPEN");
+	} finally {
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -15498,6 +15925,7 @@ if (probed) {
 	await resolverRuntime7B3();
 	await resolverRuntime7B3R1();
 	await resolverRuntime7B3R2();
+	await resolverRuntime7B4();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

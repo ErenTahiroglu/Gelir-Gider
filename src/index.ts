@@ -21,6 +21,7 @@ import { budgetV2Router } from "./http/budget-v2-routes";
 import { creditCardRouter } from "./http/credit-card-routes";
 import { incomeRouter } from "./http/income-routes";
 import { ledgerRouter } from "./http/ledger-routes";
+import { peopleRouter } from "./http/people-routes";
 import type { RequestIdVariables } from "./http/security-middleware";
 import {
 	requestIdMiddleware,
@@ -98,6 +99,7 @@ app.route("/transactions", transactionsRouter);
 app.route("/ledger", ledgerRouter);
 app.route("/income", incomeRouter);
 app.route("/credit-cards", creditCardRouter);
+app.route("/people", peopleRouter);
 
 app.notFound((c) => {
 	return c.json(
