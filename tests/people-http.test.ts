@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { PeopleError } from "../src/people/errors";
-import * as peopleModule from "../src/people/people";
-import * as obligationsModule from "../src/people/obligations";
-import * as settlementsModule from "../src/people/settlements";
 import * as dbClientModule from "../src/db/client";
+import { PeopleError } from "../src/people/errors";
+import * as obligationsModule from "../src/people/obligations";
+import * as peopleModule from "../src/people/people";
+import * as settlementsModule from "../src/people/settlements";
 
 const U1 = "11111111-1111-4111-8111-111111111111";
 const PERSON_ID = "22222222-2222-4222-8222-222222222222";
@@ -70,19 +70,23 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 		mockDbSelect = vi.fn().mockImplementation(() => {
 			const whereObj = {
 				limit: vi.fn().mockResolvedValue([]),
-				then: (resolve: (v: unknown[]) => void) => Promise.resolve([]).then(resolve),
+				// biome-ignore lint/suspicious/noThenProperty: intentional Drizzle thenable mock
+				then: (resolve: (v: unknown[]) => void) =>
+					Promise.resolve([]).then(resolve),
 			};
 			return {
 				from: vi.fn().mockReturnValue({
 					where: vi.fn().mockReturnValue(whereObj),
-					then: (resolve: (v: unknown[]) => void) => Promise.resolve([]).then(resolve),
+					// biome-ignore lint/suspicious/noThenProperty: intentional Drizzle thenable mock
+					then: (resolve: (v: unknown[]) => void) =>
+						Promise.resolve([]).then(resolve),
 				}),
 			};
 		});
 
 		vi.spyOn(dbClientModule, "createDatabase").mockReturnValue({
 			select: mockDbSelect,
-		// biome-ignore lint/suspicious/noExplicitAny: mock DB
+			// biome-ignore lint/suspicious/noExplicitAny: mock DB
 		} as any);
 	});
 
@@ -95,11 +99,20 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 			{ path: `/people/${PERSON_ID}`, method: "POST" },
 			{ path: `/people/${PERSON_ID}/archive`, method: "POST" },
 			{ path: `/people/${PERSON_ID}/obligations`, method: "GET" },
-			{ path: `/people/${PERSON_ID}/obligations/${OBLIGATION_ID}`, method: "GET" },
+			{
+				path: `/people/${PERSON_ID}/obligations/${OBLIGATION_ID}`,
+				method: "GET",
+			},
 			{ path: `/people/${PERSON_ID}/obligations/receivable`, method: "POST" },
 			{ path: `/people/${PERSON_ID}/obligations/payable`, method: "POST" },
-			{ path: `/people/${PERSON_ID}/obligations/${OBLIGATION_ID}`, method: "POST" },
-			{ path: `/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/void`, method: "POST" },
+			{
+				path: `/people/${PERSON_ID}/obligations/${OBLIGATION_ID}`,
+				method: "POST",
+			},
+			{
+				path: `/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/void`,
+				method: "POST",
+			},
 			{
 				path: `/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/settlements`,
 				method: "GET",
@@ -352,8 +365,8 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 
 		it("GET /people/:id returns 404 when not found", async () => {
 			vi.spyOn(peopleModule, "getPerson").mockResolvedValue(
-			null as unknown as import("../src/people/people").PersonReadModel,
-		);
+				null as unknown as import("../src/people/people").PersonReadModel,
+			);
 
 			const res = await app.request(
 				`/people/${PERSON_ID}`,
@@ -609,7 +622,10 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 				budgetCategory: "MANDATORY_EXPENSE",
 				fundingAssetAccountId: null,
 			};
-			vi.spyOn(obligationsModule, "recordPersonPayableExpense").mockResolvedValue({
+			vi.spyOn(
+				obligationsModule,
+				"recordPersonPayableExpense",
+			).mockResolvedValue({
 				obligation: mockPayableObligation,
 				idempotentReplay: false,
 			});
@@ -862,7 +878,10 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 			vi.spyOn(obligationsModule, "getPersonObligation").mockResolvedValue(
 				mockReceivableObligation,
 			);
-			vi.spyOn(settlementsModule, "recordPersonReceivableSettlement").mockResolvedValue({
+			vi.spyOn(
+				settlementsModule,
+				"recordPersonReceivableSettlement",
+			).mockResolvedValue({
 				settlement: mockSettlement,
 				idempotentReplay: false,
 			});
@@ -904,7 +923,10 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 			vi.spyOn(obligationsModule, "getPersonObligation").mockResolvedValue(
 				mockPayableObligation,
 			);
-			vi.spyOn(settlementsModule, "recordPersonPayableSettlement").mockResolvedValue({
+			vi.spyOn(
+				settlementsModule,
+				"recordPersonPayableSettlement",
+			).mockResolvedValue({
 				settlement: mockPayableSettlement,
 				idempotentReplay: false,
 			});
@@ -1019,7 +1041,10 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 				canonicalTransactionId: "77777777-7777-4777-8777-777777777777",
 				canonicalRevisionId: "88888888-8888-4888-8888-888888888888",
 			});
-			vi.spyOn(settlementsModule, "recordPersonReceivableSettlement").mockRejectedValue(
+			vi.spyOn(
+				settlementsModule,
+				"recordPersonReceivableSettlement",
+			).mockRejectedValue(
 				new PeopleError("PEOPLE_OBLIGATION_OVERSETTLEMENT", "Oversettled"),
 			);
 

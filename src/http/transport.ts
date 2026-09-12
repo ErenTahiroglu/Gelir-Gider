@@ -251,7 +251,8 @@ export const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	PEOPLE_OBLIGATION_NOT_FOUND: "Person obligation not found",
 	PEOPLE_OBLIGATION_NOT_ACTIVE: "Person obligation is not active",
 	PEOPLE_OBLIGATION_REVISION_CONFLICT: "Person obligation revision is stale",
-	PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT: "Person obligation settlement conflict",
+	PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT:
+		"Person obligation settlement conflict",
 	PEOPLE_OBLIGATION_OVERSETTLEMENT: "Person obligation oversettlement error",
 	PEOPLE_SETTLEMENT_NOT_FOUND: "Person settlement not found",
 	PEOPLE_IDEMPOTENCY_CONFLICT:

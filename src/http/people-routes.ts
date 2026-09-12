@@ -1,7 +1,7 @@
+import { and, eq } from "drizzle-orm";
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import { and, eq } from "drizzle-orm";
 import { type AppEnv, getDatabaseUrl } from "../config/env";
 import { createDatabase, type Database } from "../db/client";
 import {
@@ -16,13 +16,9 @@ import {
 	type PersonObligationDirection,
 	type PersonRelationship,
 } from "../db/schema/people";
-import {
-	archivePerson,
-	createPerson,
-	getPerson,
-	listPeople,
-	updatePerson,
-} from "../people/people";
+import { parsePositiveMoneyString } from "../ledger/money";
+import { validateIsoCalendarDate } from "../people/calendar";
+import { PeopleError } from "../people/errors";
 import {
 	getPersonObligation,
 	listPersonObligations,
@@ -33,15 +29,19 @@ import {
 	voidPersonObligation,
 } from "../people/obligations";
 import {
+	archivePerson,
+	createPerson,
+	getPerson,
+	listPeople,
+	updatePerson,
+} from "../people/people";
+import {
 	getPersonSettlement,
 	listPersonSettlements,
 	recordPersonPayableSettlement,
 	recordPersonReceivableSettlement,
 	voidPersonSettlement,
 } from "../people/settlements";
-import { PeopleError } from "../people/errors";
-import { validateIsoCalendarDate } from "../people/calendar";
-import { parsePositiveMoneyString } from "../ledger/money";
 import type { AuthVariables } from "./auth-middleware";
 import { requireAuthenticatedSession } from "./auth-middleware";
 import type { RequestIdVariables } from "./security-middleware";
@@ -88,7 +88,6 @@ function mapPeopleDomainError(c: Context<PeopleEnv>, err: unknown) {
 			case "PEOPLE_IDEMPOTENCY_CONFLICT":
 			case "PEOPLE_OBLIGATION_SPLIT_MANAGED":
 				return fail(c, err.code, 409);
-			case "PEOPLE_INVALID_STATE":
 			default:
 				return fail(c, "INTERNAL_ERROR", 500);
 		}
@@ -125,7 +124,10 @@ async function checkIsSplitManaged(
 		.where(
 			and(
 				eq(creditCardPurchaseSplitParticipants.userId, userId),
-				eq(creditCardPurchaseSplitParticipants.personObligationId, obligationId),
+				eq(
+					creditCardPurchaseSplitParticipants.personObligationId,
+					obligationId,
+				),
 			),
 		)
 		.limit(1);
@@ -174,7 +176,9 @@ peopleRouter.get("/", async (c) => {
 	const relationshipQuery = c.req.query("relationship");
 	let relationshipFilter: PersonRelationship | undefined;
 	if (relationshipQuery !== undefined) {
-		if (!PERSON_RELATIONSHIPS.includes(relationshipQuery as PersonRelationship)) {
+		if (
+			!PERSON_RELATIONSHIPS.includes(relationshipQuery as PersonRelationship)
+		) {
 			return fail(c, "PEOPLE_INVALID_INPUT", 400);
 		}
 		relationshipFilter = relationshipQuery as PersonRelationship;
@@ -295,7 +299,8 @@ peopleRouter.post("/", async (c) => {
 			userId: auth.userId,
 			displayName: displayName.trim(),
 			relationship: relationship as PersonRelationship,
-			note: note !== undefined && note !== null ? (note as string).trim() : null,
+			note:
+				note !== undefined && note !== null ? (note as string).trim() : null,
 			occurredAt,
 			idempotencyKey: keyRes.key,
 		});
@@ -384,7 +389,8 @@ peopleRouter.post("/:id", async (c) => {
 			expectedRevisionNo,
 			displayName: displayName.trim(),
 			relationship: relationship as PersonRelationship,
-			note: note !== undefined && note !== null ? (note as string).trim() : null,
+			note:
+				note !== undefined && note !== null ? (note as string).trim() : null,
 			occurredAt,
 			idempotencyKey: keyRes.key,
 		});
@@ -559,12 +565,10 @@ peopleRouter.get("/:personId/obligations", async (c) => {
 			splitParticipantRows.map((r) => r.obligationId),
 		);
 
-		const obligations = rawObligations
-			.slice(0, limitRes.limit)
-			.map((obl) => ({
-				...obl,
-				isSplitManaged: splitObligationIds.has(obl.obligationId),
-			}));
+		const obligations = rawObligations.slice(0, limitRes.limit).map((obl) => ({
+			...obl,
+			isSplitManaged: splitObligationIds.has(obl.obligationId),
+		}));
 
 		return c.json(
 			{
@@ -1262,7 +1266,8 @@ peopleRouter.post(
 				cashAmount,
 				destinationAssetAccountId,
 				occurredAt,
-				note: note !== undefined && note !== null ? (note as string).trim() : null,
+				note:
+					note !== undefined && note !== null ? (note as string).trim() : null,
 				idempotencyKey: keyRes.key,
 			});
 
@@ -1293,7 +1298,12 @@ peopleRouter.post(
 		const bodyRes = await readJsonObject(c);
 		if (!bodyRes.ok) return fail(c, "PEOPLE_INVALID_INPUT", 400);
 
-		const allowedKeys = ["amount", "sourceAssetAccountId", "occurredAt", "note"];
+		const allowedKeys = [
+			"amount",
+			"sourceAssetAccountId",
+			"occurredAt",
+			"note",
+		];
 		if (!hasOnlyKeys(bodyRes.value, allowedKeys)) {
 			return fail(c, "PEOPLE_INVALID_INPUT", 400);
 		}
@@ -1350,7 +1360,8 @@ peopleRouter.post(
 				amount,
 				sourceAssetAccountId,
 				occurredAt,
-				note: note !== undefined && note !== null ? (note as string).trim() : null,
+				note:
+					note !== undefined && note !== null ? (note as string).trim() : null,
 				idempotencyKey: keyRes.key,
 			});
 
