@@ -4,15 +4,30 @@ import { bodyLimit } from "hono/body-limit";
 import { type AppEnv, getDatabaseUrl } from "../config/env";
 import { CreditCardError } from "../credit-cards/errors";
 import {
+	type CardCursor,
+	decodeCardCursor,
+	decodePurchaseCursor,
+	decodeStatementCursor,
+	encodeCardCursor,
+	encodePurchaseCursor,
+	encodeStatementCursor,
+	type PurchaseCursor,
+	type StatementCursor,
+} from "../credit-cards/pagination";
+import {
 	payCreditCardStatement,
 	reconcileCreditCardStatement,
 	reopenCreditCardStatementPayment,
 } from "../credit-cards/payments";
 import {
+	getCreditCardOpeningBalance,
 	getCreditCardPurchase,
 	listCreditCardPurchases,
+	recordCreditCardOpeningBalance,
 	recordCreditCardPurchase,
+	updateCreditCardOpeningBalance,
 	updateCreditCardPurchase,
+	voidCreditCardOpeningBalance,
 	voidCreditCardPurchase,
 } from "../credit-cards/purchases";
 import {
@@ -110,6 +125,24 @@ function mapCreditCardDomainError(c: Context<CreditCardEnv>, err: unknown) {
 	return fail(c, "INTERNAL_ERROR", 500);
 }
 
+function validateStrictQueryParams(
+	c: Context,
+	allowedKeys: readonly string[],
+): boolean {
+	const url = new URL(c.req.url);
+	const seen = new Set<string>();
+	for (const key of url.searchParams.keys()) {
+		if (seen.has(key)) {
+			return false;
+		}
+		seen.add(key);
+		if (!allowedKeys.includes(key)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 // ----------------------------------------------------------------------------
 // MIDDLEWARES
 // ----------------------------------------------------------------------------
@@ -133,6 +166,10 @@ creditCardRouter.post(
  */
 creditCardRouter.get("/", async (c) => {
 	const auth = c.get("auth");
+	if (!validateStrictQueryParams(c, ["limit", "status", "after"])) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
 	const limitRes = parseBoundedLimit(c.req.query("limit"), {
 		defaultLimit: 50,
 		maxLimit: 100,
@@ -148,31 +185,42 @@ creditCardRouter.get("/", async (c) => {
 		statusFilter = statusQuery;
 	}
 
+	const afterQuery = c.req.query("after");
+	let afterCursor: CardCursor | undefined;
+	if (afterQuery !== undefined) {
+		try {
+			afterCursor = decodeCardCursor(afterQuery);
+		} catch (err) {
+			return mapCreditCardDomainError(c, err);
+		}
+	}
+
 	const db = createDatabase(getDatabaseUrl(c.env));
 	try {
-		const allCards = await listCreditCards({
+		const rows = await listCreditCards({
 			db,
 			userId: auth.userId,
 			...(statusFilter ? { status: statusFilter } : {}),
+			limit: limitRes.limit + 1,
+			afterCursor,
 		});
 
-		// Bounded pagination
-		const after = c.req.query("after");
-		let startIndex = 0;
-		if (after) {
-			const idx = allCards.findIndex((card) => card.cardId === after);
-			if (idx >= 0) {
-				startIndex = idx + 1;
-			}
-		}
-
-		const paginated = allCards.slice(startIndex, startIndex + limitRes.limit);
-		const hasMore = startIndex + limitRes.limit < allCards.length;
+		const hasMore = rows.length > limitRes.limit;
+		const cards = hasMore ? rows.slice(0, limitRes.limit) : rows;
+		const lastCard = cards.length > 0 ? cards[cards.length - 1] : null;
+		const nextCursor =
+			hasMore && lastCard
+				? encodeCardCursor({
+						createdAt: lastCard.createdAt.toISOString(),
+						id: lastCard.cardId,
+					})
+				: null;
 
 		return c.json({
-			cards: paginated,
+			cards,
 			limit: limitRes.limit,
 			hasMore,
+			nextCursor,
 		});
 	} catch (err) {
 		return mapCreditCardDomainError(c, err);
@@ -251,14 +299,14 @@ creditCardRouter.post(
 		if (
 			typeof displayName !== "string" ||
 			displayName.trim().length === 0 ||
-			displayName.length > 100
+			displayName.length > 120
 		) {
 			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 		}
 		if (
 			typeof issuer !== "string" ||
 			issuer.trim().length === 0 ||
-			issuer.length > 100
+			issuer.length > 120
 		) {
 			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 		}
@@ -376,14 +424,14 @@ creditCardRouter.post(
 		if (
 			typeof displayName !== "string" ||
 			displayName.trim().length === 0 ||
-			displayName.length > 100
+			displayName.length > 120
 		) {
 			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 		}
 		if (
 			typeof issuer !== "string" ||
 			issuer.trim().length === 0 ||
-			issuer.length > 100
+			issuer.length > 120
 		) {
 			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 		}
@@ -528,6 +576,12 @@ creditCardRouter.get("/:cardId/statements", async (c) => {
 	const cardId = c.req.param("cardId");
 	if (!isUuid(cardId)) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 
+	if (
+		!validateStrictQueryParams(c, ["limit", "status", "cycleMonth", "after"])
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
 	const limitRes = parseBoundedLimit(c.req.query("limit"), {
 		defaultLimit: 50,
 		maxLimit: 100,
@@ -558,40 +612,51 @@ creditCardRouter.get("/:cardId/statements", async (c) => {
 		cycleMonthUntil = cycleMonthQuery;
 	}
 
+	const afterQuery = c.req.query("after");
+	let afterCursor: StatementCursor | undefined;
+	if (afterQuery !== undefined) {
+		try {
+			afterCursor = decodeStatementCursor(afterQuery);
+		} catch (err) {
+			return mapCreditCardDomainError(c, err);
+		}
+	}
+
 	const db = createDatabase(getDatabaseUrl(c.env));
 	try {
 		// Confirm card ownership
 		const card = await getCreditCard({ db, userId: auth.userId, cardId });
 		if (!card) return fail(c, "CREDIT_CARD_NOT_FOUND", 404);
 
-		const allStatements = await listCreditCardStatements({
+		const rows = await listCreditCardStatements({
 			db,
 			userId: auth.userId,
 			creditCardId: cardId,
 			...(statusFilter ? { status: statusFilter } : {}),
 			...(cycleMonthFrom ? { cycleMonthFrom } : {}),
 			...(cycleMonthUntil ? { cycleMonthUntil } : {}),
+			limit: limitRes.limit + 1,
+			afterCursor,
 		});
 
-		const after = c.req.query("after");
-		let startIndex = 0;
-		if (after) {
-			const idx = allStatements.findIndex((s) => s.statementId === after);
-			if (idx >= 0) {
-				startIndex = idx + 1;
-			}
-		}
-
-		const paginated = allStatements.slice(
-			startIndex,
-			startIndex + limitRes.limit,
-		);
-		const hasMore = startIndex + limitRes.limit < allStatements.length;
+		const hasMore = rows.length > limitRes.limit;
+		const statements = hasMore ? rows.slice(0, limitRes.limit) : rows;
+		const lastStmt =
+			statements.length > 0 ? statements[statements.length - 1] : null;
+		const nextCursor =
+			hasMore && lastStmt
+				? encodeStatementCursor({
+						cycleYear: lastStmt.cycleYear,
+						cycleMonth: lastStmt.cycleMonth,
+						id: lastStmt.statementId,
+					})
+				: null;
 
 		return c.json({
-			statements: paginated,
+			statements,
 			limit: limitRes.limit,
 			hasMore,
+			nextCursor,
 		});
 	} catch (err) {
 		return mapCreditCardDomainError(c, err);
@@ -1375,6 +1440,52 @@ creditCardRouter.get("/:cardId/purchases", async (c) => {
 	const cardId = c.req.param("cardId");
 	if (!isUuid(cardId)) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 
+	if (
+		!validateStrictQueryParams(c, [
+			"limit",
+			"status",
+			"purchaseDateFrom",
+			"fromDate",
+			"purchaseDateUntil",
+			"toDate",
+			"after",
+			"budgetCategory",
+			"purchaseCategory",
+			"category",
+		])
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	if (
+		c.req.query("purchaseDateFrom") !== undefined &&
+		c.req.query("fromDate") !== undefined
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (
+		c.req.query("purchaseDateUntil") !== undefined &&
+		c.req.query("toDate") !== undefined
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const rawCategory =
+		c.req.query("budgetCategory") ??
+		c.req.query("purchaseCategory") ??
+		c.req.query("category");
+	let categoryFilter:
+		| "MANDATORY_EXPENSE"
+		| "DISCRETIONARY_SPEND"
+		| "SHORT_TERM_PURCHASE"
+		| "UNCLASSIFIED"
+		| undefined;
+	if (rawCategory !== undefined) {
+		const norm = normalizePurchaseCategoryForDomain(rawCategory);
+		if (!norm) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		categoryFilter = norm;
+	}
+
 	const limitRes = parseBoundedLimit(c.req.query("limit"), {
 		defaultLimit: 50,
 		maxLimit: 100,
@@ -1399,39 +1510,52 @@ creditCardRouter.get("/:cardId/purchases", async (c) => {
 		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 	}
 
+	const afterQuery = c.req.query("after");
+	let afterCursor: PurchaseCursor | undefined;
+	if (afterQuery !== undefined) {
+		try {
+			afterCursor = decodePurchaseCursor(afterQuery);
+		} catch (err) {
+			return mapCreditCardDomainError(c, err);
+		}
+	}
+
 	const db = createDatabase(getDatabaseUrl(c.env));
 	try {
 		const card = await getCreditCard({ db, userId: auth.userId, cardId });
 		if (!card) return fail(c, "CREDIT_CARD_NOT_FOUND", 404);
 
-		const allPurchases = await listCreditCardPurchases({
+		const rows = await listCreditCardPurchases({
 			db,
 			userId: auth.userId,
 			cardId,
+			eventType: "PURCHASE",
+			...(categoryFilter ? { budgetCategory: categoryFilter } : {}),
 			...(statusFilter ? { status: statusFilter } : {}),
 			...(fromDate ? { purchaseDateFrom: fromDate } : {}),
 			...(toDate ? { purchaseDateUntil: toDate } : {}),
+			limit: limitRes.limit + 1,
+			afterCursor,
 		});
 
-		const after = c.req.query("after");
-		let startIndex = 0;
-		if (after) {
-			const idx = allPurchases.findIndex((p) => p.eventId === after);
-			if (idx >= 0) {
-				startIndex = idx + 1;
-			}
-		}
-
-		const paginated = allPurchases.slice(
-			startIndex,
-			startIndex + limitRes.limit,
-		);
-		const hasMore = startIndex + limitRes.limit < allPurchases.length;
+		const hasMore = rows.length > limitRes.limit;
+		const purchases = hasMore ? rows.slice(0, limitRes.limit) : rows;
+		const lastPurchase =
+			purchases.length > 0 ? purchases[purchases.length - 1] : null;
+		const nextCursor =
+			hasMore && lastPurchase?.purchaseDate
+				? encodePurchaseCursor({
+						purchaseDate: lastPurchase.purchaseDate,
+						occurredAt: lastPurchase.occurredAt.toISOString(),
+						eventId: lastPurchase.eventId,
+					})
+				: null;
 
 		return c.json({
-			purchases: paginated,
+			purchases,
 			limit: limitRes.limit,
 			hasMore,
+			nextCursor,
 		});
 	} catch (err) {
 		return mapCreditCardDomainError(c, err);
@@ -1469,21 +1593,21 @@ creditCardRouter.get("/:cardId/purchases/:id", async (c) => {
 function normalizePurchaseCategoryForDomain(
 	raw: unknown,
 ):
-	| "MANDATORY"
-	| "DISCRETIONARY"
+	| "MANDATORY_EXPENSE"
+	| "DISCRETIONARY_SPEND"
 	| "SHORT_TERM_PURCHASE"
 	| "UNCLASSIFIED"
 	| null {
 	if (typeof raw !== "string") return null;
 	const trimmed = raw.trim().toUpperCase();
 	if (trimmed === "MANDATORY" || trimmed === "MANDATORY_EXPENSE")
-		return "MANDATORY";
+		return "MANDATORY_EXPENSE";
 	if (
 		trimmed === "DISCRETIONARY" ||
 		trimmed === "DISCRETIONARY_SPEND" ||
 		trimmed === "DISCRETIONARY_EXPENSE"
 	)
-		return "DISCRETIONARY";
+		return "DISCRETIONARY_SPEND";
 	if (trimmed === "SHORT_TERM_PURCHASE") return "SHORT_TERM_PURCHASE";
 	if (trimmed === "UNCLASSIFIED") return "UNCLASSIFIED";
 	return null;
@@ -1787,3 +1911,276 @@ creditCardRouter.post("/:cardId/purchases/:id/void", async (c) => {
 		return mapCreditCardDomainError(c, err);
 	}
 });
+
+// ============================================================================
+// 6. CREDIT CARD OPENING BALANCE SURFACE
+// ============================================================================
+
+/**
+ * GET /credit-cards/:cardId/opening-balance
+ * Fetches the opening balance liability event for a credit card.
+ */
+creditCardRouter.get("/:cardId/opening-balance", async (c) => {
+	const auth = c.get("auth");
+	const cardId = c.req.param("cardId");
+	if (!isUuid(cardId)) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const db = createDatabase(getDatabaseUrl(c.env));
+	try {
+		const card = await getCreditCard({ db, userId: auth.userId, cardId });
+		if (!card) return fail(c, "CREDIT_CARD_NOT_FOUND", 404);
+
+		const openingBalance = await getCreditCardOpeningBalance({
+			db,
+			userId: auth.userId,
+			cardId,
+		});
+
+		return c.json({ openingBalance }, 200);
+	} catch (err) {
+		return mapCreditCardDomainError(c, err);
+	}
+});
+
+/**
+ * POST /credit-cards/:cardId/opening-balance
+ * Records the initial opening balance for a credit card.
+ */
+creditCardRouter.post(
+	"/:cardId/opening-balance",
+	bodyLimit({ maxSize: BODY_LIMIT_BYTES }),
+	async (c) => {
+		const auth = c.get("auth");
+		const cardId = c.req.param("cardId");
+		if (!isUuid(cardId)) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+		const keyRes = readIdempotencyKey(c);
+		if (!keyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+		const bodyRes = await readJsonObject(c);
+		if (!bodyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+		const allowedKeys = ["amount", "description", "occurredAt"];
+		if (!hasOnlyKeys(bodyRes.value, allowedKeys)) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+
+		const { amount, description, occurredAt: rawOccurredAt } = bodyRes.value;
+
+		if (typeof amount !== "string" || !/^\d+\.\d{2}$/.test(amount)) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+		if (description !== undefined && description !== null) {
+			if (typeof description !== "string" || description.length > 500) {
+				return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+			}
+		}
+
+		const occurredAt = parseCanonicalInstant(rawOccurredAt);
+		if (!occurredAt) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+		const db = createDatabase(getDatabaseUrl(c.env));
+		try {
+			const card = await getCreditCard({ db, userId: auth.userId, cardId });
+			if (!card) return fail(c, "CREDIT_CARD_NOT_FOUND", 404);
+
+			const result = await recordCreditCardOpeningBalance({
+				db,
+				userId: auth.userId,
+				cardId,
+				amount,
+				description: description ? description.trim() : null,
+				occurredAt,
+				idempotencyKey: keyRes.key,
+			});
+
+			return c.json(result, 201);
+		} catch (err) {
+			return mapCreditCardDomainError(c, err);
+		}
+	},
+);
+
+/**
+ * Handler for updating an existing credit card opening balance.
+ */
+async function handleUpdateOpeningBalance(c: Context<CreditCardEnv>) {
+	const auth = c.get("auth");
+	const cardId = c.req.param("cardId");
+	const eventId = c.req.param("id");
+	if (!isUuid(cardId) || !isUuid(eventId)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const keyRes = readIdempotencyKey(c);
+	if (!keyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const bodyRes = await readJsonObject(c);
+	if (!bodyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const allowedKeys = [
+		"expectedRevisionNo",
+		"amount",
+		"description",
+		"reasonNote",
+		"occurredAt",
+	];
+	if (!hasOnlyKeys(bodyRes.value, allowedKeys)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const {
+		expectedRevisionNo,
+		amount,
+		description,
+		reasonNote,
+		occurredAt: rawOccurredAt,
+	} = bodyRes.value;
+
+	if (
+		typeof expectedRevisionNo !== "number" ||
+		!Number.isInteger(expectedRevisionNo) ||
+		expectedRevisionNo < 1
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (typeof amount !== "string" || !/^\d+\.\d{2}$/.test(amount)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (description !== undefined && description !== null) {
+		if (typeof description !== "string" || description.length > 500) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+	if (reasonNote !== undefined && reasonNote !== null) {
+		if (typeof reasonNote !== "string" || reasonNote.length > 500) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+
+	const occurredAt = parseCanonicalInstant(rawOccurredAt);
+	if (!occurredAt) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const db = createDatabase(getDatabaseUrl(c.env));
+	try {
+		const existing = await getCreditCardPurchase({
+			db,
+			userId: auth.userId,
+			eventId,
+		});
+		if (
+			!existing ||
+			existing.cardId !== cardId ||
+			existing.eventType !== "OPENING_BALANCE"
+		) {
+			return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
+		}
+
+		const result = await updateCreditCardOpeningBalance({
+			db,
+			userId: auth.userId,
+			eventId,
+			expectedRevisionNo,
+			amount,
+			description: description ? description.trim() : null,
+			reasonNote: reasonNote ? reasonNote.trim() : null,
+			occurredAt,
+			idempotencyKey: keyRes.key,
+		});
+
+		return c.json(result, 200);
+	} catch (err) {
+		return mapCreditCardDomainError(c, err);
+	}
+}
+
+creditCardRouter.post(
+	"/:cardId/opening-balance/:id",
+	bodyLimit({ maxSize: BODY_LIMIT_BYTES }),
+	handleUpdateOpeningBalance,
+);
+creditCardRouter.post(
+	"/:cardId/opening-balance/:id/revisions",
+	bodyLimit({ maxSize: BODY_LIMIT_BYTES }),
+	handleUpdateOpeningBalance,
+);
+
+/**
+ * POST /credit-cards/:cardId/opening-balance/:id/void
+ * Voids an existing credit card opening balance.
+ */
+creditCardRouter.post(
+	"/:cardId/opening-balance/:id/void",
+	bodyLimit({ maxSize: BODY_LIMIT_BYTES }),
+	async (c) => {
+		const auth = c.get("auth");
+		const cardId = c.req.param("cardId");
+		const eventId = c.req.param("id");
+		if (!isUuid(cardId) || !isUuid(eventId)) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+
+		const keyRes = readIdempotencyKey(c);
+		if (!keyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+		const bodyRes = await readJsonObject(c);
+		if (!bodyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+		const allowedKeys = ["expectedRevisionNo", "reasonNote", "occurredAt"];
+		if (!hasOnlyKeys(bodyRes.value, allowedKeys)) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+
+		const {
+			expectedRevisionNo,
+			reasonNote,
+			occurredAt: rawOccurredAt,
+		} = bodyRes.value;
+
+		if (
+			typeof expectedRevisionNo !== "number" ||
+			!Number.isInteger(expectedRevisionNo) ||
+			expectedRevisionNo < 1
+		) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+		if (reasonNote !== undefined && reasonNote !== null) {
+			if (typeof reasonNote !== "string" || reasonNote.length > 500) {
+				return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+			}
+		}
+
+		const occurredAt = parseCanonicalInstant(rawOccurredAt);
+		if (!occurredAt) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+		const db = createDatabase(getDatabaseUrl(c.env));
+		try {
+			const existing = await getCreditCardPurchase({
+				db,
+				userId: auth.userId,
+				eventId,
+			});
+			if (
+				!existing ||
+				existing.cardId !== cardId ||
+				existing.eventType !== "OPENING_BALANCE"
+			) {
+				return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
+			}
+
+			const result = await voidCreditCardOpeningBalance({
+				db,
+				userId: auth.userId,
+				eventId,
+				expectedRevisionNo,
+				reasonNote: reasonNote ? reasonNote.trim() : null,
+				occurredAt,
+				idempotencyKey: keyRes.key,
+			});
+
+			return c.json(result, 200);
+		} catch (err) {
+			return mapCreditCardDomainError(c, err);
+		}
+	},
+);

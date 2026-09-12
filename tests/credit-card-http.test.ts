@@ -983,9 +983,10 @@ describe("Credit Cards Product HTTP Surface (Checkpoint 7B.3)", () => {
 				description: "Groceries",
 				installmentCount: null,
 				canonicalTransactionId: "tx-p1",
-				canonicalRevisionId: "tx-p1-rev1",
-				journalEntryId: "je-p1",
-				createdAt: new Date(),
+				canonicalRevisionId: "11111111-1111-4111-8111-111111111111",
+				journalEntryId: null,
+				occurredAt: new Date("2026-09-10T12:00:00.000Z"),
+				createdAt: new Date("2026-09-10T12:00:00.000Z"),
 			});
 
 			vi.spyOn(purchasesModule, "voidCreditCardPurchase").mockResolvedValueOnce(

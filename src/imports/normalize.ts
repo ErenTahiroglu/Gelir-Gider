@@ -460,7 +460,13 @@ export async function normalizeImportRow(
 			const trimmedCat = input.purchaseCategory.trim();
 			if (trimmedCat !== "") {
 				try {
-					purchaseCategory = validatePurchaseCategory(trimmedCat);
+					const validated = validatePurchaseCategory(trimmedCat);
+					purchaseCategory =
+						validated === "MANDATORY_EXPENSE"
+							? "MANDATORY"
+							: validated === "DISCRETIONARY_SPEND"
+								? "DISCRETIONARY"
+								: validated;
 				} catch {
 					throw new ImportError(
 						"IMPORT_INVALID_INPUT",

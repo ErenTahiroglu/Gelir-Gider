@@ -1,4 +1,17 @@
-import { and, asc, desc, eq, gte, inArray, lte, ne, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	gt,
+	gte,
+	inArray,
+	lt,
+	lte,
+	ne,
+	or,
+	sql,
+} from "drizzle-orm";
 import type {
 	Database,
 	DatabaseOrTransaction,
@@ -67,6 +80,7 @@ import {
 	ensureCreditCardLedgerLinkInTransaction,
 	ensureCreditCardSystemAccountsInTransaction,
 } from "./ledger-provisioning";
+import type { PurchaseCursor } from "./pagination";
 import {
 	buildSplitReadModelInTransaction,
 	type CreditCardPurchaseSplitReadModel,
@@ -101,6 +115,7 @@ export interface CreditCardPurchaseRecord {
 	canonicalTransactionId: string;
 	canonicalRevisionId: string;
 	journalEntryId: string | null;
+	occurredAt: Date;
 	createdAt: Date;
 }
 
@@ -334,6 +349,12 @@ export interface GetCreditCardPurchaseParams {
 	eventId: string;
 }
 
+export interface GetCreditCardOpeningBalanceParams {
+	db: Database;
+	userId: string;
+	cardId: string;
+}
+
 export interface ListCreditCardPurchasesInTransactionParams {
 	tx: DatabaseTransaction;
 	userId: string;
@@ -342,6 +363,8 @@ export interface ListCreditCardPurchasesInTransactionParams {
 	budgetCategory?: CreditCardPurchaseBudgetCategory | string | undefined;
 	purchaseDateFrom?: string | undefined;
 	purchaseDateUntil?: string | undefined;
+	eventType?: CreditCardLiabilityEventType | undefined;
+	afterCursor?: PurchaseCursor | undefined;
 	limit?: number | undefined;
 	offset?: number | undefined;
 }
@@ -354,6 +377,8 @@ export interface ListCreditCardPurchasesParams {
 	budgetCategory?: CreditCardPurchaseBudgetCategory | string | undefined;
 	purchaseDateFrom?: string | undefined;
 	purchaseDateUntil?: string | undefined;
+	eventType?: CreditCardLiabilityEventType | undefined;
+	afterCursor?: PurchaseCursor | undefined;
 	limit?: number | undefined;
 	offset?: number | undefined;
 }
@@ -3379,8 +3404,46 @@ async function getCreditCardPurchaseInTransaction(
 		canonicalTransactionId: event.canonicalTransactionId,
 		canonicalRevisionId: latestRev.canonicalRevisionId,
 		journalEntryId: binding?.appliedJournalEntryId ?? null,
+		occurredAt: latestRev.occurredAt,
 		createdAt: event.createdAt,
 	};
+}
+
+export async function getCreditCardOpeningBalanceInTransaction(
+	db: DatabaseOrTransaction,
+	validUserId: string,
+	validCardId: string,
+): Promise<CreditCardPurchaseRecord | null> {
+	const [event] = await db
+		.select({ id: creditCardLiabilityEvents.id })
+		.from(creditCardLiabilityEvents)
+		.where(
+			and(
+				eq(creditCardLiabilityEvents.creditCardId, validCardId),
+				eq(creditCardLiabilityEvents.userId, validUserId),
+				eq(creditCardLiabilityEvents.eventType, "OPENING_BALANCE"),
+			),
+		)
+		.limit(1);
+
+	if (!event) {
+		return null;
+	}
+
+	return getCreditCardPurchaseInTransaction(db, validUserId, event.id);
+}
+
+export async function getCreditCardOpeningBalance({
+	db,
+	userId,
+	cardId,
+}: GetCreditCardOpeningBalanceParams): Promise<CreditCardPurchaseRecord | null> {
+	const validUserId = validateCcCanonicalUuid(userId, "userId");
+	const validCardId = validateCcCanonicalUuid(cardId, "cardId");
+
+	return runCreditCardReadTransaction(db, (tx) =>
+		getCreditCardOpeningBalanceInTransaction(tx, validUserId, validCardId),
+	);
 }
 
 /**
@@ -3396,6 +3459,8 @@ export async function listCreditCardPurchasesInTransaction({
 	budgetCategory,
 	purchaseDateFrom,
 	purchaseDateUntil,
+	eventType,
+	afterCursor,
 	limit = 50,
 	offset = 0,
 }: ListCreditCardPurchasesInTransactionParams): Promise<
@@ -3442,7 +3507,11 @@ export async function listCreditCardPurchasesInTransaction({
 		offset !== undefined ? validateCcOffset(offset, "offset") : 0;
 
 	// 1. Define subquery for latest liability revisions per event
-	const innerConditions = [eq(creditCardLiabilityEvents.userId, validUserId)];
+	const validEventType = eventType ?? "PURCHASE";
+	const innerConditions = [
+		eq(creditCardLiabilityEvents.userId, validUserId),
+		eq(creditCardLiabilityEvents.eventType, validEventType),
+	];
 	if (validCardId) {
 		innerConditions.push(
 			eq(creditCardLiabilityEvents.creditCardId, validCardId),
@@ -3508,6 +3577,24 @@ export async function listCreditCardPurchasesInTransaction({
 		);
 	}
 
+	if (afterCursor) {
+		const cursorOccurredAt = new Date(afterCursor.occurredAt);
+		outerConditions.push(
+			or(
+				lt(latestRevsSq.purchaseDate, afterCursor.purchaseDate),
+				and(
+					eq(latestRevsSq.purchaseDate, afterCursor.purchaseDate),
+					lt(latestRevsSq.occurredAt, cursorOccurredAt),
+				),
+				and(
+					eq(latestRevsSq.purchaseDate, afterCursor.purchaseDate),
+					eq(latestRevsSq.occurredAt, cursorOccurredAt),
+					gt(latestRevsSq.eventId, afterCursor.eventId),
+				),
+			),
+		);
+	}
+
 	// 3. Query filtered, ordered, paginated rows
 	const rows = await tx
 		.select()
@@ -3519,7 +3606,7 @@ export async function listCreditCardPurchasesInTransaction({
 			asc(latestRevsSq.eventId),
 		)
 		.limit(validLimit)
-		.offset(validOffset);
+		.offset(afterCursor ? 0 : validOffset);
 
 	if (rows.length === 0) {
 		return [];
@@ -3618,6 +3705,7 @@ export async function listCreditCardPurchasesInTransaction({
 			canonicalTransactionId: row.canonicalTransactionId,
 			canonicalRevisionId: row.canonicalRevisionId,
 			journalEntryId: appliedJournalEntryId,
+			occurredAt: row.occurredAt,
 			createdAt: row.eventCreatedAt,
 		};
 	});

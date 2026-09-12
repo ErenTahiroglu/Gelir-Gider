@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, lt, lte, or } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import { users } from "../db/schema/auth";
 import { creditCardLedgerLinks } from "../db/schema/credit-card-ledger";
@@ -45,6 +45,7 @@ import {
 	validateCcPositiveMoneyString,
 	validateCcRequiredText,
 	validateLastFour,
+	validatePositiveIntegerRange,
 	validateReservePlacement,
 	validateStatementStatusFilter,
 } from "./calendar";
@@ -62,6 +63,7 @@ import {
 	ensureCreditCardLedgerLinkInTransaction,
 	ensureCreditCardSystemAccountsInTransaction,
 } from "./ledger-provisioning";
+import type { CardCursor, StatementCursor } from "./pagination";
 
 // ============================================================================
 // Record Types & Lifecycle Snapshots
@@ -239,7 +241,9 @@ export interface GetCreditCardParams {
 export interface ListCreditCardsParams {
 	db: Database | DatabaseTransaction;
 	userId: string;
-	status?: CreditCardStatus;
+	status?: CreditCardStatus | undefined;
+	limit?: number | undefined;
+	afterCursor?: CardCursor | undefined;
 }
 
 export interface CreateCreditCardStatementInTransactionParams {
@@ -323,10 +327,12 @@ export interface GetCreditCardStatementParams {
 export interface ListCreditCardStatementsParams {
 	db: Database | DatabaseTransaction;
 	userId: string;
-	creditCardId?: string;
-	status?: CreditCardStatementStatus;
-	cycleMonthFrom?: string;
-	cycleMonthUntil?: string;
+	creditCardId?: string | undefined;
+	status?: CreditCardStatementStatus | undefined;
+	cycleMonthFrom?: string | undefined;
+	cycleMonthUntil?: string | undefined;
+	limit?: number | undefined;
+	afterCursor?: StatementCursor | undefined;
 }
 
 // ============================================================================
@@ -1303,78 +1309,116 @@ export async function listCreditCards(
 ): Promise<CreditCardRecord[]> {
 	const userId = validateCcCanonicalUuid(params.userId, "userId");
 	const statusFilter = validateCardStatusFilter(params.status);
+	const validLimit =
+		params.limit !== undefined
+			? validatePositiveIntegerRange(params.limit, "limit", 1, 1000)
+			: 50;
 
 	try {
-		const allCards = await params.db
-			.select({
-				id: creditCards.id,
-				code: creditCards.code,
+		const latestRevsSq = params.db
+			.selectDistinctOn([creditCardRevisions.creditCardId], {
+				revisionId: creditCardRevisions.id,
+				creditCardId: creditCardRevisions.creditCardId,
+				userId: creditCardRevisions.userId,
+				revisionNo: creditCardRevisions.revisionNo,
+				status: creditCardRevisions.status,
+				displayName: creditCardRevisions.displayName,
+				issuer: creditCardRevisions.issuer,
+				statementDay: creditCardRevisions.statementDay,
+				dueDay: creditCardRevisions.dueDay,
+				creditLimit: creditCardRevisions.creditLimit,
+				lastFour: creditCardRevisions.lastFour,
+				note: creditCardRevisions.note,
 				createdAt: creditCards.createdAt,
+				code: creditCards.code,
 			})
-			.from(creditCards)
-			.where(eq(creditCards.userId, userId))
-			.orderBy(asc(creditCards.createdAt));
+			.from(creditCardRevisions)
+			.innerJoin(
+				creditCards,
+				eq(creditCards.id, creditCardRevisions.creditCardId),
+			)
+			.where(eq(creditCardRevisions.userId, userId))
+			.orderBy(
+				creditCardRevisions.creditCardId,
+				desc(creditCardRevisions.revisionNo),
+			)
+			.as("latest_card_revs");
+
+		const outerConditions = [];
+		if (statusFilter) {
+			outerConditions.push(eq(latestRevsSq.status, statusFilter));
+		}
+		if (params.afterCursor) {
+			const cursorCreatedAt = new Date(params.afterCursor.createdAt);
+			outerConditions.push(
+				or(
+					gt(latestRevsSq.createdAt, cursorCreatedAt),
+					and(
+						eq(latestRevsSq.createdAt, cursorCreatedAt),
+						gt(latestRevsSq.creditCardId, params.afterCursor.id),
+					),
+				),
+			);
+		}
+
+		const rows = await params.db
+			.select()
+			.from(latestRevsSq)
+			.where(outerConditions.length > 0 ? and(...outerConditions) : undefined)
+			.orderBy(asc(latestRevsSq.createdAt), asc(latestRevsSq.creditCardId))
+			.limit(validLimit);
+
+		if (rows.length === 0) {
+			return [];
+		}
+
+		const cardIds = rows.map((r) => r.creditCardId);
+		const links = await params.db
+			.select({
+				creditCardId: creditCardLedgerLinks.creditCardId,
+				liabilityAccountId: creditCardLedgerLinks.liabilityAccountId,
+			})
+			.from(creditCardLedgerLinks)
+			.where(
+				and(
+					eq(creditCardLedgerLinks.userId, userId),
+					inArray(creditCardLedgerLinks.creditCardId, cardIds),
+				),
+			);
+
+		const linkMap = new Map<string, string>();
+		for (const l of links) {
+			linkMap.set(l.creditCardId, l.liabilityAccountId);
+		}
 
 		const results: CreditCardRecord[] = [];
-		for (const card of allCards) {
-			const [latest] = await params.db
-				.select({
-					revisionNo: creditCardRevisions.revisionNo,
-					status: creditCardRevisions.status,
-					displayName: creditCardRevisions.displayName,
-					issuer: creditCardRevisions.issuer,
-					statementDay: creditCardRevisions.statementDay,
-					dueDay: creditCardRevisions.dueDay,
-					creditLimit: creditCardRevisions.creditLimit,
-					lastFour: creditCardRevisions.lastFour,
-					note: creditCardRevisions.note,
-				})
-				.from(creditCardRevisions)
-				.where(eq(creditCardRevisions.creditCardId, card.id))
-				.orderBy(desc(creditCardRevisions.revisionNo))
-				.limit(1);
-
-			if (!latest) continue;
-			if (statusFilter && latest.status !== statusFilter) continue;
-
-			const [link] = await params.db
-				.select({
-					liabilityAccountId: creditCardLedgerLinks.liabilityAccountId,
-				})
-				.from(creditCardLedgerLinks)
-				.where(
-					and(
-						eq(creditCardLedgerLinks.userId, userId),
-						eq(creditCardLedgerLinks.creditCardId, card.id),
-					),
-				)
-				.limit(1);
-
+		for (const row of rows) {
+			const liabilityAccountId = linkMap.get(row.creditCardId);
 			let liveLiabilityBalance = "0.00";
-			if (link) {
+			if (liabilityAccountId) {
 				const bal = await getLedgerAccountBalanceInTransaction({
 					tx: params.db as unknown as DatabaseTransaction,
 					userId,
-					accountId: link.liabilityAccountId,
+					accountId: liabilityAccountId,
 				});
 				liveLiabilityBalance = bal.balance;
 			}
 
 			results.push({
-				cardId: card.id,
+				cardId: row.creditCardId,
 				userId,
-				code: card.code,
-				status: latest.status as CreditCardStatus,
-				revisionNo: latest.revisionNo,
-				displayName: latest.displayName,
-				issuer: latest.issuer,
-				statementDay: latest.statementDay,
-				dueDay: latest.dueDay,
-				creditLimit: latest.creditLimit,
-				lastFour: latest.lastFour,
-				note: latest.note,
-				createdAt: card.createdAt,
-				liabilityAccountId: link?.liabilityAccountId,
+				code: row.code,
+				status: row.status as CreditCardStatus,
+				revisionNo: row.revisionNo,
+				displayName: row.displayName,
+				issuer: row.issuer,
+				statementDay: row.statementDay,
+				dueDay: row.dueDay,
+				creditLimit: row.creditLimit,
+				lastFour: row.lastFour,
+				note: row.note,
+				createdAt: row.createdAt,
+				liabilityAccountId,
 				liveLiabilityBalance,
 			});
 		}
@@ -2569,13 +2613,7 @@ export async function getCreditCardStatement(
 
 export async function listCreditCardStatementsInTransaction(
 	tx: DatabaseTransaction,
-	params: {
-		userId: string;
-		creditCardId?: string;
-		status?: CreditCardStatementStatus;
-		cycleMonthFrom?: string;
-		cycleMonthUntil?: string;
-	},
+	params: Omit<ListCreditCardStatementsParams, "db">,
 ): Promise<CreditCardStatementRecord[]> {
 	const canonicalUserId = validateCcCanonicalUuid(params.userId, "userId");
 	const canonicalCardId =
@@ -2583,6 +2621,10 @@ export async function listCreditCardStatementsInTransaction(
 			? validateCcCanonicalUuid(params.creditCardId, "creditCardId")
 			: undefined;
 	const statusFilter = validateStatementStatusFilter(params.status);
+	const validLimit =
+		params.limit !== undefined
+			? validatePositiveIntegerRange(params.limit, "limit", 1, 1000)
+			: 50;
 
 	let cycleFromYear: number | undefined;
 	let cycleFromMonth: number | undefined;
@@ -2642,42 +2684,12 @@ export async function listCreditCardStatementsInTransaction(
 			bucketMap.set(b.bucketId, b);
 		}
 
-		// 3. Load statement identities in one query
-		const allStmts = await tx
-			.select({
-				id: creditCardStatements.id,
-				cardId: creditCardStatements.creditCardId,
-				cycleYear: creditCardStatements.cycleYear,
-				cycleMonth: creditCardStatements.cycleMonth,
-				midasAccountId: creditCardStatements.midasAccountId,
-				midasReserveBucketId: creditCardStatements.midasReserveBucketId,
-			})
-			.from(creditCardStatements)
-			.where(
-				and(
-					eq(creditCardStatements.userId, canonicalUserId),
-					canonicalCardId
-						? eq(creditCardStatements.creditCardId, canonicalCardId)
-						: undefined,
-				),
-			)
-			.orderBy(
-				desc(creditCardStatements.cycleYear),
-				desc(creditCardStatements.cycleMonth),
-				asc(creditCardStatements.id),
-			);
-
-		if (allStmts.length === 0) {
-			return [];
-		}
-
-		const stmtIds = allStmts.map((s) => s.id);
-
-		// 4. Load all revisions for these statements in bulk
-		const allRevisions = await tx
-			.select({
-				id: creditCardStatementRevisions.id,
+		// 3. Subquery for latest statement revisions
+		const latestRevsSq = tx
+			.selectDistinctOn([creditCardStatementRevisions.statementId], {
+				revisionId: creditCardStatementRevisions.id,
 				statementId: creditCardStatementRevisions.statementId,
+				userId: creditCardStatementRevisions.userId,
 				revisionNo: creditCardStatementRevisions.revisionNo,
 				status: creditCardStatementRevisions.status,
 				statementAmount: creditCardStatementRevisions.statementAmount,
@@ -2685,46 +2697,107 @@ export async function listCreditCardStatementsInTransaction(
 				dueDate: creditCardStatementRevisions.dueDate,
 				reservePlacement: creditCardStatementRevisions.reservePlacement,
 				note: creditCardStatementRevisions.note,
+				cycleYear: creditCardStatements.cycleYear,
+				cycleMonth: creditCardStatements.cycleMonth,
+				creditCardId: creditCardStatements.creditCardId,
+				midasAccountId: creditCardStatements.midasAccountId,
+				midasReserveBucketId: creditCardStatements.midasReserveBucketId,
 			})
 			.from(creditCardStatementRevisions)
+			.innerJoin(
+				creditCardStatements,
+				eq(creditCardStatements.id, creditCardStatementRevisions.statementId),
+			)
 			.where(
 				and(
 					eq(creditCardStatementRevisions.userId, canonicalUserId),
-					inArray(creditCardStatementRevisions.statementId, stmtIds),
+					canonicalCardId
+						? eq(creditCardStatements.creditCardId, canonicalCardId)
+						: undefined,
 				),
 			)
 			.orderBy(
-				asc(creditCardStatementRevisions.statementId),
+				creditCardStatementRevisions.statementId,
 				desc(creditCardStatementRevisions.revisionNo),
-			);
+			)
+			.as("latest_statement_revs");
 
-		// 5. Derive latest revision per statement
-		const latestRevMap = new Map<string, (typeof allRevisions)[0]>();
-		for (const rev of allRevisions) {
-			if (!latestRevMap.has(rev.statementId)) {
-				latestRevMap.set(rev.statementId, rev);
-			}
+		// 4. Build outer filter conditions
+		const outerConditions = [];
+		if (statusFilter) {
+			outerConditions.push(eq(latestRevsSq.status, statusFilter));
+		}
+		if (cycleFromYear !== undefined && cycleFromMonth !== undefined) {
+			outerConditions.push(
+				or(
+					gt(latestRevsSq.cycleYear, cycleFromYear),
+					and(
+						eq(latestRevsSq.cycleYear, cycleFromYear),
+						gte(latestRevsSq.cycleMonth, cycleFromMonth),
+					),
+				),
+			);
+		}
+		if (cycleUntilYear !== undefined && cycleUntilMonth !== undefined) {
+			outerConditions.push(
+				or(
+					lt(latestRevsSq.cycleYear, cycleUntilYear),
+					and(
+						eq(latestRevsSq.cycleYear, cycleUntilYear),
+						lte(latestRevsSq.cycleMonth, cycleUntilMonth),
+					),
+				),
+			);
+		}
+		if (params.afterCursor) {
+			const { cycleYear, cycleMonth, id } = params.afterCursor;
+			outerConditions.push(
+				or(
+					lt(latestRevsSq.cycleYear, cycleYear),
+					and(
+						eq(latestRevsSq.cycleYear, cycleYear),
+						lt(latestRevsSq.cycleMonth, cycleMonth),
+					),
+					and(
+						eq(latestRevsSq.cycleYear, cycleYear),
+						eq(latestRevsSq.cycleMonth, cycleMonth),
+						gt(latestRevsSq.statementId, id),
+					),
+				),
+			);
+		}
+
+		// 5. Query filtered, ordered, paginated rows
+		const rows = await tx
+			.select()
+			.from(latestRevsSq)
+			.where(outerConditions.length > 0 ? and(...outerConditions) : undefined)
+			.orderBy(
+				desc(latestRevsSq.cycleYear),
+				desc(latestRevsSq.cycleMonth),
+				asc(latestRevsSq.statementId),
+			)
+			.limit(validLimit);
+
+		if (rows.length === 0) {
+			return [];
 		}
 
 		// 6. Map reserve buckets and validate ALL matched domain rows (fail closed)
 		const results: CreditCardStatementRecord[] = [];
 
-		for (const stmt of allStmts) {
-			const latest = latestRevMap.get(stmt.id);
-			if (!latest) continue;
-
-			// Find bucket in Midas state
-			const bucket = bucketMap.get(stmt.midasReserveBucketId);
+		for (const row of rows) {
+			const bucket = bucketMap.get(row.midasReserveBucketId);
 			if (!bucket) {
 				throw new CreditCardError(
 					"CREDIT_CARD_INVALID_STATE",
-					`Dedicated reserve bucket ${stmt.midasReserveBucketId} not found in Midas state for statement ${stmt.id}`,
+					`Dedicated reserve bucket ${row.midasReserveBucketId} not found in Midas state for statement ${row.statementId}`,
 				);
 			}
 			if (bucket.bucketType !== "CREDIT_CARD_RESERVE") {
 				throw new CreditCardError(
 					"CREDIT_CARD_INVALID_STATE",
-					`Reserve bucket ${stmt.midasReserveBucketId} has invalid bucketType: ${bucket.bucketType}`,
+					`Reserve bucket ${row.midasReserveBucketId} has invalid bucketType: ${bucket.bucketType}`,
 				);
 			}
 
@@ -2732,95 +2805,63 @@ export async function listCreditCardStatementsInTransaction(
 			if (parsedBal.cents < 0n) {
 				throw new CreditCardError(
 					"CREDIT_CARD_INVALID_STATE",
-					`Reserve bucket ${stmt.midasReserveBucketId} has negative balance: ${bucket.balance}`,
+					`Reserve bucket ${row.midasReserveBucketId} has negative balance: ${bucket.balance}`,
 				);
 			}
 
-			const placement = latest.reservePlacement as CreditCardReservePlacement;
+			const placement = row.reservePlacement as CreditCardReservePlacement;
 			const stmtAmountCents = parseSignedAggregateMoneyString(
-				latest.statementAmount,
+				row.statementAmount,
 			).cents;
 
 			// Fail-closed invariant validation
-			if (latest.status === "VOID") {
+			if (row.status === "VOID") {
 				if (parsedBal.cents !== 0n) {
 					throw new CreditCardError(
 						"CREDIT_CARD_INVALID_STATE",
-						`VOID statement ${stmt.id} has non-zero reserve bucket balance: ${bucket.balance}`,
+						`VOID statement ${row.statementId} has non-zero reserve bucket balance: ${bucket.balance}`,
 					);
 				}
-			} else if (latest.status === "PAID") {
+			} else if (row.status === "PAID") {
 				if (parsedBal.cents !== 0n) {
 					throw new CreditCardError(
 						"CREDIT_CARD_INVALID_STATE",
-						`PAID statement ${stmt.id} has non-zero reserve bucket balance: ${bucket.balance}`,
+						`PAID statement ${row.statementId} has non-zero reserve bucket balance: ${bucket.balance}`,
 					);
 				}
 			} else if (placement === "MIDAS_FUND") {
 				if (parsedBal.cents !== stmtAmountCents) {
 					throw new CreditCardError(
 						"CREDIT_CARD_INVALID_STATE",
-						`OPEN MIDAS_FUND statement ${stmt.id} has mismatched reserve: expected ${latest.statementAmount} found ${bucket.balance}`,
+						`OPEN MIDAS_FUND statement ${row.statementId} has mismatched reserve: expected ${row.statementAmount} found ${bucket.balance}`,
 					);
 				}
 			} else if (placement === "OUTSIDE_MIDAS") {
 				if (parsedBal.cents !== 0n) {
 					throw new CreditCardError(
 						"CREDIT_CARD_INVALID_STATE",
-						`OPEN OUTSIDE_MIDAS statement ${stmt.id} has non-zero reserve bucket balance: ${bucket.balance}`,
+						`OPEN OUTSIDE_MIDAS statement ${row.statementId} has non-zero reserve bucket balance: ${bucket.balance}`,
 					);
 				}
 			}
 
-			// Apply filters
-			if (statusFilter && latest.status !== statusFilter) continue;
-
-			if (cycleFromYear !== undefined && cycleFromMonth !== undefined) {
-				if (
-					stmt.cycleYear < cycleFromYear ||
-					(stmt.cycleYear === cycleFromYear && stmt.cycleMonth < cycleFromMonth)
-				) {
-					continue;
-				}
-			}
-			if (cycleUntilYear !== undefined && cycleUntilMonth !== undefined) {
-				if (
-					stmt.cycleYear > cycleUntilYear ||
-					(stmt.cycleYear === cycleUntilYear &&
-						stmt.cycleMonth > cycleUntilMonth)
-				) {
-					continue;
-				}
-			}
-
 			results.push({
-				statementId: stmt.id,
-				cardId: stmt.cardId,
+				statementId: row.statementId,
+				cardId: row.creditCardId,
 				userId: canonicalUserId,
-				cycleYear: stmt.cycleYear,
-				cycleMonth: stmt.cycleMonth,
-				status: latest.status as CreditCardStatementStatus,
-				revisionNo: latest.revisionNo,
-				statementAmount: latest.statementAmount,
-				statementDate: latest.statementDate,
-				dueDate: latest.dueDate,
-				reservePlacement: placement,
+				cycleYear: row.cycleYear,
+				cycleMonth: row.cycleMonth,
+				status: row.status as CreditCardStatementStatus,
+				revisionNo: row.revisionNo,
+				statementAmount: row.statementAmount,
+				statementDate: row.statementDate,
+				dueDate: row.dueDate,
+				reservePlacement: row.reservePlacement as CreditCardReservePlacement,
 				reserveAmount: bucket.balance,
 				reserveSatisfied: true,
-				note: latest.note,
+				note: row.note,
 			});
 		}
-
-		// 7. Sort: OPEN first (statementDate DESC, id ASC), then VOID after (same order)
-		results.sort((a, b) => {
-			const aOpen = a.status === "OPEN" ? 0 : 1;
-			const bOpen = b.status === "OPEN" ? 0 : 1;
-			if (aOpen !== bOpen) return aOpen - bOpen;
-			if (a.statementDate !== b.statementDate) {
-				return a.statementDate > b.statementDate ? -1 : 1;
-			}
-			return a.statementId < b.statementId ? -1 : 1;
-		});
 
 		return results;
 	} catch (err: unknown) {

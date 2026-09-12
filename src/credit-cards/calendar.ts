@@ -386,16 +386,24 @@ export function validateStatementStatusFilter(
  */
 export function validatePurchaseCategory(
 	value: unknown,
-): "MANDATORY" | "DISCRETIONARY" | "SHORT_TERM_PURCHASE" | "UNCLASSIFIED" {
+):
+	| "MANDATORY"
+	| "MANDATORY_EXPENSE"
+	| "DISCRETIONARY"
+	| "DISCRETIONARY_SPEND"
+	| "SHORT_TERM_PURCHASE"
+	| "UNCLASSIFIED" {
 	if (
 		value !== "MANDATORY" &&
+		value !== "MANDATORY_EXPENSE" &&
 		value !== "DISCRETIONARY" &&
+		value !== "DISCRETIONARY_SPEND" &&
 		value !== "SHORT_TERM_PURCHASE" &&
 		value !== "UNCLASSIFIED"
 	) {
 		throw new CreditCardError(
 			"CREDIT_CARD_INVALID_INPUT",
-			`Invalid purchaseCategory: "${String(value)}". Must be MANDATORY, DISCRETIONARY, SHORT_TERM_PURCHASE, or UNCLASSIFIED`,
+			`Invalid purchaseCategory: "${String(value)}". Must be MANDATORY, MANDATORY_EXPENSE, DISCRETIONARY, DISCRETIONARY_SPEND, SHORT_TERM_PURCHASE, or UNCLASSIFIED`,
 		);
 	}
 	return value;

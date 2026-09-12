@@ -534,21 +534,23 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
 All routes require session authentication (`__Host-gg_session` cookie) with user identity strictly bound to `c.get("auth").userId`. Mutating POST endpoints require `Origin: <WEBAUTHN_ORIGIN>` and closed bodies.
 
 #### 5.8.1 Credit Cards
-- **`GET /credit-cards`**: Bounded list of user's credit cards. Query parameters: `status` (`"ACTIVE"` | `"ARCHIVED"`), `limit` (default 50, max 100), `after` (card UUID cursor).
+- **`GET /credit-cards`**: Bounded list of user's credit cards. Query parameters: `status` (`"ACTIVE"` | `"ARCHIVED"`), `limit` (default 50, max 100), `after` (opaque base64url cursor). Ordered `createdAt ASC, id ASC`.
+  - Response: `{ cards: [ { cardId, userId, code, status, revisionNo, displayName, issuer, statementDay, dueDay, creditLimit, lastFour, note, createdAt, liabilityAccountId, liveLiabilityBalance } ], limit, hasMore, nextCursor }`.
 - **`GET /credit-cards/:id`**: Single card record. Returns 404 for missing or another user's card.
 - **`POST /credit-cards`**: Create a new credit card.
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ code, displayName, issuer, statementDay (1..31), dueDay (1..31), creditLimit, lastFour? (4 digits), note?, occurredAt }`
+  - Body (closed): `{ code, displayName (max 120), issuer (max 120), statementDay (1..31), dueDay (1..31), creditLimit, lastFour? (4 digits), note? (max 500), occurredAt }`
   - Automatically provisions ledger links and credit card system accounts.
 - **`POST /credit-cards/:id`**: Update credit card with OCC.
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ expectedRevisionNo, displayName, issuer, statementDay, dueDay, creditLimit, lastFour?, note?, changeReason?, occurredAt }`
+  - Body (closed): `{ expectedRevisionNo, displayName (max 120), issuer (max 120), statementDay, dueDay, creditLimit, lastFour?, note? (max 500), changeReason? (max 500), occurredAt }`
 - **`POST /credit-cards/:id/archive`**: Archive credit card.
   - Header: `Idempotency-Key` (required).
   - Body (closed): `{ expectedRevisionNo, changeReason?, occurredAt }`
 
 #### 5.8.2 Statements
-- **`GET /credit-cards/:cardId/statements`**: List statements for a card. Query parameters: `status` (`"OPEN"` | `"PAID"` | `"VOID"`), `cycleMonth` (`YYYY-MM`), `limit` (default 50, max 100), `after` (statement UUID cursor).
+- **`GET /credit-cards/:cardId/statements`**: List statements for a card. Query parameters: `status` (`"OPEN"` | `"PAID"` | `"VOID"`), `cycleMonth` (`YYYY-MM`), `limit` (default 50, max 100), `after` (opaque base64url cursor). Ordered `cycleYear DESC, cycleMonth DESC, id ASC`.
+  - Response: `{ statements: [ { statementId, cardId, userId, cycleYear, cycleMonth, status, revisionNo, statementAmount, statementDate, dueDate, reservePlacement, reserveAmount, reserveSatisfied, note } ], limit, hasMore, nextCursor }`.
 - **`GET /credit-cards/:cardId/statements/:id`**: Single statement record. Returns 404 if not found or card/user mismatch.
 - **`POST /credit-cards/:cardId/statements`**: Create monthly statement.
   - Header: `Idempotency-Key` (required).
@@ -572,7 +574,7 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
 
 #### 5.8.4 Payment-Readiness & Reconciliation
 - **`GET /credit-cards/:cardId/statements/:id/readiness`**: Pure read-only payment-readiness calculation.
-  - Returns `{ readiness: { cardId, statementId, cycleYear, cycleMonth, statementAmount, totalPostedPurchases, postedPurchaseCount, isExactMatch, isLiabilityCovered, uncoveredAmount, currentLiveLiabilityBalance, purchases } }`.
+  - Returns `{ readiness: { statementId, cardId, statementAmount, cardLiabilityBalance, reservePlacement ("MIDAS_FUND"|"OUTSIDE_MIDAS"), reserveAmount, liabilityCoverage ("READY"|"SHORTFALL"), liabilityAfterPayment } }`.
 - **`GET /credit-cards/:cardId/statements/:id/reconciliation`**: Stored component decomposition. Optional `?asOf=` timestamp query.
   - Returns `{ reconciliation: { statementId, status, revisionNo, statementRevisionId, reconciledStatementAmount, staleReason, components, personalAmount, externalAmountsByPerson } }`.
 - **`POST /credit-cards/:cardId/statements/:id/reconcile`**: Persist explicit statement reconciliation mutation.
@@ -583,11 +585,12 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
   - Body (closed): `{ expectedRevisionNo, occurredAt? }`
 
 #### 5.8.5 Unshared Purchases (Product Lifecycle)
-- **`GET /credit-cards/:cardId/purchases`**: List purchases for a card. Query parameters: `status` (`"POSTED"` | `"VOID"`), `purchaseDateFrom` / `fromDate`, `purchaseDateUntil` / `toDate`, `limit`, `after`.
+- **`GET /credit-cards/:cardId/purchases`**: List unshared purchases for a card (excludes opening balance events). Query parameters: `status` (`"POSTED"` | `"VOID"`), `purchaseDateFrom` / `fromDate` (`YYYY-MM-DD`), `purchaseDateUntil` / `toDate` (`YYYY-MM-DD`), `limit` (default 50, max 100), `after` (opaque base64url cursor). Ordered `purchaseDate DESC, occurredAt DESC, id ASC`.
+  - Response: `{ purchases: [ { eventId, cardId, userId, eventType ("PURCHASE"), status ("POSTED"|"VOID"), revisionNo, amount, personalExpenseAmount, externalReceivableAmount, split, purchaseDate, purchaseCategory, shortTermGoalId, merchant, description, installmentCount, canonicalTransactionId, canonicalRevisionId, journalEntryId, createdAt } ], limit, hasMore, nextCursor }`.
 - **`GET /credit-cards/:cardId/purchases/:id`**: Single purchase record.
 - **`POST /credit-cards/:cardId/purchases`**: Record an unshared purchase.
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ amount, purchaseCategory ("MANDATORY_EXPENSE"|"DISCRETIONARY_EXPENSE"|"SAVING_INVESTMENT"|"DEBT_REPAYMENT"), shortTermGoalId?, merchant?, description?, installmentCount?, occurredAt }`
+  - Body (closed): `{ amount, purchaseCategory ("MANDATORY_EXPENSE"|"DISCRETIONARY_SPEND"|"SHORT_TERM_PURCHASE"|"UNCLASSIFIED"), shortTermGoalId?, merchant?, description?, installmentCount?, occurredAt }`
 - **`POST /credit-cards/:cardId/purchases/:id`** & **`POST /credit-cards/:cardId/purchases/:id/revisions`**: Update unshared purchase with OCC.
   - Header: `Idempotency-Key` (required).
   - Body (closed): `{ expectedRevisionNo, amount, purchaseCategory, shortTermGoalId?, merchant?, description?, installmentCount?, reasonNote?, occurredAt }`
@@ -597,19 +600,56 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
 
 *Note: Shared purchases with participant splits are deferred to Checkpoint 7B.4 (People + Family).*
 
+#### 5.8.6 Opening Balance (Direct Setup / Onboarding Lifecycle)
+- **`GET /credit-cards/:cardId/opening-balance`**: Returns the card's opening balance liability event, or `{ openingBalance: null }` if not set.
+- **`POST /credit-cards/:cardId/opening-balance`**: Record initial credit card opening balance debt at onboarding/import time.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ amount, description?, occurredAt }`
+- **`POST /credit-cards/:cardId/opening-balance/:id`** & **`POST /credit-cards/:cardId/opening-balance/:id/revisions`**: Update opening balance with OCC.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, amount, description?, reasonNote?, occurredAt }`
+- **`POST /credit-cards/:cardId/opening-balance/:id/void`**: Void opening balance.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, reasonNote?, occurredAt }`
+
 **Credit Card Error Codes:**
 | Code | Status | Description |
 |------|--------|-------------|
 | `CREDIT_CARD_INVALID_INPUT` | 400 | Malformed parameter, invalid format, or closed-body rejection |
+| `CREDIT_CARD_LEDGER_ACCOUNT_INVALID` | 400 | Invalid ledger account for credit card |
+| `CREDIT_CARD_STATEMENT_RECONCILIATION_NOT_BALANCED` | 400 | Statement reconciliation is not balanced |
 | `CREDIT_CARD_NOT_FOUND` | 404 | Credit card not found or owned by another user |
 | `CREDIT_CARD_STATEMENT_NOT_FOUND` | 404 | Statement not found or card/user mismatch |
 | `CREDIT_CARD_PURCHASE_NOT_FOUND` | 404 | Purchase event not found or card/user mismatch |
-| `CREDIT_CARD_REVISION_CONFLICT` | 409 | Stale expectedRevisionNo on card mutation |
-| `CREDIT_CARD_STATEMENT_CONFLICT` | 409 | Stale expectedRevisionNo or invalid status on statement |
-| `CREDIT_CARD_PAYMENT_CONFLICT` | 409 | Stale expectedRevisionNo or invalid payment state |
-| `CREDIT_CARD_IDEMPOTENCY_CONFLICT` | 409 | Replay with different payload on same idempotency key |
-| `CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT` | 409 | Reconciliation revision conflict or component mismatch |
-| `CREDIT_CARD_CARD_ARCHIVED` | 409 | Mutation rejected because credit card is archived |
+| `CREDIT_CARD_PAYMENT_NOT_FOUND` | 404 | Credit card statement payment not found |
+| `CREDIT_CARD_LEDGER_LINK_NOT_FOUND` | 404 | Credit card ledger link not found |
+| `CREDIT_CARD_SYSTEM_ACCOUNT_NOT_FOUND` | 404 | Credit card system account not found |
+| `CREDIT_CARD_SPLIT_NOT_FOUND` | 404 | Credit card split not found |
+| `CREDIT_CARD_STATEMENT_RECONCILIATION_NOT_FOUND` | 404 | Statement reconciliation not found |
+| `CREDIT_CARD_NOT_ACTIVE` | 409 | Credit card is not active |
+| `CREDIT_CARD_CONFLICT` | 409 | Credit card code conflict |
+| `CREDIT_CARD_REVISION_CONFLICT` | 409 | Credit card revision is stale |
+| `CREDIT_CARD_STATEMENT_PERIOD_CONFLICT` | 409 | Credit card statement period conflict |
+| `CREDIT_CARD_STATEMENT_NOT_OPEN` | 409 | Credit card statement is not open |
+| `CREDIT_CARD_STATEMENT_REVISION_CONFLICT` | 409 | Credit card statement revision is stale |
+| `CREDIT_CARD_INSUFFICIENT_MIDAS_LIQUIDITY` | 409 | Insufficient Midas liquidity for reserve |
+| `CREDIT_CARD_RESERVE_CONFLICT` | 409 | Credit card reserve conflict |
+| `CREDIT_CARD_IDEMPOTENCY_CONFLICT` | 409 | Idempotency-Key was already used with a different request |
+| `CREDIT_CARD_INVALID_STATE` | 409 | Credit card invalid state transition |
+| `CREDIT_CARD_PURCHASE_NOT_ACTIVE` | 409 | Credit card purchase is not active |
+| `CREDIT_CARD_OPENING_BALANCE_CONFLICT` | 409 | Credit card opening balance conflict |
+| `CREDIT_CARD_LIABILITY_SHORTFALL` | 409 | Credit card liability shortfall |
+| `CREDIT_CARD_PAYMENT_CONFLICT` | 409 | Credit card statement payment conflict |
+| `CREDIT_CARD_STATEMENT_ALREADY_PAID` | 409 | Credit card statement is already paid |
+| `CREDIT_CARD_STATEMENT_NOT_PAID` | 409 | Credit card statement is not paid |
+| `CREDIT_CARD_CANNOT_ARCHIVE_WITH_LIABILITY` | 409 | Cannot archive credit card with outstanding liability |
+| `CREDIT_CARD_SPLIT_NOT_ACTIVE` | 409 | Credit card split is not active |
+| `CREDIT_CARD_SPLIT_REVISION_CONFLICT` | 409 | Credit card split revision is stale |
+| `CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT` | 409 | Credit card split idempotency conflict |
+| `CREDIT_CARD_SPLIT_CONFLICT` | 409 | Credit card split conflict |
+| `CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT` | 409 | Statement reconciliation conflict |
+| `CREDIT_CARD_STATEMENT_RECONCILIATION_IDEMPOTENCY_CONFLICT` | 409 | Statement reconciliation idempotency conflict |
+
 
 ---
 

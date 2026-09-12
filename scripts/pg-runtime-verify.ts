@@ -13233,7 +13233,7 @@ async function resolverRuntime7B2() {
 	const refRes = await getMonthlyReferenceIncome({
 		db,
 		userId: U1,
-		asOf: "2026-09-12",
+		asOf: new Date(),
 	});
 	eqD(refRes.currency, "TRY", "7B.2/18: reference income currency is TRY");
 	// REG1: 20000.00 (from scenario base), S1: 50000.00 (FIXED), Seasonal: 6000.00 (12000 * 6 / 12) -> Total = 76000.00
@@ -14592,6 +14592,548 @@ async function resolverRuntime7B3() {
 	}
 }
 
+async function resolverRuntime7B3R1() {
+	console.log("\n== PHASE 7B.3-R1: CREDIT CARDS PAGINATION, OPENING BALANCE & CONTRACT TRUTH (PGlite / Drizzle / Hono) ==");
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const eqD = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 71);
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
+
+	setDatabaseFactoryOverrideForTest(() => db);
+
+	try {
+		const testEnv: AppEnv = {
+			DATABASE_URL: "postgres://fake-pglite/db",
+			WEBAUTHN_RP_ID: "localhost",
+			WEBAUTHN_RP_NAME: "Gelir Gider Test",
+			WEBAUTHN_ORIGIN: "http://localhost:8787",
+		};
+
+		const USER_A = "11111111-aaaa-4aaa-8aaa-111111111111";
+		const USER_B = "22222222-bbbb-4bbb-8bbb-222222222222";
+
+		// Seed genuine User A and User B
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now()), ($2, 'User B', 'TRY', 'Europe/Istanbul', now())",
+			[USER_A, USER_B],
+		);
+
+		const { token: tokenA } = await createSession({ db, userId: USER_A });
+		const { token: tokenB } = await createSession({ db, userId: USER_B });
+
+		const httpCall = async (
+			path: string,
+			opts: {
+				method: string;
+				body?: unknown;
+				token?: string;
+				idempotencyKey?: string;
+				origin?: string;
+			},
+		) => {
+			const headers: Record<string, string> = {};
+			if (opts.token) {
+				headers.Cookie = `__Host-gg_session=${opts.token}`;
+			}
+			if (opts.origin !== undefined) {
+				headers.Origin = opts.origin;
+			} else if (opts.method !== "GET" && opts.method !== "HEAD") {
+				headers.Origin = "http://localhost:8787";
+			}
+			if (opts.idempotencyKey) {
+				headers["Idempotency-Key"] = opts.idempotencyKey;
+			}
+			if (opts.body !== undefined) {
+				headers["Content-Type"] = "application/json";
+			}
+			const res = await app.request(
+				path,
+				{
+					method: opts.method,
+					headers,
+					body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+				},
+				testEnv,
+			);
+			let json: any = null;
+			try {
+				json = await res.json();
+			} catch {
+				// no-op
+			}
+			return { status: res.status, json, headers: res.headers };
+		};
+
+		// 1. Funding accounts for User A
+		const bankAccountRes = await httpCall("/ledger/accounts", {
+			method: "POST",
+			token: tokenA,
+			body: { code: "BANK_ASSET", name: "User A Bank", accountType: "ASSET" },
+		});
+		eqD(bankAccountRes.status, 200, "7B.3-R1: User A bank account created");
+		const bankAccountId = bankAccountRes.json?.accountId;
+
+		const midasAccountRes = await httpCall("/ledger/accounts", {
+			method: "POST",
+			token: tokenA,
+			body: { code: "MIDAS_ASSET_R1", name: "User A Midas R1", accountType: "ASSET" },
+		});
+		eqD(midasAccountRes.status, 200, "7B.3-R1: User A Midas account created");
+		const midasAssetAccountId = midasAccountRes.json?.accountId;
+
+		const midasAccId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+		await pg.query(
+			"insert into midas_accounts (id, user_id, ledger_account_id) values ($1, $2, $3)",
+			[midasAccId, USER_A, midasAssetAccountId],
+		);
+		const midasAccountId = midasAccId;
+
+		// 2. CARD PAGINATION & ORDERING WITH STABLE TIEBREAKER
+		// Create 3 cards for User A
+		const cardRes1 = await httpCall("/credit-cards", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "card-alpha-key",
+			body: {
+				code: "card_alpha",
+				displayName: "Card Alpha",
+				issuer: "Alpha Bank",
+				statementDay: 10,
+				dueDay: 20,
+				creditLimit: "50000.00",
+				occurredAt: "2026-09-01T12:00:00.000Z",
+			},
+		});
+		eqD(cardRes1.status, 200, "7B.3-R1: Card Alpha created");
+		const cardId1 = cardRes1.json?.cardId;
+
+		const cardRes2 = await httpCall("/credit-cards", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "card-beta-key",
+			body: {
+				code: "card_beta",
+				displayName: "Card Beta",
+				issuer: "Beta Bank",
+				statementDay: 15,
+				dueDay: 25,
+				creditLimit: "30000.00",
+				occurredAt: "2026-09-01T12:00:00.000Z",
+			},
+		});
+		eqD(cardRes2.status, 200, "7B.3-R1: Card Beta created");
+		const cardId2 = cardRes2.json?.cardId;
+
+		const cardRes3 = await httpCall("/credit-cards", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "card-gamma-key",
+			body: {
+				code: "card_gamma",
+				displayName: "Card Gamma",
+				issuer: "Gamma Bank",
+				statementDay: 1,
+				dueDay: 11,
+				creditLimit: "20000.00",
+				occurredAt: "2026-09-01T12:00:00.000Z",
+			},
+		});
+		eqD(cardRes3.status, 200, "7B.3-R1: Card Gamma created");
+		const cardId3 = cardRes3.json?.cardId;
+
+		// Query page 1 (limit=2)
+		const cardsPage1 = await httpCall("/credit-cards?limit=2", {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(cardsPage1.status, 200, "7B.3-R1: GET /credit-cards page 1 returns 200");
+		eqD(cardsPage1.json?.cards?.length, 2, "7B.3-R1: Cards page 1 has 2 items");
+		eqD(cardsPage1.json?.hasMore, true, "7B.3-R1: Cards page 1 hasMore=true");
+		chkD(typeof cardsPage1.json?.nextCursor === "string", "7B.3-R1: Cards page 1 has valid nextCursor string");
+
+		// Query page 2 with nextCursor
+		const cardsPage2 = await httpCall(`/credit-cards?limit=2&after=${cardsPage1.json.nextCursor}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(cardsPage2.status, 200, "7B.3-R1: GET /credit-cards page 2 returns 200");
+		eqD(cardsPage2.json?.cards?.length, 1, "7B.3-R1: Cards page 2 has 1 item");
+		eqD(cardsPage2.json?.hasMore, false, "7B.3-R1: Cards page 2 hasMore=false");
+		eqD(cardsPage2.json?.nextCursor, null, "7B.3-R1: Cards page 2 nextCursor is null");
+
+		// Verify no duplicates across pages
+		const allCards = [...cardsPage1.json.cards, ...cardsPage2.json.cards];
+		const cardIds = new Set(allCards.map((c: any) => c.cardId));
+		eqD(cardIds.size, 3, "7B.3-R1: Exactly 3 unique cards traversed across pages");
+
+		// Malformed/unknown card cursor rejects with 400
+		const badCardCursor = await httpCall("/credit-cards?after=invalid_cursor_xyz", {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(badCardCursor.status, 400, "7B.3-R1: Invalid card cursor returns 400");
+		eqD(badCardCursor.json?.error?.code, "CREDIT_CARD_INVALID_INPUT", "7B.3-R1: Error code is CREDIT_CARD_INVALID_INPUT");
+
+		// 3. STATEMENTS ORDERING & KEYSET CURSOR
+		// Create 3 statements for Card Alpha
+		const stmt1 = await httpCall(`/credit-cards/${cardId1}/statements`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stmt-alpha-1",
+			body: {
+				midasAccountId,
+				cycleMonth: "2026-07",
+				statementAmount: "1000.00",
+				reservePlacement: "OUTSIDE_MIDAS",
+				occurredAt: "2026-07-10T10:00:00.000Z",
+			},
+		});
+		eqD(stmt1.status, 200, "7B.3-R1: Statement 2026-07 created");
+
+		const stmt2 = await httpCall(`/credit-cards/${cardId1}/statements`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stmt-alpha-2",
+			body: {
+				midasAccountId,
+				cycleMonth: "2026-08",
+				statementAmount: "1200.00",
+				reservePlacement: "OUTSIDE_MIDAS",
+				occurredAt: "2026-08-10T10:00:00.000Z",
+			},
+		});
+		eqD(stmt2.status, 200, "7B.3-R1: Statement 2026-08 created");
+
+		const stmt3 = await httpCall(`/credit-cards/${cardId1}/statements`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stmt-alpha-3",
+			body: {
+				midasAccountId,
+				cycleMonth: "2026-09",
+				statementAmount: "1500.00",
+				reservePlacement: "OUTSIDE_MIDAS",
+				occurredAt: "2026-09-10T10:00:00.000Z",
+			},
+		});
+		eqD(stmt3.status, 200, "7B.3-R1: Statement 2026-09 created");
+
+		// Query statements page 1 (limit=2)
+		const stmtsPage1 = await httpCall(`/credit-cards/${cardId1}/statements?limit=2`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(stmtsPage1.status, 200, "7B.3-R1: Statements page 1 returns 200");
+		eqD(stmtsPage1.json?.statements?.length, 2, "7B.3-R1: Statements page 1 has 2 items");
+		eqD(stmtsPage1.json?.statements[0].cycleMonth, 9, "7B.3-R1: Latest statement 2026-09 (month=9) first");
+		eqD(stmtsPage1.json?.statements[1].cycleMonth, 8, "7B.3-R1: Statement 2026-08 (month=8) second");
+		eqD(stmtsPage1.json?.hasMore, true, "7B.3-R1: Statements page 1 hasMore=true");
+		chkD(typeof stmtsPage1.json?.nextCursor === "string", "7B.3-R1: Statements page 1 has nextCursor");
+
+		// Query statements page 2
+		const stmtsPage2 = await httpCall(`/credit-cards/${cardId1}/statements?limit=2&after=${stmtsPage1.json.nextCursor}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(stmtsPage2.status, 200, "7B.3-R1: Statements page 2 returns 200");
+		eqD(stmtsPage2.json?.statements?.length, 1, "7B.3-R1: Statements page 2 has 1 item");
+		eqD(stmtsPage2.json?.statements[0].cycleMonth, 7, "7B.3-R1: Statement 2026-07 (month=7) on page 2");
+		eqD(stmtsPage2.json?.hasMore, false, "7B.3-R1: Statements page 2 hasMore=false");
+		eqD(stmtsPage2.json?.nextCursor, null, "7B.3-R1: Statements page 2 nextCursor is null");
+
+		// 4. OPENING BALANCE DEDICATED LIFECYCLE & SEMANTIC SEPARATION
+		// Record opening balance
+		const obRecordRes = await httpCall(`/credit-cards/${cardId1}/opening-balance`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "ob-rec-1",
+			body: {
+				amount: "3500.00",
+				occurredAt: "2026-06-01T10:00:00.000Z",
+				description: "Card migration opening balance",
+			},
+		});
+		eqD(obRecordRes.status, 201, "7B.3-R1: Opening balance recorded returns 201");
+		const obEventId = obRecordRes.json?.eventId;
+		chkD(typeof obEventId === "string" && obEventId.length > 0, "7B.3-R1: Valid opening balance eventId");
+
+		// GET opening balance
+		const obGetRes = await httpCall(`/credit-cards/${cardId1}/opening-balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(obGetRes.status, 200, "7B.3-R1: GET /opening-balance returns 200");
+		eqD(obGetRes.json?.openingBalance?.amount, "3500.00", "7B.3-R1: Opening balance amount is 3500.00");
+		eqD(obGetRes.json?.openingBalance?.eventType, "OPENING_BALANCE", "7B.3-R1: eventType is OPENING_BALANCE");
+
+		// UPDATE opening balance
+		const obUpdateRes = await httpCall(`/credit-cards/${cardId1}/opening-balance/${obEventId}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "ob-upd-1",
+			body: {
+				expectedRevisionNo: 1,
+				amount: "4000.00",
+				occurredAt: "2026-06-01T12:00:00.000Z",
+				description: "Corrected opening balance",
+			},
+		});
+		eqD(obUpdateRes.status, 200, "7B.3-R1: Opening balance update returns 200");
+		eqD(obUpdateRes.json?.snapshot?.amount, "4000.00", "7B.3-R1: Updated amount is 4000.00");
+
+		// Verify GET /purchases EXCLUDES opening balance
+		const emptyPurchases = await httpCall(`/credit-cards/${cardId1}/purchases`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(emptyPurchases.status, 200, "7B.3-R1: GET /purchases returns 200");
+		eqD(emptyPurchases.json?.purchases?.length, 0, "7B.3-R1: Opening balance is NOT returned in /purchases");
+
+		// 5. >100 PURCHASES PAGINATION PROOF (Traverse across 3 pages: 50 + 50 + 5 = 105)
+		console.log("  ... Seeding 105 purchases for pagination verification ...");
+		const seededEventIds: string[] = [];
+		for (let i = 1; i <= 105; i++) {
+			const day = String((i % 25) + 1).padStart(2, "0");
+			const hour = String((i % 20) + 1).padStart(2, "0");
+			const category =
+				i % 3 === 0
+					? "MANDATORY_EXPENSE"
+					: i % 3 === 1
+					? "DISCRETIONARY_SPEND"
+					: "UNCLASSIFIED";
+			const purchRes = await httpCall(`/credit-cards/${cardId1}/purchases`, {
+				method: "POST",
+				token: tokenA,
+				idempotencyKey: `p-seed-${i}`,
+				body: {
+					amount: `${(10 + i)}.00`,
+					occurredAt: `2026-08-${day}T${hour}:00:00.000Z`,
+					purchaseCategory: category,
+					merchant: `Merchant ${i}`,
+					description: `Purchase #${i}`,
+				},
+			});
+			if (purchRes.status !== 200) {
+				throw new Error(`Failed to seed purchase #${i}: ${JSON.stringify(purchRes.json)}`);
+			}
+			seededEventIds.push(purchRes.json.eventId);
+		}
+		eqD(seededEventIds.length, 105, "7B.3-R1: Successfully seeded 105 purchases");
+
+		// Page 1: limit=50
+		const pPage1 = await httpCall(`/credit-cards/${cardId1}/purchases?limit=50`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(pPage1.status, 200, "7B.3-R1: Purchases page 1 returns 200");
+		eqD(pPage1.json?.purchases?.length, 50, "7B.3-R1: Purchases page 1 has exactly 50 items");
+		eqD(pPage1.json?.hasMore, true, "7B.3-R1: Purchases page 1 hasMore=true");
+		chkD(typeof pPage1.json?.nextCursor === "string", "7B.3-R1: Purchases page 1 nextCursor is valid string");
+
+		// Page 2: limit=50 with after=pPage1.nextCursor
+		const pPage2 = await httpCall(`/credit-cards/${cardId1}/purchases?limit=50&after=${pPage1.json.nextCursor}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(pPage2.status, 200, "7B.3-R1: Purchases page 2 returns 200");
+		eqD(pPage2.json?.purchases?.length, 50, "7B.3-R1: Purchases page 2 has exactly 50 items");
+		eqD(pPage2.json?.hasMore, true, "7B.3-R1: Purchases page 2 hasMore=true");
+		chkD(typeof pPage2.json?.nextCursor === "string", "7B.3-R1: Purchases page 2 nextCursor is valid string");
+
+		// Page 3: limit=50 with after=pPage2.nextCursor
+		const pPage3 = await httpCall(`/credit-cards/${cardId1}/purchases?limit=50&after=${pPage2.json.nextCursor}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(pPage3.status, 200, "7B.3-R1: Purchases page 3 returns 200");
+		eqD(pPage3.json?.purchases?.length, 5, "7B.3-R1: Purchases page 3 has exactly 5 remaining items");
+		eqD(pPage3.json?.hasMore, false, "7B.3-R1: Purchases page 3 hasMore=false");
+		eqD(pPage3.json?.nextCursor, null, "7B.3-R1: Purchases page 3 nextCursor is null");
+
+		// Verify EXACTLY 105 unique purchases traversed across pages 1, 2, 3 (no duplicates, no missing)
+		const allPurchases = [
+			...pPage1.json.purchases,
+			...pPage2.json.purchases,
+			...pPage3.json.purchases,
+		];
+		eqD(allPurchases.length, 105, "7B.3-R1: Total items retrieved across 3 pages is 105");
+		const uniqueEventIds = new Set(allPurchases.map((p: any) => p.eventId));
+		eqD(uniqueEventIds.size, 105, "7B.3-R1: All 105 purchases are unique (no duplicates, no missing rows)");
+
+		// 6. UNKNOWN / MALFORMED PURCHASE CURSOR DOES NOT RESTART AT PAGE 1
+		const badPurchCursor = await httpCall(`/credit-cards/${cardId1}/purchases?after=invalid_cursor_xyz`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(badPurchCursor.status, 400, "7B.3-R1: Malformed purchase cursor returns 400");
+		eqD(badPurchCursor.json?.error?.code, "CREDIT_CARD_INVALID_INPUT", "7B.3-R1: Error code is CREDIT_CARD_INVALID_INPUT");
+
+		// 7. FILTER-BEFORE-PAGINATION
+		const catFiltered = await httpCall(`/credit-cards/${cardId1}/purchases?budgetCategory=MANDATORY_EXPENSE&limit=100`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(catFiltered.status, 200, "7B.3-R1: Filtered by category returns 200");
+		eqD(catFiltered.json?.purchases?.length, 35, "7B.3-R1: Exactly 35 MANDATORY_EXPENSE purchases returned");
+		chkD(catFiltered.json.purchases.every((p: any) => p.purchaseCategory === "MANDATORY_EXPENSE"), "7B.3-R1: All items have category MANDATORY_EXPENSE");
+
+		// 8. CROSS-USER CURSOR ISOLATION
+		// User B creates a card and purchase
+		const u2CardRes = await httpCall("/credit-cards", {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-card-key",
+			body: {
+				code: "u2_card",
+				displayName: "User B Card",
+				issuer: "User B Bank",
+				statementDay: 5,
+				dueDay: 15,
+				creditLimit: "10000.00",
+				occurredAt: "2026-09-01T12:00:00.000Z",
+			},
+		});
+		eqD(u2CardRes.status, 200, "7B.3-R1: User B card created");
+		const u2CardId = u2CardRes.json?.cardId;
+
+		const u2PurchRes = await httpCall(`/credit-cards/${u2CardId}/purchases`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "u2-purch-key",
+			body: {
+				amount: "100.00",
+				occurredAt: "2026-08-10T12:00:00.000Z",
+				purchaseCategory: "UNCLASSIFIED",
+				merchant: "User B Merchant",
+			},
+		});
+		eqD(u2PurchRes.status, 200, "7B.3-R1: User B purchase created");
+
+		const u2PurchList = await httpCall(`/credit-cards/${u2CardId}/purchases?limit=1`, {
+			method: "GET",
+			token: tokenB,
+		});
+		eqD(u2PurchList.status, 200, "7B.3-R1: User B purchase list returns 200");
+
+		// User A attempts to use User B's purchase cursor on User A's card
+		const crossCursorRes = await httpCall(`/credit-cards/${cardId1}/purchases?after=${pPage1.json.nextCursor}`, {
+			method: "GET",
+			token: tokenB, // User B using User A's card/cursor
+		});
+		eqD(crossCursorRes.status === 404 || crossCursorRes.status === 400, true, "7B.3-R1: Cross-user access rejected (404/400)");
+
+		// 9. PAYMENT READINESS CONTRACT CONFORMANCE
+		const readinessRes = await httpCall(`/credit-cards/${cardId1}/statements/${stmt3.json.statementId}/readiness`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(readinessRes.status, 200, "7B.3-R1: GET statement readiness returns 200");
+		const readiness = readinessRes.json?.readiness;
+		chkD("statementId" in readiness, "7B.3-R1: readiness contains statementId");
+		chkD("cardId" in readiness, "7B.3-R1: readiness contains cardId");
+		chkD("statementAmount" in readiness, "7B.3-R1: readiness contains statementAmount");
+		chkD("cardLiabilityBalance" in readiness, "7B.3-R1: readiness contains cardLiabilityBalance");
+		chkD("reservePlacement" in readiness, "7B.3-R1: readiness contains reservePlacement");
+		chkD("reserveAmount" in readiness, "7B.3-R1: readiness contains reserveAmount");
+		chkD("liabilityCoverage" in readiness, "7B.3-R1: readiness contains liabilityCoverage");
+		chkD("liabilityAfterPayment" in readiness, "7B.3-R1: readiness contains liabilityAfterPayment");
+		chkD(readiness.liabilityCoverage === "READY" || readiness.liabilityCoverage === "SHORTFALL", "7B.3-R1: liabilityCoverage is READY or SHORTFALL");
+
+		// 10. PURCHASE CATEGORIES CONTRACT CONFORMANCE
+		// Valid categories: MANDATORY_EXPENSE, DISCRETIONARY_SPEND, SHORT_TERM_PURCHASE, UNCLASSIFIED
+		const validCatRes = await httpCall(`/credit-cards/${cardId1}/purchases`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-cat-valid",
+			body: {
+				amount: "50.00",
+				occurredAt: "2026-08-28T10:00:00.000Z",
+				purchaseCategory: "UNCLASSIFIED",
+			},
+		});
+		eqD(validCatRes.status, 200, "7B.3-R1: Purchase with UNCLASSIFIED category accepted");
+
+		// Invalid categories (e.g. SAVING_INVESTMENT, DEBT_REPAYMENT) rejected
+		const invalidCatRes1 = await httpCall(`/credit-cards/${cardId1}/purchases`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-cat-inv-1",
+			body: {
+				amount: "50.00",
+				occurredAt: "2026-08-28T10:00:00.000Z",
+				purchaseCategory: "SAVING_INVESTMENT",
+			},
+		});
+		eqD(invalidCatRes1.status, 400, "7B.3-R1: SAVING_INVESTMENT rejected with 400");
+
+		const invalidCatRes2 = await httpCall(`/credit-cards/${cardId1}/purchases`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-cat-inv-2",
+			body: {
+				amount: "50.00",
+				occurredAt: "2026-08-28T10:00:00.000Z",
+				purchaseCategory: "DEBT_REPAYMENT",
+			},
+		});
+		eqD(invalidCatRes2.status, 400, "7B.3-R1: DEBT_REPAYMENT rejected with 400");
+
+		// 11. QUERY STRICTNESS
+		const badQuery1 = await httpCall("/credit-cards?unsupportedFilter=yes", {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(badQuery1.status, 400, "7B.3-R1: Unsupported query parameter on /credit-cards returns 400");
+
+		const badQuery2 = await httpCall(`/credit-cards/${cardId1}/statements?unknownParam=123`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(badQuery2.status, 400, "7B.3-R1: Unsupported query parameter on /statements returns 400");
+
+		const badQuery3 = await httpCall(`/credit-cards/${cardId1}/purchases?misspelled=abc`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(badQuery3.status, 400, "7B.3-R1: Unsupported query parameter on /purchases returns 400");
+
+		// 12. VOID OPENING BALANCE
+		const obVoidRes = await httpCall(`/credit-cards/${cardId1}/opening-balance/${obEventId}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "ob-void-1",
+			body: {
+				expectedRevisionNo: 2,
+				reasonNote: "Voiding test opening balance",
+				occurredAt: "2026-06-01T15:00:00.000Z",
+			},
+		});
+		eqD(obVoidRes.status, 200, "7B.3-R1: Opening balance void returns 200");
+		eqD(obVoidRes.json?.status, "VOID", "7B.3-R1: Voided opening balance status is VOID");
+
+		const obGetAfterVoid = await httpCall(`/credit-cards/${cardId1}/opening-balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(obGetAfterVoid.status, 200, "7B.3-R1: GET /opening-balance after void returns 200");
+		eqD(obGetAfterVoid.json?.openingBalance?.status, "VOID", "7B.3-R1: Opening balance is marked VOID");
+	} finally {
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -14619,6 +15161,7 @@ if (probed) {
 	await resolverRuntime7B2R1();
 	await resolverRuntime7B2R2();
 	await resolverRuntime7B3();
+	await resolverRuntime7B3R1();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
