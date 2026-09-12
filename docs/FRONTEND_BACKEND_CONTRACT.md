@@ -534,7 +534,7 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
 All routes require session authentication (`__Host-gg_session` cookie) with user identity strictly bound to `c.get("auth").userId`. Mutating POST endpoints require `Origin: <WEBAUTHN_ORIGIN>` and closed bodies.
 
 #### 5.8.1 Credit Cards
-- **`GET /credit-cards`**: Bounded list of user's credit cards. Query parameters: `status` (`"ACTIVE"` | `"ARCHIVED"`), `limit` (default 50, max 100), `after` (opaque base64url cursor). Ordered `createdAt ASC, id ASC`.
+- **`GET /credit-cards`**: Bounded list of user's credit cards. Query parameters: `status` (`"ACTIVE"` | `"ARCHIVED"`), `limit` (default 50, max 100), `after` (opaque stateless keyset cursor). Ordered `createdAt ASC, id ASC`.
   - Response: `{ cards: [ { cardId, userId, code, status, revisionNo, displayName, issuer, statementDay, dueDay, creditLimit, lastFour, note, createdAt, liabilityAccountId, liveLiabilityBalance } ], limit, hasMore, nextCursor }`.
 - **`GET /credit-cards/:id`**: Single card record. Returns 404 for missing or another user's card.
 - **`POST /credit-cards`**: Create a new credit card.
@@ -549,7 +549,7 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
   - Body (closed): `{ expectedRevisionNo, changeReason?, occurredAt }`
 
 #### 5.8.2 Statements
-- **`GET /credit-cards/:cardId/statements`**: List statements for a card. Query parameters: `status` (`"OPEN"` | `"PAID"` | `"VOID"`), `cycleMonth` (`YYYY-MM`), `limit` (default 50, max 100), `after` (opaque base64url cursor). Ordered `cycleYear DESC, cycleMonth DESC, id ASC`.
+- **`GET /credit-cards/:cardId/statements`**: List statements for a card. Query parameters: `status` (`"OPEN"` | `"PAID"` | `"VOID"`), `cycleMonth` (`YYYY-MM`), `limit` (default 50, max 100), `after` (opaque stateless keyset cursor). Ordered `cycleYear DESC, cycleMonth DESC, id ASC`.
   - Response: `{ statements: [ { statementId, cardId, userId, cycleYear, cycleMonth, status, revisionNo, statementAmount, statementDate, dueDate, reservePlacement, reserveAmount, reserveSatisfied, note } ], limit, hasMore, nextCursor }`.
 - **`GET /credit-cards/:cardId/statements/:id`**: Single statement record. Returns 404 if not found or card/user mismatch.
 - **`POST /credit-cards/:cardId/statements`**: Create monthly statement.
@@ -585,18 +585,20 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
   - Body (closed): `{ expectedRevisionNo, occurredAt? }`
 
 #### 5.8.5 Unshared Purchases (Product Lifecycle)
-- **`GET /credit-cards/:cardId/purchases`**: List unshared purchases for a card (excludes opening balance events). Query parameters: `status` (`"POSTED"` | `"VOID"`), `purchaseDateFrom` / `fromDate` (`YYYY-MM-DD`), `purchaseDateUntil` / `toDate` (`YYYY-MM-DD`), `limit` (default 50, max 100), `after` (opaque base64url cursor). Ordered `purchaseDate DESC, occurredAt DESC, id ASC`.
-  - Response: `{ purchases: [ { eventId, cardId, userId, eventType ("PURCHASE"), status ("POSTED"|"VOID"), revisionNo, amount, personalExpenseAmount, externalReceivableAmount, split, purchaseDate, purchaseCategory, shortTermGoalId, merchant, description, installmentCount, canonicalTransactionId, canonicalRevisionId, journalEntryId, createdAt } ], limit, hasMore, nextCursor }`.
-- **`GET /credit-cards/:cardId/purchases/:id`**: Single purchase record.
+- **`GET /credit-cards/:cardId/purchases`**: List unshared purchases for a card (excludes opening balance events). Query parameters: `purchaseCategory` (aliases `budgetCategory` and `category` supported; supplying more than one category alias in the same request returns `400 CREDIT_CARD_INVALID_INPUT`), `status` (`"POSTED"` | `"VOID"`), `purchaseDateFrom` / `fromDate` (`YYYY-MM-DD`), `purchaseDateUntil` / `toDate` (`YYYY-MM-DD`), `limit` (default 50, max 100), `after` (opaque stateless keyset cursor). Ordered `purchaseDate DESC, occurredAt DESC, id ASC`.
+  - Response: `{ purchases: [ { eventId, cardId, userId, eventType ("PURCHASE"), status ("POSTED"|"VOID"), revisionNo, amount, personalExpenseAmount, externalReceivableAmount, split, purchaseDate, purchaseCategory, shortTermGoalId, merchant, description, installmentCount, canonicalTransactionId, canonicalRevisionId, journalEntryId, occurredAt, createdAt } ], limit, hasMore, nextCursor }`.
+- **`GET /credit-cards/:cardId/purchases/:id`**: Single purchase record. Returns only eventType `PURCHASE`. If the event ID corresponds to an opening balance or non-purchase event, returns `404 CREDIT_CARD_PURCHASE_NOT_FOUND` without leaking event type (opening balances are isolated under `/credit-cards/:cardId/opening-balance`).
 - **`POST /credit-cards/:cardId/purchases`**: Record an unshared purchase.
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ amount, purchaseCategory ("MANDATORY_EXPENSE"|"DISCRETIONARY_SPEND"|"SHORT_TERM_PURCHASE"|"UNCLASSIFIED"), shortTermGoalId?, merchant?, description?, installmentCount?, occurredAt }`
+  - Body (closed): `{ amount, purchaseCategory ("MANDATORY_EXPENSE"|"DISCRETIONARY_SPEND"|"SHORT_TERM_PURCHASE"|"UNCLASSIFIED"), shortTermGoalId?, merchant?, description?, installmentCount? (1..60), occurredAt }`
 - **`POST /credit-cards/:cardId/purchases/:id`** & **`POST /credit-cards/:cardId/purchases/:id/revisions`**: Update unshared purchase with OCC.
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ expectedRevisionNo, amount, purchaseCategory, shortTermGoalId?, merchant?, description?, installmentCount?, reasonNote?, occurredAt }`
+  - Body (closed): `{ expectedRevisionNo, amount, purchaseCategory, shortTermGoalId?, merchant?, description?, installmentCount? (1..60), reasonNote?, occurredAt }`
+  - Preflight checks require eventType `PURCHASE`; returns `404 CREDIT_CARD_PURCHASE_NOT_FOUND` if the target event is not a purchase.
 - **`POST /credit-cards/:cardId/purchases/:id/void`**: Void unshared purchase.
   - Header: `Idempotency-Key` (required).
   - Body (closed): `{ expectedRevisionNo, reasonNote?, occurredAt }`
+  - Preflight checks require eventType `PURCHASE`; returns `404 CREDIT_CARD_PURCHASE_NOT_FOUND` if the target event is not a purchase.
 
 *Note: Shared purchases with participant splits are deferred to Checkpoint 7B.4 (People + Family).*
 

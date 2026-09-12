@@ -1032,5 +1032,127 @@ describe("Credit Cards Product HTTP Surface (Checkpoint 7B.3)", () => {
 			const body = (await res.json()) as JsonAny;
 			expect(body.status).toBe("VOID");
 		});
+
+		it("GET /credit-cards/:cardId/purchases/:id returns 404 for OPENING_BALANCE event", async () => {
+			vi.spyOn(purchasesModule, "getCreditCardPurchase").mockResolvedValueOnce({
+				eventId: EVENT_ID,
+				cardId: CARD_ID,
+				userId: U1,
+				eventType: "OPENING_BALANCE",
+				status: "POSTED",
+				revisionNo: 1,
+				amount: "500.00",
+				personalExpenseAmount: "500.00",
+				externalReceivableAmount: "0.00",
+				split: null,
+				purchaseDate: null,
+				purchaseCategory: null,
+				shortTermGoalId: null,
+				merchant: null,
+				description: "Opening Balance",
+				installmentCount: null,
+				canonicalTransactionId: "tx-ob1",
+				canonicalRevisionId: "11111111-1111-4111-8111-111111111111",
+				journalEntryId: null,
+				occurredAt: new Date("2026-09-10T12:00:00.000Z"),
+				createdAt: new Date("2026-09-10T12:00:00.000Z"),
+			});
+
+			const res = await app.request(
+				`/credit-cards/${CARD_ID}/purchases/${EVENT_ID}`,
+				{
+					method: "GET",
+					headers: {
+						Cookie: COOKIE,
+					},
+				},
+				mockEnv,
+			);
+			expect(res.status).toBe(404);
+			const body = (await res.json()) as JsonAny;
+			expect(body.error.code).toBe("CREDIT_CARD_PURCHASE_NOT_FOUND");
+		});
+
+		it("POST /credit-cards/:cardId/purchases accepts installmentCount 60 and rejects 61", async () => {
+			vi.spyOn(
+				purchasesModule,
+				"recordCreditCardPurchase",
+			).mockResolvedValueOnce({
+				eventId: EVENT_ID,
+				revisionId: "ev-rev-1",
+				revisionNo: 1,
+				operation: "CREATE",
+				status: "POSTED",
+				idempotentReplay: false,
+				snapshot: {
+					amount: "600.00",
+					purchaseDate: "2026-09-10",
+					purchaseCategory: "MANDATORY_EXPENSE",
+					shortTermGoalId: null,
+					merchant: null,
+					description: null,
+					installmentCount: 60,
+					reasonNote: null,
+				},
+			});
+
+			const res60 = await app.request(
+				`/credit-cards/${CARD_ID}/purchases`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "purch-inst-60",
+					},
+					body: JSON.stringify({
+						amount: "600.00",
+						purchaseCategory: "MANDATORY_EXPENSE",
+						installmentCount: 60,
+						occurredAt: OCCURRED_AT,
+					}),
+				},
+				mockEnv,
+			);
+			expect(res60.status).toBe(200);
+
+			const res61 = await app.request(
+				`/credit-cards/${CARD_ID}/purchases`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "purch-inst-61",
+					},
+					body: JSON.stringify({
+						amount: "610.00",
+						purchaseCategory: "MANDATORY_EXPENSE",
+						installmentCount: 61,
+						occurredAt: OCCURRED_AT,
+					}),
+				},
+				mockEnv,
+			);
+			expect(res61.status).toBe(400);
+		});
+
+		it("GET /credit-cards/:cardId/purchases rejects multiple category aliases with 400", async () => {
+			const res = await app.request(
+				`/credit-cards/${CARD_ID}/purchases?purchaseCategory=MANDATORY_EXPENSE&category=MANDATORY_EXPENSE`,
+				{
+					method: "GET",
+					headers: {
+						Cookie: COOKIE,
+					},
+				},
+				mockEnv,
+			);
+			expect(res.status).toBe(400);
+			const body = (await res.json()) as JsonAny;
+			expect(body.error.code).toBe("CREDIT_CARD_INVALID_INPUT");
+		});
 	});
 });

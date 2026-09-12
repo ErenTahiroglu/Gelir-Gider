@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { type AppEnv, getDatabaseUrl } from "../config/env";
+import { validateGregorianDateString } from "../credit-cards/calendar";
 import { CreditCardError } from "../credit-cards/errors";
 import {
 	type CardCursor,
@@ -1470,9 +1471,19 @@ creditCardRouter.get("/:cardId/purchases", async (c) => {
 		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 	}
 
+	const categoryKeysPresent = [
+		c.req.query("budgetCategory"),
+		c.req.query("purchaseCategory"),
+		c.req.query("category"),
+	].filter((v) => v !== undefined);
+
+	if (categoryKeysPresent.length > 1) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
 	const rawCategory =
-		c.req.query("budgetCategory") ??
 		c.req.query("purchaseCategory") ??
+		c.req.query("budgetCategory") ??
 		c.req.query("category");
 	let categoryFilter:
 		| "MANDATORY_EXPENSE"
@@ -1503,11 +1514,19 @@ creditCardRouter.get("/:cardId/purchases", async (c) => {
 
 	const fromDate = c.req.query("purchaseDateFrom") ?? c.req.query("fromDate");
 	const toDate = c.req.query("purchaseDateUntil") ?? c.req.query("toDate");
-	if (fromDate && !/^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
-		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	if (fromDate) {
+		try {
+			validateGregorianDateString(fromDate, "fromDate");
+		} catch {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
 	}
-	if (toDate && !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
-		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	if (toDate) {
+		try {
+			validateGregorianDateString(toDate, "toDate");
+		} catch {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
 	}
 
 	const afterQuery = c.req.query("after");
@@ -1582,7 +1601,11 @@ creditCardRouter.get("/:cardId/purchases/:id", async (c) => {
 			eventId,
 		});
 
-		if (!purchase || purchase.cardId !== cardId)
+		if (
+			!purchase ||
+			purchase.cardId !== cardId ||
+			purchase.eventType !== "PURCHASE"
+		)
 			return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
 		return c.json({ purchase });
 	} catch (err) {
@@ -1678,7 +1701,7 @@ creditCardRouter.post("/:cardId/purchases", async (c) => {
 			typeof installmentCount !== "number" ||
 			!Number.isInteger(installmentCount) ||
 			installmentCount < 1 ||
-			installmentCount > 36
+			installmentCount > 60
 		) {
 			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 		}
@@ -1787,7 +1810,7 @@ async function handleUpdatePurchase(c: Context<CreditCardEnv>) {
 			typeof installmentCount !== "number" ||
 			!Number.isInteger(installmentCount) ||
 			installmentCount < 1 ||
-			installmentCount > 36
+			installmentCount > 60
 		) {
 			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
 		}
@@ -1808,7 +1831,11 @@ async function handleUpdatePurchase(c: Context<CreditCardEnv>) {
 			userId: auth.userId,
 			eventId,
 		});
-		if (!existing || existing.cardId !== cardId)
+		if (
+			!existing ||
+			existing.cardId !== cardId ||
+			existing.eventType !== "PURCHASE"
+		)
 			return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
 
 		const result = await updateCreditCardPurchase({
@@ -1893,7 +1920,11 @@ creditCardRouter.post("/:cardId/purchases/:id/void", async (c) => {
 			userId: auth.userId,
 			eventId,
 		});
-		if (!existing || existing.cardId !== cardId)
+		if (
+			!existing ||
+			existing.cardId !== cardId ||
+			existing.eventType !== "PURCHASE"
+		)
 			return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
 
 		const result = await voidCreditCardPurchase({

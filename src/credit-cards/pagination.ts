@@ -1,4 +1,5 @@
 import { isUuid, parseCanonicalInstant } from "../http/transport";
+import { validateGregorianDateString } from "./calendar";
 import { CreditCardError } from "./errors";
 
 export interface CardCursor {
@@ -95,7 +96,6 @@ export function decodePurchaseCursor(raw: string): PurchaseCursor {
 			typeof parsed !== "object" ||
 			parsed === null ||
 			typeof parsed.purchaseDate !== "string" ||
-			!/^\d{4}-\d{2}-\d{2}$/.test(parsed.purchaseDate) ||
 			typeof parsed.occurredAt !== "string" ||
 			!parseCanonicalInstant(parsed.occurredAt) ||
 			typeof parsed.eventId !== "string" ||
@@ -103,6 +103,7 @@ export function decodePurchaseCursor(raw: string): PurchaseCursor {
 		) {
 			throw new Error("Invalid purchase cursor payload");
 		}
+		validateGregorianDateString(parsed.purchaseDate, "purchaseDate");
 		return {
 			purchaseDate: parsed.purchaseDate,
 			occurredAt: parsed.occurredAt,

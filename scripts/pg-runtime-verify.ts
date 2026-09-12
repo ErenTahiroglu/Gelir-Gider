@@ -13233,7 +13233,7 @@ async function resolverRuntime7B2() {
 	const refRes = await getMonthlyReferenceIncome({
 		db,
 		userId: U1,
-		asOf: new Date(),
+		asOf: new Date("2026-09-12T23:59:59.999Z"),
 	});
 	eqD(refRes.currency, "TRY", "7B.2/18: reference income currency is TRY");
 	// REG1: 20000.00 (from scenario base), S1: 50000.00 (FIXED), Seasonal: 6000.00 (12000 * 6 / 12) -> Total = 76000.00
@@ -15134,6 +15134,341 @@ async function resolverRuntime7B3R1() {
 	}
 }
 
+async function resolverRuntime7B3R2() {
+	console.log("\n== PHASE 7B.3-R2: FINAL CREDIT-CARD PRODUCT-BOUNDARY CLOSURE (drizzle / PGlite) ==");
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const eqD = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	const isUuid = (val: unknown): val is string =>
+		typeof val === "string" &&
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
+
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 71);
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
+	setDatabaseFactoryOverrideForTest(() => db);
+
+	try {
+		const testEnv: AppEnv = {
+			DATABASE_URL: "postgres://fake-pglite/db",
+			WEBAUTHN_RP_ID: "localhost",
+			WEBAUTHN_RP_NAME: "Gelir Gider Test",
+			WEBAUTHN_ORIGIN: "http://localhost:8787",
+		};
+
+		const USER_A = "11111111-aaaa-4aaa-8aaa-111111111111";
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now())",
+			[USER_A],
+		);
+
+		const { token: tokenA } = await createSession({ db, userId: USER_A });
+
+		const httpCall = async (
+			path: string,
+			opts: {
+				method?: string;
+				body?: unknown;
+				token?: string;
+				idempotencyKey?: string;
+				origin?: string;
+			} = {},
+		) => {
+			const headers: Record<string, string> = {};
+			if (opts.token) {
+				headers.Cookie = `__Host-gg_session=${opts.token}`;
+			}
+			if (opts.origin !== undefined) {
+				headers.Origin = opts.origin;
+			} else if (opts.method !== "GET" && opts.method !== "HEAD") {
+				headers.Origin = "http://localhost:8787";
+			}
+			if (opts.idempotencyKey) {
+				headers["Idempotency-Key"] = opts.idempotencyKey;
+			}
+			if (opts.body !== undefined) {
+				headers["Content-Type"] = "application/json";
+			}
+			const res = await app.request(
+				path,
+				{
+					method: opts.method ?? "GET",
+					headers,
+					body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+				},
+				testEnv,
+			);
+			let json: any = null;
+			try {
+				json = await res.json();
+			} catch {
+				// no-op
+			}
+			return { status: res.status, json, headers: res.headers };
+		};
+
+		// 1. Setup Card
+		const cardRes = await httpCall("/credit-cards", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "card-7b3r2-1",
+			body: {
+				code: "card_r2_test",
+				displayName: "Card R2 Test",
+				issuer: "Bank R2",
+				statementDay: 15,
+				dueDay: 25,
+				creditLimit: "50000.00",
+				occurredAt: "2026-06-01T10:00:00.000Z",
+			},
+		});
+		eqD(cardRes.status, 200, "7B.3-R2: Card created");
+		const cardId = cardRes.json?.cardId;
+
+		// 2. Setup Opening Balance
+		const obCreateRes = await httpCall(`/credit-cards/${cardId}/opening-balance`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "ob-r2-create",
+			body: {
+				amount: "1500.00",
+				description: "Initial Onboarding Balance",
+				occurredAt: "2026-06-01T10:05:00.000Z",
+			},
+		});
+		eqD(obCreateRes.status, 201, "7B.3-R2: Opening balance created");
+		const obEventId = obCreateRes.json?.eventId;
+		chkD(isUuid(obEventId), "7B.3-R2: Opening balance eventId is valid UUID");
+
+		// 3. Opening-Balance isolation: GET /purchases/:id with opening balance event ID
+		const getObAsPurchase = await httpCall(`/credit-cards/${cardId}/purchases/${obEventId}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getObAsPurchase.status, 404, "7B.3-R2: GET /purchases/:obId returns 404");
+		eqD(getObAsPurchase.json?.error?.code, "CREDIT_CARD_PURCHASE_NOT_FOUND", "7B.3-R2: Error code is CREDIT_CARD_PURCHASE_NOT_FOUND");
+
+		// 4. Opening-Balance isolation: UPDATE purchase with opening balance event ID
+		const updateObAsPurchase = await httpCall(`/credit-cards/${cardId}/purchases/${obEventId}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "upd-ob-as-purch",
+			body: {
+				expectedRevisionNo: 1,
+				amount: "1600.00",
+				purchaseCategory: "MANDATORY_EXPENSE",
+				occurredAt: "2026-06-01T11:00:00.000Z",
+			},
+		});
+		eqD(updateObAsPurchase.status, 404, "7B.3-R2: POST /purchases/:obId returns 404");
+		eqD(updateObAsPurchase.json?.error?.code, "CREDIT_CARD_PURCHASE_NOT_FOUND", "7B.3-R2: Update error code is CREDIT_CARD_PURCHASE_NOT_FOUND");
+
+		// 5. Opening-Balance isolation: UPDATE purchase revision route with opening balance event ID
+		const updateRevObAsPurchase = await httpCall(`/credit-cards/${cardId}/purchases/${obEventId}/revisions`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "upd-rev-ob-as-purch",
+			body: {
+				expectedRevisionNo: 1,
+				amount: "1600.00",
+				purchaseCategory: "MANDATORY_EXPENSE",
+				occurredAt: "2026-06-01T11:00:00.000Z",
+			},
+		});
+		eqD(updateRevObAsPurchase.status, 404, "7B.3-R2: POST /purchases/:obId/revisions returns 404");
+		eqD(updateRevObAsPurchase.json?.error?.code, "CREDIT_CARD_PURCHASE_NOT_FOUND", "7B.3-R2: Revisions error code is CREDIT_CARD_PURCHASE_NOT_FOUND");
+
+		// 6. Opening-Balance isolation: VOID purchase with opening balance event ID
+		const voidObAsPurchase = await httpCall(`/credit-cards/${cardId}/purchases/${obEventId}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "void-ob-as-purch",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-06-01T11:00:00.000Z",
+			},
+		});
+		eqD(voidObAsPurchase.status, 404, "7B.3-R2: POST /purchases/:obId/void returns 404");
+		eqD(voidObAsPurchase.json?.error?.code, "CREDIT_CARD_PURCHASE_NOT_FOUND", "7B.3-R2: Void error code is CREDIT_CARD_PURCHASE_NOT_FOUND");
+
+		// 7. Verify zero side effects on Opening Balance
+		const obVerifyAfterRejected = await httpCall(`/credit-cards/${cardId}/opening-balance`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(obVerifyAfterRejected.status, 200, "7B.3-R2: GET /opening-balance returns 200");
+		eqD(obVerifyAfterRejected.json?.openingBalance?.amount, "1500.00", "7B.3-R2: Opening balance amount unchanged at 1500.00");
+		eqD(obVerifyAfterRejected.json?.openingBalance?.revisionNo, 1, "7B.3-R2: Opening balance revisionNo unchanged at 1");
+		eqD(obVerifyAfterRejected.json?.openingBalance?.status, "POSTED", "7B.3-R2: Opening balance status unchanged at POSTED");
+
+		// 8. Normal Purchase Lifecycle: Installment count range (1, 36, 60 accepted, 61 rejected)
+		const pInst1 = await httpCall(`/credit-cards/${cardId}/purchases`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-inst-1",
+			body: {
+				amount: "100.00",
+				purchaseCategory: "MANDATORY_EXPENSE",
+				installmentCount: 1,
+				occurredAt: "2026-06-02T10:00:00.000Z",
+			},
+		});
+		eqD(pInst1.status, 200, "7B.3-R2: installmentCount=1 accepted on create");
+
+		const pInst36 = await httpCall(`/credit-cards/${cardId}/purchases`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-inst-36",
+			body: {
+				amount: "360.00",
+				purchaseCategory: "MANDATORY_EXPENSE",
+				installmentCount: 36,
+				occurredAt: "2026-06-02T10:00:00.000Z",
+			},
+		});
+		eqD(pInst36.status, 200, "7B.3-R2: installmentCount=36 accepted on create");
+
+		const pInst60 = await httpCall(`/credit-cards/${cardId}/purchases`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-inst-60",
+			body: {
+				amount: "600.00",
+				purchaseCategory: "MANDATORY_EXPENSE",
+				installmentCount: 60,
+				occurredAt: "2026-06-02T10:00:00.000Z",
+			},
+		});
+		eqD(pInst60.status, 200, "7B.3-R2: installmentCount=60 accepted on create");
+		const p60Id = pInst60.json?.eventId;
+
+		const pInst61 = await httpCall(`/credit-cards/${cardId}/purchases`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-inst-61",
+			body: {
+				amount: "610.00",
+				purchaseCategory: "MANDATORY_EXPENSE",
+				installmentCount: 61,
+				occurredAt: "2026-06-02T10:00:00.000Z",
+			},
+		});
+		eqD(pInst61.status, 400, "7B.3-R2: installmentCount=61 rejected with 400 on create");
+
+		// Update path installment range
+		const pUpd60 = await httpCall(`/credit-cards/${cardId}/purchases/${p60Id}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-upd-60",
+			body: {
+				expectedRevisionNo: 1,
+				amount: "600.00",
+				purchaseCategory: "MANDATORY_EXPENSE",
+				installmentCount: 60,
+				occurredAt: "2026-06-02T12:00:00.000Z",
+			},
+		});
+		eqD(pUpd60.status, 200, "7B.3-R2: installmentCount=60 accepted on update");
+
+		const pUpd61 = await httpCall(`/credit-cards/${cardId}/purchases/${p60Id}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-upd-61",
+			body: {
+				expectedRevisionNo: 2,
+				amount: "600.00",
+				purchaseCategory: "MANDATORY_EXPENSE",
+				installmentCount: 61,
+				occurredAt: "2026-06-02T13:00:00.000Z",
+			},
+		});
+		eqD(pUpd61.status, 400, "7B.3-R2: installmentCount=61 rejected with 400 on update");
+
+		// Normal Purchase GET / update / void
+		const pGetSingle = await httpCall(`/credit-cards/${cardId}/purchases/${p60Id}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(pGetSingle.status, 200, "7B.3-R2: GET /purchases/:id for normal purchase returns 200");
+		eqD(pGetSingle.json?.purchase?.eventType, "PURCHASE", "7B.3-R2: Purchase record eventType is PURCHASE");
+
+		const pVoidSingle = await httpCall(`/credit-cards/${cardId}/purchases/${p60Id}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-void-60",
+			body: {
+				expectedRevisionNo: 2,
+				reasonNote: "Voiding test purchase",
+				occurredAt: "2026-06-02T14:00:00.000Z",
+			},
+		});
+		eqD(pVoidSingle.status, 200, "7B.3-R2: Normal purchase void returns 200");
+		eqD(pVoidSingle.json?.status, "VOID", "7B.3-R2: Voided purchase status is VOID");
+
+		// 9. Category Query Ambiguity (multi-alias collision returns 400)
+		const catSingleRes = await httpCall(`/credit-cards/${cardId}/purchases?purchaseCategory=MANDATORY_EXPENSE`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(catSingleRes.status, 200, "7B.3-R2: Single purchaseCategory query param accepted");
+
+		const catDualRes1 = await httpCall(`/credit-cards/${cardId}/purchases?purchaseCategory=MANDATORY_EXPENSE&category=MANDATORY_EXPENSE`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(catDualRes1.status, 400, "7B.3-R2: Dual category aliases (purchaseCategory + category) rejected with 400");
+		eqD(catDualRes1.json?.error?.code, "CREDIT_CARD_INVALID_INPUT", "7B.3-R2: Error code is CREDIT_CARD_INVALID_INPUT");
+
+		const catDualRes2 = await httpCall(`/credit-cards/${cardId}/purchases?budgetCategory=MANDATORY_EXPENSE&category=MANDATORY_EXPENSE`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(catDualRes2.status, 400, "7B.3-R2: Dual category aliases (budgetCategory + category) rejected with 400");
+
+		const catTripleRes = await httpCall(`/credit-cards/${cardId}/purchases?purchaseCategory=MANDATORY_EXPENSE&budgetCategory=MANDATORY_EXPENSE&category=MANDATORY_EXPENSE`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(catTripleRes.status, 400, "7B.3-R2: Triple category aliases rejected with 400");
+
+		// 10. Cursor Gregorian Date Validation & Malformed Payloads
+		const badDateCursorPayload = {
+			purchaseDate: "2026-02-31", // Impossible Gregorian date
+			occurredAt: "2026-02-28T12:00:00.000Z",
+			eventId: "550e8400-e29b-41d4-a716-446655440000",
+		};
+		const badDateCursor = Buffer.from(JSON.stringify(badDateCursorPayload), "utf8").toString("base64url");
+		const badCursorRes1 = await httpCall(`/credit-cards/${cardId}/purchases?after=${badDateCursor}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(badCursorRes1.status, 400, "7B.3-R2: Impossible Gregorian cursor date 2026-02-31 rejected with 400");
+		eqD(badCursorRes1.json?.error?.code, "CREDIT_CARD_INVALID_INPUT", "7B.3-R2: Cursor error code is CREDIT_CARD_INVALID_INPUT");
+
+		const badFromDateRes = await httpCall(`/credit-cards/${cardId}/purchases?fromDate=2026-02-31`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(badFromDateRes.status, 400, "7B.3-R2: Impossible fromDate 2026-02-31 rejected with 400");
+
+		const badToDateRes = await httpCall(`/credit-cards/${cardId}/purchases?toDate=2026-13-01`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(badToDateRes.status, 400, "7B.3-R2: Impossible toDate 2026-13-01 rejected with 400");
+	} finally {
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -15162,6 +15497,7 @@ if (probed) {
 	await resolverRuntime7B2R2();
 	await resolverRuntime7B3();
 	await resolverRuntime7B3R1();
+	await resolverRuntime7B3R2();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
