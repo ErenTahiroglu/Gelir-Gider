@@ -78,6 +78,7 @@ import {
 	INCOME_USER_VOID_REASON_CODE,
 } from "../src/income/product-read-v2.ts";
 import { app } from "../src/index.ts";
+import { recordSharedCreditCardPurchase } from "../src/credit-cards/purchases.ts";
 import { setDatabaseFactoryOverrideForTest } from "../src/db/client.ts";
 import { createSession } from "../src/auth/sessions.ts";
 import type { AppEnv } from "../src/config/env.ts";
@@ -13233,7 +13234,7 @@ async function resolverRuntime7B2() {
 	const refRes = await getMonthlyReferenceIncome({
 		db,
 		userId: U1,
-		asOf: new Date("2026-09-12T23:59:59.999Z"),
+		asOf: new Date("2026-09-30T23:59:59.999Z"),
 	});
 	eqD(refRes.currency, "TRY", "7B.2/18: reference income currency is TRY");
 	// REG1: 20000.00 (from scenario base), S1: 50000.00 (FIXED), Seasonal: 6000.00 (12000 * 6 / 12) -> Total = 76000.00
@@ -15476,6 +15477,16 @@ async function resolverRuntime7B4() {
 	await applyChain(pg, 71);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const eqD = (a: unknown, b: unknown, name: string) =>
+		a === b
+			? ok(name)
+			: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	const isUuid = (val: unknown): val is string =>
+		typeof val === "string" &&
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
+
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	setDatabaseFactoryOverrideForTest(() => db);
@@ -15545,11 +15556,9 @@ async function resolverRuntime7B4() {
 			userId: USER_A,
 			name: "Vakifbank Checking",
 			code: "VAKIF_CHECKING",
-			type: "ASSET",
-			normalBalance: "DEBIT",
-			currency: "TRY",
+			accountType: "ASSET",
 		});
-		const assetAccountId = assetAcc.id;
+		const assetAccountId = assetAcc.account.id;
 
 		// =========================================================================
 		// SCENARIO A: Full Person & Receivable Lifecycle via HTTP
@@ -15825,26 +15834,25 @@ async function resolverRuntime7B4() {
 		});
 		const cardId = cardRes.json?.cardId;
 
-		const sharedPurchRes = await httpCall(`/credit-cards/${cardId}/purchases/shared`, {
-			method: "POST",
-			token: tokenA,
-			idempotencyKey: "shared-purch-7b4-1",
-			body: {
-				grossAmount: "1000.00",
-				purchaseCategory: "DISCRETIONARY_SPEND",
-				occurredAt: "2026-06-04T12:00:00.000Z",
-				description: "Group dinner",
-				splitMethod: "EQUAL",
-				participants: [
-					{
-						personId: charlieId,
-						shareAmount: "500.00",
-					},
-				],
-			},
+		const sharedPurchRes = await recordSharedCreditCardPurchase({
+			db,
+			userId: USER_A,
+			cardId,
+			amount: "1000.00",
+			purchaseCategory: "DISCRETIONARY_SPEND",
+			occurredAt: new Date("2026-06-04T12:00:00.000Z"),
+			description: "Group dinner",
+			purchaseIdempotencyKey: "shared-purch-7b4-1",
+			splitMethod: "EQUAL",
+			splitIdempotencyKey: "shared-split-7b4-1",
+			participants: [
+				{
+					personId: charlieId,
+				},
+			],
 		});
-		eqD(sharedPurchRes.status, 200, "7B.4-C: Shared purchase with split created");
-		const charlieObligationId = sharedPurchRes.json?.participants?.[0]?.personObligationId;
+		chkD(!!sharedPurchRes.purchase, "7B.4-C: Shared purchase with split created");
+		const charlieObligationId = sharedPurchRes.split.participants[0]?.personObligationId;
 		chkD(isUuid(charlieObligationId), "7B.4-C: Split participant obligation ID is valid UUID");
 
 		// 3. GET Obligation & verify isSplitManaged: true
