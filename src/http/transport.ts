@@ -264,6 +264,21 @@ export const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE:
 		"Cannot archive person with outstanding balance",
 	PEOPLE_SETTLEMENT_NOT_ACTIVE: "Person settlement is not active",
+	REWARD_INVALID_INPUT: "Invalid reward request",
+	REWARD_ACCOUNT_NOT_FOUND: "Reward account not found",
+	REWARD_ACCOUNT_NOT_ACTIVE: "Reward account is not active",
+	REWARD_ACCOUNT_CONFLICT: "Reward account conflict",
+	REWARD_ACCOUNT_REVISION_CONFLICT: "Reward account revision is stale",
+	REWARD_EVENT_NOT_FOUND: "Reward event not found",
+	REWARD_EVENT_NOT_ACTIVE: "Reward event is not active",
+	REWARD_EVENT_CONFLICT: "Reward event conflict",
+	REWARD_EVENT_REVISION_CONFLICT: "Reward event revision is stale",
+	REWARD_IDEMPOTENCY_CONFLICT:
+		"Idempotency-Key was already used with a different request",
+	REWARD_INSUFFICIENT_POINTS: "Insufficient reward point balance",
+	REWARD_EVENT_EXTERNALLY_MANAGED:
+		"Cannot manually void an externally managed reward event",
+	REWARD_INVALID_STATE: "Reward state transition failed",
 	INVALID_ORIGIN: "Invalid request origin",
 	UNAUTHENTICATED: "Authentication required",
 	NOT_FOUND: "Route not found",

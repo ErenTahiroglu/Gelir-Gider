@@ -860,16 +860,93 @@ The People + Family domain manages trusted counterparts, interpersonal obligatio
 | `PEOPLE_SETTLEMENT_NOT_ACTIVE` | 409 | Settlement is not active (already VOID) |
 | `PEOPLE_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different payload |
 
+### 7B.5 — Rewards (IMPLEMENTED)
+
+The Rewards domain manages user-defined loyalty and point reward wallets (e.g., credit card points, airline miles, hotel points), tracking their lifecycle, point balances, point valuation rates, manual events, economic redemptions, and protection against modifying externally-managed campaign points.
+
+#### 1. Endpoints
+
+```
+IMPLEMENTED  GET   /rewards/accounts                           ?status=&limit=&after=
+IMPLEMENTED  GET   /rewards/accounts/:id
+IMPLEMENTED  POST  /rewards/accounts                           (create anchor & rev 1)
+IMPLEMENTED  POST  /rewards/accounts/:id                       (update mutable config)
+IMPLEMENTED  POST  /rewards/accounts/:id/archive               (archive wallet with zero balance)
+
+IMPLEMENTED  GET   /rewards/accounts/:accountId/events         ?eventType=&status=&limit=&after=
+IMPLEMENTED  GET   /rewards/accounts/:accountId/events/:eventId
+IMPLEMENTED  POST  /rewards/accounts/:accountId/events/opening-balance
+IMPLEMENTED  POST  /rewards/accounts/:accountId/events/earn
+IMPLEMENTED  POST  /rewards/accounts/:accountId/events/expire
+IMPLEMENTED  POST  /rewards/accounts/:accountId/events/adjustment-credit
+IMPLEMENTED  POST  /rewards/accounts/:accountId/events/adjustment-debit
+IMPLEMENTED  POST  /rewards/accounts/:accountId/purchases      (economic redemption)
+IMPLEMENTED  POST  /rewards/accounts/:accountId/events/:eventId/void (void manual event)
+```
+
+#### 2. Product DTO Shapes
+
+##### `RewardAccountProductDto`
+```typescript
+interface RewardAccountProductDto {
+  rewardAccountId: string;
+  code: string;
+  status: "ACTIVE" | "ARCHIVED";
+  displayName: string;
+  provider: string;
+  unitName: string;
+  creditCardId: string | null;
+  defaultConversionRate: string; // 6 decimal digits (e.g. "0.050000")
+  balancePoints: string;         // 4 decimal digits (e.g. "5000.0000")
+  estimatedCurrentValue: string; // 2 decimal digits (e.g. "250.00")
+  revisionNo: number;
+  occurredAt: string;            // ISO 8601 UTC timestamp
+  createdAt: string;             // ISO 8601 UTC timestamp
+}
+```
+
+##### `RewardEventProductDto`
+```typescript
+interface RewardEventProductDto {
+  rewardEventId: string;
+  rewardAccountId: string;
+  revisionNo: number;
+  status: "ACTIVE" | "VOID";
+  eventType: "OPENING_BALANCE" | "EARN" | "EXPIRE" | "ADJUSTMENT_CREDIT" | "ADJUSTMENT_DEBIT" | "REDEEM_PURCHASE";
+  pointAmount: string;           // 4 decimal digits (e.g. "1000.0000")
+  signedPointEffect: string;     // Signed 4 decimal digits (e.g. "+1000.0000", "-500.0000", "+0.0000" if VOID)
+  conversionRate: string;        // 6 decimal digits (e.g. "0.010000")
+  economicAmount: string;        // 2 decimal digits (e.g. "10.00")
+  purchaseCategory: "MANDATORY_EXPENSE" | "DISCRETIONARY_SPEND" | "SHORT_TERM_PURCHASE" | "UNCLASSIFIED" | null;
+  shortTermGoalId: string | null;
+  merchant: string | null;
+  description: string | null;
+  reasonNote: string | null;
+  sourceType: "MANUAL" | "CAMPAIGN" | "IMPORT";
+  sourceRef: string | null;
+  occurredAt: string;            // ISO 8601 UTC timestamp
+  createdAt: string;             // ISO 8601 UTC timestamp
+}
+```
+
+#### 3. Error Codes & HTTP Mapping
+
+| Code | HTTP Status | Description |
+|---|---|---|
+| `REWARD_INVALID_INPUT` | 400 | Malformed UUID, invalid decimal precision, invalid query params, or closed body violation |
+| `REWARD_ACCOUNT_NOT_FOUND` | 404 | Reward account does not exist or belongs to another user |
+| `REWARD_EVENT_NOT_FOUND` | 404 | Reward event does not exist, belongs to another user, or account mismatch |
+| `REWARD_ACCOUNT_NOT_ACTIVE` | 409 | Attempting to record events or mutate an ARCHIVED account |
+| `REWARD_ACCOUNT_CONFLICT` | 409 | Duplicate account code or archiving account with non-zero point balance |
+| `REWARD_ACCOUNT_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict on account revision (`expectedRevisionNo` mismatch) |
+| `REWARD_EVENT_NOT_ACTIVE` | 409 | Event is already in VOID status |
+| `REWARD_EVENT_CONFLICT` | 409 | Invalid event operation or conflicting event state |
+| `REWARD_EVENT_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict on event revision (`expectedRevisionNo` mismatch) |
+| `REWARD_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different payload |
+| `REWARD_INSUFFICIENT_POINTS` | 409 | Negative point operation exceeds available account balance |
+| `REWARD_EVENT_EXTERNALLY_MANAGED` | 409 | Attempting to manually void an event owned by CAMPAIGN or IMPORT |
+
 ---
-
-### 7B.5 — Rewards
-
-```
-PLANNED  GET   /rewards/accounts/:id
-PLANNED  GET   /rewards/accounts        ?status=&limit=&after=
-PLANNED  POST  /rewards/accounts        (create)
-PLANNED  POST  /rewards/accounts/:id/archive  (archive)
-```
 
 ### 7B.6 — Campaigns
 

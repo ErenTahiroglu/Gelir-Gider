@@ -16398,6 +16398,584 @@ async function resolverRuntime7B4() {
 	}
 }
 
+async function resolverRuntime7B5(): Promise<void> {
+	console.log("\n--- Checkpoint 7B.5: Rewards Product HTTP Surface Runtime Verification ---");
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 71);
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const eqD = (a: unknown, b: unknown, name: string) => {
+		if (a === b) {
+			ok(name);
+		} else {
+			bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+		}
+	};
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	const isUuid = (val: unknown): val is string =>
+		typeof val === "string" &&
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
+
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
+	setDatabaseFactoryOverrideForTest(() => db);
+
+	try {
+		const testEnv: AppEnv = {
+			DATABASE_URL: "postgres://fake-pglite/db",
+			WEBAUTHN_RP_ID: "localhost",
+			WEBAUTHN_RP_NAME: "Gelir Gider Test",
+			WEBAUTHN_ORIGIN: "http://localhost:8787",
+		};
+
+		const USER_A = "11111111-cccc-4ccc-8ccc-111111111111";
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now())",
+			[USER_A],
+		);
+
+		const { token: tokenA } = await createSession({ db, userId: USER_A });
+
+		const httpCall = async (
+			path: string,
+			opts: {
+				method?: string;
+				body?: unknown;
+				token?: string;
+				idempotencyKey?: string;
+				origin?: string;
+			} = {},
+		) => {
+			const headers: Record<string, string> = {};
+			if (opts.token) {
+				headers.Cookie = `__Host-gg_session=${opts.token}`;
+			}
+			if (opts.origin !== undefined) {
+				headers.Origin = opts.origin;
+			} else if (opts.method !== "GET" && opts.method !== "HEAD") {
+				headers.Origin = "http://localhost:8787";
+			}
+			if (opts.idempotencyKey) {
+				headers["Idempotency-Key"] = opts.idempotencyKey;
+			}
+			if (opts.body !== undefined) {
+				headers["Content-Type"] = "application/json";
+			}
+			const res = await app.request(
+				path,
+				{
+					method: opts.method ?? "GET",
+					headers,
+					body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+				},
+				testEnv,
+			);
+			let json: any = null;
+			try {
+				json = await res.json();
+			} catch {
+				// no-op
+			}
+			return { status: res.status, json, headers: res.headers };
+		};
+
+		// =========================================================================
+		// SCENARIO A: Full Reward Account Lifecycle via HTTP
+		// =========================================================================
+		// 1. Create Account (Miles & Smiles)
+		const createAccRes = await httpCall("/rewards/accounts", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-acc-create-1",
+			body: {
+				code: "MILES_SMILES",
+				displayName: "Miles & Smiles",
+				provider: "Turkish Airlines",
+				unitName: "Miles",
+				defaultConversionRate: "0.050000",
+				occurredAt: "2026-06-01T10:00:00.000Z",
+			},
+		});
+		eqD(createAccRes.status, 201, "7B.5-A: Create reward account returns 201");
+		const acc1 = createAccRes.json?.account;
+		chkD(isUuid(acc1?.rewardAccountId), "7B.5-A: rewardAccountId is valid UUID");
+		eqD(acc1?.code, "MILES_SMILES", "7B.5-A: Account code is MILES_SMILES");
+		eqD(acc1?.displayName, "Miles & Smiles", "7B.5-A: Account displayName is Miles & Smiles");
+		eqD(acc1?.provider, "Turkish Airlines", "7B.5-A: Provider is Turkish Airlines");
+		eqD(acc1?.unitName, "Miles", "7B.5-A: Unit name is Miles");
+		eqD(acc1?.defaultConversionRate, "0.050000", "7B.5-A: Default conversion rate is 0.050000");
+		eqD(acc1?.balancePoints, "0.0000", "7B.5-A: Initial point balance is 0.0000");
+		eqD(acc1?.estimatedCurrentValue, "0.00", "7B.5-A: Initial estimatedCurrentValue is 0.00");
+		eqD(acc1?.status, "ACTIVE", "7B.5-A: Initial status is ACTIVE");
+		eqD(acc1?.revisionNo, 1, "7B.5-A: Initial revisionNo is 1");
+		eqD(createAccRes.json?.idempotentReplay, false, "7B.5-A: First create is not replay");
+		const acc1Id = acc1?.rewardAccountId;
+
+		// 2. Idempotent Replay on Create
+		const replayAccRes = await httpCall("/rewards/accounts", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-acc-create-1",
+			body: {
+				code: "MILES_SMILES",
+				displayName: "Miles & Smiles",
+				provider: "Turkish Airlines",
+				unitName: "Miles",
+				defaultConversionRate: "0.050000",
+				occurredAt: "2026-06-01T10:00:00.000Z",
+			},
+		});
+		eqD(replayAccRes.status, 200, "7B.5-A: Create replay returns 200");
+		eqD(replayAccRes.json?.account?.rewardAccountId, acc1Id, "7B.5-A: Replayed account ID matches");
+		eqD(replayAccRes.json?.idempotentReplay, true, "7B.5-A: idempotentReplay is true");
+
+		// 3. GET /rewards/accounts/:id
+		const getAccRes = await httpCall(`/rewards/accounts/${acc1Id}`, { method: "GET", token: tokenA });
+		eqD(getAccRes.status, 200, "7B.5-A: GET account returns 200");
+		eqD(getAccRes.json?.account?.displayName, "Miles & Smiles", "7B.5-A: GET account displayName matches");
+
+		// 4. Update Account with omitted defaultConversionRate (rate preservation)
+		const updateAccRes = await httpCall(`/rewards/accounts/${acc1Id}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-acc-update-1",
+			body: {
+				expectedRevisionNo: 1,
+				displayName: "Miles & Smiles Elite",
+				provider: "Turkish Airlines",
+				unitName: "Miles",
+				occurredAt: "2026-06-01T11:00:00.000Z",
+			},
+		});
+		eqD(updateAccRes.status, 200, "7B.5-A: Update account returns 200");
+		eqD(updateAccRes.json?.account?.displayName, "Miles & Smiles Elite", "7B.5-A: Updated displayName is Miles & Smiles Elite");
+		eqD(updateAccRes.json?.account?.defaultConversionRate, "0.050000", "7B.5-A: Preserved defaultConversionRate 0.050000");
+		eqD(updateAccRes.json?.account?.revisionNo, 2, "7B.5-A: RevisionNo updated to 2");
+
+		// 5. OCC Conflict on Stale Revision Update
+		const occConflictRes = await httpCall(`/rewards/accounts/${acc1Id}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-acc-update-stale",
+			body: {
+				expectedRevisionNo: 1,
+				displayName: "Miles & Smiles Outdated",
+				provider: "Turkish Airlines",
+				unitName: "Miles",
+				occurredAt: "2026-06-01T12:00:00.000Z",
+			},
+		});
+		eqD(occConflictRes.status, 409, "7B.5-A: Stale expectedRevisionNo returns 409");
+		eqD(occConflictRes.json?.error?.code, "REWARD_ACCOUNT_REVISION_CONFLICT", "7B.5-A: OCC conflict code is REWARD_ACCOUNT_REVISION_CONFLICT");
+
+		// 6. Archive Account with zero balance
+		const archiveAccRes = await httpCall(`/rewards/accounts/${acc1Id}/archive`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-acc-archive-1",
+			body: {
+				expectedRevisionNo: 2,
+				occurredAt: "2026-06-01T13:00:00.000Z",
+			},
+		});
+		eqD(archiveAccRes.status, 200, "7B.5-A: Archive zero-balance account returns 200");
+		eqD(archiveAccRes.json?.account?.status, "ARCHIVED", "7B.5-A: Account status is ARCHIVED");
+
+		// =========================================================================
+		// SCENARIO B: Point Events, Redemptions, Balance Math & Reversals
+		// =========================================================================
+		// 1. Create a second active account (WorldPoints)
+		const createWpRes = await httpCall("/rewards/accounts", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-acc-wp-1",
+			body: {
+				code: "WORLD_POINTS",
+				displayName: "WorldPoints",
+				provider: "Yapi Kredi",
+				unitName: "Puan",
+				defaultConversionRate: "0.010000",
+				occurredAt: "2026-06-02T10:00:00.000Z",
+			},
+		});
+		const wpId = createWpRes.json?.account?.rewardAccountId;
+
+		// 2. Opening balance event (+5000.0000)
+		const obRes = await httpCall(`/rewards/accounts/${wpId}/events/opening-balance`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-ev-ob-1",
+			body: {
+				pointAmount: "5000.0000",
+				occurredAt: "2026-06-02T10:01:00.000Z",
+			},
+		});
+		eqD(obRes.status, 201, "7B.5-B: Opening balance returns 201");
+		eqD(obRes.json?.event?.eventType, "OPENING_BALANCE", "7B.5-B: Event type is OPENING_BALANCE");
+		eqD(obRes.json?.event?.signedPointEffect, "5000.0000", "7B.5-B: Signed point effect is 5000.0000");
+		eqD(obRes.json?.event?.canonicalTransactionId, undefined, "7B.5-B: canonicalTransactionId stripped from event DTO");
+
+		// 3. Earn event (+2000.0000)
+		const earnRes = await httpCall(`/rewards/accounts/${wpId}/events/earn`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-ev-earn-1",
+			body: {
+				pointAmount: "2000.0000",
+				reasonNote: "Market shopping bonus",
+				occurredAt: "2026-06-03T10:00:00.000Z",
+			},
+		});
+		eqD(earnRes.status, 201, "7B.5-B: Earn event returns 201");
+		eqD(earnRes.json?.event?.signedPointEffect, "2000.0000", "7B.5-B: Earn signed effect is 2000.0000");
+
+		// 4. Expire event (-1000.0000)
+		const expRes = await httpCall(`/rewards/accounts/${wpId}/events/expire`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-ev-exp-1",
+			body: {
+				pointAmount: "1000.0000",
+				reasonNote: "Monthly expiration",
+				occurredAt: "2026-06-04T10:00:00.000Z",
+			},
+		});
+		eqD(expRes.status, 201, "7B.5-B: Expire event returns 201");
+		eqD(expRes.json?.event?.signedPointEffect, "-1000.0000", "7B.5-B: Expire signed effect is -1000.0000");
+
+		// 5. Adjustment credit (+500.0000)
+		const adjCreditRes = await httpCall(`/rewards/accounts/${wpId}/events/adjustment-credit`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-ev-adjc-1",
+			body: {
+				pointAmount: "500.0000",
+				reasonNote: "Bank goodwill credit",
+				occurredAt: "2026-06-05T10:00:00.000Z",
+			},
+		});
+		eqD(adjCreditRes.status, 201, "7B.5-B: Adjustment credit returns 201");
+		eqD(adjCreditRes.json?.event?.signedPointEffect, "500.0000", "7B.5-B: Adj credit signed effect is 500.0000");
+
+		// 6. Adjustment debit (-300.0000)
+		const adjDebitRes = await httpCall(`/rewards/accounts/${wpId}/events/adjustment-debit`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-ev-adjd-1",
+			body: {
+				pointAmount: "300.0000",
+				reasonNote: "Returned merchandise point clawback",
+				occurredAt: "2026-06-06T10:00:00.000Z",
+			},
+		});
+		eqD(adjDebitRes.status, 201, "7B.5-B: Adjustment debit returns 201");
+		eqD(adjDebitRes.json?.event?.signedPointEffect, "-300.0000", "7B.5-B: Adj debit signed effect is -300.0000");
+
+		// 7. Purchase redemption (-2000.0000 points @ rate 0.020000 -> 40.00 TL)
+		const purchaseRes = await httpCall(`/rewards/accounts/${wpId}/purchases`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-ev-purch-1",
+			body: {
+				pointAmount: "2000.0000",
+				conversionRateOverride: "0.020000",
+				purchaseCategory: "DISCRETIONARY_SPEND",
+				merchant: "Akbank Statement Credit",
+				description: "Redeemed for statement credit",
+				occurredAt: "2026-06-07T10:00:00.000Z",
+			},
+		});
+		eqD(purchaseRes.status, 201, "7B.5-B: Purchase redemption returns 201");
+		const purchaseEvent = purchaseRes.json?.event;
+		const purchaseEventId = purchaseEvent?.rewardEventId;
+		eqD(purchaseEvent?.eventType, "REDEEM_PURCHASE", "7B.5-B: Purchase event type is REDEEM_PURCHASE");
+		eqD(purchaseEvent?.signedPointEffect, "-2000.0000", "7B.5-B: Purchase signed effect is -2000.0000");
+		eqD(purchaseEvent?.economicAmount, "40.00", "7B.5-B: Economic amount is 40.00");
+
+		// Check account balance: 5000 + 2000 - 1000 + 500 - 300 - 2000 = 4200.0000
+		const getWpAcc = await httpCall(`/rewards/accounts/${wpId}`, { method: "GET", token: tokenA });
+		eqD(getWpAcc.json?.account?.balancePoints, "4200.0000", "7B.5-B: Account balancePoints is exactly 4200.0000");
+
+		// 8. Attempt archive on account with non-zero balance -> 409 REWARD_ACCOUNT_NON_ZERO_BALANCE
+		const archiveBlockedRes = await httpCall(`/rewards/accounts/${wpId}/archive`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-acc-wp-arch-block",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-06-08T10:00:00.000Z",
+			},
+		});
+		eqD(archiveBlockedRes.status, 409, "7B.5-B: Archiving non-zero balance account returns 409");
+		eqD(archiveBlockedRes.json?.error?.code, "REWARD_ACCOUNT_CONFLICT", "7B.5-B: Conflict code is REWARD_ACCOUNT_CONFLICT");
+
+		// 9. Void the purchase redemption event
+		const voidRes = await httpCall(`/rewards/accounts/${wpId}/events/${purchaseEventId}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-ev-purch-void-1",
+			body: {
+				expectedRevisionNo: 1,
+				reasonNote: "Customer cancelled statement credit",
+			},
+		});
+		eqD(voidRes.status, 200, "7B.5-B: Void purchase event returns 200");
+		eqD(voidRes.json?.event?.status, "VOID", "7B.5-B: Voided event status is VOID");
+		eqD(voidRes.json?.event?.signedPointEffect, "0.0000", "7B.5-B: Voided event signed point effect becomes 0.0000");
+
+		// Check account balance after void: 4200 + 2000 = 6200.0000
+		const getWpAccAfterVoid = await httpCall(`/rewards/accounts/${wpId}`, { method: "GET", token: tokenA });
+		eqD(getWpAccAfterVoid.json?.account?.balancePoints, "6200.0000", "7B.5-B: Points refunded back to 6200.0000");
+
+		// 10. Replay void -> 200 idempotentReplay: true
+		const voidReplayRes = await httpCall(`/rewards/accounts/${wpId}/events/${purchaseEventId}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "rew-ev-purch-void-1",
+			body: {
+				expectedRevisionNo: 1,
+				reasonNote: "Customer cancelled statement credit",
+			},
+		});
+		eqD(voidReplayRes.status, 200, "7B.5-B: Void replay returns 200");
+		eqD(voidReplayRes.json?.idempotentReplay, true, "7B.5-B: Void idempotentReplay is true");
+
+		// =========================================================================
+		// SCENARIO C: External Ownership Protection Guard
+		// =========================================================================
+		// Insert a CAMPAIGN-owned event directly into DB to test protection
+		const CAMPAIGN_EVENT_ID = "99999999-9999-4999-8999-999999999999";
+		await pg.exec("SET session_replication_role = replica;");
+		await pg.query(
+			`insert into reward_events (id, user_id, reward_account_id, event_type, canonical_transaction_id, created_at)
+			 values ($1, $2, $3, 'EARN', null, now())`,
+			[CAMPAIGN_EVENT_ID, USER_A, wpId],
+		);
+		await pg.query(
+			`insert into reward_event_revisions (
+				user_id, reward_event_id, revision_no, revision_fingerprint, idempotency_key, operation,
+				point_amount, conversion_rate, economic_amount,
+				purchase_category, short_term_goal_id, merchant, description, reason_note,
+				canonical_revision_id, source_type, source_ref, occurred_at, created_at
+			) values (
+				$1, $2, 1, '00000000000000000000000000000000000000000000000000000000000000c1', 'camp-key-1', 'CREATE',
+				'100.0000', '0.010000', '1.00',
+				null, null, null, 'Campaign award', null,
+				null, 'CAMPAIGN', 'camp-ref-1', now(), now()
+			)`,
+			[USER_A, CAMPAIGN_EVENT_ID],
+		);
+		await pg.exec("SET session_replication_role = origin;");
+
+		// Attempt to void CAMPAIGN event -> 409 REWARD_EVENT_EXTERNALLY_MANAGED
+		const voidCampRes = await httpCall(`/rewards/accounts/${wpId}/events/${CAMPAIGN_EVENT_ID}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "void-camp-attempt",
+			body: {
+				expectedRevisionNo: 1,
+				reasonNote: "Attempt to void campaign event",
+			},
+		});
+		eqD(voidCampRes.status, 409, "7B.5-C: Voiding CAMPAIGN-owned event returns 409");
+		eqD(voidCampRes.json?.error?.code, "REWARD_EVENT_EXTERNALLY_MANAGED", "7B.5-C: External ownership conflict code is REWARD_EVENT_EXTERNALLY_MANAGED");
+
+		// Path consistency check: mismatched account ID -> 404
+		const mismatchedVoidRes = await httpCall(`/rewards/accounts/${acc1Id}/events/${CAMPAIGN_EVENT_ID}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "void-mismatch-attempt",
+			body: {
+				expectedRevisionNo: 1,
+			},
+		});
+		eqD(mismatchedVoidRes.status, 404, "7B.5-C: Voiding event under wrong accountId returns 404");
+
+		// =========================================================================
+		// SCENARIO D: Bounded Keyset Pagination (>100 accounts & >100 events)
+		// =========================================================================
+		// 1. Seed 105 Accounts for User A
+		console.log("Seeding 105 accounts for pagination test...");
+		await pg.exec("SET session_replication_role = replica;");
+		for (let i = 1; i <= 105; i++) {
+			const accId = `aaaa1000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+			const baseDate = new Date(Date.UTC(2026, 0, 1, 0, 0, i));
+			const accCode = `ACC_${String(i).padStart(4, "0")}`;
+			const hexFp = String(i).padStart(64, "0");
+			await pg.query(
+				`insert into reward_accounts (id, user_id, code, created_at) values ($1, $2, $3, $4)`,
+				[accId, USER_A, accCode, baseDate],
+			);
+			await pg.query(
+				`insert into reward_account_revisions (
+					user_id, reward_account_id, revision_no, revision_fingerprint, idempotency_key, operation,
+					status, display_name, provider, unit_name, default_conversion_rate,
+					note, occurred_at, created_at
+				) values (
+					$1, $2, 1, $3, $4, 'CREATE',
+					'ACTIVE', $5, 'Bank', 'Points', '0.010000',
+					null, $6, $6
+				)`,
+				[USER_A, accId, hexFp, `idemp-acc-page-${i}`, `Paged Account ${String(i).padStart(3, "0")}`, baseDate],
+			);
+		}
+		await pg.exec("SET session_replication_role = origin;");
+
+		// Traverse all accounts pages with limit=50
+		let accCursor: string | null = null;
+		const allFetchedAccIds: string[] = [];
+		let accPageCount = 0;
+		while (true) {
+			accPageCount++;
+			const url = accCursor
+				? `/rewards/accounts?limit=50&after=${encodeURIComponent(accCursor)}`
+				: `/rewards/accounts?limit=50`;
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.5-D: GET accounts page ${accPageCount} returns 200`);
+			const items = pageRes.json?.accounts ?? [];
+			for (const item of items) {
+				allFetchedAccIds.push(item.rewardAccountId);
+			}
+			if (accPageCount === 1) {
+				eqD(items.length, 50, "7B.5-D: Accounts page 1 has 50 items");
+				eqD(pageRes.json?.hasMore, true, "7B.5-D: Accounts page 1 hasMore is true");
+			}
+			if (!pageRes.json?.hasMore) {
+				eqD(pageRes.json?.nextCursor, null, "7B.5-D: Accounts final page nextCursor is null");
+				break;
+			}
+			accCursor = pageRes.json?.nextCursor;
+		}
+		// 105 seeded + 2 created in Scenario A & B = 107 accounts
+		const uniqueAccIds = new Set(allFetchedAccIds);
+		eqD(allFetchedAccIds.length, uniqueAccIds.size, "7B.5-D: Accounts pagination returned zero duplicate rows");
+		eqD(allFetchedAccIds.length, 107, "7B.5-D: Exactly 107 unique account rows traversed (>100 traversal PASS)");
+
+		// 2. Seed 105 Events for wpId
+		console.log("Seeding 105 events for pagination test...");
+		await pg.exec("SET session_replication_role = replica;");
+		for (let i = 1; i <= 105; i++) {
+			const evId = `eeee2000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+			const baseDate = new Date(Date.UTC(2026, 1, 1, 0, 0, i));
+			const hexFp = String(i).padStart(64, "0");
+			await pg.query(
+				`insert into reward_events (id, user_id, reward_account_id, event_type, canonical_transaction_id, created_at) values ($1, $2, $3, 'EARN', null, $4)`,
+				[evId, USER_A, wpId, baseDate],
+			);
+			await pg.query(
+				`insert into reward_event_revisions (
+					user_id, reward_event_id, revision_no, revision_fingerprint, idempotency_key, operation,
+					point_amount, conversion_rate, economic_amount,
+					purchase_category, short_term_goal_id, merchant, description, reason_note,
+					canonical_revision_id, source_type, source_ref, occurred_at, created_at
+				) values (
+					$1, $2, 1, $3, $4, 'CREATE',
+					'10.0000', '0.010000', '0.10',
+					null, null, null, $5, null,
+					null, 'MANUAL', null, $6, $6
+				)`,
+				[USER_A, evId, hexFp, `idemp-ev-page-${i}`, `Paged Event ${String(i).padStart(3, "0")}`, baseDate],
+			);
+		}
+		await pg.exec("SET session_replication_role = origin;");
+
+		// Traverse all events pages with limit=50
+		let evCursor: string | null = null;
+		const allFetchedEvIds: string[] = [];
+		let evPageCount = 0;
+		while (true) {
+			evPageCount++;
+			const url = evCursor
+				? `/rewards/accounts/${wpId}/events?limit=50&after=${encodeURIComponent(evCursor)}`
+				: `/rewards/accounts/${wpId}/events?limit=50`;
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.5-D: GET events page ${evPageCount} returns 200`);
+			const items = pageRes.json?.events ?? [];
+			for (const item of items) {
+				allFetchedEvIds.push(item.rewardEventId);
+			}
+			if (evPageCount === 1) {
+				eqD(items.length, 50, "7B.5-D: Events page 1 has 50 items");
+				eqD(pageRes.json?.hasMore, true, "7B.5-D: Events page 1 hasMore is true");
+			}
+			if (!pageRes.json?.hasMore) {
+				eqD(pageRes.json?.nextCursor, null, "7B.5-D: Events final page nextCursor is null");
+				break;
+			}
+			evCursor = pageRes.json?.nextCursor;
+		}
+		// 105 seeded + 6 created in Scenario B + 1 in Scenario C = 112 events
+		const uniqueEvIds = new Set(allFetchedEvIds);
+		eqD(allFetchedEvIds.length, uniqueEvIds.size, "7B.5-D: Events pagination returned zero duplicate rows");
+		eqD(allFetchedEvIds.length, 112, "7B.5-D: Exactly 112 unique event rows traversed (>100 traversal PASS)");
+
+		// =========================================================================
+		// SCENARIO E: Same-Database Cross-User Security Proofs
+		// =========================================================================
+		const USER_B = "22222222-cccc-4ccc-8ccc-222222222222";
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User B', 'TRY', 'Europe/Istanbul', now())",
+			[USER_B],
+		);
+		const { token: tokenB } = await createSession({ db, userId: USER_B });
+
+		// User B attempts to access User A's Account -> 404
+		const crossAccRes = await httpCall(`/rewards/accounts/${wpId}`, { method: "GET", token: tokenB });
+		eqD(crossAccRes.status, 404, "7B.5-E: User B cannot GET User A account (404 NOT_FOUND)");
+
+		// User B attempts to access User A's Events -> 404
+		const crossEventsRes = await httpCall(`/rewards/accounts/${wpId}/events`, { method: "GET", token: tokenB });
+		eqD(crossEventsRes.status, 404, "7B.5-E: User B cannot GET User A events (404 NOT_FOUND)");
+
+		// User B attempts to mutate User A's Event -> 404
+		const crossVoidRes = await httpCall(`/rewards/accounts/${wpId}/events/${purchaseEventId}/void`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "cross-void-att",
+			body: {
+				expectedRevisionNo: 1,
+			},
+		});
+		eqD(crossVoidRes.status, 404, "7B.5-E: User B cannot void User A event (404 NOT_FOUND)");
+
+		// User B with User A cursor sees 0 items
+		const crossCursorRes = await httpCall(`/rewards/accounts?after=${encodeURIComponent(accCursor!)}`, { method: "GET", token: tokenB });
+		eqD(crossCursorRes.status, 200, "7B.5-E: User B with User A cursor returns 200 for User B scope");
+		eqD((crossCursorRes.json?.accounts ?? []).length, 0, "7B.5-E: User B sees 0 items from User A cursor (zero leakage)");
+
+		// =========================================================================
+		// SCENARIO F: Read-Only GET Proof (Zero Database Writes on All GET Endpoints)
+		// =========================================================================
+		const countAllRewardTables = async () => {
+			const q = async (table: string) => (await pg.query(`select count(*)::int as n from ${table}`)).rows[0].n as number;
+			return (
+				(await q("reward_accounts")) +
+				(await q("reward_account_revisions")) +
+				(await q("reward_events")) +
+				(await q("reward_event_revisions")) +
+				(await q("canonical_transactions")) +
+				(await q("transaction_revisions")) +
+				(await q("journal_entries")) +
+				(await q("journal_lines"))
+			);
+		};
+
+		const countBefore = await countAllRewardTables();
+		await httpCall("/rewards/accounts", { method: "GET", token: tokenA });
+		await httpCall(`/rewards/accounts/${wpId}`, { method: "GET", token: tokenA });
+		await httpCall(`/rewards/accounts/${wpId}/events`, { method: "GET", token: tokenA });
+		await httpCall(`/rewards/accounts/${wpId}/events/${purchaseEventId}`, { method: "GET", token: tokenA });
+		const countAfter = await countAllRewardTables();
+		eqD(countBefore, countAfter, "7B.5-F: Read-only GET endpoints perform exactly zero database writes");
+
+	} finally {
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -16428,6 +17006,7 @@ if (probed) {
 	await resolverRuntime7B3R1();
 	await resolverRuntime7B3R2();
 	await resolverRuntime7B4();
+	await resolverRuntime7B5();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

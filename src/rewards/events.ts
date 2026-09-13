@@ -1261,6 +1261,60 @@ export async function voidRewardEvent(
 	);
 }
 
+/**
+ * Public Manual VOID API: enforces that the target event is owned by MANUAL
+ * provenance before permitting voiding. Externally managed events (e.g. CAMPAIGN,
+ * IMPORT) cannot be voided through the manual product boundary and must be managed
+ * by their respective owning domains.
+ */
+export async function voidManualRewardEvent(
+	params: VoidRewardEventParams,
+): Promise<{ event: RewardEventReadModel; idempotentReplay: boolean }> {
+	const userId = validateRewardCanonicalUuid(params.userId, "userId");
+	const rewardEventId = validateRewardCanonicalUuid(
+		params.rewardEventId,
+		"rewardEventId",
+	);
+	const expectedRevisionNo = validateRewardExpectedRevisionNo(
+		params.expectedRevisionNo,
+	);
+	const reasonNote = validateRewardOptionalText(
+		params.reasonNote,
+		"reasonNote",
+		500,
+	);
+	const idempotencyKey = validateRewardIdempotencyKey(params.idempotencyKey);
+
+	return runRewardsTransaction(params.db, async (tx) => {
+		const [latestRev] = await tx
+			.select({ sourceType: rewardEventRevisions.sourceType })
+			.from(rewardEventRevisions)
+			.where(
+				and(
+					eq(rewardEventRevisions.rewardEventId, rewardEventId),
+					eq(rewardEventRevisions.userId, userId),
+				),
+			)
+			.orderBy(desc(rewardEventRevisions.revisionNo))
+			.limit(1);
+
+		if (latestRev && latestRev.sourceType !== "MANUAL") {
+			throw new RewardError(
+				"REWARD_EVENT_EXTERNALLY_MANAGED",
+				`Cannot manually void reward event "${rewardEventId}" managed by ${latestRev.sourceType}`,
+			);
+		}
+
+		return voidRewardEventInTransaction(tx, {
+			userId,
+			rewardEventId,
+			expectedRevisionNo,
+			reasonNote,
+			idempotencyKey,
+		});
+	});
+}
+
 // ============================================================================
 // Reads
 // ============================================================================
