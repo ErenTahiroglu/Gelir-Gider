@@ -896,6 +896,75 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 			expect(data.settlements[0].settlementId).toBe(SETTLEMENT_ID);
 		});
 
+		it("GET /settlements with status query parameter validates ACTIVE | VOIDED strictly", async () => {
+			vi.spyOn(obligationsModule, "getPersonObligation").mockResolvedValue(
+				mockReceivableObligation,
+			);
+			const listBoundedSettlementsSpy = vi
+				.spyOn(productReadV2Module, "listBoundedSettlements")
+				.mockResolvedValue({
+					settlements: [],
+					hasMore: false,
+					nextCursor: null,
+				});
+
+			// A. status=VOIDED is accepted and forwarded as statusFilter
+			const resVoided = await app.request(
+				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/settlements?status=VOIDED`,
+				{
+					method: "GET",
+					headers: { Cookie: COOKIE },
+				},
+				mockEnv,
+			);
+			expect(resVoided.status).toBe(200);
+			expect(listBoundedSettlementsSpy).toHaveBeenLastCalledWith(
+				expect.objectContaining({ status: "VOIDED" }),
+			);
+
+			// B. status=ACTIVE is accepted and forwarded as statusFilter
+			const resActive = await app.request(
+				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/settlements?status=ACTIVE`,
+				{
+					method: "GET",
+					headers: { Cookie: COOKIE },
+				},
+				mockEnv,
+			);
+			expect(resActive.status).toBe(200);
+			expect(listBoundedSettlementsSpy).toHaveBeenLastCalledWith(
+				expect.objectContaining({ status: "ACTIVE" }),
+			);
+
+			// C. status=VOID returns 400 PEOPLE_INVALID_INPUT
+			const resVoid = await app.request(
+				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/settlements?status=VOID`,
+				{
+					method: "GET",
+					headers: { Cookie: COOKIE },
+				},
+				mockEnv,
+			);
+			expect(resVoid.status).toBe(400);
+			// biome-ignore lint/suspicious/noExplicitAny: test payload
+			const errorDataVoid = (await resVoid.json()) as any;
+			expect(errorDataVoid.error.code).toBe("PEOPLE_INVALID_INPUT");
+
+			// D. Unknown status returns 400 PEOPLE_INVALID_INPUT
+			const resUnknown = await app.request(
+				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/settlements?status=UNKNOWN_STATUS`,
+				{
+					method: "GET",
+					headers: { Cookie: COOKIE },
+				},
+				mockEnv,
+			);
+			expect(resUnknown.status).toBe(400);
+			// biome-ignore lint/suspicious/noExplicitAny: test payload
+			const errorDataUnknown = (await resUnknown.json()) as any;
+			expect(errorDataUnknown.error.code).toBe("PEOPLE_INVALID_INPUT");
+		});
+
 		it("GET /settlements/:id returns single settlement", async () => {
 			vi.spyOn(settlementsModule, "getPersonSettlement").mockResolvedValue(
 				mockSettlement,

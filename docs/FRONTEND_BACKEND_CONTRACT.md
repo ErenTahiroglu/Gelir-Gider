@@ -806,7 +806,7 @@ The People + Family domain manages trusted counterparts, interpersonal obligatio
 
 #### 5.9.3 Settlements Lifecycle (5 Routes)
 - **`GET /people/:personId/obligations/:obligationId/settlements`**: Bounded keyset-paginated list of settlements for an obligation.
-  - Query parameters: `status` (`ACTIVE` | `VOID`), `limit` (default 50, max 100), `after` (opaque Base64URL cursor).
+  - Query parameters: `status` (`ACTIVE` | `VOIDED`), `limit` (default 50, max 100), `after` (opaque Base64URL cursor).
   - Response: `{ settlements: SettlementProductDto[], hasMore: boolean, nextCursor: string | null }`
 - **`GET /people/:personId/obligations/:obligationId/settlements/:id`**: Get single settlement details.
 - **`POST /people/:personId/obligations/:obligationId/settlements/receivable`**: Settle a receivable obligation (person paying back user).
