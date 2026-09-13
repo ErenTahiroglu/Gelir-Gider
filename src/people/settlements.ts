@@ -867,7 +867,7 @@ export async function voidPersonSettlement(
 		}
 		if (latest.operation === "VOID") {
 			throw new PeopleError(
-				"PEOPLE_INVALID_STATE",
+				"PEOPLE_SETTLEMENT_NOT_ACTIVE",
 				`Settlement "${settlementId}" is already VOID`,
 			);
 		}

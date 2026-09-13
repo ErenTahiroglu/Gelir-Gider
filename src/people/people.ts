@@ -593,7 +593,7 @@ export async function archivePerson(
 			});
 			if (receivableBalance.balance !== "0.00") {
 				throw new PeopleError(
-					"PEOPLE_INVALID_STATE",
+					"PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE",
 					`Cannot archive person "${personId}" with non-zero receivable balance ${receivableBalance.balance}`,
 				);
 			}
@@ -605,7 +605,7 @@ export async function archivePerson(
 			});
 			if (payableBalance.balance !== "0.00") {
 				throw new PeopleError(
-					"PEOPLE_INVALID_STATE",
+					"PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE",
 					`Cannot archive person "${personId}" with non-zero payable balance ${payableBalance.balance}`,
 				);
 			}

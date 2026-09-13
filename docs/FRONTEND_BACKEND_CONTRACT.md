@@ -602,7 +602,7 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
 
 #### 5.8.7 Shared Purchases & Split Management (Checkpoint 7B.4-R1)
 - **`POST /credit-cards/:cardId/purchases/shared`**: Atomically create a purchase and its initial participant split.
-  - Header: `Idempotency-Key` (required; server derives child purchase & split keys deterministically).
+  - Header: `Idempotency-Key` (required; server derives child purchase & split keys deterministically using SHA-256 digest derivation `CC_SHARED_PURCHASE_<sha256hex>` and `CC_SHARED_SPLIT_<sha256hex>`).
   - Body (closed):
     ```json
     {
@@ -636,7 +636,7 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
   - Body (closed): `{ expectedRevisionNo, splitMethod, userWeight?, participants: ParticipantInput[], occurredAt? }`
 - **`POST /credit-cards/:cardId/purchases/:id/split/void`**: Void split allocation (OCC).
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ expectedRevisionNo, reasonNote?, occurredAt? }`
+  - Body (closed): `{ expectedRevisionNo, occurredAt? }`
 - **`POST /credit-cards/:cardId/purchases/:id/shared-revisions`**: Coordinated atomic revision of both purchase details and split allocations.
   - Header: `Idempotency-Key` (required).
   - Body (closed): `{ expectedPurchaseRevisionNo, expectedSplitRevisionNo, amount, purchaseCategory, shortTermGoalId?, merchant?, description?, installmentCount?, reasonNote?, occurredAt, splitMethod, userWeight?, participants: ParticipantInput[] }`
@@ -745,7 +745,7 @@ The People + Family domain manages trusted counterparts, interpersonal obligatio
   - Body (closed): `{ expectedRevisionNo, displayName, relationship, note?, occurredAt }`
 - **`POST /people/:id/archive`**: Archive a person counterpart.
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ expectedRevisionNo, reasonNote?, occurredAt }`
+  - Body (closed): `{ expectedRevisionNo, occurredAt }`
   - Returns `409 PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE` if receivable or payable balance is non-zero.
 
 **Person Product DTO (`PersonProductDto`):**
@@ -774,15 +774,15 @@ The People + Family domain manages trusted counterparts, interpersonal obligatio
   - Body (closed): `{ amount, fundingAssetAccountId, dueDate?, description?, occurredAt }`
 - **`POST /people/:personId/obligations/payable`**: Record a standalone payable expense obligation (money owed to person).
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ amount, budgetCategory?, dueDate?, description?, occurredAt }`
+  - Body (closed): `{ amount, budgetCategory, dueDate?, description?, occurredAt }`
 - **`POST /people/:personId/obligations/:id`**: Update standalone obligation details with OCC.
   - Header: `Idempotency-Key` (required).
   - Body (closed): `{ expectedRevisionNo, amount, fundingAssetAccountId?, budgetCategory?, dueDate?, description?, occurredAt }`
   - *Authority Protection:* Returns `409 PEOPLE_OBLIGATION_SPLIT_MANAGED` if the obligation was created by a credit card purchase split. Split-managed obligations must be revised via split routes.
 - **`POST /people/:personId/obligations/:id/void`**: Void a standalone obligation with OCC.
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ expectedRevisionNo, reason?, occurredAt? }`
-  - Returns `409 PEOPLE_OBLIGATION_SPLIT_MANAGED` if split-managed. Returns `409 PEOPLE_OBLIGATION_ALREADY_SETTLED` if active settlements exist.
+  - Body (closed): `{ expectedRevisionNo }`
+  - Returns `409 PEOPLE_OBLIGATION_SPLIT_MANAGED` if split-managed. Returns `409 PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT` if active settlements exist.
 
 **Obligation Product DTO (`ObligationProductDto`):**
 ```json
@@ -806,7 +806,7 @@ The People + Family domain manages trusted counterparts, interpersonal obligatio
 
 #### 5.9.3 Settlements Lifecycle (5 Routes)
 - **`GET /people/:personId/obligations/:obligationId/settlements`**: Bounded keyset-paginated list of settlements for an obligation.
-  - Query parameters: `status` (`ACTIVE` | `VOIDED`), `limit` (default 50, max 100), `after` (opaque Base64URL cursor).
+  - Query parameters: `status` (`ACTIVE` | `VOID`), `limit` (default 50, max 100), `after` (opaque Base64URL cursor).
   - Response: `{ settlements: SettlementProductDto[], hasMore: boolean, nextCursor: string | null }`
 - **`GET /people/:personId/obligations/:obligationId/settlements/:id`**: Get single settlement details.
 - **`POST /people/:personId/obligations/:obligationId/settlements/receivable`**: Settle a receivable obligation (person paying back user).
@@ -815,11 +815,12 @@ The People + Family domain manages trusted counterparts, interpersonal obligatio
   - *Overpayment behavior:* If `cashAmount > remainingAmount`, the obligation is fully settled (`appliedAmount = remainingAmount`) and the excess amount is routed to unearned income receipt (`overpaymentIncomeReceiptId`).
 - **`POST /people/:personId/obligations/:obligationId/settlements/payable`**: Settle a payable obligation (user paying person back).
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ cashAmount, sourceAssetAccountId, note?, occurredAt }`
-  - Cannot overpay payable obligations (`409 PEOPLE_SETTLEMENT_OVERPAYMENT_NOT_ALLOWED`).
+  - Body (closed): `{ amount, sourceAssetAccountId, note?, occurredAt }`
+  - Cannot overpay payable obligations (`409 PEOPLE_OBLIGATION_OVERSETTLEMENT`).
 - **`POST /people/:personId/obligations/:obligationId/settlements/:id/void`**: Void a settlement with OCC.
   - Header: `Idempotency-Key` (required).
-  - Body (closed): `{ expectedRevisionNo, reason?, occurredAt? }`
+  - Body (closed): `{ expectedRevisionNo, reason }`
+  - Returns `409 PEOPLE_SETTLEMENT_NOT_ACTIVE` if already VOID. Returns `409 PEOPLE_REVISION_CONFLICT` on OCC mismatch.
 
 **Settlement Product DTO (`SettlementProductDto`):**
 ```json
@@ -844,16 +845,19 @@ The People + Family domain manages trusted counterparts, interpersonal obligatio
 | Code | Status | Description |
 |------|--------|-------------|
 | `PEOPLE_INVALID_INPUT` | 400 | Malformed UUID, invalid parameters, or closed body violation |
+| `PEOPLE_LEDGER_ACCOUNT_INVALID` | 400 | Invalid ledger account for person |
 | `PEOPLE_NOT_FOUND` | 404 | Person counterpart not found or owned by another user |
 | `PEOPLE_OBLIGATION_NOT_FOUND` | 404 | Obligation not found or person mismatch |
 | `PEOPLE_SETTLEMENT_NOT_FOUND` | 404 | Settlement not found or obligation mismatch |
-| `PEOPLE_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict on person revision |
+| `PEOPLE_NOT_ACTIVE` | 409 | Person or obligation is not active for this operation |
+| `PEOPLE_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict on person revision or settlement revision |
+| `PEOPLE_OBLIGATION_NOT_ACTIVE` | 409 | Person obligation is not active |
 | `PEOPLE_OBLIGATION_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict on obligation revision |
-| `PEOPLE_SETTLEMENT_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict on settlement revision |
+| `PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT` | 409 | Obligation has active settlements and cannot be voided or reduced |
+| `PEOPLE_OBLIGATION_OVERSETTLEMENT` | 409 | Payable settlement amount exceeds remaining balance |
 | `PEOPLE_OBLIGATION_SPLIT_MANAGED` | 409 | Cannot directly update/void obligation managed by credit card split |
 | `PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE` | 409 | Cannot archive person with active receivable or payable balance |
-| `PEOPLE_OBLIGATION_ALREADY_SETTLED` | 409 | Cannot void obligation with active settlements |
-| `PEOPLE_SETTLEMENT_OVERPAYMENT_NOT_ALLOWED` | 409 | Payable settlement amount cannot exceed remaining debt |
+| `PEOPLE_SETTLEMENT_NOT_ACTIVE` | 409 | Settlement is not active (already VOID) |
 | `PEOPLE_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different payload |
 
 ---

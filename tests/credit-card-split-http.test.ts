@@ -93,9 +93,11 @@ describe("Credit Card Shared Purchase & Split HTTP Surface (Checkpoint 7B.4-R1)"
 
 		mockDb = {
 			transaction: vi
-				// biome-ignore lint/suspicious/noExplicitAny: mock DB tx
 				.fn()
-				.mockImplementation(async (cb: (tx: any) => any) => cb(mockDb)),
+				// biome-ignore lint/suspicious/noExplicitAny: mock DB tx
+				.mockImplementation(async (cb: (tx: any) => Promise<any>) =>
+					cb(mockDb),
+				),
 			select: vi.fn().mockReturnValue({
 				from: vi.fn().mockReturnValue({
 					where: vi.fn().mockReturnValue({

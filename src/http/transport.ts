@@ -261,6 +261,9 @@ export const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	PEOPLE_INVALID_STATE: "Person invalid state transition",
 	PEOPLE_OBLIGATION_SPLIT_MANAGED:
 		"Obligation is managed by a credit card split and cannot be modified standalone",
+	PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE:
+		"Cannot archive person with outstanding balance",
+	PEOPLE_SETTLEMENT_NOT_ACTIVE: "Person settlement is not active",
 	INVALID_ORIGIN: "Invalid request origin",
 	UNAUTHENTICATED: "Authentication required",
 	NOT_FOUND: "Route not found",

@@ -1111,5 +1111,242 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 			const body = (await res.json()) as ErrBody;
 			expect(body.error.code).toBe("PEOPLE_OBLIGATION_OVERSETTLEMENT");
 		});
+
+		it("maps PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE to 409", async () => {
+			vi.spyOn(peopleModule, "archivePerson").mockRejectedValue(
+				new PeopleError(
+					"PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE",
+					"Cannot archive person with outstanding balance",
+				),
+			);
+
+			const res = await app.request(
+				`/people/${PERSON_ID}/archive`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "key-archive-balance",
+					},
+					body: JSON.stringify({
+						expectedRevisionNo: 1,
+						occurredAt: OCCURRED_AT,
+					}),
+				},
+				mockEnv,
+			);
+			expect(res.status).toBe(409);
+			const body = (await res.json()) as ErrBody;
+			expect(body.error.code).toBe("PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE");
+		});
+
+		it("maps PEOPLE_SETTLEMENT_NOT_ACTIVE to 409", async () => {
+			vi.spyOn(settlementsModule, "getPersonSettlement").mockResolvedValue({
+				settlementId: SETTLEMENT_ID,
+				obligationId: OBLIGATION_ID,
+				personId: PERSON_ID,
+				direction: "RECEIVABLE" as const,
+				status: "ACTIVE" as const,
+				assetAccountId: ASSET_ACC_ID,
+				cashAmount: "200.00",
+				appliedAmount: "200.00",
+				excessAmount: "0.00",
+				overpaymentIncomeReceiptId: null,
+				note: "First partial settlement",
+				occurredAt: new Date(OCCURRED_AT),
+				revisionNo: 1,
+				canonicalTransactionId: "99999999-9999-4999-8999-999999999999",
+				canonicalRevisionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+			});
+			vi.spyOn(settlementsModule, "voidPersonSettlement").mockRejectedValue(
+				new PeopleError(
+					"PEOPLE_SETTLEMENT_NOT_ACTIVE",
+					"Settlement is already VOID",
+				),
+			);
+
+			const res = await app.request(
+				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/settlements/${SETTLEMENT_ID}/void`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "key-void-stale",
+					},
+					body: JSON.stringify({
+						expectedRevisionNo: 1,
+						reason: "Re-voiding",
+					}),
+				},
+				mockEnv,
+			);
+			expect(res.status).toBe(409);
+			const body = (await res.json()) as ErrBody;
+			expect(body.error.code).toBe("PEOPLE_SETTLEMENT_NOT_ACTIVE");
+		});
+
+		it("maps generic PEOPLE_INVALID_STATE to 500 INTERNAL_ERROR (not 409)", async () => {
+			vi.spyOn(peopleModule, "archivePerson").mockRejectedValue(
+				new PeopleError(
+					"PEOPLE_INVALID_STATE",
+					"Database integrity invariant violated",
+				),
+			);
+
+			const res = await app.request(
+				`/people/${PERSON_ID}/archive`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "key-invalid-state",
+					},
+					body: JSON.stringify({
+						expectedRevisionNo: 1,
+						occurredAt: OCCURRED_AT,
+					}),
+				},
+				mockEnv,
+			);
+			expect(res.status).toBe(500);
+			const body = (await res.json()) as ErrBody;
+			expect(body.error.code).toBe("INTERNAL_ERROR");
+		});
+	});
+
+	// --- 11. Request Contract & Strict Closed-Body Regression ---
+	describe("Request contract & strict closed body validation", () => {
+		it("Payable settlement: rejects cashAmount as unknown field and accepts amount", async () => {
+			const resBad = await app.request(
+				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/settlements/payable`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "key-pay-settle-bad",
+					},
+					body: JSON.stringify({
+						cashAmount: "100.00",
+						sourceAssetAccountId: ASSET_ACC_ID,
+						occurredAt: OCCURRED_AT,
+					}),
+				},
+				mockEnv,
+			);
+			expect(resBad.status).toBe(400);
+			const badBody = (await resBad.json()) as ErrBody;
+			expect(badBody.error.code).toBe("PEOPLE_INVALID_INPUT");
+		});
+
+		it("Payable obligation: requires budgetCategory (missing -> 400)", async () => {
+			const res = await app.request(
+				`/people/${PERSON_ID}/obligations/payable`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "key-pay-obl-missing-cat",
+					},
+					body: JSON.stringify({
+						amount: "250.00",
+						occurredAt: OCCURRED_AT,
+					}),
+				},
+				mockEnv,
+			);
+			expect(res.status).toBe(400);
+			const body = (await res.json()) as ErrBody;
+			expect(body.error.code).toBe("PEOPLE_INVALID_INPUT");
+		});
+
+		it("Obligation void: rejects extra reason or occurredAt fields", async () => {
+			const resExtraReason = await app.request(
+				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/void`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "key-void-extra-reason",
+					},
+					body: JSON.stringify({
+						expectedRevisionNo: 1,
+						reason: "Extra reason not allowed",
+					}),
+				},
+				mockEnv,
+			);
+			expect(resExtraReason.status).toBe(400);
+
+			const resExtraOccurredAt = await app.request(
+				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/void`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "key-void-extra-date",
+					},
+					body: JSON.stringify({
+						expectedRevisionNo: 1,
+						occurredAt: OCCURRED_AT,
+					}),
+				},
+				mockEnv,
+			);
+			expect(resExtraOccurredAt.status).toBe(400);
+		});
+
+		it("Settlement void: requires reason (missing -> 400) and rejects extra occurredAt", async () => {
+			const resMissingReason = await app.request(
+				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/settlements/${SETTLEMENT_ID}/void`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "key-void-settle-missing-reason",
+					},
+					body: JSON.stringify({
+						expectedRevisionNo: 1,
+					}),
+				},
+				mockEnv,
+			);
+			expect(resMissingReason.status).toBe(400);
+
+			const resExtraOccurredAt = await app.request(
+				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/settlements/${SETTLEMENT_ID}/void`,
+				{
+					method: "POST",
+					headers: {
+						Cookie: COOKIE,
+						Origin: ORIGIN,
+						"Content-Type": "application/json",
+						"Idempotency-Key": "key-void-settle-extra-date",
+					},
+					body: JSON.stringify({
+						expectedRevisionNo: 1,
+						reason: "Valid reason",
+						occurredAt: OCCURRED_AT,
+					}),
+				},
+				mockEnv,
+			);
+			expect(resExtraOccurredAt.status).toBe(400);
+		});
 	});
 });

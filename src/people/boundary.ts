@@ -302,6 +302,21 @@ export function mapDbError(err: unknown, _context?: string): never {
 		);
 	}
 	if (
+		causeChain.includes("non-zero receivable balance") ||
+		causeChain.includes("non-zero payable balance")
+	) {
+		throw new PeopleError(
+			"PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE",
+			"Cannot archive person with non-zero balance",
+		);
+	}
+	if (causeChain.includes("cannot create revision on void settlement")) {
+		throw new PeopleError(
+			"PEOPLE_SETTLEMENT_NOT_ACTIVE",
+			"Settlement is already VOID",
+		);
+	}
+	if (
 		causeChain.includes("cannot archive") ||
 		causeChain.includes("cannot create revision on archived") ||
 		causeChain.includes("cannot create revision on void")

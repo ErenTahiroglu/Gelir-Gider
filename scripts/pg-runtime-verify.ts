@@ -15722,6 +15722,32 @@ async function resolverRuntime7B4() {
 		eqD(voidS2Res.status, 200, "7B.4-A: Void settlement returns 200");
 		eqD(voidS2Res.json?.settlement?.status, "VOIDED", "7B.4-A: Settlement status is VOIDED");
 
+		// 10b. Replay Void with Same Key -> Idempotent Replay 200
+		const voidS2Replay = await httpCall(`/people/${aliceId}/obligations/${obl1Id}/settlements/${s2Id}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-alice-void-s2",
+			body: {
+				expectedRevisionNo: 1,
+				reason: "Payment reversed at bank",
+			},
+		});
+		eqD(voidS2Replay.status, 200, "7B.4-A: Void settlement exact replay returns 200");
+		eqD(voidS2Replay.json?.idempotentReplay, true, "7B.4-A: Void settlement exact replay returns idempotentReplay = true");
+
+		// 10c. Re-Void with Different Key -> 409 PEOPLE_SETTLEMENT_NOT_ACTIVE
+		const voidS2Revoid = await httpCall(`/people/${aliceId}/obligations/${obl1Id}/settlements/${s2Id}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-alice-void-s2-diff-key",
+			body: {
+				expectedRevisionNo: 1,
+				reason: "Attempt second void with different key",
+			},
+		});
+		eqD(voidS2Revoid.status, 409, "7B.4-A: Attempting second void with different key returns 409");
+		eqD(voidS2Revoid.json?.error?.code, "PEOPLE_SETTLEMENT_NOT_ACTIVE", "7B.4-A: Re-void error code is PEOPLE_SETTLEMENT_NOT_ACTIVE");
+
 		// 11. Verify Obligation is reopened to OPEN with remaining 600.00
 		const getOblAfterVoid = await httpCall(`/people/${aliceId}/obligations/${obl1Id}`, {
 			method: "GET",
@@ -15729,6 +15755,24 @@ async function resolverRuntime7B4() {
 		});
 		eqD(getOblAfterVoid.json?.obligation?.status, "OPEN", "7B.4-A: Obligation reopened to OPEN");
 		eqD(getOblAfterVoid.json?.obligation?.remainingAmount, "600.00", "7B.4-A: Remaining amount back to 600.00");
+
+		// 11b. Archive Attempt on Alice with Outstanding Receivable Balance -> 409 PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE
+		const archiveAliceBlocked = await httpCall(`/people/${aliceId}/archive`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-alice-archive-fail",
+			body: {
+				expectedRevisionNo: 2,
+				occurredAt: "2026-06-15T10:00:00.000Z",
+			},
+		});
+		eqD(archiveAliceBlocked.status, 409, "7B.4-A: Archiving person with outstanding receivable balance returns 409");
+		eqD(archiveAliceBlocked.json?.error?.code, "PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE", "7B.4-A: Archive conflict code is PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE");
+
+		// Verify Alice status and balances remained unchanged
+		const getAliceAfterFailedArchive = await httpCall(`/people/${aliceId}`, { method: "GET", token: tokenA });
+		eqD(getAliceAfterFailedArchive.json?.person?.status, "ACTIVE", "7B.4-A: Alice remains ACTIVE after failed archive");
+		eqD(getAliceAfterFailedArchive.json?.person?.revisionNo, 2, "7B.4-A: Alice revisionNo remains 2");
 
 		// =========================================================================
 		// SCENARIO B: Person & Payable Expense Lifecycle via HTTP
@@ -15780,6 +15824,19 @@ async function resolverRuntime7B4() {
 		eqD(updPayOblRes.status, 200, "7B.4-B: Update payable obligation returns 200");
 		eqD(updPayOblRes.json?.obligation?.principalAmount, "600.00", "7B.4-B: Updated principal is 600.00");
 		eqD(updPayOblRes.json?.obligation?.revisionNo, 2, "7B.4-B: Obligation revision is 2");
+
+		// 3b. Attempt to archive Bob with Outstanding Payable Balance -> 409 PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE
+		const archiveBobBlocked = await httpCall(`/people/${bobId}/archive`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-bob-archive-fail",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-06-07T10:00:00.000Z",
+			},
+		});
+		eqD(archiveBobBlocked.status, 409, "7B.4-B: Archiving person with outstanding payable balance returns 409");
+		eqD(archiveBobBlocked.json?.error?.code, "PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE", "7B.4-B: Archive payable conflict code is PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE");
 
 		// 4. Record Payable Settlement (600.00)
 		const paySettleRes = await httpCall(`/people/${bobId}/obligations/${obl2Id}/settlements/payable`, {
