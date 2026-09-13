@@ -3,6 +3,7 @@ import * as dbClientModule from "../src/db/client";
 import { PeopleError } from "../src/people/errors";
 import * as obligationsModule from "../src/people/obligations";
 import * as peopleModule from "../src/people/people";
+import * as productReadV2Module from "../src/people/product-read-v2";
 import * as settlementsModule from "../src/people/settlements";
 
 const U1 = "11111111-1111-4111-8111-111111111111";
@@ -331,21 +332,22 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 	// --- 7. Person Surface Happy Paths & Service Invocations ---
 	describe("People CRUD Endpoints", () => {
 		it("GET /people returns list of people", async () => {
-			const mockPeople = [
-				{
-					personId: PERSON_ID,
-					status: "ACTIVE" as const,
-					displayName: "Alice",
-					relationship: "FRIEND" as const,
-					note: null,
-					revisionNo: 1,
-					receivableAccountId: ASSET_ACC_ID,
-					receivableBalance: "0.00",
-					payableAccountId: ASSET_ACC_ID,
-					payableBalance: "0.00",
-				},
-			];
-			vi.spyOn(peopleModule, "listPeople").mockResolvedValue(mockPeople);
+			vi.spyOn(productReadV2Module, "listBoundedPeople").mockResolvedValue({
+				people: [
+					{
+						personId: PERSON_ID,
+						status: "ACTIVE" as const,
+						displayName: "Alice",
+						relationship: "FRIEND" as const,
+						note: null,
+						revisionNo: 1,
+						receivableBalance: "0.00",
+						payableBalance: "0.00",
+					},
+				],
+				hasMore: false,
+				nextCursor: null,
+			});
 
 			const res = await app.request(
 				"/people?limit=20&status=ACTIVE&relationship=FRIEND",
@@ -360,7 +362,7 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 			const data = (await res.json()) as any;
 			expect(data.people).toHaveLength(1);
 			expect(data.people[0].displayName).toBe("Alice");
-			expect(data.limit).toBe(20);
+			expect(data.hasMore).toBe(false);
 		});
 
 		it("GET /people/:id returns 404 when not found", async () => {
@@ -544,9 +546,28 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 				payableAccountId: null,
 				payableBalance: "0.00",
 			});
-			vi.spyOn(obligationsModule, "listPersonObligations").mockResolvedValue([
-				mockReceivableObligation,
-			]);
+			vi.spyOn(productReadV2Module, "listBoundedObligations").mockResolvedValue(
+				{
+					obligations: [
+						{
+							obligationId: OBLIGATION_ID,
+							personId: PERSON_ID,
+							direction: "RECEIVABLE" as const,
+							status: "OPEN" as const,
+							principalAmount: "500.00",
+							settledAmount: "0.00",
+							remainingAmount: "500.00",
+							dueDate: "2026-10-01",
+							description: "Loan",
+							budgetCategory: null,
+							revisionNo: 1,
+							isSplitManaged: false,
+						},
+					],
+					hasMore: false,
+					nextCursor: null,
+				},
+			);
 
 			const res = await app.request(
 				`/people/${PERSON_ID}/obligations`,
@@ -836,9 +857,29 @@ describe("People + Family Product HTTP Surface (Checkpoint 7B.4)", () => {
 			vi.spyOn(obligationsModule, "getPersonObligation").mockResolvedValue(
 				mockReceivableObligation,
 			);
-			vi.spyOn(settlementsModule, "listPersonSettlements").mockResolvedValue([
-				mockSettlement,
-			]);
+			vi.spyOn(productReadV2Module, "listBoundedSettlements").mockResolvedValue(
+				{
+					settlements: [
+						{
+							settlementId: SETTLEMENT_ID,
+							obligationId: OBLIGATION_ID,
+							personId: PERSON_ID,
+							direction: "RECEIVABLE" as const,
+							status: "ACTIVE" as const,
+							assetAccountId: ASSET_ACC_ID,
+							cashAmount: "200.00",
+							appliedAmount: "200.00",
+							excessAmount: "0.00",
+							overpaymentIncomeReceiptId: null,
+							note: "First payment",
+							occurredAt: "2026-09-01T12:00:00.000Z",
+							revisionNo: 1,
+						},
+					],
+					hasMore: false,
+					nextCursor: null,
+				},
+			);
 
 			const res = await app.request(
 				`/people/${PERSON_ID}/obligations/${OBLIGATION_ID}/settlements`,

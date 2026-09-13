@@ -15561,7 +15561,7 @@ async function resolverRuntime7B4() {
 		const assetAccountId = assetAcc.account.id;
 
 		// =========================================================================
-		// SCENARIO A: Full Person & Receivable Lifecycle via HTTP
+		// SCENARIO A: Full Person & Receivable Lifecycle via HTTP + Lazy Ledger Truth
 		// =========================================================================
 		// 1. Create Person Alice
 		const createAliceRes = await httpCall("/people", {
@@ -15580,7 +15580,15 @@ async function resolverRuntime7B4() {
 		chkD(isUuid(aliceId), "7B.4-A: Alice personId is valid UUID");
 		eqD(createAliceRes.json?.person?.displayName, "Alice", "7B.4-A: Person name is Alice");
 		eqD(createAliceRes.json?.person?.status, "ACTIVE", "7B.4-A: Person status is ACTIVE");
+		eqD(createAliceRes.json?.person?.receivableBalance, "0.00", "7B.4-A: Initial receivableBalance is 0.00");
+		eqD(createAliceRes.json?.person?.payableBalance, "0.00", "7B.4-A: Initial payableBalance is 0.00");
+		eqD(createAliceRes.json?.person?.receivableAccountId, undefined, "7B.4-A: receivableAccountId stripped from product DTO");
+		eqD(createAliceRes.json?.person?.payableAccountId, undefined, "7B.4-A: payableAccountId stripped from product DTO");
 		eqD(createAliceRes.json?.idempotentReplay, false, "7B.4-A: First create is not replay");
+
+		// Verify lazy provisioning truth: creating Person does not provision ledger accounts/entries
+		const personAccsBefore = (await pg.query("select count(*)::int as n from person_ledger_links where person_id = $1", [aliceId])).rows[0].n as number;
+		eqD(personAccsBefore, 0, "7B.4-A: Person creation lazily defers ledger account provisioning (count = 0)");
 
 		// 2. Idempotent Replay
 		const replayAliceRes = await httpCall("/people", {
@@ -15615,7 +15623,7 @@ async function resolverRuntime7B4() {
 		eqD(updateAliceRes.json?.person?.displayName, "Alice Cooper", "7B.4-A: Updated name is Alice Cooper");
 		eqD(updateAliceRes.json?.person?.revisionNo, 2, "7B.4-A: Updated revisionNo is 2");
 
-		// 4. Record Receivable Obligation for Alice (1000.00)
+		// 4. Record Receivable Obligation for Alice (1000.00) -> Triggers lazy ledger provisioning
 		const recOblRes = await httpCall(`/people/${aliceId}/obligations/receivable`, {
 			method: "POST",
 			token: tokenA,
@@ -15635,6 +15643,12 @@ async function resolverRuntime7B4() {
 		eqD(recOblRes.json?.obligation?.principalAmount, "1000.00", "7B.4-A: Principal amount is 1000.00");
 		eqD(recOblRes.json?.obligation?.remainingAmount, "1000.00", "7B.4-A: Remaining amount is 1000.00");
 		eqD(recOblRes.json?.obligation?.status, "OPEN", "7B.4-A: Obligation status is OPEN");
+		eqD(recOblRes.json?.obligation?.canonicalTransactionId, undefined, "7B.4-A: canonicalTransactionId stripped from obligation DTO");
+		eqD(recOblRes.json?.obligation?.canonicalRevisionId, undefined, "7B.4-A: canonicalRevisionId stripped from obligation DTO");
+
+		// Verify ledger link was now provisioned
+		const personAccsAfter = (await pg.query("select count(*)::int as n from person_ledger_links where person_id = $1", [aliceId])).rows[0].n as number;
+		eqD(personAccsAfter, 1, "7B.4-A: First obligation lazily provisioned Person receivable ledger link (count = 1)");
 
 		// 5. GET Obligation & verify isSplitManaged: false
 		const getObl1Res = await httpCall(`/people/${aliceId}/obligations/${obl1Id}`, {
@@ -15660,6 +15674,7 @@ async function resolverRuntime7B4() {
 		const s1Id = settle1Res.json?.settlement?.settlementId;
 		chkD(isUuid(s1Id), "7B.4-A: Settlement ID is valid UUID");
 		eqD(settle1Res.json?.settlement?.appliedAmount, "400.00", "7B.4-A: Applied amount is 400.00");
+		eqD(settle1Res.json?.settlement?.canonicalTransactionId, undefined, "7B.4-A: canonicalTransactionId stripped from settlement DTO");
 
 		// 7. Check Obligation after partial settlement
 		const getOblAfterPartial = await httpCall(`/people/${aliceId}/obligations/${obl1Id}`, {
@@ -15802,9 +15817,9 @@ async function resolverRuntime7B4() {
 		eqD(archiveBobRes.json?.person?.status, "ARCHIVED", "7B.4-B: Bob is ARCHIVED");
 
 		// =========================================================================
-		// SCENARIO C: Split-Managed Obligation Mutation Guard Isolation
+		// SCENARIO C: Shared Purchase & Split HTTP Boundary + Protection Guards
 		// =========================================================================
-		// 1. Create Person Charlie
+		// 1. Create Person Charlie & David
 		const createCharlieRes = await httpCall("/people", {
 			method: "POST",
 			token: tokenA,
@@ -15817,7 +15832,19 @@ async function resolverRuntime7B4() {
 		});
 		const charlieId = createCharlieRes.json?.person?.personId;
 
-		// 2. Setup Card & Shared Purchase with Split for Charlie
+		const createDavidRes = await httpCall("/people", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "p-david-create-1",
+			body: {
+				displayName: "David",
+				relationship: "FRIEND",
+				occurredAt: "2026-06-01T10:00:00.000Z",
+			},
+		});
+		const davidId = createDavidRes.json?.person?.personId;
+
+		// 2. Setup Card & Shared Purchase via real HTTP POST /credit-cards/:cardId/purchases/shared
 		const cardRes = await httpCall("/credit-cards", {
 			method: "POST",
 			token: tokenA,
@@ -15834,28 +15861,50 @@ async function resolverRuntime7B4() {
 		});
 		const cardId = cardRes.json?.cardId;
 
-		const sharedPurchRes = await recordSharedCreditCardPurchase({
-			db,
-			userId: USER_A,
-			cardId,
-			amount: "1000.00",
-			purchaseCategory: "DISCRETIONARY_SPEND",
-			occurredAt: new Date("2026-06-04T12:00:00.000Z"),
-			description: "Group dinner",
-			purchaseIdempotencyKey: "shared-purch-7b4-1",
-			splitMethod: "EQUAL",
-			splitIdempotencyKey: "shared-split-7b4-1",
-			participants: [
-				{
-					personId: charlieId,
-				},
-			],
+		const sharedPurchRes = await httpCall(`/credit-cards/${cardId}/purchases/shared`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "shared-purch-7b4-http-1",
+			body: {
+				amount: "1000.00",
+				purchaseCategory: "DISCRETIONARY_SPEND",
+				description: "Group dinner",
+				merchant: "Restaurant 7B4",
+				installmentCount: 1,
+				occurredAt: "2026-06-04T12:00:00.000Z",
+				splitMethod: "EQUAL",
+				participants: [
+					{
+						personId: charlieId,
+					},
+				],
+			},
 		});
-		chkD(!!sharedPurchRes.purchase, "7B.4-C: Shared purchase with split created");
-		const charlieObligationId = sharedPurchRes.split.participants[0]?.personObligationId;
+		eqD(sharedPurchRes.status, 200, "7B.4-C: POST /credit-cards/:cardId/purchases/shared returns 200");
+		chkD(!!sharedPurchRes.json?.purchase, "7B.4-C: Shared purchase created via HTTP");
+		chkD(!!sharedPurchRes.json?.split, "7B.4-C: Shared purchase created with split");
+		const purchaseEventId = sharedPurchRes.json?.purchase?.eventId ?? sharedPurchRes.json?.split?.purchaseEventId;
+		const splitId = sharedPurchRes.json?.split?.splitId;
+		const charlieObligationId = sharedPurchRes.json?.split?.participants[0]?.obligationId;
+		chkD(isUuid(purchaseEventId), "7B.4-C: purchaseEventId is valid UUID");
+		chkD(isUuid(splitId), "7B.4-C: splitId is valid UUID");
 		chkD(isUuid(charlieObligationId), "7B.4-C: Split participant obligation ID is valid UUID");
+		eqD(sharedPurchRes.json?.split?.userId, undefined, "7B.4-C: userId stripped from split product DTO");
+		eqD(sharedPurchRes.json?.split?.canonicalTransactionId, undefined, "7B.4-C: canonicalTransactionId stripped from split product DTO");
 
-		// 3. GET Obligation & verify isSplitManaged: true
+		// 3. GET /credit-cards/:cardId/purchases/:purchaseEventId/split
+		const getSplitRes = await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}/split`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getSplitRes.status, 200, "7B.4-C: GET split returns 200");
+		eqD(getSplitRes.json?.split?.splitId, splitId, "7B.4-C: GET split returns matching splitId");
+		eqD(getSplitRes.json?.split?.status, "ACTIVE", "7B.4-C: Split status is ACTIVE");
+		eqD(getSplitRes.json?.split?.grossAmount, "1000.00", "7B.4-C: Split grossAmount is 1000.00");
+		eqD(getSplitRes.json?.split?.userShareAmount, "500.00", "7B.4-C: Split userShareAmount is 500.00");
+		eqD(getSplitRes.json?.split?.externalShareAmount, "500.00", "7B.4-C: Split externalShareAmount is 500.00");
+
+		// 4. GET Obligation & verify isSplitManaged: true
 		const getCharlieOblRes = await httpCall(`/people/${charlieId}/obligations/${charlieObligationId}`, {
 			method: "GET",
 			token: tokenA,
@@ -15863,7 +15912,7 @@ async function resolverRuntime7B4() {
 		eqD(getCharlieOblRes.status, 200, "7B.4-C: GET split obligation returns 200");
 		eqD(getCharlieOblRes.json?.obligation?.isSplitManaged, true, "7B.4-C: isSplitManaged is true");
 
-		// 4. Direct Update Attempt on Split-Managed Obligation -> 409 PEOPLE_OBLIGATION_SPLIT_MANAGED
+		// 5. Direct Update Attempt on Split-Managed Obligation -> 409 PEOPLE_OBLIGATION_SPLIT_MANAGED
 		const blockUpdRes = await httpCall(`/people/${charlieId}/obligations/${charlieObligationId}`, {
 			method: "POST",
 			token: tokenA,
@@ -15878,7 +15927,7 @@ async function resolverRuntime7B4() {
 		eqD(blockUpdRes.status, 409, "7B.4-C: Direct update of split-managed obligation blocked with 409");
 		eqD(blockUpdRes.json?.error?.code, "PEOPLE_OBLIGATION_SPLIT_MANAGED", "7B.4-C: Error code is PEOPLE_OBLIGATION_SPLIT_MANAGED");
 
-		// 5. Direct Void Attempt on Split-Managed Obligation -> 409 PEOPLE_OBLIGATION_SPLIT_MANAGED
+		// 6. Direct Void Attempt on Split-Managed Obligation -> 409 PEOPLE_OBLIGATION_SPLIT_MANAGED
 		const blockVoidRes = await httpCall(`/people/${charlieId}/obligations/${charlieObligationId}/void`, {
 			method: "POST",
 			token: tokenA,
@@ -15890,14 +15939,402 @@ async function resolverRuntime7B4() {
 		eqD(blockVoidRes.status, 409, "7B.4-C: Direct void of split-managed obligation blocked with 409");
 		eqD(blockVoidRes.json?.error?.code, "PEOPLE_OBLIGATION_SPLIT_MANAGED", "7B.4-C: Void error code is PEOPLE_OBLIGATION_SPLIT_MANAGED");
 
-		// 6. Verify obligation remains untouched (revision 1, amount 500.00, OPEN)
-		const getCharlieOblAfter = await httpCall(`/people/${charlieId}/obligations/${charlieObligationId}`, {
-			method: "GET",
+		// 7. Direct Purchase Update Attempt on purchase with active split -> 409 CREDIT_CARD_SPLIT_CONFLICT
+		const blockDirectPurchUpd = await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}`, {
+			method: "POST",
 			token: tokenA,
+			idempotencyKey: "direct-purch-upd-1",
+			body: {
+				expectedRevisionNo: 1,
+				amount: "1100.00",
+				purchaseCategory: "DISCRETIONARY_SPEND",
+				occurredAt: "2026-06-04T14:00:00.000Z",
+			},
 		});
-		eqD(getCharlieOblAfter.json?.obligation?.revisionNo, 1, "7B.4-C: Obligation revision remains 1");
-		eqD(getCharlieOblAfter.json?.obligation?.principalAmount, "500.00", "7B.4-C: Principal amount remains 500.00");
-		eqD(getCharlieOblAfter.json?.obligation?.status, "OPEN", "7B.4-C: Obligation status remains OPEN");
+		eqD(blockDirectPurchUpd.status, 409, "7B.4-C: Direct update on split purchase blocked with 409");
+		eqD(blockDirectPurchUpd.json?.error?.code, "CREDIT_CARD_SPLIT_CONFLICT", "7B.4-C: Direct update error code is CREDIT_CARD_SPLIT_CONFLICT");
+
+		// 8. Direct Purchase Void Attempt on purchase with active split -> 409 CREDIT_CARD_SPLIT_CONFLICT
+		const blockDirectPurchVoid = await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "direct-purch-void-1",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-06-04T15:00:00.000Z",
+			},
+		});
+		eqD(blockDirectPurchVoid.status, 409, "7B.4-C: Direct void on split purchase blocked with 409");
+		eqD(blockDirectPurchVoid.json?.error?.code, "CREDIT_CARD_SPLIT_CONFLICT", "7B.4-C: Direct void error code is CREDIT_CARD_SPLIT_CONFLICT");
+
+		// 9. Revise Split via HTTP (POST /credit-cards/:cardId/purchases/:purchaseEventId/split/revisions)
+		const reviseSplitRes = await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}/split/revisions`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "split-rev-http-1",
+			body: {
+				expectedRevisionNo: 1,
+				splitMethod: "EQUAL",
+				participants: [
+					{ personId: charlieId },
+					{ personId: davidId },
+				],
+			},
+		});
+		eqD(reviseSplitRes.status, 200, "7B.4-C: POST /split/revisions returns 200");
+		eqD(reviseSplitRes.json?.split?.revisionNo, 2, "7B.4-C: Revised split revisionNo is 2");
+		eqD(reviseSplitRes.json?.split?.participants?.length, 2, "7B.4-C: Split now has 2 participants");
+		eqD(reviseSplitRes.json?.split?.userShareAmount, "333.34", "7B.4-C: User share amount updated to 333.34");
+
+		// 10. Replay with Stale Revision OCC Check -> 409 CREDIT_CARD_REVISION_CONFLICT
+		const staleRevRes = await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}/split/revisions`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "split-rev-stale-1",
+			body: {
+				expectedRevisionNo: 1, // stale, current is 2
+				splitMethod: "EQUAL",
+				participants: [
+					{ personId: charlieId },
+					{ personId: davidId },
+				],
+			},
+		});
+		eqD(staleRevRes.status, 409, "7B.4-C: Stale split revision rejected with 409");
+		eqD(staleRevRes.json?.error?.code, "CREDIT_CARD_SPLIT_REVISION_CONFLICT", "7B.4-C: Error code is CREDIT_CARD_SPLIT_REVISION_CONFLICT");
+
+		// 11. Coordinated Purchase + Split Update via HTTP
+		const sharedRevRes = await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}/shared-revisions`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "shared-rev-http-1",
+			body: {
+				expectedPurchaseRevisionNo: 1,
+				expectedSplitRevisionNo: 2,
+				amount: "1200.00",
+				purchaseCategory: "DISCRETIONARY_SPEND",
+				description: "Group dinner - updated with dessert",
+				merchant: "Restaurant 7B4",
+				installmentCount: 1,
+				occurredAt: "2026-06-04T12:00:00.000Z",
+				splitMethod: "EQUAL",
+				participants: [
+					{ personId: charlieId },
+					{ personId: davidId },
+				],
+			},
+		});
+		eqD(sharedRevRes.status, 200, "7B.4-C: POST /shared-revisions returns 200");
+		eqD(sharedRevRes.json?.purchase?.snapshot?.amount ?? sharedRevRes.json?.purchase?.amount, "1200.00", "7B.4-C: Coordinated purchase amount is 1200.00");
+		eqD(sharedRevRes.json?.split?.grossAmount, "1200.00", "7B.4-C: Coordinated split gross amount is 1200.00");
+		eqD(sharedRevRes.json?.split?.revisionNo, 3, "7B.4-C: Coordinated split revisionNo is 3");
+		eqD(sharedRevRes.json?.split?.userShareAmount, "400.00", "7B.4-C: Coordinated user share is 400.00");
+
+		// 12. Active Settlement Reduction Conflict:
+		// Settle 300.00 on Charlie's obligation
+		const charlieOblAfterRevId = sharedRevRes.json?.split?.participants?.find((p: any) => p.personId === charlieId)?.obligationId;
+		const charlieSettleRes = await httpCall(`/people/${charlieId}/obligations/${charlieOblAfterRevId}/settlements/receivable`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "charlie-settle-300",
+			body: {
+				cashAmount: "300.00",
+				destinationAssetAccountId: assetAccountId,
+				occurredAt: "2026-06-06T10:00:00.000Z",
+				note: "Charlie partial payment",
+			},
+		});
+		eqD(charlieSettleRes.status, 200, "7B.4-C: Settle 300.00 on Charlie obligation returns 200");
+		const charlieSettleId = charlieSettleRes.json?.settlement?.settlementId;
+
+		// Now attempt to revise split so Charlie's share is 200.00 (< 300.00 settled) -> 409 conflict
+		const conflictSplitRev = await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}/split/revisions`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "split-rev-reduce-conflict",
+			body: {
+				expectedRevisionNo: 3,
+				splitMethod: "MANUAL",
+				participants: [
+					{ personId: charlieId, shareAmount: "200.00" }, // 200.00 < 300.00 settled!
+					{ personId: davidId, shareAmount: "400.00" },
+				],
+			},
+		});
+		eqD(conflictSplitRev.status, 409, "7B.4-C: Reducing split share below settled amount rejected with 409");
+
+		// 13. Void Charlie's settlement then execute Coordinated Void
+		const voidCharlieSettleRes = await httpCall(`/people/${charlieId}/obligations/${charlieOblAfterRevId}/settlements/${charlieSettleId}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "void-charlie-settle-300",
+			body: {
+				expectedRevisionNo: 1,
+				reason: "Reset for void test",
+			},
+		});
+		eqD(voidCharlieSettleRes.status, 200, "7B.4-C: Void Charlie settlement returns 200");
+
+		const coordinatedVoidRes = await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}/shared-void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "shared-void-http-1",
+			body: {
+				expectedPurchaseRevisionNo: 2,
+				expectedSplitRevisionNo: 3,
+			},
+		});
+		eqD(coordinatedVoidRes.status, 200, "7B.4-C: POST /shared-void returns 200");
+		eqD(coordinatedVoidRes.json?.purchase?.status, "VOID", "7B.4-C: Purchase status is VOID");
+		eqD(coordinatedVoidRes.json?.split?.status, "VOID", "7B.4-C: Split status is VOID");
+
+		// =========================================================================
+		// SCENARIO D: Keyset Pagination >100 Traversal Proofs (People, Obligation, Settlement)
+		// =========================================================================
+		console.log("  --- Starting >100 Keyset Pagination Traversal Proofs ---");
+
+		// 1. >100 People Pagination
+		// Seed 105 people for User A
+		const seededPeopleIds: string[] = [];
+		for (let i = 1; i <= 105; i++) {
+			const numStr = String(i).padStart(3, "0");
+			const pRes = await httpCall("/people", {
+				method: "POST",
+				token: tokenA,
+				idempotencyKey: `p-seed-105-${numStr}`,
+				body: {
+					displayName: `Person_${numStr}`,
+					relationship: i % 2 === 0 ? "FAMILY" : "FRIEND",
+					occurredAt: `2026-07-01T10:00:${String(i % 60).padStart(2, "0")}.000Z`,
+				},
+			});
+			seededPeopleIds.push(pRes.json?.person?.personId);
+		}
+		eqD(seededPeopleIds.length, 105, "7B.4-D: Seeded 105 people rows for User A");
+
+		// Traverse GET /people with limit 50
+		const allFetchedPeopleIds: string[] = [];
+		let peopleCursor: string | null = null;
+		let peoplePageCount = 0;
+		while (true) {
+			peoplePageCount++;
+			const url = peopleCursor ? `/people?limit=50&after=${encodeURIComponent(peopleCursor)}` : "/people?limit=50";
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.4-D: GET /people page ${peoplePageCount} returns 200`);
+			const items = pageRes.json?.people ?? pageRes.json?.items ?? [];
+			for (const item of items) {
+				allFetchedPeopleIds.push(item.personId);
+			}
+			if (peoplePageCount === 1) {
+				eqD(items.length, 50, "7B.4-D: People page 1 has exactly 50 items");
+				eqD(pageRes.json?.hasMore, true, "7B.4-D: People page 1 hasMore is true");
+				chkD(typeof pageRes.json?.nextCursor === "string", "7B.4-D: People page 1 has nextCursor");
+			} else if (peoplePageCount === 2) {
+				eqD(items.length, 50, "7B.4-D: People page 2 has exactly 50 items");
+				eqD(pageRes.json?.hasMore, true, "7B.4-D: People page 2 hasMore is true");
+			}
+			if (!pageRes.json?.hasMore) {
+				eqD(pageRes.json?.nextCursor, null, "7B.4-D: People final page nextCursor is null");
+				break;
+			}
+			peopleCursor = pageRes.json?.nextCursor;
+		}
+		// Notice earlier we created Alice, Bob, Charlie, David + 105 seeded = 109 people total
+		const uniquePeopleIds = new Set(allFetchedPeopleIds);
+		eqD(allFetchedPeopleIds.length, uniquePeopleIds.size, "7B.4-D: People pagination returned zero duplicate rows");
+		chkD(allFetchedPeopleIds.length >= 105, "7B.4-D: People pagination returned all seeded rows (>100 traversal PASS)");
+
+		// Test People Pre-Pagination Filtering
+		const familyPeopleRes = await httpCall("/people?relationship=FAMILY&limit=50", { method: "GET", token: tokenA });
+		eqD(familyPeopleRes.status, 200, "7B.4-D: Filter /people?relationship=FAMILY returns 200");
+		const familyItems = familyPeopleRes.json?.people ?? familyPeopleRes.json?.items ?? [];
+		chkD(familyItems.every((p: any) => p.relationship === "FAMILY"), "7B.4-D: All returned filtered people have relationship FAMILY");
+
+		// Malformed Cursor Test
+		const badCursorRes = await httpCall("/people?after=not-a-valid-base64url-cursor", { method: "GET", token: tokenA });
+		eqD(badCursorRes.status, 400, "7B.4-D: Malformed cursor returns 400");
+		eqD(badCursorRes.json?.error?.code, "PEOPLE_INVALID_INPUT", "7B.4-D: Malformed cursor error code is PEOPLE_INVALID_INPUT");
+
+		// 2. >100 Obligation Pagination
+		// Seed 105 obligations for Alice
+		const seededOblIds: string[] = [];
+		for (let i = 1; i <= 105; i++) {
+			const numStr = String(i).padStart(3, "0");
+			const oRes = await httpCall(`/people/${aliceId}/obligations/receivable`, {
+				method: "POST",
+				token: tokenA,
+				idempotencyKey: `obl-seed-105-${numStr}`,
+				body: {
+					amount: "10.00",
+					fundingAssetAccountId: assetAccountId,
+					occurredAt: `2026-07-02T10:00:${String(i % 60).padStart(2, "0")}.000Z`,
+					description: `Bulk receivable obligation ${numStr}`,
+				},
+			});
+			seededOblIds.push(oRes.json?.obligation?.obligationId);
+		}
+		eqD(seededOblIds.length, 105, "7B.4-D: Seeded 105 obligation rows for Alice");
+
+		// Traverse GET /people/:personId/obligations with limit 50
+		const allFetchedOblIds: string[] = [];
+		let oblCursor: string | null = null;
+		let oblPageCount = 0;
+		while (true) {
+			oblPageCount++;
+			const url = oblCursor ? `/people/${aliceId}/obligations?limit=50&after=${encodeURIComponent(oblCursor)}` : `/people/${aliceId}/obligations?limit=50`;
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.4-D: GET obligations page ${oblPageCount} returns 200`);
+			const items = pageRes.json?.obligations ?? pageRes.json?.items ?? [];
+			for (const item of items) {
+				allFetchedOblIds.push(item.obligationId);
+			}
+			if (oblPageCount === 1) {
+				eqD(items.length, 50, "7B.4-D: Obligations page 1 has 50 items");
+				eqD(pageRes.json?.hasMore, true, "7B.4-D: Obligations page 1 hasMore is true");
+			}
+			if (!pageRes.json?.hasMore) {
+				eqD(pageRes.json?.nextCursor, null, "7B.4-D: Obligations final page nextCursor is null");
+				break;
+			}
+			oblCursor = pageRes.json?.nextCursor;
+		}
+		const uniqueOblIds = new Set(allFetchedOblIds);
+		eqD(allFetchedOblIds.length, uniqueOblIds.size, "7B.4-D: Obligations pagination returned zero duplicate rows");
+		chkD(allFetchedOblIds.length >= 105, "7B.4-D: Obligations pagination returned all seeded rows (>100 traversal PASS)");
+
+		// 3. >100 Settlement Pagination
+		// Create a large obligation and seed 105 partial settlements
+		const largeOblRes = await httpCall(`/people/${aliceId}/obligations/receivable`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "obl-large-for-settlements",
+			body: {
+				amount: "5000.00",
+				fundingAssetAccountId: assetAccountId,
+				occurredAt: "2026-07-03T10:00:00.000Z",
+				description: "Large obligation for 105 settlements",
+			},
+		});
+		const largeOblId = largeOblRes.json?.obligation?.obligationId;
+
+		const seededSettleIds: string[] = [];
+		for (let i = 1; i <= 105; i++) {
+			const numStr = String(i).padStart(3, "0");
+			const sRes = await httpCall(`/people/${aliceId}/obligations/${largeOblId}/settlements/receivable`, {
+				method: "POST",
+				token: tokenA,
+				idempotencyKey: `settle-seed-105-${numStr}`,
+				body: {
+					cashAmount: "10.00",
+					destinationAssetAccountId: assetAccountId,
+					occurredAt: `2026-07-04T10:00:${String(i % 60).padStart(2, "0")}.000Z`,
+					note: `Settlement installment ${numStr}`,
+				},
+			});
+			seededSettleIds.push(sRes.json?.settlement?.settlementId);
+		}
+		eqD(seededSettleIds.length, 105, "7B.4-D: Seeded 105 settlement rows for large obligation");
+
+		// Traverse GET settlements with limit 50
+		const allFetchedSettleIds: string[] = [];
+		let settleCursor: string | null = null;
+		let settlePageCount = 0;
+		while (true) {
+			settlePageCount++;
+			const url = settleCursor ? `/people/${aliceId}/obligations/${largeOblId}/settlements?limit=50&after=${encodeURIComponent(settleCursor)}` : `/people/${aliceId}/obligations/${largeOblId}/settlements?limit=50`;
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.4-D: GET settlements page ${settlePageCount} returns 200`);
+			const items = pageRes.json?.settlements ?? pageRes.json?.items ?? [];
+			for (const item of items) {
+				allFetchedSettleIds.push(item.settlementId);
+			}
+			if (settlePageCount === 1) {
+				eqD(items.length, 50, "7B.4-D: Settlements page 1 has 50 items");
+				eqD(pageRes.json?.hasMore, true, "7B.4-D: Settlements page 1 hasMore is true");
+			}
+			if (!pageRes.json?.hasMore) {
+				eqD(pageRes.json?.nextCursor, null, "7B.4-D: Settlements final page nextCursor is null");
+				break;
+			}
+			settleCursor = pageRes.json?.nextCursor;
+		}
+		const uniqueSettleIds = new Set(allFetchedSettleIds);
+		eqD(allFetchedSettleIds.length, uniqueSettleIds.size, "7B.4-D: Settlements pagination returned zero duplicate rows");
+		eqD(allFetchedSettleIds.length, 105, "7B.4-D: Exactly 105 unique settlement rows traversed (>100 traversal PASS)");
+
+		// =========================================================================
+		// SCENARIO E: Same-Database Cross-User Security Proofs
+		// =========================================================================
+		const USER_B = "22222222-bbbb-4bbb-8bbb-222222222222";
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User B', 'TRY', 'Europe/Istanbul', now())",
+			[USER_B],
+		);
+		const { token: tokenB } = await createSession({ db, userId: USER_B });
+
+		// User B attempts to access User A's Person -> 404
+		const crossUserPersonRes = await httpCall(`/people/${aliceId}`, { method: "GET", token: tokenB });
+		eqD(crossUserPersonRes.status, 404, "7B.4-E: User B cannot GET User A person (404 NOT_FOUND)");
+
+		// User B attempts to access User A's Obligations -> 404
+		const crossUserOblRes = await httpCall(`/people/${aliceId}/obligations`, { method: "GET", token: tokenB });
+		eqD(crossUserOblRes.status, 404, "7B.4-E: User B cannot GET User A obligations (404 NOT_FOUND)");
+
+		// User B attempts to read User A's Split -> 404
+		const crossUserSplitRes = await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}/split`, { method: "GET", token: tokenB });
+		eqD(crossUserSplitRes.status, 404, "7B.4-E: User B cannot GET User A split (404 NOT_FOUND)");
+
+		// User B attempts to mutate User A's Split -> 404
+		const crossUserSplitMutRes = await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}/split/revisions`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "cross-user-split-mut",
+			body: {
+				expectedRevisionNo: 1,
+				splitMethod: "EQUAL",
+				participants: [{ personId: charlieId }],
+			},
+		});
+		eqD(crossUserSplitMutRes.status, 404, "7B.4-E: User B cannot mutate User A split (404 NOT_FOUND)");
+
+		// User B cannot reuse User A cursor to access User A rows
+		const crossCursorRes = await httpCall(`/people?after=${encodeURIComponent(peopleCursor!)}`, { method: "GET", token: tokenB });
+		eqD(crossCursorRes.status, 200, "7B.4-E: User B with User A cursor returns 200 for User B scope");
+		eqD((crossCursorRes.json?.people ?? crossCursorRes.json?.items ?? []).length, 0, "7B.4-E: User B sees 0 items from User A cursor (zero leakage)");
+
+		// =========================================================================
+		// SCENARIO F: Read-Only GET Proof (Zero Database Writes on All GET Endpoints)
+		// =========================================================================
+		const countAllTables = async () => {
+			const q = async (table: string) => (await pg.query(`select count(*)::int as n from ${table}`)).rows[0].n as number;
+			return (
+				(await q("people")) +
+				(await q("person_revisions")) +
+				(await q("person_obligations")) +
+				(await q("person_obligation_revisions")) +
+				(await q("person_settlements")) +
+				(await q("person_settlement_revisions")) +
+				(await q("credit_card_purchase_splits")) +
+				(await q("credit_card_purchase_split_revisions")) +
+				(await q("credit_card_liability_events")) +
+				(await q("credit_card_liability_event_revisions")) +
+				(await q("canonical_transactions")) +
+				(await q("transaction_revisions")) +
+				(await q("journal_entries")) +
+				(await q("journal_lines"))
+			);
+		};
+
+		const countBefore = await countAllTables();
+		await httpCall("/people", { method: "GET", token: tokenA });
+		await httpCall(`/people/${aliceId}`, { method: "GET", token: tokenA });
+		await httpCall(`/people/${aliceId}/obligations`, { method: "GET", token: tokenA });
+		await httpCall(`/people/${aliceId}/obligations/${obl1Id}`, { method: "GET", token: tokenA });
+		await httpCall(`/people/${aliceId}/obligations/${obl1Id}/settlements`, { method: "GET", token: tokenA });
+		await httpCall(`/credit-cards/${cardId}/purchases/${purchaseEventId}/split`, { method: "GET", token: tokenA });
+		const countAfter = await countAllTables();
+		eqD(countBefore, countAfter, "7B.4-F: Read-only GET endpoints perform exactly zero database writes");
+
 	} finally {
 		setDatabaseFactoryOverrideForTest(null);
 		await pg.close();

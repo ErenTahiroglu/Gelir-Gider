@@ -600,9 +600,82 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
   - Body (closed): `{ expectedRevisionNo, reasonNote?, occurredAt }`
   - Preflight checks require eventType `PURCHASE`; returns `404 CREDIT_CARD_PURCHASE_NOT_FOUND` if the target event is not a purchase.
 
-*Note: Shared purchases with participant splits are deferred to Checkpoint 7B.4 (People + Family).*
+#### 5.8.7 Shared Purchases & Split Management (Checkpoint 7B.4-R1)
+- **`POST /credit-cards/:cardId/purchases/shared`**: Atomically create a purchase and its initial participant split.
+  - Header: `Idempotency-Key` (required; server derives child purchase & split keys deterministically).
+  - Body (closed):
+    ```json
+    {
+      "amount": "1000.00",
+      "purchaseCategory": "DISCRETIONARY_SPEND",
+      "shortTermGoalId": "optional-uuid",
+      "merchant": "optional merchant",
+      "description": "optional description",
+      "installmentCount": 1,
+      "occurredAt": "2026-09-10T12:00:00.000Z",
+      "splitMethod": "EQUAL",
+      "userWeight": 1,
+      "participants": [
+        {
+          "personId": "uuid-person-1",
+          "shareAmount": "500.00",
+          "weight": 1,
+          "dueDate": "2026-10-01",
+          "description": "optional note"
+        }
+      ]
+    }
+    ```
+  - Response: `{ purchase: PurchaseMutationResult, split: CreditCardPurchaseSplitProductDto, idempotentReplay: boolean }`
+- **`GET /credit-cards/:cardId/purchases/:id/split`**: Read active split product DTO. Returns `404 CREDIT_CARD_SPLIT_NOT_FOUND` if no active split exists.
+- **`POST /credit-cards/:cardId/purchases/:id/split`**: Attach a new split to an existing unshared credit card purchase.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ splitMethod, userWeight?, participants: ParticipantInput[], occurredAt? }`
+- **`POST /credit-cards/:cardId/purchases/:id/split/revisions`**: Revise split participant allocation (OCC).
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, splitMethod, userWeight?, participants: ParticipantInput[], occurredAt? }`
+- **`POST /credit-cards/:cardId/purchases/:id/split/void`**: Void split allocation (OCC).
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, reasonNote?, occurredAt? }`
+- **`POST /credit-cards/:cardId/purchases/:id/shared-revisions`**: Coordinated atomic revision of both purchase details and split allocations.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedPurchaseRevisionNo, expectedSplitRevisionNo, amount, purchaseCategory, shortTermGoalId?, merchant?, description?, installmentCount?, reasonNote?, occurredAt, splitMethod, userWeight?, participants: ParticipantInput[] }`
+- **`POST /credit-cards/:cardId/purchases/:id/shared-void`**: Coordinated atomic void of both purchase and active split.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedPurchaseRevisionNo, expectedSplitRevisionNo, reasonNote?, occurredAt }`
 
-#### 5.8.6 Opening Balance (Direct Setup / Onboarding Lifecycle)
+**Split Product DTO (`CreditCardPurchaseSplitProductDto`):**
+```json
+{
+  "splitId": "uuid",
+  "purchaseEventId": "uuid",
+  "status": "ACTIVE",
+  "revisionNo": 1,
+  "method": "EQUAL",
+  "grossAmount": "1000.00",
+  "userShareAmount": "500.00",
+  "externalShareAmount": "500.00",
+  "userWeight": 1,
+  "occurredAt": "2026-09-10T12:00:00.000Z",
+  "participants": [
+    {
+      "personId": "uuid",
+      "displayName": "Alice",
+      "relationship": "FAMILY",
+      "shareAmount": "500.00",
+      "settledAmount": "0.00",
+      "remainingAmount": "500.00",
+      "weight": 1,
+      "dueDate": "2026-10-01",
+      "description": "Dinner share",
+      "obligationId": "uuid"
+    }
+  ]
+}
+```
+*Note: Internal fields `userId`, `canonicalTransactionId`, `canonicalRevisionId`, `revisionFingerprint`, and internal seal/item IDs are stripped from all public split responses.*
+
+#### 5.8.8 Opening Balance (Direct Setup / Onboarding Lifecycle)
 - **`GET /credit-cards/:cardId/opening-balance`**: Returns the card's opening balance liability event, or `{ openingBalance: null }` if not set.
 - **`POST /credit-cards/:cardId/opening-balance`**: Record initial credit card opening balance debt at onboarding/import time.
   - Header: `Idempotency-Key` (required).
@@ -648,67 +721,142 @@ All routes require session authentication (`__Host-gg_session` cookie) with user
 | `CREDIT_CARD_SPLIT_NOT_ACTIVE` | 409 | Credit card split is not active |
 | `CREDIT_CARD_SPLIT_REVISION_CONFLICT` | 409 | Credit card split revision is stale |
 | `CREDIT_CARD_SPLIT_IDEMPOTENCY_CONFLICT` | 409 | Credit card split idempotency conflict |
-| `CREDIT_CARD_SPLIT_CONFLICT` | 409 | Credit card split conflict |
+| `CREDIT_CARD_SPLIT_CONFLICT` | 409 | Credit card split conflict or active-settlement reduction conflict |
 | `CREDIT_CARD_STATEMENT_RECONCILIATION_CONFLICT` | 409 | Statement reconciliation conflict |
 | `CREDIT_CARD_STATEMENT_RECONCILIATION_IDEMPOTENCY_CONFLICT` | 409 | Statement reconciliation idempotency conflict |
 
-
 ---
 
-## 6. Exact-Money Rule
+### 5.9 People + Family (Checkpoint 7B.4 — IMPLEMENTED)
 
-> **All monetary amounts are transmitted as decimal strings. The frontend must
-> never convert money to or from JavaScript `number` (IEEE 754 float).**
+The People + Family domain manages trusted counterparts, interpersonal obligations (receivables & payables), and cash settlements.
 
-**Encoding:**
+#### 5.9.1 Person Lifecycle (5 Routes)
+- **`GET /people`**: Bounded keyset-paginated list of people.
+  - Query parameters: `status` (`ACTIVE` | `ARCHIVED`), `relationship` (`FAMILY` | `FRIEND` | `COLLEAGUE` | `OTHER`), `limit` (default 50, max 100), `after` (opaque Base64URL cursor).
+  - Response: `{ people: PersonProductDto[], hasMore: boolean, nextCursor: string | null }`
+- **`GET /people/:id`**: Get single person details. Returns `404 PEOPLE_NOT_FOUND` if nonexistent or owned by another user.
+- **`POST /people`**: Create a new person counterpart.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ displayName, relationship, note?, occurredAt }`
+  - *Domain Truth Note:* Creating a person is a metadata operation. Dedicated person ledger accounts are lazily provisioned on first financial obligation creation.
+- **`POST /people/:id`**: Update person metadata (OCC).
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, displayName, relationship, note?, occurredAt }`
+- **`POST /people/:id/archive`**: Archive a person counterpart.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, reasonNote?, occurredAt }`
+  - Returns `409 PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE` if receivable or payable balance is non-zero.
 
-- Amounts are transmitted as JSON strings, e.g. `"1234.56"` or `"-50.00"`.
-- The string always has exactly two decimal places for Turkish Lira amounts.
-- No scientific notation, no trailing zeros beyond two decimal places, no currency symbol.
-- Server-side storage is integer cents (bigint); the API layer converts to/from decimal
-  string at the boundary.
+**Person Product DTO (`PersonProductDto`):**
+```json
+{
+  "personId": "uuid",
+  "status": "ACTIVE",
+  "displayName": "Alice Smith",
+  "relationship": "FAMILY",
+  "note": "Sister",
+  "revisionNo": 1,
+  "receivableBalance": "0.00",
+  "payableBalance": "0.00"
+}
+```
+*Note: Internal ledger account IDs (`receivableAccountId`, `payableAccountId`) and user IDs are stripped from public responses.*
 
-**Frontend obligations:**
+#### 5.9.2 Obligations Lifecycle (6 Routes)
+- **`GET /people/:personId/obligations`**: Bounded keyset-paginated list of obligations for a person.
+  - Query parameters: `direction` (`RECEIVABLE` | `PAYABLE`), `status` (`OPEN` | `SETTLED` | `VOID`), `dueDateFrom`, `dueDateUntil`, `limit` (default 50, max 100), `after` (opaque Base64URL cursor).
+  - Filtering by status/direction/due dates is evaluated before pagination truncation in SQL.
+  - Response: `{ obligations: ObligationProductDto[], hasMore: boolean, nextCursor: string | null }`
+- **`GET /people/:personId/obligations/:id`**: Get single obligation details.
+- **`POST /people/:personId/obligations/receivable`**: Record a standalone receivable obligation (money lent to person).
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ amount, fundingAssetAccountId, dueDate?, description?, occurredAt }`
+- **`POST /people/:personId/obligations/payable`**: Record a standalone payable expense obligation (money owed to person).
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ amount, budgetCategory?, dueDate?, description?, occurredAt }`
+- **`POST /people/:personId/obligations/:id`**: Update standalone obligation details with OCC.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, amount, fundingAssetAccountId?, budgetCategory?, dueDate?, description?, occurredAt }`
+  - *Authority Protection:* Returns `409 PEOPLE_OBLIGATION_SPLIT_MANAGED` if the obligation was created by a credit card purchase split. Split-managed obligations must be revised via split routes.
+- **`POST /people/:personId/obligations/:id/void`**: Void a standalone obligation with OCC.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, reason?, occurredAt? }`
+  - Returns `409 PEOPLE_OBLIGATION_SPLIT_MANAGED` if split-managed. Returns `409 PEOPLE_OBLIGATION_ALREADY_SETTLED` if active settlements exist.
 
-- Parse money strings using a decimal library (e.g. `Decimal.js`, `big.js`) — never `parseFloat`.
-- Display using locale-aware formatting from the decimal representation, not from a float.
-- Never submit a money amount as a JSON number — always as a string.
+**Obligation Product DTO (`ObligationProductDto`):**
+```json
+{
+  "obligationId": "uuid",
+  "personId": "uuid",
+  "direction": "RECEIVABLE",
+  "status": "OPEN",
+  "principalAmount": "500.00",
+  "settledAmount": "0.00",
+  "remainingAmount": "500.00",
+  "dueDate": "2026-10-01",
+  "description": "Dinner share",
+  "budgetCategory": null,
+  "revisionNo": 1,
+  "isSplitManaged": false,
+  "fundingAssetAccountId": "uuid"
+}
+```
+*Note: Canonical IDs (`canonicalTransactionId`, `canonicalRevisionId`) are stripped.*
+
+#### 5.9.3 Settlements Lifecycle (5 Routes)
+- **`GET /people/:personId/obligations/:obligationId/settlements`**: Bounded keyset-paginated list of settlements for an obligation.
+  - Query parameters: `status` (`ACTIVE` | `VOIDED`), `limit` (default 50, max 100), `after` (opaque Base64URL cursor).
+  - Response: `{ settlements: SettlementProductDto[], hasMore: boolean, nextCursor: string | null }`
+- **`GET /people/:personId/obligations/:obligationId/settlements/:id`**: Get single settlement details.
+- **`POST /people/:personId/obligations/:obligationId/settlements/receivable`**: Settle a receivable obligation (person paying back user).
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ cashAmount, destinationAssetAccountId, note?, occurredAt }`
+  - *Overpayment behavior:* If `cashAmount > remainingAmount`, the obligation is fully settled (`appliedAmount = remainingAmount`) and the excess amount is routed to unearned income receipt (`overpaymentIncomeReceiptId`).
+- **`POST /people/:personId/obligations/:obligationId/settlements/payable`**: Settle a payable obligation (user paying person back).
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ cashAmount, sourceAssetAccountId, note?, occurredAt }`
+  - Cannot overpay payable obligations (`409 PEOPLE_SETTLEMENT_OVERPAYMENT_NOT_ALLOWED`).
+- **`POST /people/:personId/obligations/:obligationId/settlements/:id/void`**: Void a settlement with OCC.
+  - Header: `Idempotency-Key` (required).
+  - Body (closed): `{ expectedRevisionNo, reason?, occurredAt? }`
+
+**Settlement Product DTO (`SettlementProductDto`):**
+```json
+{
+  "settlementId": "uuid",
+  "obligationId": "uuid",
+  "personId": "uuid",
+  "direction": "RECEIVABLE",
+  "status": "ACTIVE",
+  "cashAmount": "600.00",
+  "appliedAmount": "500.00",
+  "excessAmount": "100.00",
+  "note": "Bank transfer",
+  "occurredAt": "2026-09-10T12:00:00.000Z",
+  "revisionNo": 1,
+  "assetAccountId": "uuid",
+  "overpaymentIncomeReceiptId": "uuid"
+}
+```
+
+**People + Family Error Codes:**
+| Code | Status | Description |
+|------|--------|-------------|
+| `PEOPLE_INVALID_INPUT` | 400 | Malformed UUID, invalid parameters, or closed body violation |
+| `PEOPLE_NOT_FOUND` | 404 | Person counterpart not found or owned by another user |
+| `PEOPLE_OBLIGATION_NOT_FOUND` | 404 | Obligation not found or person mismatch |
+| `PEOPLE_SETTLEMENT_NOT_FOUND` | 404 | Settlement not found or obligation mismatch |
+| `PEOPLE_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict on person revision |
+| `PEOPLE_OBLIGATION_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict on obligation revision |
+| `PEOPLE_SETTLEMENT_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict on settlement revision |
+| `PEOPLE_OBLIGATION_SPLIT_MANAGED` | 409 | Cannot directly update/void obligation managed by credit card split |
+| `PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE` | 409 | Cannot archive person with active receivable or payable balance |
+| `PEOPLE_OBLIGATION_ALREADY_SETTLED` | 409 | Cannot void obligation with active settlements |
+| `PEOPLE_SETTLEMENT_OVERPAYMENT_NOT_ALLOWED` | 409 | Payable settlement amount cannot exceed remaining debt |
+| `PEOPLE_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different payload |
 
 ---
-
-## 7. Future Financial Route Inventory
-
-> **⚠️ PLANNED — NOT YET IMPLEMENTED**
->
-> The route families below do not exist in the current codebase. They must not be called by
-> the frontend until the corresponding checkpoint (7B.x) is complete and merged.
-> Route paths, request shapes, and response shapes may change before implementation.
-
-The underlying domain **service** code exists for all of these domains. What is missing is
-the HTTP adapter layer (route handlers, input validation, error mapping).
-
-### 7B.4 — People + Family
-
-```
-PLANNED  GET   /people/:id
-PLANNED  GET   /people                      ?limit=&after=
-PLANNED  POST  /people                      (create)
-PLANNED  POST  /people/:id                  (update)
-PLANNED  POST  /people/:id/archive          (archive)
-
-PLANNED  GET   /people/:personId/obligations/:id
-PLANNED  GET   /people/:personId/obligations  ?type=&limit=&after=
-PLANNED  POST  /people/:personId/receivables    (record receivable)
-PLANNED  POST  /people/:personId/payables       (record payable expense)
-PLANNED  POST  /people/:personId/obligations/:id  (update)
-PLANNED  POST  /people/:personId/obligations/:id/void  (void)
-
-PLANNED  GET   /people/:personId/settlements/:id
-PLANNED  GET   /people/:personId/settlements  ?limit=&after=
-PLANNED  POST  /people/:personId/receivable-settlements  (settle receivable)
-PLANNED  POST  /people/:personId/payable-settlements     (settle payable)
-PLANNED  POST  /people/:personId/settlements/:id/void    (void settlement)
-```
 
 ### 7B.5 — Rewards
 

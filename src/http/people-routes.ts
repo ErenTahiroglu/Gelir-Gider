@@ -21,7 +21,6 @@ import { validateIsoCalendarDate } from "../people/calendar";
 import { PeopleError } from "../people/errors";
 import {
 	getPersonObligation,
-	listPersonObligations,
 	recordPersonPayableExpense,
 	recordPersonReceivable,
 	updatePersonPayableExpense,
@@ -29,15 +28,32 @@ import {
 	voidPersonObligation,
 } from "../people/obligations";
 import {
+	decodeObligationCursor,
+	decodePersonCursor,
+	decodeSettlementCursor,
+	encodeObligationCursor,
+	encodePersonCursor,
+	encodeSettlementCursor,
+	type ObligationCursor,
+	type PersonCursor,
+	type SettlementCursor,
+} from "../people/pagination";
+import {
 	archivePerson,
 	createPerson,
 	getPerson,
-	listPeople,
 	updatePerson,
 } from "../people/people";
 import {
+	listBoundedObligations,
+	listBoundedPeople,
+	listBoundedSettlements,
+	toObligationProductDto,
+	toPersonProductDto,
+	toSettlementProductDto,
+} from "../people/product-read-v2";
+import {
 	getPersonSettlement,
-	listPersonSettlements,
 	recordPersonPayableSettlement,
 	recordPersonReceivableSettlement,
 	voidPersonSettlement,
@@ -152,9 +168,12 @@ peopleRouter.post(
 /**
  * 1.1 GET /people
  * Lists people for the authenticated user with optional status and relationship filters.
+ * Real bounded keyset pagination with cursor support.
  */
 peopleRouter.get("/", async (c) => {
-	if (!validateStrictQueryParams(c, ["limit", "status", "relationship"])) {
+	if (
+		!validateStrictQueryParams(c, ["limit", "status", "relationship", "after"])
+	) {
 		return fail(c, "PEOPLE_INVALID_INPUT", 400);
 	}
 
@@ -184,23 +203,40 @@ peopleRouter.get("/", async (c) => {
 		relationshipFilter = relationshipQuery as PersonRelationship;
 	}
 
+	const afterQuery = c.req.query("after");
+	let afterCursor: PersonCursor | undefined;
+	if (afterQuery !== undefined) {
+		try {
+			afterCursor = decodePersonCursor(afterQuery);
+		} catch (err) {
+			return mapPeopleDomainError(c, err);
+		}
+	}
+
 	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
 
 	try {
-		const allPeople = await listPeople({
+		const result = await listBoundedPeople({
 			db,
 			userId: auth.userId,
 			status: statusFilter,
 			relationship: relationshipFilter,
+			limit: limitRes.limit,
+			afterCursor,
 		});
 
-		const peopleList = allPeople.slice(0, limitRes.limit);
+		const nextCursor =
+			result.hasMore && result.nextCursor
+				? encodePersonCursor(result.nextCursor)
+				: null;
 
 		return c.json(
 			{
-				people: peopleList,
+				people: result.people,
 				limit: limitRes.limit,
+				hasMore: result.hasMore,
+				nextCursor,
 			},
 			200,
 		);
@@ -237,7 +273,7 @@ peopleRouter.get("/:id", async (c) => {
 			return fail(c, "PEOPLE_NOT_FOUND", 404);
 		}
 
-		return c.json({ person }, 200);
+		return c.json({ person: toPersonProductDto(person) }, 200);
 	} catch (err) {
 		return mapPeopleDomainError(c, err);
 	}
@@ -305,7 +341,13 @@ peopleRouter.post("/", async (c) => {
 			idempotencyKey: keyRes.key,
 		});
 
-		return c.json(result, 200);
+		return c.json(
+			{
+				person: toPersonProductDto(result.person),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
 	} catch (err) {
 		return mapPeopleDomainError(c, err);
 	}
@@ -395,7 +437,13 @@ peopleRouter.post("/:id", async (c) => {
 			idempotencyKey: keyRes.key,
 		});
 
-		return c.json(result, 200);
+		return c.json(
+			{
+				person: toPersonProductDto(result.person),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
 	} catch (err) {
 		return mapPeopleDomainError(c, err);
 	}
@@ -448,7 +496,13 @@ peopleRouter.post("/:id/archive", async (c) => {
 			idempotencyKey: keyRes.key,
 		});
 
-		return c.json(result, 200);
+		return c.json(
+			{
+				person: toPersonProductDto(result.person),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
 	} catch (err) {
 		return mapPeopleDomainError(c, err);
 	}
@@ -461,6 +515,7 @@ peopleRouter.post("/:id/archive", async (c) => {
 /**
  * 2.1 GET /people/:personId/obligations
  * Lists obligations for a given person with optional direction/status/dueDate filters.
+ * Real bounded keyset pagination with cursor support.
  */
 peopleRouter.get("/:personId/obligations", async (c) => {
 	const personId = c.req.param("personId");
@@ -475,6 +530,7 @@ peopleRouter.get("/:personId/obligations", async (c) => {
 			"status",
 			"dueDateFrom",
 			"dueDateUntil",
+			"after",
 		])
 	) {
 		return fail(c, "PEOPLE_INVALID_INPUT", 400);
@@ -532,6 +588,16 @@ peopleRouter.get("/:personId/obligations", async (c) => {
 		}
 	}
 
+	const afterQuery = c.req.query("after");
+	let afterCursor: ObligationCursor | undefined;
+	if (afterQuery !== undefined) {
+		try {
+			afterCursor = decodeObligationCursor(afterQuery);
+		} catch (err) {
+			return mapPeopleDomainError(c, err);
+		}
+	}
+
 	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
 
@@ -545,7 +611,7 @@ peopleRouter.get("/:personId/obligations", async (c) => {
 			return fail(c, "PEOPLE_NOT_FOUND", 404);
 		}
 
-		const rawObligations = await listPersonObligations({
+		const result = await listBoundedObligations({
 			db,
 			userId: auth.userId,
 			personId,
@@ -553,27 +619,21 @@ peopleRouter.get("/:personId/obligations", async (c) => {
 			status: statusFilter,
 			dueDateFrom,
 			dueDateUntil,
+			limit: limitRes.limit,
+			afterCursor,
 		});
 
-		const splitParticipantRows = await db
-			.select({
-				obligationId: creditCardPurchaseSplitParticipants.personObligationId,
-			})
-			.from(creditCardPurchaseSplitParticipants)
-			.where(eq(creditCardPurchaseSplitParticipants.userId, auth.userId));
-		const splitObligationIds = new Set(
-			splitParticipantRows.map((r) => r.obligationId),
-		);
-
-		const obligations = rawObligations.slice(0, limitRes.limit).map((obl) => ({
-			...obl,
-			isSplitManaged: splitObligationIds.has(obl.obligationId),
-		}));
+		const nextCursor =
+			result.hasMore && result.nextCursor
+				? encodeObligationCursor(result.nextCursor)
+				: null;
 
 		return c.json(
 			{
-				obligations,
+				obligations: result.obligations,
 				limit: limitRes.limit,
+				hasMore: result.hasMore,
+				nextCursor,
 			},
 			200,
 		);
@@ -620,10 +680,7 @@ peopleRouter.get("/:personId/obligations/:id", async (c) => {
 
 		return c.json(
 			{
-				obligation: {
-					...obligation,
-					isSplitManaged,
-				},
+				obligation: toObligationProductDto(obligation, isSplitManaged),
 			},
 			200,
 		);
@@ -723,7 +780,13 @@ peopleRouter.post("/:personId/obligations/receivable", async (c) => {
 			idempotencyKey: keyRes.key,
 		});
 
-		return c.json(result, 200);
+		return c.json(
+			{
+				obligation: toObligationProductDto(result.obligation, false),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
 	} catch (err) {
 		return mapPeopleDomainError(c, err);
 	}
@@ -822,7 +885,13 @@ peopleRouter.post("/:personId/obligations/payable", async (c) => {
 			idempotencyKey: keyRes.key,
 		});
 
-		return c.json(result, 200);
+		return c.json(
+			{
+				obligation: toObligationProductDto(result.obligation, false),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
 	} catch (err) {
 		return mapPeopleDomainError(c, err);
 	}
@@ -956,7 +1025,13 @@ peopleRouter.post("/:personId/obligations/:id", async (c) => {
 				idempotencyKey: keyRes.key,
 			});
 
-			return c.json(result, 200);
+			return c.json(
+				{
+					obligation: toObligationProductDto(result.obligation, false),
+					idempotentReplay: result.idempotentReplay,
+				},
+				200,
+			);
 		}
 
 		if (existing.direction === "PAYABLE") {
@@ -991,7 +1066,13 @@ peopleRouter.post("/:personId/obligations/:id", async (c) => {
 				idempotencyKey: keyRes.key,
 			});
 
-			return c.json(result, 200);
+			return c.json(
+				{
+					obligation: toObligationProductDto(result.obligation, false),
+					idempotentReplay: result.idempotentReplay,
+				},
+				200,
+			);
 		}
 
 		return fail(c, "PEOPLE_INVALID_STATE", 500);
@@ -1062,7 +1143,13 @@ peopleRouter.post("/:personId/obligations/:id/void", async (c) => {
 			idempotencyKey: keyRes.key,
 		});
 
-		return c.json(result, 200);
+		return c.json(
+			{
+				obligation: toObligationProductDto(result.obligation, false),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
 	} catch (err) {
 		return mapPeopleDomainError(c, err);
 	}
@@ -1075,6 +1162,7 @@ peopleRouter.post("/:personId/obligations/:id/void", async (c) => {
 /**
  * 3.1 GET /people/:personId/obligations/:obligationId/settlements
  * Lists settlements for an obligation.
+ * Real bounded keyset pagination with cursor support.
  */
 peopleRouter.get(
 	"/:personId/obligations/:obligationId/settlements",
@@ -1086,7 +1174,7 @@ peopleRouter.get(
 			return fail(c, "PEOPLE_INVALID_INPUT", 400);
 		}
 
-		if (!validateStrictQueryParams(c, ["limit", "status"])) {
+		if (!validateStrictQueryParams(c, ["limit", "status", "after"])) {
 			return fail(c, "PEOPLE_INVALID_INPUT", 400);
 		}
 
@@ -1105,32 +1193,41 @@ peopleRouter.get(
 			statusFilter = statusQuery;
 		}
 
+		const afterQuery = c.req.query("after");
+		let afterCursor: SettlementCursor | undefined;
+		if (afterQuery !== undefined) {
+			try {
+				afterCursor = decodeSettlementCursor(afterQuery);
+			} catch (err) {
+				return mapPeopleDomainError(c, err);
+			}
+		}
+
 		const auth = c.get("auth");
 		const db = createDatabase(getDatabaseUrl(c.env));
 
 		try {
-			const obligation = await getPersonObligation({
+			const result = await listBoundedSettlements({
 				db,
 				userId: auth.userId,
-				obligationId,
-			});
-			if (!obligation || obligation.personId !== personId) {
-				return fail(c, "PEOPLE_OBLIGATION_NOT_FOUND", 404);
-			}
-
-			const allSettlements = await listPersonSettlements({
-				db,
-				userId: auth.userId,
+				personId,
 				obligationId,
 				status: statusFilter,
+				limit: limitRes.limit,
+				afterCursor,
 			});
 
-			const settlements = allSettlements.slice(0, limitRes.limit);
+			const nextCursor =
+				result.hasMore && result.nextCursor
+					? encodeSettlementCursor(result.nextCursor)
+					: null;
 
 			return c.json(
 				{
-					settlements,
+					settlements: result.settlements,
 					limit: limitRes.limit,
+					hasMore: result.hasMore,
+					nextCursor,
 				},
 				200,
 			);
@@ -1177,7 +1274,7 @@ peopleRouter.get(
 				return fail(c, "PEOPLE_SETTLEMENT_NOT_FOUND", 404);
 			}
 
-			return c.json({ settlement }, 200);
+			return c.json({ settlement: toSettlementProductDto(settlement) }, 200);
 		} catch (err) {
 			return mapPeopleDomainError(c, err);
 		}
@@ -1271,7 +1368,13 @@ peopleRouter.post(
 				idempotencyKey: keyRes.key,
 			});
 
-			return c.json(result, 200);
+			return c.json(
+				{
+					settlement: toSettlementProductDto(result.settlement),
+					idempotentReplay: result.idempotentReplay,
+				},
+				200,
+			);
 		} catch (err) {
 			return mapPeopleDomainError(c, err);
 		}
@@ -1365,7 +1468,13 @@ peopleRouter.post(
 				idempotencyKey: keyRes.key,
 			});
 
-			return c.json(result, 200);
+			return c.json(
+				{
+					settlement: toSettlementProductDto(result.settlement),
+					idempotentReplay: result.idempotentReplay,
+				},
+				200,
+			);
 		} catch (err) {
 			return mapPeopleDomainError(c, err);
 		}
@@ -1443,7 +1552,13 @@ peopleRouter.post(
 				idempotencyKey: keyRes.key,
 			});
 
-			return c.json(result, 200);
+			return c.json(
+				{
+					settlement: toSettlementProductDto(result.settlement),
+					idempotentReplay: result.idempotentReplay,
+				},
+				200,
+			);
 		} catch (err) {
 			return mapPeopleDomainError(c, err);
 		}

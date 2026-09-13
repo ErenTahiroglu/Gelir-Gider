@@ -601,3 +601,19 @@ export async function deriveCreditCardSplitChildIdempotencyKey(
 	]);
 	return `CC_SPLIT_CHILD_${hex}`;
 }
+
+/**
+ * Derives a deterministic, bounded (<=128 char) child idempotency key for a
+ * coordinated shared credit card operation (purchase vs. split).
+ */
+export async function deriveCreditCardSharedChildKey(
+	parentKey: string,
+	target: "PURCHASE" | "SPLIT",
+): Promise<string> {
+	const hex = await sha256Hex([
+		"cc-shared-child-key-v1",
+		parentKey.trim(),
+		target,
+	]);
+	return `CC_SHARED_${target}_${hex}`;
+}

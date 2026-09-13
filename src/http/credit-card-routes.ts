@@ -4,6 +4,7 @@ import { bodyLimit } from "hono/body-limit";
 import { type AppEnv, getDatabaseUrl } from "../config/env";
 import { validateGregorianDateString } from "../credit-cards/calendar";
 import { CreditCardError } from "../credit-cards/errors";
+import { deriveCreditCardSharedChildKey } from "../credit-cards/fingerprint";
 import {
 	type CardCursor,
 	decodeCardCursor,
@@ -26,10 +27,13 @@ import {
 	listCreditCardPurchases,
 	recordCreditCardOpeningBalance,
 	recordCreditCardPurchase,
+	recordSharedCreditCardPurchase,
 	updateCreditCardOpeningBalance,
 	updateCreditCardPurchase,
+	updateCreditCardPurchaseWithSplit,
 	voidCreditCardOpeningBalance,
 	voidCreditCardPurchase,
+	voidCreditCardPurchaseWithSplit,
 } from "../credit-cards/purchases";
 import {
 	archiveCreditCard,
@@ -44,12 +48,21 @@ import {
 	voidCreditCardStatement,
 } from "../credit-cards/service";
 import {
+	type CreditCardPurchaseSplitReadModel,
+	createCreditCardPurchaseSplit,
+	getCreditCardPurchaseSplit,
+	type ParticipantAllocationInput,
+	updateCreditCardPurchaseSplit,
+	voidCreditCardPurchaseSplit,
+} from "../credit-cards/splits";
+import {
 	getStatementReconciliation,
 	getStatementReconciliationAsOf,
 	reconcileStatement,
 	voidStatementReconciliation,
 } from "../credit-cards/statement-reconciliation";
 import { createDatabase } from "../db/client";
+import type { SplitMethod } from "../db/schema/credit-card-splits";
 import { formatSignedCentsToMoney } from "../ledger/money";
 import type { AuthVariables } from "./auth-middleware";
 import { requireAuthenticatedSession } from "./auth-middleware";
@@ -1732,6 +1745,238 @@ creditCardRouter.post("/:cardId/purchases", async (c) => {
 	}
 });
 
+function toCreditCardPurchaseSplitProductDto(
+	split: CreditCardPurchaseSplitReadModel,
+) {
+	return {
+		splitId: split.splitId,
+		purchaseEventId: split.purchaseEventId,
+		status: split.status,
+		revisionNo: split.revisionNo,
+		method: split.method,
+		grossAmount: split.grossAmount,
+		userShareAmount: split.userShareAmount,
+		externalShareAmount: split.externalShareAmount,
+		userWeight: split.userWeight,
+		occurredAt: split.occurredAt.toISOString(),
+		participants: split.participants.map((p) => ({
+			personId: p.personId,
+			displayName: p.displayName,
+			relationship: p.relationship,
+			shareAmount: p.shareAmount,
+			settledAmount: p.settledAmount,
+			remainingAmount: p.remainingAmount,
+			weight: p.weight,
+			dueDate: p.dueDate,
+			description: p.description,
+			obligationId: p.personObligationId,
+		})),
+	};
+}
+
+function parseSplitParticipantsInput(
+	raw: unknown,
+): ParticipantAllocationInput[] | null {
+	if (!Array.isArray(raw) || raw.length === 0 || raw.length > 9) return null;
+	const participants: ParticipantAllocationInput[] = [];
+	const allowedParticipantKeys = [
+		"personId",
+		"shareAmount",
+		"weight",
+		"dueDate",
+		"description",
+	];
+	for (const item of raw) {
+		if (typeof item !== "object" || item === null) return null;
+		if (!hasOnlyKeys(item, allowedParticipantKeys)) return null;
+		if (typeof item.personId !== "string" || !isUuid(item.personId)) {
+			return null;
+		}
+		if (item.shareAmount !== undefined && item.shareAmount !== null) {
+			if (
+				typeof item.shareAmount !== "string" ||
+				!/^\d+\.\d{2}$/.test(item.shareAmount)
+			) {
+				return null;
+			}
+		}
+		if (item.weight !== undefined && item.weight !== null) {
+			if (
+				typeof item.weight !== "number" ||
+				!Number.isSafeInteger(item.weight) ||
+				item.weight <= 0
+			) {
+				return null;
+			}
+		}
+		if (item.dueDate !== undefined && item.dueDate !== null) {
+			if (
+				typeof item.dueDate !== "string" ||
+				!/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/.test(item.dueDate)
+			) {
+				return null;
+			}
+		}
+		if (item.description !== undefined && item.description !== null) {
+			if (
+				typeof item.description !== "string" ||
+				item.description.length > 500
+			) {
+				return null;
+			}
+		}
+		participants.push({
+			personId: item.personId,
+			shareAmount: item.shareAmount ?? undefined,
+			weight: item.weight ?? undefined,
+			dueDate: item.dueDate ?? undefined,
+			description: item.description ? item.description.trim() : undefined,
+		});
+	}
+	return participants;
+}
+
+/**
+ * POST /credit-cards/:cardId/purchases/shared
+ * Records a new shared purchase and its split in one atomic transaction.
+ */
+creditCardRouter.post("/:cardId/purchases/shared", async (c) => {
+	const auth = c.get("auth");
+	const cardId = c.req.param("cardId");
+	if (!isUuid(cardId)) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const keyRes = readIdempotencyKey(c);
+	if (!keyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const bodyRes = await readJsonObject(c);
+	if (!bodyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const allowedKeys = [
+		"amount",
+		"purchaseCategory",
+		"shortTermGoalId",
+		"merchant",
+		"description",
+		"installmentCount",
+		"occurredAt",
+		"splitMethod",
+		"userWeight",
+		"participants",
+	];
+	if (!hasOnlyKeys(bodyRes.value, allowedKeys)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const {
+		amount,
+		purchaseCategory,
+		shortTermGoalId,
+		merchant,
+		description,
+		installmentCount,
+		occurredAt: rawOccurredAt,
+		splitMethod,
+		userWeight,
+		participants: rawParticipants,
+	} = bodyRes.value;
+
+	if (typeof amount !== "string" || !/^\d+\.\d{2}$/.test(amount)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	const normCat = normalizePurchaseCategoryForDomain(purchaseCategory);
+	if (!normCat) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (shortTermGoalId !== undefined && shortTermGoalId !== null) {
+		if (typeof shortTermGoalId !== "string" || !isUuid(shortTermGoalId)) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+	if (merchant !== undefined && merchant !== null) {
+		if (typeof merchant !== "string" || merchant.length > 200) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+	if (description !== undefined && description !== null) {
+		if (typeof description !== "string" || description.length > 500) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+	if (installmentCount !== undefined && installmentCount !== null) {
+		if (
+			typeof installmentCount !== "number" ||
+			!Number.isInteger(installmentCount) ||
+			installmentCount < 1 ||
+			installmentCount > 60
+		) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+	if (
+		typeof splitMethod !== "string" ||
+		(splitMethod !== "EQUAL" &&
+			splitMethod !== "MANUAL" &&
+			splitMethod !== "RATIO")
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (userWeight !== undefined && userWeight !== null) {
+		if (
+			typeof userWeight !== "number" ||
+			!Number.isSafeInteger(userWeight) ||
+			userWeight < 0
+		) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+
+	const participants = parseSplitParticipantsInput(rawParticipants);
+	if (!participants) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const occurredAt = parseCanonicalInstant(rawOccurredAt);
+	if (!occurredAt) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const db = createDatabase(getDatabaseUrl(c.env));
+	try {
+		const purchaseKey = await deriveCreditCardSharedChildKey(
+			keyRes.key,
+			"PURCHASE",
+		);
+		const splitKey = await deriveCreditCardSharedChildKey(keyRes.key, "SPLIT");
+
+		const result = await recordSharedCreditCardPurchase({
+			db,
+			userId: auth.userId,
+			cardId,
+			amount,
+			purchaseCategory: normCat,
+			shortTermGoalId: shortTermGoalId ?? null,
+			merchant: merchant ? merchant.trim() : null,
+			description: description ? description.trim() : null,
+			installmentCount: installmentCount ?? null,
+			occurredAt,
+			purchaseIdempotencyKey: purchaseKey,
+			splitMethod: splitMethod as SplitMethod,
+			userWeight: userWeight ?? undefined,
+			participants,
+			splitIdempotencyKey: splitKey,
+		});
+
+		return c.json(
+			{
+				purchase: result.purchase,
+				split: toCreditCardPurchaseSplitProductDto(result.split),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
+	} catch (err) {
+		return mapCreditCardDomainError(c, err);
+	}
+});
+
 /**
  * Helper to update a credit card purchase.
  */
@@ -2215,3 +2460,692 @@ creditCardRouter.post(
 		}
 	},
 );
+
+// ============================================================================
+// 7. CREDIT CARD SHARED PURCHASES & SPLITS SURFACE
+// ============================================================================
+
+export interface CreditCardPurchaseSplitParticipantProductDto {
+	personId: string;
+	displayName: string;
+	relationship: string;
+	shareAmount: string;
+	settledAmount: string;
+	remainingAmount: string;
+	weight: number | null;
+	dueDate: string | null;
+	description: string | null;
+	obligationId: string;
+}
+
+export interface CreditCardPurchaseSplitProductDto {
+	splitId: string;
+	purchaseEventId: string;
+	status: "ACTIVE" | "VOID";
+	revisionNo: number;
+	method: SplitMethod;
+	grossAmount: string;
+	userShareAmount: string;
+	externalShareAmount: string;
+	userWeight: number | null;
+	occurredAt: string;
+	participants: CreditCardPurchaseSplitParticipantProductDto[];
+}
+
+/**
+ * GET /credit-cards/:cardId/purchases/:id/split
+ * Fetches the active split product DTO for a credit card purchase.
+ */
+creditCardRouter.get("/:cardId/purchases/:id/split", async (c) => {
+	const auth = c.get("auth");
+	const cardId = c.req.param("cardId");
+	const eventId = c.req.param("id");
+	if (!isUuid(cardId) || !isUuid(eventId)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const db = createDatabase(getDatabaseUrl(c.env));
+	try {
+		const purchase = await getCreditCardPurchase({
+			db,
+			userId: auth.userId,
+			eventId,
+		});
+		if (
+			!purchase ||
+			purchase.cardId !== cardId ||
+			purchase.eventType !== "PURCHASE"
+		) {
+			return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
+		}
+
+		const split = await getCreditCardPurchaseSplit({
+			db,
+			userId: auth.userId,
+			purchaseEventId: eventId,
+		});
+		if (!split) {
+			return fail(c, "CREDIT_CARD_SPLIT_NOT_FOUND", 404);
+		}
+
+		return c.json(
+			{
+				split: toCreditCardPurchaseSplitProductDto(split),
+			},
+			200,
+		);
+	} catch (err) {
+		return mapCreditCardDomainError(c, err);
+	}
+});
+
+/**
+ * POST /credit-cards/:cardId/purchases/:id/split
+ * Attaches a new split to an existing unshared credit card purchase.
+ */
+creditCardRouter.post("/:cardId/purchases/:id/split", async (c) => {
+	const auth = c.get("auth");
+	const cardId = c.req.param("cardId");
+	const eventId = c.req.param("id");
+	if (!isUuid(cardId) || !isUuid(eventId)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const keyRes = readIdempotencyKey(c);
+	if (!keyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const bodyRes = await readJsonObject(c);
+	if (!bodyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const allowedKeys = [
+		"method",
+		"splitMethod",
+		"userWeight",
+		"participants",
+		"occurredAt",
+	];
+	if (!hasOnlyKeys(bodyRes.value, allowedKeys)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const {
+		userWeight,
+		participants: rawParticipants,
+		occurredAt: rawOccurredAt,
+	} = bodyRes.value;
+	const method = bodyRes.value.splitMethod ?? bodyRes.value.method;
+
+	if (
+		typeof method !== "string" ||
+		(method !== "EQUAL" && method !== "MANUAL" && method !== "RATIO")
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (userWeight !== undefined && userWeight !== null) {
+		if (
+			typeof userWeight !== "number" ||
+			!Number.isSafeInteger(userWeight) ||
+			userWeight < 0
+		) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+
+	const participants = parseSplitParticipantsInput(rawParticipants);
+	if (!participants) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	let occurredAt: Date | undefined;
+	if (rawOccurredAt !== undefined) {
+		occurredAt = parseCanonicalInstant(rawOccurredAt) ?? undefined;
+		if (!occurredAt) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const db = createDatabase(getDatabaseUrl(c.env));
+	try {
+		const purchase = await getCreditCardPurchase({
+			db,
+			userId: auth.userId,
+			eventId,
+		});
+		if (
+			!purchase ||
+			purchase.cardId !== cardId ||
+			purchase.eventType !== "PURCHASE"
+		) {
+			return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
+		}
+
+		const result = await createCreditCardPurchaseSplit({
+			db,
+			userId: auth.userId,
+			purchaseEventId: eventId,
+			method: method as SplitMethod,
+			userWeight: userWeight ?? undefined,
+			participants,
+			idempotencyKey: keyRes.key,
+			occurredAt,
+		});
+
+		return c.json(
+			{
+				split: toCreditCardPurchaseSplitProductDto(result.split),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
+	} catch (err) {
+		return mapCreditCardDomainError(c, err);
+	}
+});
+
+/**
+ * Helper to update a credit card purchase split.
+ */
+async function handleUpdateSplit(c: Context<CreditCardEnv>) {
+	const auth = c.get("auth");
+	const cardId = c.req.param("cardId");
+	const eventId = c.req.param("id");
+	if (!isUuid(cardId) || !isUuid(eventId)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const keyRes = readIdempotencyKey(c);
+	if (!keyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const bodyRes = await readJsonObject(c);
+	if (!bodyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const allowedKeys = [
+		"expectedRevisionNo",
+		"method",
+		"splitMethod",
+		"userWeight",
+		"participants",
+		"occurredAt",
+	];
+	if (!hasOnlyKeys(bodyRes.value, allowedKeys)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const {
+		expectedRevisionNo,
+		userWeight,
+		participants: rawParticipants,
+		occurredAt: rawOccurredAt,
+	} = bodyRes.value;
+	const method = bodyRes.value.splitMethod ?? bodyRes.value.method;
+
+	if (
+		typeof expectedRevisionNo !== "number" ||
+		!Number.isInteger(expectedRevisionNo) ||
+		expectedRevisionNo < 1
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (
+		typeof method !== "string" ||
+		(method !== "EQUAL" && method !== "MANUAL" && method !== "RATIO")
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (userWeight !== undefined && userWeight !== null) {
+		if (
+			typeof userWeight !== "number" ||
+			!Number.isSafeInteger(userWeight) ||
+			userWeight < 0
+		) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+
+	const participants = parseSplitParticipantsInput(rawParticipants);
+	if (!participants) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	let occurredAt: Date | undefined;
+	if (rawOccurredAt !== undefined) {
+		occurredAt = parseCanonicalInstant(rawOccurredAt) ?? undefined;
+		if (!occurredAt) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const db = createDatabase(getDatabaseUrl(c.env));
+	try {
+		const purchase = await getCreditCardPurchase({
+			db,
+			userId: auth.userId,
+			eventId,
+		});
+		if (
+			!purchase ||
+			purchase.cardId !== cardId ||
+			purchase.eventType !== "PURCHASE"
+		) {
+			return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
+		}
+
+		const split = await getCreditCardPurchaseSplit({
+			db,
+			userId: auth.userId,
+			purchaseEventId: eventId,
+		});
+		if (!split) {
+			return fail(c, "CREDIT_CARD_SPLIT_NOT_FOUND", 404);
+		}
+
+		const result = await updateCreditCardPurchaseSplit({
+			db,
+			userId: auth.userId,
+			splitId: split.splitId,
+			expectedRevisionNo,
+			method: method as SplitMethod,
+			userWeight: userWeight ?? undefined,
+			participants,
+			idempotencyKey: keyRes.key,
+			occurredAt,
+		});
+
+		return c.json(
+			{
+				split: toCreditCardPurchaseSplitProductDto(result.split),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
+	} catch (err) {
+		return mapCreditCardDomainError(c, err);
+	}
+}
+
+creditCardRouter.post(
+	"/:cardId/purchases/:id/split/revisions",
+	handleUpdateSplit,
+);
+
+/**
+ * POST /credit-cards/:cardId/purchases/:id/split/void
+ * Voids an existing credit card purchase split.
+ */
+creditCardRouter.post("/:cardId/purchases/:id/split/void", async (c) => {
+	const auth = c.get("auth");
+	const cardId = c.req.param("cardId");
+	const eventId = c.req.param("id");
+	if (!isUuid(cardId) || !isUuid(eventId)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const keyRes = readIdempotencyKey(c);
+	if (!keyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const bodyRes = await readJsonObject(c);
+	if (!bodyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const allowedKeys = ["expectedRevisionNo", "occurredAt"];
+	if (!hasOnlyKeys(bodyRes.value, allowedKeys)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const { expectedRevisionNo, occurredAt: rawOccurredAt } = bodyRes.value;
+
+	if (
+		typeof expectedRevisionNo !== "number" ||
+		!Number.isInteger(expectedRevisionNo) ||
+		expectedRevisionNo < 1
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	let occurredAt: Date | undefined;
+	if (rawOccurredAt !== undefined) {
+		occurredAt = parseCanonicalInstant(rawOccurredAt) ?? undefined;
+		if (!occurredAt) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const db = createDatabase(getDatabaseUrl(c.env));
+	try {
+		const purchase = await getCreditCardPurchase({
+			db,
+			userId: auth.userId,
+			eventId,
+		});
+		if (
+			!purchase ||
+			purchase.cardId !== cardId ||
+			purchase.eventType !== "PURCHASE"
+		) {
+			return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
+		}
+
+		const split = await getCreditCardPurchaseSplit({
+			db,
+			userId: auth.userId,
+			purchaseEventId: eventId,
+		});
+		if (!split) {
+			return fail(c, "CREDIT_CARD_SPLIT_NOT_FOUND", 404);
+		}
+
+		const result = await voidCreditCardPurchaseSplit({
+			db,
+			userId: auth.userId,
+			splitId: split.splitId,
+			expectedRevisionNo,
+			idempotencyKey: keyRes.key,
+			occurredAt,
+		});
+
+		return c.json(
+			{
+				split: toCreditCardPurchaseSplitProductDto(result.split),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
+	} catch (err) {
+		return mapCreditCardDomainError(c, err);
+	}
+});
+
+/**
+ * POST /credit-cards/:cardId/purchases/:id/shared-revisions
+ * Coordinated revision of both purchase details and split allocation in one atomic transaction.
+ */
+creditCardRouter.post("/:cardId/purchases/:id/shared-revisions", async (c) => {
+	const auth = c.get("auth");
+	const cardId = c.req.param("cardId");
+	const eventId = c.req.param("id");
+	if (!isUuid(cardId) || !isUuid(eventId)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const keyRes = readIdempotencyKey(c);
+	if (!keyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const bodyRes = await readJsonObject(c);
+	if (!bodyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const allowedKeys = [
+		"purchaseExpectedRevisionNo",
+		"expectedPurchaseRevisionNo",
+		"amount",
+		"purchaseCategory",
+		"shortTermGoalId",
+		"merchant",
+		"description",
+		"installmentCount",
+		"reasonNote",
+		"occurredAt",
+		"splitExpectedRevisionNo",
+		"expectedSplitRevisionNo",
+		"splitMethod",
+		"method",
+		"userWeight",
+		"participants",
+	];
+	if (!hasOnlyKeys(bodyRes.value, allowedKeys)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const {
+		amount,
+		purchaseCategory,
+		shortTermGoalId,
+		merchant,
+		description,
+		installmentCount,
+		reasonNote,
+		occurredAt: rawOccurredAt,
+		userWeight,
+		participants: rawParticipants,
+	} = bodyRes.value;
+	const purchaseExpectedRevisionNo =
+		bodyRes.value.expectedPurchaseRevisionNo ??
+		bodyRes.value.purchaseExpectedRevisionNo;
+	const splitExpectedRevisionNo =
+		bodyRes.value.expectedSplitRevisionNo ??
+		bodyRes.value.splitExpectedRevisionNo;
+	const splitMethod = bodyRes.value.splitMethod ?? bodyRes.value.method;
+
+	if (
+		typeof purchaseExpectedRevisionNo !== "number" ||
+		!Number.isInteger(purchaseExpectedRevisionNo) ||
+		purchaseExpectedRevisionNo < 1
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (
+		typeof splitExpectedRevisionNo !== "number" ||
+		!Number.isInteger(splitExpectedRevisionNo) ||
+		splitExpectedRevisionNo < 1
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (typeof amount !== "string" || !/^\d+\.\d{2}$/.test(amount)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	const normCat = normalizePurchaseCategoryForDomain(purchaseCategory);
+	if (!normCat) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (shortTermGoalId !== undefined && shortTermGoalId !== null) {
+		if (typeof shortTermGoalId !== "string" || !isUuid(shortTermGoalId)) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+	if (merchant !== undefined && merchant !== null) {
+		if (typeof merchant !== "string" || merchant.length > 200) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+	if (description !== undefined && description !== null) {
+		if (typeof description !== "string" || description.length > 500) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+	if (installmentCount !== undefined && installmentCount !== null) {
+		if (
+			typeof installmentCount !== "number" ||
+			!Number.isInteger(installmentCount) ||
+			installmentCount < 1 ||
+			installmentCount > 60
+		) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+	if (reasonNote !== undefined && reasonNote !== null) {
+		if (typeof reasonNote !== "string" || reasonNote.length > 500) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+	if (
+		typeof splitMethod !== "string" ||
+		(splitMethod !== "EQUAL" &&
+			splitMethod !== "MANUAL" &&
+			splitMethod !== "RATIO")
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (userWeight !== undefined && userWeight !== null) {
+		if (
+			typeof userWeight !== "number" ||
+			!Number.isSafeInteger(userWeight) ||
+			userWeight < 0
+		) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+
+	const participants = parseSplitParticipantsInput(rawParticipants);
+	if (!participants) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const occurredAt = parseCanonicalInstant(rawOccurredAt);
+	if (!occurredAt) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const db = createDatabase(getDatabaseUrl(c.env));
+	try {
+		const purchase = await getCreditCardPurchase({
+			db,
+			userId: auth.userId,
+			eventId,
+		});
+		if (
+			!purchase ||
+			purchase.cardId !== cardId ||
+			purchase.eventType !== "PURCHASE"
+		) {
+			return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
+		}
+
+		const purchaseKey = await deriveCreditCardSharedChildKey(
+			keyRes.key,
+			"PURCHASE",
+		);
+		const splitKey = await deriveCreditCardSharedChildKey(keyRes.key, "SPLIT");
+
+		const result = await updateCreditCardPurchaseWithSplit({
+			db,
+			userId: auth.userId,
+			purchaseEventId: eventId,
+			purchaseExpectedRevisionNo,
+			amount,
+			purchaseCategory: normCat,
+			shortTermGoalId: shortTermGoalId ?? null,
+			merchant: merchant ? merchant.trim() : null,
+			description: description ? description.trim() : null,
+			installmentCount: installmentCount ?? null,
+			reasonNote: reasonNote ? reasonNote.trim() : null,
+			occurredAt,
+			purchaseIdempotencyKey: purchaseKey,
+			splitExpectedRevisionNo,
+			splitMethod: splitMethod as SplitMethod,
+			userWeight: userWeight ?? undefined,
+			participants,
+			splitIdempotencyKey: splitKey,
+		});
+
+		return c.json(
+			{
+				purchase: result.purchase,
+				split: toCreditCardPurchaseSplitProductDto(result.split),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
+	} catch (err) {
+		return mapCreditCardDomainError(c, err);
+	}
+});
+
+/**
+ * POST /credit-cards/:cardId/purchases/:id/shared-void
+ * Coordinated void of both purchase and its split in one atomic transaction.
+ */
+creditCardRouter.post("/:cardId/purchases/:id/shared-void", async (c) => {
+	const auth = c.get("auth");
+	const cardId = c.req.param("cardId");
+	const eventId = c.req.param("id");
+	if (!isUuid(cardId) || !isUuid(eventId)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const keyRes = readIdempotencyKey(c);
+	if (!keyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const bodyRes = await readJsonObject(c);
+	if (!bodyRes.ok) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+
+	const allowedKeys = [
+		"purchaseExpectedRevisionNo",
+		"expectedPurchaseRevisionNo",
+		"splitExpectedRevisionNo",
+		"expectedSplitRevisionNo",
+		"reasonNote",
+		"occurredAt",
+	];
+	if (!hasOnlyKeys(bodyRes.value, allowedKeys)) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const { reasonNote, occurredAt: rawOccurredAt } = bodyRes.value;
+	const purchaseExpectedRevisionNo =
+		bodyRes.value.expectedPurchaseRevisionNo ??
+		bodyRes.value.purchaseExpectedRevisionNo;
+	const splitExpectedRevisionNo =
+		bodyRes.value.expectedSplitRevisionNo ??
+		bodyRes.value.splitExpectedRevisionNo;
+
+	if (
+		typeof purchaseExpectedRevisionNo !== "number" ||
+		!Number.isInteger(purchaseExpectedRevisionNo) ||
+		purchaseExpectedRevisionNo < 1
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (
+		typeof splitExpectedRevisionNo !== "number" ||
+		!Number.isInteger(splitExpectedRevisionNo) ||
+		splitExpectedRevisionNo < 1
+	) {
+		return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+	if (reasonNote !== undefined && reasonNote !== null) {
+		if (typeof reasonNote !== "string" || reasonNote.length > 500) {
+			return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+		}
+	}
+
+	let occurredAt: Date | undefined;
+	if (rawOccurredAt !== undefined) {
+		occurredAt = parseCanonicalInstant(rawOccurredAt) ?? undefined;
+		if (!occurredAt) return fail(c, "CREDIT_CARD_INVALID_INPUT", 400);
+	}
+
+	const db = createDatabase(getDatabaseUrl(c.env));
+	try {
+		const purchase = await getCreditCardPurchase({
+			db,
+			userId: auth.userId,
+			eventId,
+		});
+		if (
+			!purchase ||
+			purchase.cardId !== cardId ||
+			purchase.eventType !== "PURCHASE"
+		) {
+			return fail(c, "CREDIT_CARD_PURCHASE_NOT_FOUND", 404);
+		}
+
+		const purchaseKey = await deriveCreditCardSharedChildKey(
+			keyRes.key,
+			"PURCHASE",
+		);
+		const splitKey = await deriveCreditCardSharedChildKey(keyRes.key, "SPLIT");
+
+		const result = await voidCreditCardPurchaseWithSplit({
+			db,
+			userId: auth.userId,
+			purchaseEventId: eventId,
+			purchaseExpectedRevisionNo,
+			splitExpectedRevisionNo,
+			purchaseIdempotencyKey: purchaseKey,
+			splitIdempotencyKey: splitKey,
+			reasonNote: reasonNote ? reasonNote.trim() : null,
+			occurredAt,
+		});
+
+		return c.json(
+			{
+				purchase: result.purchase,
+				split: toCreditCardPurchaseSplitProductDto(result.split),
+				idempotentReplay: result.idempotentReplay,
+			},
+			200,
+		);
+	} catch (err) {
+		return mapCreditCardDomainError(c, err);
+	}
+});
