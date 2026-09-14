@@ -914,16 +914,15 @@ interface RewardEventProductDto {
   status: "ACTIVE" | "VOID";
   eventType: "OPENING_BALANCE" | "EARN" | "EXPIRE" | "ADJUSTMENT_CREDIT" | "ADJUSTMENT_DEBIT" | "REDEEM_PURCHASE";
   pointAmount: string;           // 4 decimal digits (e.g. "1000.0000")
-  signedPointEffect: string;     // Signed 4 decimal digits (e.g. "+1000.0000", "-500.0000", "+0.0000" if VOID)
+  signedPointEffect: string;     // Signed 4 decimal digits: positive e.g. "1000.0000", negative e.g. "-500.0000", "0.0000" if VOID (no plus sign prefix)
   conversionRate: string;        // 6 decimal digits (e.g. "0.010000")
-  economicAmount: string;        // 2 decimal digits (e.g. "10.00")
+  economicAmount: string | null; // 2 decimal digits for REDEEM_PURCHASE (e.g. "10.00"), null for non-economic events
   purchaseCategory: "MANDATORY_EXPENSE" | "DISCRETIONARY_SPEND" | "SHORT_TERM_PURCHASE" | "UNCLASSIFIED" | null;
   shortTermGoalId: string | null;
   merchant: string | null;
   description: string | null;
   reasonNote: string | null;
   sourceType: "MANUAL" | "CAMPAIGN" | "IMPORT";
-  sourceRef: string | null;
   occurredAt: string;            // ISO 8601 UTC timestamp
   createdAt: string;             // ISO 8601 UTC timestamp
 }

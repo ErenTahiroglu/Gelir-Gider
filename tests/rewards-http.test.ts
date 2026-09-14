@@ -528,7 +528,7 @@ describe("Rewards Product HTTP Surface (Checkpoint 7B.5)", () => {
 			status: "ACTIVE" as const,
 			revisionNo: 1,
 			pointAmount: "500.0000",
-			signedPointEffect: "+500.0000",
+			signedPointEffect: "500.0000",
 			conversionRate: "1.000000",
 			economicAmount: null,
 			purchaseCategory: null,
@@ -651,7 +651,7 @@ describe("Rewards Product HTTP Surface (Checkpoint 7B.5)", () => {
 				event: {
 					...mockEventDto,
 					eventType: "OPENING_BALANCE",
-					signedPointEffect: "+1000.0000",
+					signedPointEffect: "1000.0000",
 					pointAmount: "1000.0000",
 					canonicalTransactionId: null,
 					canonicalRevisionId: null,
@@ -859,6 +859,80 @@ describe("Rewards Product HTTP Surface (Checkpoint 7B.5)", () => {
 			expect(res.status).toBe(409);
 			const data = (await res.json()) as ErrBody;
 			expect(data.error.code).toBe("REWARD_EVENT_EXTERNALLY_MANAGED");
+		});
+
+		it("GET event detail and list return authoritative CAMPAIGN sourceType without fabrication", async () => {
+			vi.spyOn(accountsModule, "getRewardAccount").mockResolvedValue({
+				rewardAccountId: ACCOUNT_ID,
+				code: "MAXIPUAN",
+				status: "ACTIVE",
+				displayName: "MaxiPuan",
+				provider: "İş Bankası",
+				unitName: "Puan",
+				creditCardId: null,
+				defaultConversionRate: "1.000000",
+				balancePoints: "500.0000",
+				estimatedCurrentValue: "500.00",
+				revisionNo: 1,
+				occurredAt: new Date(OCCURRED_AT),
+				createdAt: new Date(OCCURRED_AT),
+			});
+
+			const campaignEventDto = {
+				...mockEventDto,
+				sourceType: "CAMPAIGN" as const,
+			};
+
+			vi.spyOn(eventsModule, "getRewardEvent").mockResolvedValue({
+				rewardEventId: EVENT_ID,
+				rewardAccountId: ACCOUNT_ID,
+				eventType: "EARN",
+				status: "ACTIVE",
+				revisionNo: 1,
+				pointAmount: "500.0000",
+				signedPointEffect: "500.0000",
+				conversionRate: "1.000000",
+				economicAmount: null,
+				purchaseCategory: null,
+				shortTermGoalId: null,
+				merchant: null,
+				description: null,
+				reasonNote: "Campaign bonus",
+				sourceType: "CAMPAIGN",
+				occurredAt: new Date(OCCURRED_AT),
+				createdAt: new Date(OCCURRED_AT),
+				canonicalTransactionId: null,
+				canonicalRevisionId: null,
+			});
+
+			const resDetail = await app.request(
+				`/rewards/accounts/${ACCOUNT_ID}/events/${EVENT_ID}`,
+				{ method: "GET", headers: { Cookie: COOKIE } },
+				mockEnv,
+			);
+			expect(resDetail.status).toBe(200);
+			// biome-ignore lint/suspicious/noExplicitAny: test payload
+			const dataDetail = (await resDetail.json()) as any;
+			expect(dataDetail.event.sourceType).toBe("CAMPAIGN");
+			expect(dataDetail.event.signedPointEffect).toBe("500.0000");
+			expect(dataDetail.event.economicAmount).toBeNull();
+
+			vi.spyOn(productReadModule, "listBoundedRewardEvents").mockResolvedValue({
+				events: [campaignEventDto],
+				hasMore: false,
+				nextCursor: null,
+			});
+
+			const resList = await app.request(
+				`/rewards/accounts/${ACCOUNT_ID}/events`,
+				{ method: "GET", headers: { Cookie: COOKIE } },
+				mockEnv,
+			);
+			expect(resList.status).toBe(200);
+			// biome-ignore lint/suspicious/noExplicitAny: test payload
+			const dataList = (await resList.json()) as any;
+			expect(dataList.events[0].sourceType).toBe("CAMPAIGN");
+			expect(dataList.events[0].signedPointEffect).toBe("500.0000");
 		});
 
 		it("Generic REWARD_INVALID_STATE maps strictly to 500 INTERNAL_ERROR", async () => {

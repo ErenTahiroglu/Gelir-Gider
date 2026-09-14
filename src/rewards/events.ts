@@ -6,6 +6,7 @@ import type {
 } from "../db/client";
 import { mapPurchaseCategoryToSystemRole } from "../db/schema/credit-card-ledger";
 import {
+	type RewardEventSourceType,
 	type RewardEventType,
 	rewardAccountRevisions,
 	rewardAccounts,
@@ -70,6 +71,7 @@ export interface RewardEventReadModel {
 	merchant: string | null;
 	description: string | null;
 	reasonNote: string | null;
+	sourceType: RewardEventSourceType;
 	occurredAt: Date;
 	createdAt: Date;
 	canonicalTransactionId: string | null;
@@ -105,20 +107,21 @@ export async function deriveRewardPointBalanceInTransaction(
 		}
 	}
 
-	const eventTypeById = new Map(eventRows.map((e) => [e.id, e.eventType]));
+	let totalBalanceUnits = 0n;
+	for (const event of eventRows) {
+		const latestRev = latestByEvent.get(event.id);
+		if (!latestRev) continue;
+		if (latestRev.operation === "VOID") continue;
 
-	let balance = 0n;
-	for (const [eventId, rev] of latestByEvent) {
-		if (rev.operation === "VOID") continue;
-		const units = parsePointQuantity(rev.pointAmount).units;
-		const type = eventTypeById.get(eventId);
-		if (type && POSITIVE_EVENT_TYPES.has(type as RewardEventType)) {
-			balance += units;
+		const pointQty = parsePointQuantity(latestRev.pointAmount);
+		if (POSITIVE_EVENT_TYPES.has(event.eventType as RewardEventType)) {
+			totalBalanceUnits += pointQty.units;
 		} else {
-			balance -= units;
+			totalBalanceUnits -= pointQty.units;
 		}
 	}
-	return balance;
+
+	return totalBalanceUnits;
 }
 
 // ============================================================================
@@ -129,9 +132,10 @@ function signedEffectFor(
 	eventType: RewardEventType,
 	pointAmount: string,
 ): string {
-	const units = parsePointQuantity(pointAmount).units;
-	const signed = POSITIVE_EVENT_TYPES.has(eventType) ? units : -units;
-	return formatUnitsToDecimal(signed, 4);
+	if (POSITIVE_EVENT_TYPES.has(eventType)) {
+		return pointAmount;
+	}
+	return `-${pointAmount}`;
 }
 
 function buildRewardEventReadModel(
@@ -159,6 +163,7 @@ function buildRewardEventReadModel(
 		merchant: revision.merchant,
 		description: revision.description,
 		reasonNote: revision.reasonNote,
+		sourceType: revision.sourceType as RewardEventSourceType,
 		occurredAt: revision.occurredAt,
 		createdAt: event.createdAt,
 		canonicalTransactionId: event.canonicalTransactionId,

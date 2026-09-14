@@ -20,6 +20,16 @@ import pg from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { createProductLedgerAccount } from "../src/ledger/product-accounts.ts";
 import { LedgerError } from "../src/ledger/errors.ts";
+import {
+	createRewardAccount,
+	getRewardAccount,
+} from "../src/rewards/accounts.ts";
+import {
+	recordRewardOpeningBalance,
+	recordRewardAdjustmentDebit,
+	recordRewardEarn,
+} from "../src/rewards/events.ts";
+import { RewardError } from "../src/rewards/errors.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const migDir = path.join(root, "migrations");
@@ -53,12 +63,13 @@ async function getMigrationFiles(): Promise<string[]> {
  * Deterministic database-observed wait barrier.
  *
  * Observes pg_locks to verify that BOTH competitor backend PIDs have an
- * ungranted relation lock on ledger_accounts before proceeding.
+ * ungranted relation lock on the specified relation before proceeding.
  *
  * Timeout acts strictly as a watchdog; time passing NEVER satisfies the barrier.
  */
-async function waitUntilBothCompetitorsBlockedOnLedgerAccounts(
+async function waitUntilBothCompetitorsBlockedOnRelation(
 	controlClient: pg.Client,
+	relationName: string,
 	pids: [number, number],
 	timeoutMs = 5000,
 	pollIntervalMs = 15,
@@ -72,10 +83,10 @@ async function waitUntilBothCompetitorsBlockedOnLedgerAccounts(
 			`SELECT pid, mode, granted
 			 FROM pg_locks
 			 WHERE locktype = 'relation'
-			   AND relation = 'ledger_accounts'::regclass
-			   AND pid = ANY($1::int[])
+			   AND relation = $1::regclass
+			   AND pid = ANY($2::int[])
 			   AND granted = false`,
-			[[pidA, pidB]],
+			[relationName, [pidA, pidB]],
 		);
 
 		let blockedA = false;
@@ -100,7 +111,22 @@ async function waitUntilBothCompetitorsBlockedOnLedgerAccounts(
 	}
 
 	throw new Error(
-		`Deterministic barrier failure: Timed out after ${timeoutMs}ms waiting for both competitors (PIDs: ${pidA}, ${pidB}) to be observed in ungranted lock state on ledger_accounts in pg_locks.`,
+		`Deterministic barrier failure: Timed out after ${timeoutMs}ms waiting for both competitors (PIDs: ${pidA}, ${pidB}) to be observed in ungranted lock state on ${relationName} in pg_locks.`,
+	);
+}
+
+async function waitUntilBothCompetitorsBlockedOnLedgerAccounts(
+	controlClient: pg.Client,
+	pids: [number, number],
+	timeoutMs = 5000,
+	pollIntervalMs = 15,
+): Promise<{ pidA: number; pidB: number; modes: Record<number, string> }> {
+	return waitUntilBothCompetitorsBlockedOnRelation(
+		controlClient,
+		"ledger_accounts",
+		pids,
+		timeoutMs,
+		pollIntervalMs,
 	);
 }
 
@@ -313,9 +339,9 @@ async function run() {
 		eq(confRowCount, 1, "7B.2-R4/2: exactly ONE ledger_accounts row exists in PostgreSQL for USR_RACE_CONF");
 
 		// --------------------------------------------------------------------------
-		// 3. POST-RACE DATABASE USABILITY
+		// 3. POST-RACE DATABASE USABILITY (LEDGER)
 		// --------------------------------------------------------------------------
-		console.log("\n--- Test 3: Post-Race Database Usability ---");
+		console.log("\n--- Test 3: Post-Race Database Usability (Ledger) ---");
 		const postRaceRes = await createProductLedgerAccount({
 			db: dbA,
 			userId: USER_A,
@@ -325,6 +351,210 @@ async function run() {
 		});
 		eq(postRaceRes.account.code, "USR_POST_RACE_REAL", "7B.2-R4/3: subsequent account creation succeeds as USR_POST_RACE_REAL");
 		eq(postRaceRes.idempotentReplay, false, "7B.2-R4/3: subsequent creation is fresh (idempotentReplay = false)");
+
+		// --------------------------------------------------------------------------
+		// 4. REAL PG REWARDS POINT-BALANCE CONCURRENCY RACE (DETERMINISTIC BARRIER)
+		// --------------------------------------------------------------------------
+		console.log("\n--- Test 4: Real PG Rewards Point-Balance Concurrency Race ---");
+		// Create an active reward account with initial balance = 100.0000 points
+		const raceRewAcc = await createRewardAccount({
+			db: dbA,
+			userId: USER_A,
+			code: "RACE_POINT_ACC",
+			displayName: "Race Point Account",
+			provider: "Test Bank",
+			unitName: "Points",
+			occurredAt: new Date(),
+			idempotencyKey: "race-rew-acc-init",
+		});
+		const rewardAccountId = raceRewAcc.account.rewardAccountId;
+		eq(raceRewAcc.account.code, "RACE_POINT_ACC", "7B.5-R1/4: Reward account created with code RACE_POINT_ACC");
+
+		await recordRewardOpeningBalance({
+			db: dbA,
+			userId: USER_A,
+			rewardAccountId,
+			pointAmount: "100.0000",
+			occurredAt: new Date(),
+			idempotencyKey: "race-rew-ob-init",
+		});
+
+		const initAcc = await getRewardAccount({ db: dbA, userId: USER_A, rewardAccountId });
+		eq(initAcc?.balancePoints, "100.0000", "7B.5-R1/4: Initial reward account point balance is 100.0000");
+
+		// Acquire exclusive table lock on reward_accounts via control connection
+		await controlClient.query("BEGIN; LOCK TABLE reward_accounts IN EXCLUSIVE MODE;");
+
+		const promiseDebitA = recordRewardAdjustmentDebit({
+			db: dbA,
+			userId: USER_A,
+			rewardAccountId,
+			pointAmount: "80.0000",
+			reasonNote: "Concurrent debit race A",
+			occurredAt: new Date(),
+			idempotencyKey: "race-debit-a",
+		});
+
+		const promiseDebitB = recordRewardAdjustmentDebit({
+			db: dbB,
+			userId: USER_A,
+			rewardAccountId,
+			pointAmount: "80.0000",
+			reasonNote: "Concurrent debit race B",
+			occurredAt: new Date(),
+			idempotencyKey: "race-debit-b",
+		});
+
+		// Wait until BOTH competitor backend sessions are objectively observed waiting on reward_accounts in pg_locks
+		const blockedDebits = await waitUntilBothCompetitorsBlockedOnRelation(
+			controlClient,
+			"reward_accounts",
+			[pidA, pidB],
+		);
+		ok(
+			"7B.5-R1/4: both independent PostgreSQL competitors observed waiting on reward_accounts before barrier release",
+			`(pidA=${blockedDebits.pidA} mode=${blockedDebits.modes[pidA]}, pidB=${blockedDebits.pidB} mode=${blockedDebits.modes[pidB]})`,
+		);
+
+		// Release lock to trigger simultaneous execution inside PostgreSQL
+		await controlClient.query("COMMIT;");
+
+		const [settledDebitA, settledDebitB] = await Promise.allSettled([promiseDebitA, promiseDebitB]);
+
+		const fulfilledDebit = [settledDebitA, settledDebitB].find((s) => s.status === "fulfilled") as
+			| PromiseFulfilledResult<Awaited<ReturnType<typeof recordRewardAdjustmentDebit>>>
+			| undefined;
+		const rejectedDebit = [settledDebitA, settledDebitB].find((s) => s.status === "rejected") as
+			| PromiseRejectedResult
+			| undefined;
+
+		chk(fulfilledDebit !== undefined, "7B.5-R1/4: exactly one competitor succeeded with debit fulfillment");
+		chk(rejectedDebit !== undefined, "7B.5-R1/4: exactly one competitor was rejected");
+
+		if (fulfilledDebit) {
+			eq(fulfilledDebit.value.event.eventType, "ADJUSTMENT_DEBIT", "7B.5-R1/4: winner created ADJUSTMENT_DEBIT event");
+			eq(fulfilledDebit.value.event.signedPointEffect, "-80.0000", "7B.5-R1/4: winner signedPointEffect is -80.0000");
+			eq(fulfilledDebit.value.idempotentReplay, false, "7B.5-R1/4: winner idempotentReplay = false");
+		}
+
+		if (rejectedDebit) {
+			chk(rejectedDebit.reason instanceof RewardError, "7B.5-R1/4: loser threw typed RewardError");
+			eq(
+				(rejectedDebit.reason as RewardError).code,
+				"REWARD_INSUFFICIENT_POINTS",
+				"7B.5-R1/4: loser threw typed REWARD_INSUFFICIENT_POINTS",
+			);
+			chk(
+				!(rejectedDebit.reason instanceof pg.DatabaseError),
+				"7B.5-R1/4: raw PostgreSQL 23505 / 25P02 did not escape",
+			);
+		}
+
+		// Verify final derived balance in PostgreSQL is exactly 20.0000
+		const finalAcc = await getRewardAccount({ db: dbA, userId: USER_A, rewardAccountId });
+		eq(finalAcc?.balancePoints, "20.0000", "7B.5-R1/4: final derived point balance in PostgreSQL is exactly 20.0000");
+
+		// Verify event row count: 1 OPENING_BALANCE + 1 ADJUSTMENT_DEBIT = 2 events (loser created zero rows)
+		const eventRowCount = (
+			await controlClient.query(
+				"select count(*)::int as n from reward_events where reward_account_id = $1",
+				[rewardAccountId],
+			)
+		).rows[0].n;
+		eq(eventRowCount, 2, "7B.5-R1/4: exactly TWO reward_events rows exist (1 opening + 1 winner debit, 0 loser partial rows)");
+
+		// Verify post-race database usability for Rewards
+		console.log("\n--- Test 4b: Post-Race Rewards Usability ---");
+		const followUpEarn = await recordRewardEarn({
+			db: dbA,
+			userId: USER_A,
+			rewardAccountId,
+			pointAmount: "50.0000",
+			reasonNote: "Post-race earn event",
+			occurredAt: new Date(),
+			idempotencyKey: "race-follow-up-earn",
+		});
+		eq(followUpEarn.event.signedPointEffect, "5000.0000".length === 9 ? "50.0000" : "50.0000", "7B.5-R1/4: follow-up earn creates event with 50.0000 points");
+		const usableAcc = await getRewardAccount({ db: dbA, userId: USER_A, rewardAccountId });
+		eq(usableAcc?.balancePoints, "70.0000", "7B.5-R1/4: subsequent earn succeeds and balance becomes 70.0000");
+
+		// --------------------------------------------------------------------------
+		// 5. REAL PG REWARDS DUPLICATE ACCOUNT CODE RACE (DETERMINISTIC BARRIER)
+		// --------------------------------------------------------------------------
+		console.log("\n--- Test 5: Real PG Rewards Duplicate Account Code Race ---");
+		await controlClient.query("BEGIN; LOCK TABLE reward_accounts IN EXCLUSIVE MODE;");
+
+		const promiseCodeA = createRewardAccount({
+			db: dbA,
+			userId: USER_A,
+			code: "RACE_CODE_DUP",
+			displayName: "Definition Alpha",
+			provider: "Bank Alpha",
+			unitName: "Points",
+			occurredAt: new Date(),
+			idempotencyKey: "idemp-code-dup-a",
+		});
+
+		const promiseCodeB = createRewardAccount({
+			db: dbB,
+			userId: USER_A,
+			code: "RACE_CODE_DUP",
+			displayName: "Definition Beta",
+			provider: "Bank Beta",
+			unitName: "Points",
+			occurredAt: new Date(),
+			idempotencyKey: "idemp-code-dup-b",
+		});
+
+		const blockedCodes = await waitUntilBothCompetitorsBlockedOnRelation(
+			controlClient,
+			"reward_accounts",
+			[pidA, pidB],
+		);
+		ok(
+			"7B.5-R1/5: both independent PostgreSQL competitors observed waiting on reward_accounts before barrier release",
+			`(pidA=${blockedCodes.pidA} mode=${blockedCodes.modes[pidA]}, pidB=${blockedCodes.modes[pidB]})`,
+		);
+
+		await controlClient.query("COMMIT;");
+
+		const [settledCodeA, settledCodeB] = await Promise.allSettled([promiseCodeA, promiseCodeB]);
+
+		const fulfilledCode = [settledCodeA, settledCodeB].find((s) => s.status === "fulfilled") as
+			| PromiseFulfilledResult<Awaited<ReturnType<typeof createRewardAccount>>>
+			| undefined;
+		const rejectedCode = [settledCodeA, settledCodeB].find((s) => s.status === "rejected") as
+			| PromiseRejectedResult
+			| undefined;
+
+		chk(fulfilledCode !== undefined, "7B.5-R1/5: exactly one competitor succeeded with account creation");
+		chk(rejectedCode !== undefined, "7B.5-R1/5: exactly one competitor was rejected with code conflict");
+
+		if (fulfilledCode) {
+			eq(fulfilledCode.value.account.code, "RACE_CODE_DUP", "7B.5-R1/5: winner created account RACE_CODE_DUP");
+			eq(fulfilledCode.value.idempotentReplay, false, "7B.5-R1/5: winner idempotentReplay = false");
+		}
+
+		if (rejectedCode) {
+			chk(rejectedCode.reason instanceof RewardError, "7B.5-R1/5: loser threw typed RewardError");
+			eq(
+				(rejectedCode.reason as RewardError).code,
+				"REWARD_ACCOUNT_CONFLICT",
+				"7B.5-R1/5: loser threw typed REWARD_ACCOUNT_CONFLICT",
+			);
+			chk(
+				!(rejectedCode.reason instanceof pg.DatabaseError),
+				"7B.5-R1/5: raw PostgreSQL 23505 / 25P02 did not escape",
+			);
+		}
+
+		const codeRowCount = (
+			await controlClient.query(
+				"select count(*)::int as n from reward_accounts where user_id = $1 and code = 'RACE_CODE_DUP'",
+				[USER_A],
+			)
+		).rows[0].n;
+		eq(codeRowCount, 1, "7B.5-R1/5: exactly ONE reward_accounts row exists in PostgreSQL for RACE_CODE_DUP");
 	} finally {
 		// Failure-safe lock and client cleanup
 		try {

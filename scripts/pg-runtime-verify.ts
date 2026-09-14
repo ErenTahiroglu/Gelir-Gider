@@ -16769,6 +16769,69 @@ async function resolverRuntime7B5(): Promise<void> {
 		);
 		await pg.exec("SET session_replication_role = origin;");
 
+		// Verify GET detail returns authoritative sourceType = "CAMPAIGN"
+		const getCampDetailRes = await httpCall(`/rewards/accounts/${wpId}/events/${CAMPAIGN_EVENT_ID}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getCampDetailRes.status, 200, "7B.5-C: GET CAMPAIGN event detail returns 200");
+		eqD(getCampDetailRes.json?.event?.sourceType, "CAMPAIGN", "7B.5-C: CAMPAIGN event detail returns authoritative sourceType = CAMPAIGN (no fabrication)");
+
+		// Verify GET list returns authoritative sourceType = "CAMPAIGN"
+		const getEventsListRes = await httpCall(`/rewards/accounts/${wpId}/events`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getEventsListRes.status, 200, "7B.5-C: GET events list returns 200");
+		const allEventsList = getEventsListRes.json?.events ?? [];
+		const campInList = allEventsList.find((e: any) => e.rewardEventId === CAMPAIGN_EVENT_ID);
+		chkD(campInList !== undefined, "7B.5-C: CAMPAIGN event present in event list");
+		eqD(campInList?.sourceType, "CAMPAIGN", "7B.5-C: CAMPAIGN event in list returns authoritative sourceType = CAMPAIGN");
+
+		// Verify MANUAL event detail and list return sourceType = "MANUAL"
+		const earnId = earnRes.json?.event?.rewardEventId;
+		const getEarnDetailRes = await httpCall(`/rewards/accounts/${wpId}/events/${earnId}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(getEarnDetailRes.status, 200, "7B.5-C: GET MANUAL earn event detail returns 200");
+		eqD(getEarnDetailRes.json?.event?.sourceType, "MANUAL", "7B.5-C: MANUAL event detail returns authoritative sourceType = MANUAL");
+		const earnInList = allEventsList.find((e: any) => e.rewardEventId === earnId);
+		eqD(earnInList?.sourceType, "MANUAL", "7B.5-C: MANUAL event in list returns authoritative sourceType = MANUAL");
+
+		// Verify signedPointEffect consistency across create, detail GET, and list GET
+		// 1. Positive EARN: "2000.0000"
+		eqD(earnRes.json?.event?.signedPointEffect, "2000.0000", "7B.5-C: Positive EARN create signedPointEffect is 2000.0000 (no plus sign)");
+		eqD(getEarnDetailRes.json?.event?.signedPointEffect, "2000.0000", "7B.5-C: Positive EARN detail signedPointEffect is 2000.0000");
+		eqD(earnInList?.signedPointEffect, "2000.0000", "7B.5-C: Positive EARN list signedPointEffect is 2000.0000");
+
+		// 2. Negative EXPIRE: "-1000.0000"
+		const expId = expRes.json?.event?.rewardEventId;
+		const getExpDetailRes = await httpCall(`/rewards/accounts/${wpId}/events/${expId}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		const expInList = allEventsList.find((e: any) => e.rewardEventId === expId);
+		eqD(expRes.json?.event?.signedPointEffect, "-1000.0000", "7B.5-C: Negative EXPIRE create signedPointEffect is -1000.0000");
+		eqD(getExpDetailRes.json?.event?.signedPointEffect, "-1000.0000", "7B.5-C: Negative EXPIRE detail signedPointEffect is -1000.0000");
+		eqD(expInList?.signedPointEffect, "-1000.0000", "7B.5-C: Negative EXPIRE list signedPointEffect is -1000.0000");
+
+		// 3. VOID event: "0.0000"
+		const getVoidDetailRes = await httpCall(`/rewards/accounts/${wpId}/events/${purchaseEventId}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		const voidInList = allEventsList.find((e: any) => e.rewardEventId === purchaseEventId);
+		eqD(voidRes.json?.event?.signedPointEffect, "0.0000", "7B.5-C: VOID event mutation signedPointEffect is 0.0000");
+		eqD(getVoidDetailRes.json?.event?.signedPointEffect, "0.0000", "7B.5-C: VOID event detail signedPointEffect is 0.0000");
+		eqD(voidInList?.signedPointEffect, "0.0000", "7B.5-C: VOID event list signedPointEffect is 0.0000");
+
+		// Verify economicAmount contract truth
+		eqD(getEarnDetailRes.json?.event?.economicAmount, null, "7B.5-C: Non-economic EARN event has economicAmount = null");
+		eqD(getExpDetailRes.json?.event?.economicAmount, null, "7B.5-C: Non-economic EXPIRE event has economicAmount = null");
+		eqD(obRes.json?.event?.economicAmount, null, "7B.5-C: Non-economic OPENING_BALANCE event has economicAmount = null");
+		eqD(purchaseEvent?.economicAmount, "40.00", "7B.5-C: Economic REDEEM_PURCHASE event has economicAmount = 40.00");
+
 		// Attempt to void CAMPAIGN event -> 409 REWARD_EVENT_EXTERNALLY_MANAGED
 		const voidCampRes = await httpCall(`/rewards/accounts/${wpId}/events/${CAMPAIGN_EVENT_ID}/void`, {
 			method: "POST",

@@ -134,7 +134,7 @@ export function toRewardEventProductDto(
 				merchant: string | null;
 				description: string | null;
 				reasonNote: string | null;
-				sourceType?: RewardEventSourceType | undefined;
+				sourceType: RewardEventSourceType;
 				occurredAt: Date | string;
 				createdAt: Date | string;
 		  },
@@ -163,10 +163,7 @@ export function toRewardEventProductDto(
 		merchant: model.merchant,
 		description: model.description,
 		reasonNote: model.reasonNote,
-		sourceType:
-			"sourceType" in model && typeof model.sourceType === "string"
-				? (model.sourceType as RewardEventProductDto["sourceType"])
-				: "MANUAL",
+		sourceType: model.sourceType,
 		occurredAt: occurredAtStr,
 		createdAt: createdAtStr,
 	};
@@ -457,7 +454,7 @@ export async function listBoundedRewardEvents({
 			let signedPointEffect = "0.0000";
 			if (eventStatus === "ACTIVE") {
 				const isPos = POSITIVE_EVENT_TYPES.has(r.eventType as RewardEventType);
-				signedPointEffect = isPos ? `+${r.pointAmount}` : `-${r.pointAmount}`;
+				signedPointEffect = isPos ? r.pointAmount : `-${r.pointAmount}`;
 			}
 
 			return {
