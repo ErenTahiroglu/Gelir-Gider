@@ -588,11 +588,11 @@ async function run() {
 			userId: USER_A,
 			code: "CARD_CAMP_RACE",
 			displayName: "Campaign Race Card",
-			cardBrand: "VISA",
-			last4: "4321",
+			issuer: "Bank Alpha",
+			lastFour: "4321",
 			creditLimit: "10000.00",
-			statementClosingDay: 25,
-			paymentDueDaysAfterClosing: 10,
+			statementDay: 25,
+			dueDay: 5,
 			occurredAt: new Date("2026-09-01T00:00:00Z"),
 			idempotencyKey: "camp-race-card",
 		});
@@ -622,8 +622,6 @@ async function run() {
 			endsOn: "2026-09-30",
 			ruleMode: "TOTAL_SPEND",
 			targetSpendAmount: "200.00",
-			requiredTransactionCount: 1,
-			minimumTransactionAmount: "10.00",
 			rewardKind: "REWARD_POINTS",
 			rewardAccountId: campRewardAcc.account.rewardAccountId,
 			expectedRewardPoints: "1000.0000",
@@ -732,11 +730,11 @@ async function run() {
 
 		const rewardEventRowCount = (
 			await controlClient.query(
-				"select count(*)::int as n from reward_events where source_type = 'CAMPAIGN' and source_ref = $1",
+				"select count(*)::int as n from reward_event_revisions where source_type = 'CAMPAIGN' and source_ref = $1",
 				[campConfirmed.campaignPeriodId],
 			)
 		).rows[0].n;
-		eq(rewardEventRowCount, 1, "7B.6/6: exactly ONE CAMPAIGN-owned reward_events row exists");
+		eq(rewardEventRowCount, 1, "7B.6/6: exactly ONE CAMPAIGN-owned reward_event_revisions row exists");
 
 		const finalRewAcc = await getRewardAccount({
 			db: dbA,
