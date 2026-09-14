@@ -22,6 +22,8 @@ import { campaignsRouter } from "./http/campaign-routes";
 import { creditCardRouter } from "./http/credit-card-routes";
 import { incomeRouter } from "./http/income-routes";
 import { ledgerRouter } from "./http/ledger-routes";
+import { longTermRouter } from "./http/long-term-routes";
+import { midasRouter } from "./http/midas-routes";
 import { peopleRouter } from "./http/people-routes";
 import { rewardsRouter } from "./http/rewards-routes";
 import type { RequestIdVariables } from "./http/security-middleware";
@@ -29,6 +31,7 @@ import {
 	requestIdMiddleware,
 	securityHeadersMiddleware,
 } from "./http/security-middleware";
+import { shortTermGoalsRouter } from "./http/short-term-goal-routes";
 import { transactionsRouter } from "./http/transactions-routes";
 import { runNotificationScheduler } from "./notifications/scheduler";
 import { WebPushTransport } from "./notifications/web-push";
@@ -104,6 +107,9 @@ app.route("/credit-cards", creditCardRouter);
 app.route("/people", peopleRouter);
 app.route("/rewards", rewardsRouter);
 app.route("/campaigns", campaignsRouter);
+app.route("/short-term-goals", shortTermGoalsRouter);
+app.route("/midas", midasRouter);
+app.route("/long-term", longTermRouter);
 
 app.notFound((c) => {
 	return c.json(

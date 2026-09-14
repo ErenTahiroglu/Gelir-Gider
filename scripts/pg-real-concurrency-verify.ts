@@ -40,6 +40,20 @@ import {
 } from "../src/campaigns/service.ts";
 import { CampaignError } from "../src/campaigns/errors.ts";
 import { getCampaignProgressInTransaction } from "../src/campaigns/progress.ts";
+import { createLedgerAccount } from "../src/ledger/accounts.ts";
+import { postJournalEntry } from "../src/ledger/posting.ts";
+import {
+	createMidasAccount,
+	createMidasAllocationTransfer,
+	getMidasLiquidityState,
+} from "../src/midas/service.ts";
+import { MidasError } from "../src/midas/errors.ts";
+import {
+	allocateLongTermInvestment,
+	markLongTermInvestmentSent,
+	getLongTermInvestmentTask,
+} from "../src/long-term/service.ts";
+import { LongTermError } from "../src/long-term/errors.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const migDir = path.join(root, "migrations");
@@ -758,7 +772,249 @@ async function run() {
 			),
 		);
 		eq(progressAfterRace.qualificationStatus, "REWARD_CREDITED", "7B.6/6: post-race progress is REWARD_CREDITED and DB is healthy");
-	} finally {
+
+		// --------------------------------------------------------------------------
+		// 7. REAL PG MIDAS OVERSPEND ALLOCATION TRANSFER RACE (DETERMINISTIC BARRIER)
+		// --------------------------------------------------------------------------
+		console.log("\n--- Test 7: Real PG Midas Overspend Allocation Transfer Race ---");
+
+		// Create dedicated asset and equity accounts for Midas test
+		const midasLedgerAcc = await createLedgerAccount({
+			db: dbA,
+			userId: USER_A,
+			code: "MIDAS_RACE_ASSET",
+			name: "Midas Race Asset",
+			accountType: "ASSET",
+			normalBalance: "DEBIT",
+			currency: "TRY",
+		});
+		const midasEquityAcc = await createLedgerAccount({
+			db: dbA,
+			userId: USER_A,
+			code: "MIDAS_RACE_EQUITY",
+			name: "Midas Race Equity",
+			accountType: "EQUITY",
+			normalBalance: "CREDIT",
+			currency: "TRY",
+		});
+		// Post exactly 100.00 TRY to Midas Checking Account
+		await postJournalEntry({
+			db: dbA,
+			userId: USER_A,
+			occurredAt: new Date("2026-09-01T00:00:00Z"),
+			description: "Opening Midas race balance",
+			idempotencyKey: "midas-race-init-post",
+			lines: [
+				{ accountId: midasLedgerAcc.id, side: "DEBIT", amount: "100.00" },
+				{ accountId: midasEquityAcc.id, side: "CREDIT", amount: "100.00" },
+			],
+		});
+
+		// Setup Midas Account
+		const midasAccSetup = await createMidasAccount({
+			db: dbA,
+			userId: USER_A,
+			ledgerAccountId: midasLedgerAcc.id,
+		});
+		eq(midasAccSetup.account.ledgerAccountId, midasLedgerAcc.id, "7B.7/7: Midas account created with ledgerAccountId");
+
+		const initialLiquidity = await getMidasLiquidityState({ db: dbA, userId: USER_A });
+		eq(initialLiquidity.unallocatedBalance, "100.00", "7B.7/7: initial unallocatedBalance is 100.00");
+		eq(initialLiquidity.earmarkedBalance, "0.00", "7B.7/7: initial earmarkedBalance is 0.00");
+
+		// Hold lock on midas_accounts via control connection
+		await controlClient.query("BEGIN; LOCK TABLE midas_accounts IN EXCLUSIVE MODE;");
+
+		const promiseMidasA = createMidasAllocationTransfer({
+			db: dbA,
+			userId: USER_A,
+			amount: "80.00",
+			occurredAt: new Date(),
+			idempotencyKey: "midas-race-key-a",
+		});
+
+		const promiseMidasB = createMidasAllocationTransfer({
+			db: dbB,
+			userId: USER_A,
+			amount: "80.00",
+			occurredAt: new Date(),
+			idempotencyKey: "midas-race-key-b",
+		});
+
+		// Wait until BOTH competitor backend sessions are objectively observed waiting on midas_accounts in pg_locks
+		const blockedMidas = await waitUntilBothCompetitorsBlockedOnRelation(
+			controlClient,
+			"midas_accounts",
+			[pidA, pidB],
+		);
+		ok(
+			"7B.7/7: both independent PostgreSQL competitors observed waiting on midas_accounts before barrier release",
+			`(pidA=${blockedMidas.pidA} mode=${blockedMidas.modes[pidA]}, pidB=${blockedMidas.pidB} mode=${blockedMidas.modes[pidB]})`,
+		);
+
+		// Release barrier
+		await controlClient.query("COMMIT;");
+
+		const [settledMidasA, settledMidasB] = await Promise.allSettled([
+			promiseMidasA,
+			promiseMidasB,
+		]);
+
+		const fulfilledMidas = [settledMidasA, settledMidasB].find((s) => s.status === "fulfilled") as
+			| PromiseFulfilledResult<Awaited<ReturnType<typeof createMidasAllocationTransfer>>>
+			| undefined;
+		const rejectedMidas = [settledMidasA, settledMidasB].find((s) => s.status === "rejected") as
+			| PromiseRejectedResult
+			| undefined;
+
+		chk(fulfilledMidas !== undefined, "7B.7/7: exactly one competitor succeeded with Midas transfer fulfillment");
+		chk(rejectedMidas !== undefined, "7B.7/7: exactly one competitor was rejected with insufficient balance");
+
+		if (fulfilledMidas) {
+			eq(fulfilledMidas.value.transfer.amount, "80.00", "7B.7/7: winner created transfer of 80.00");
+			eq(fulfilledMidas.value.idempotentReplay, false, "7B.7/7: winner idempotentReplay = false");
+		}
+
+		if (rejectedMidas) {
+			chk(rejectedMidas.reason instanceof MidasError, "7B.7/7: loser threw typed MidasError");
+			eq(
+				(rejectedMidas.reason as MidasError).code,
+				"MIDAS_INSUFFICIENT_FREE_BALANCE",
+				"7B.7/7: loser threw typed MIDAS_INSUFFICIENT_FREE_BALANCE",
+			);
+			chk(
+				!(rejectedMidas.reason instanceof pg.DatabaseError),
+				"7B.7/7: raw PostgreSQL 23505 / 25P02 did not escape",
+			);
+		}
+
+		// Exact-once assertions in PostgreSQL
+		const transferRowCount = (
+			await controlClient.query(
+				"select count(*)::int as n from midas_allocation_transfers where midas_account_id = $1",
+				[midasAccSetup.account.midasAccountId],
+			)
+		).rows[0].n;
+		eq(transferRowCount, 1, "7B.7/7: exactly ONE midas_allocation_transfers row exists in PostgreSQL");
+
+		const finalLiquidity = await getMidasLiquidityState({ db: dbA, userId: USER_A });
+		eq(finalLiquidity.earmarkedBalance, "80.00", "7B.7/7: final earmarked balance in PostgreSQL is exactly 80.00");
+		eq(finalLiquidity.unallocatedBalance, "20.00", "7B.7/7: final unallocated balance in PostgreSQL is exactly 20.00");
+
+		// --------------------------------------------------------------------------
+		// 8. REAL PG LONG-TERM TASK MARK-SENT OCC CONCURRENCY RACE (DETERMINISTIC BARRIER)
+		// --------------------------------------------------------------------------
+		console.log("\n--- Test 8: Real PG Long-Term Task Mark-Sent OCC Concurrency Race ---");
+
+		// Allocate long term task with amount 50.00 (we have 80.00 earmarked balance in PENDING_LONG_TERM)
+		const allocatedTask = await allocateLongTermInvestment({
+			db: dbA,
+			userId: USER_A,
+			amount: "50.00",
+			notes: "Race allocate",
+			occurredAt: new Date("2026-09-02T10:00:00Z"),
+			idempotencyKey: "lt-race-alloc-init",
+		});
+		eq(allocatedTask.task.lifecycleStatus, "PENDING", "7B.7/8: long-term task allocated with lifecycleStatus PENDING");
+		eq(allocatedTask.task.revisionNo, 1, "7B.7/8: long-term task initial revisionNo is 1");
+
+		// Hold lock on long_term_send_tasks via control connection
+		await controlClient.query("BEGIN; LOCK TABLE long_term_send_tasks IN EXCLUSIVE MODE;");
+
+		const promiseMarkSentA = markLongTermInvestmentSent({
+			db: dbA,
+			userId: USER_A,
+			taskId: allocatedTask.task.taskId,
+			expectedRevisionNo: 1,
+			brokerReference: "BRK-RACE-A",
+			notes: "Send race A",
+			occurredAt: new Date("2026-09-03T10:00:00Z"),
+			idempotencyKey: "lt-race-mark-sent-a",
+		});
+
+		const promiseMarkSentB = markLongTermInvestmentSent({
+			db: dbB,
+			userId: USER_A,
+			taskId: allocatedTask.task.taskId,
+			expectedRevisionNo: 1,
+			brokerReference: "BRK-RACE-B",
+			notes: "Send race B",
+			occurredAt: new Date("2026-09-03T10:00:00Z"),
+			idempotencyKey: "lt-race-mark-sent-b",
+		});
+
+		// Wait until BOTH competitor backend sessions are objectively observed waiting on long_term_send_tasks in pg_locks
+		const blockedLT = await waitUntilBothCompetitorsBlockedOnRelation(
+			controlClient,
+			"long_term_send_tasks",
+			[pidA, pidB],
+		);
+		ok(
+			"7B.7/8: both independent PostgreSQL competitors observed waiting on long_term_send_tasks before barrier release",
+			`(pidA=${blockedLT.pidA} mode=${blockedLT.modes[pidA]}, pidB=${blockedLT.modes[pidB]})`,
+		);
+
+		// Release barrier
+		await controlClient.query("COMMIT;");
+
+		const [settledLTA, settledLTB] = await Promise.allSettled([
+			promiseMarkSentA,
+			promiseMarkSentB,
+		]);
+
+		const fulfilledLT = [settledLTA, settledLTB].find((s) => s.status === "fulfilled") as
+			| PromiseFulfilledResult<Awaited<ReturnType<typeof markLongTermInvestmentSent>>>
+			| undefined;
+		const rejectedLT = [settledLTA, settledLTB].find((s) => s.status === "rejected") as
+			| PromiseRejectedResult
+			| undefined;
+
+		chk(fulfilledLT !== undefined, "7B.7/8: exactly one competitor succeeded with mark-sent");
+		chk(rejectedLT !== undefined, "7B.7/8: exactly one competitor was rejected with revision conflict");
+
+		if (fulfilledLT) {
+			eq(fulfilledLT.value.task.lifecycleStatus, "SENT", "7B.7/8: winner transitioned task to SENT");
+			eq(fulfilledLT.value.task.revisionNo, 2, "7B.7/8: winner updated revisionNo to 2");
+			chk(fulfilledLT.value.canonicalTransactionId.length > 0, "7B.7/8: winner created canonicalTransactionId");
+		}
+
+		if (rejectedLT) {
+			chk(rejectedLT.reason instanceof LongTermError, "7B.7/8: loser threw typed LongTermError");
+			eq(
+				(rejectedLT.reason as LongTermError).code,
+				"LONG_TERM_REVISION_CONFLICT",
+				"7B.7/8: loser threw typed LONG_TERM_REVISION_CONFLICT",
+			);
+			chk(
+				!(rejectedLT.reason instanceof pg.DatabaseError),
+				"7B.7/8: raw PostgreSQL 23505 / 25P02 did not escape",
+			);
+		}
+
+		// Exact-once assertions in PostgreSQL
+		const taskRow = (
+			await controlClient.query(
+				"select lifecycle_status, revision_no from long_term_send_tasks where id = $1",
+				[allocatedTask.task.taskId],
+			)
+		).rows[0];
+		eq(taskRow.lifecycle_status, "SENT", "7B.7/8: exactly ONE task in DB with status SENT");
+		eq(taskRow.revision_no, 2, "7B.7/8: exactly ONE task in DB with revision 2");
+
+		const taskRevsCount = (
+			await controlClient.query(
+				"select count(*)::int as n from long_term_send_task_revisions where task_id = $1",
+				[allocatedTask.task.taskId],
+			)
+		).rows[0].n;
+		eq(taskRevsCount, 2, "7B.7/8: exactly TWO revisions exist (1 PENDING + 1 SENT, zero partial writes from loser)");
+
+		const taskInDb = await getLongTermInvestmentTask({
+			db: dbA,
+			userId: USER_A,
+			taskId: allocatedTask.task.taskId,
+		});
+		eq(taskInDb?.lifecycleStatus, "SENT", "7B.7/8: post-race DB usability getLongTermInvestmentTask returns SENT");
 		// Failure-safe lock and client cleanup
 		try {
 			await controlClient.query("ROLLBACK;");

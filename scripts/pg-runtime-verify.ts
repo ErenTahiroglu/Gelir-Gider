@@ -18027,6 +18027,561 @@ async function resolverRuntime7B6(): Promise<void> {
 	}
 }
 
+// ============================================================================
+// PHASE 7B.7: SHORT-TERM GOALS + MIDAS + LONG-TERM HTTP SURFACE & BOUNDARY CLOSURE
+// ============================================================================
+
+async function resolverRuntime7B7() {
+	const { PGlite } = await import("@electric-sql/pglite");
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const { createSession } = await import("../src/auth/sessions.ts");
+	const { createLedgerAccount } = await import("../src/ledger/accounts.ts");
+	const { postJournalEntry } = await import("../src/ledger/posting.ts");
+
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 71);
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+
+	const eqD = (a: unknown, b: unknown, name: string) => {
+		if (JSON.stringify(a) === JSON.stringify(b)) {
+			ok(name);
+		} else {
+			bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+		}
+	};
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	const isUuid = (val: unknown): val is string =>
+		typeof val === "string" &&
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
+
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
+	setDatabaseFactoryOverrideForTest(() => db);
+
+	try {
+		const testEnv: AppEnv = {
+			DATABASE_URL: "postgres://fake-pglite/db",
+			WEBAUTHN_RP_ID: "localhost",
+			WEBAUTHN_RP_NAME: "Gelir Gider Test",
+			WEBAUTHN_ORIGIN: "http://localhost:8787",
+		};
+
+		const USER_A = "11111111-dddd-4ddd-8ddd-111111111111";
+		const USER_B = "22222222-dddd-4ddd-8ddd-222222222222";
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now())",
+			[USER_A],
+		);
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User B', 'TRY', 'Europe/Istanbul', now())",
+			[USER_B],
+		);
+
+		const { token: tokenA } = await createSession({ db, userId: USER_A });
+		const { token: tokenB } = await createSession({ db, userId: USER_B });
+
+		const httpCall = async (
+			path: string,
+			opts: {
+				method?: string;
+				body?: unknown;
+				token?: string;
+				idempotencyKey?: string;
+				origin?: string;
+			} = {},
+		) => {
+			const headers: Record<string, string> = {};
+			if (opts.token) {
+				headers.Cookie = `__Host-gg_session=${opts.token}`;
+			}
+			if (opts.origin !== undefined) {
+				headers.Origin = opts.origin;
+			} else if (opts.method !== "GET" && opts.method !== "HEAD") {
+				headers.Origin = "http://localhost:8787";
+			}
+			if (opts.idempotencyKey) {
+				headers["Idempotency-Key"] = opts.idempotencyKey;
+			}
+			if (opts.body !== undefined) {
+				headers["Content-Type"] = "application/json";
+			}
+			const res = await app.request(
+				path,
+				{
+					method: opts.method ?? "GET",
+					headers,
+					body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+				},
+				testEnv,
+			);
+			let json: any = null;
+			try {
+				json = await res.json();
+			} catch {
+				// no-op
+			}
+			return { status: res.status, json, headers: res.headers };
+		};
+
+		// --- 1. Ledger Accounts & Initial Physical Balances ---
+		const ledgerAccA1 = await createLedgerAccount({
+			db,
+			userId: USER_A,
+			code: "MIDAS_CASH_A",
+			name: "Midas Checking Account",
+			accountType: "ASSET",
+			normalBalance: "DEBIT",
+			currency: "TRY",
+		});
+		const ledgerAccA2 = await createLedgerAccount({
+			db,
+			userId: USER_A,
+			code: "INVESTMENT_BROKER_A",
+			name: "External Investment Account",
+			accountType: "ASSET",
+			normalBalance: "DEBIT",
+			currency: "TRY",
+		});
+		const equityAccA = await createLedgerAccount({
+			db,
+			userId: USER_A,
+			code: "OPENING_EQUITY_A",
+			name: "Opening Equity",
+			accountType: "EQUITY",
+			normalBalance: "CREDIT",
+			currency: "TRY",
+		});
+
+		// Post initial 100,000.00 TRY to Midas Checking Account
+		await postJournalEntry({
+			db,
+			userId: USER_A,
+			occurredAt: new Date("2026-06-01T00:00:00Z"),
+			description: "Opening Midas balance",
+			idempotencyKey: "midas-a-init-posting",
+			lines: [
+				{ accountId: ledgerAccA1.id, side: "DEBIT", amount: "100000.00" },
+				{ accountId: equityAccA.id, side: "CREDIT", amount: "100000.00" },
+			],
+		});
+
+		// User B Ledger
+		const ledgerAccB1 = await createLedgerAccount({
+			db,
+			userId: USER_B,
+			code: "MIDAS_CASH_B",
+			name: "Midas Checking B",
+			accountType: "ASSET",
+			normalBalance: "DEBIT",
+			currency: "TRY",
+		});
+		const equityAccB = await createLedgerAccount({
+			db,
+			userId: USER_B,
+			code: "OPENING_EQUITY_B",
+			name: "Opening Equity B",
+			accountType: "EQUITY",
+			normalBalance: "CREDIT",
+			currency: "TRY",
+		});
+		await postJournalEntry({
+			db,
+			userId: USER_B,
+			occurredAt: new Date("2026-06-01T00:00:00Z"),
+			description: "Opening B balance",
+			idempotencyKey: "midas-b-init-posting",
+			lines: [
+				{ accountId: ledgerAccB1.id, side: "DEBIT", amount: "50000.00" },
+				{ accountId: equityAccB.id, side: "CREDIT", amount: "50000.00" },
+			],
+		});
+
+		// --- 2. Midas Account Setup ---
+		const setupResA = await httpCall("/midas/accounts", {
+			method: "POST",
+			token: tokenA,
+			body: { ledgerAccountId: ledgerAccA1.id },
+		});
+		eqD(setupResA.status, 200, "7B.7-A: POST /midas/accounts sets up Midas account");
+		const midasAccIdA = setupResA.json?.midasAccount?.midasAccountId;
+		chkD(isUuid(midasAccIdA), "7B.7-A: Valid Midas account UUID returned");
+
+		// User B setup
+		const setupResB = await httpCall("/midas/setup", {
+			method: "POST",
+			token: tokenB,
+			body: { ledgerAccountId: ledgerAccB1.id },
+		});
+		eqD(setupResB.status, 200, "7B.7-A: POST /midas/setup sets up Midas account for User B");
+		const midasAccIdB = setupResB.json?.midasAccount?.midasAccountId;
+
+		// Check initial liquidity state for User A
+		const liqRes1 = await httpCall(`/midas/liquidity?midasAccountId=${midasAccIdA}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(liqRes1.status, 200, "7B.7-B: GET /midas/liquidity returns 200");
+		eqD(liqRes1.json?.liquidity?.physicalBalance, "100000.00", "7B.7-B: Physical balance is 100,000.00");
+		eqD(liqRes1.json?.liquidity?.totalEarmarked, "0.00", "7B.7-B: Total earmarked is 0.00");
+		eqD(liqRes1.json?.liquidity?.unallocatedBalance, "100000.00", "7B.7-B: Unallocated balance is 100,000.00");
+		const pendingLongTermBucket = liqRes1.json?.liquidity?.buckets?.find((b: any) => b.bucketType === "PENDING_LONG_TERM");
+		chkD(pendingLongTermBucket !== undefined, "7B.7-B: PENDING_LONG_TERM singleton bucket exists");
+
+		// --- 3. Short-Term Goals Lifecycle & Operations ---
+		// Create Goal 1 (MacBook)
+		const createGoal1 = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-create-1",
+			body: {
+				midasAccountId: midasAccIdA,
+				name: "Emergency MacBook",
+				fundingTarget: "50000.00",
+				maxBudget: "60000.00",
+				targetPrice: "50000.00",
+				priorityPosition: 1,
+				occurredAt: "2026-06-02T10:00:00.000Z",
+			},
+		});
+		eqD(createGoal1.status, 201, "7B.7-C: Create Goal 1 returns 201");
+		const goal1Id = createGoal1.json?.goal?.goalId;
+		const goal1BucketId = createGoal1.json?.goal?.midasBucketId;
+		eqD(createGoal1.json?.goal?.priority, 1, "7B.7-C: Goal 1 priority is 1");
+		eqD(createGoal1.json?.goal?.fundingStatus, "EMPTY", "7B.7-C: Goal 1 is EMPTY");
+
+		// Create Goal 2 (Vacation)
+		const createGoal2 = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-create-2",
+			body: {
+				midasAccountId: midasAccIdA,
+				name: "Vacation Fund",
+				fundingTarget: "20000.00",
+				priorityPosition: 2,
+				occurredAt: "2026-06-02T10:05:00.000Z",
+			},
+		});
+		eqD(createGoal2.status, 201, "7B.7-C: Create Goal 2 returns 201");
+		const goal2Id = createGoal2.json?.goal?.goalId;
+
+		// Create Goal 3 (Phone)
+		const createGoal3 = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-create-3",
+			body: {
+				midasAccountId: midasAccIdA,
+				name: "New Phone",
+				fundingTarget: "30000.00",
+				priorityPosition: 3,
+				occurredAt: "2026-06-02T10:10:00.000Z",
+			},
+		});
+		eqD(createGoal3.status, 201, "7B.7-C: Create Goal 3 returns 201");
+		const goal3Id = createGoal3.json?.goal?.goalId;
+
+		// List goals
+		const listGoals1 = await httpCall(`/short-term-goals?midasAccountId=${midasAccIdA}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(listGoals1.status, 200, "7B.7-D: List goals returns 200");
+		eqD(listGoals1.json?.goals?.length, 3, "7B.7-D: 3 goals returned");
+		eqD(listGoals1.json?.goals?.[0]?.goalId, goal1Id, "7B.7-D: Goal 1 first by priority");
+		eqD(listGoals1.json?.goals?.[1]?.goalId, goal2Id, "7B.7-D: Goal 2 second by priority");
+		eqD(listGoals1.json?.goals?.[2]?.goalId, goal3Id, "7B.7-D: Goal 3 third by priority");
+
+		// Detail view GET /short-term-goals/:id
+		const getGoal1 = await httpCall(`/short-term-goals/${goal1Id}`, { method: "GET", token: tokenA });
+		eqD(getGoal1.status, 200, "7B.7-E: GET goal detail returns 200");
+		eqD(getGoal1.json?.goal?.name, "Emergency MacBook", "7B.7-E: Goal name matches");
+
+		// Update goal POST /short-term-goals/:id
+		const updateGoal1 = await httpCall(`/short-term-goals/${goal1Id}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-update-1",
+			body: {
+				expectedRevisionNo: 1,
+				name: "Emergency MacBook Pro",
+				fundingTarget: "55000.00",
+				occurredAt: "2026-06-02T11:00:00.000Z",
+			},
+		});
+		eqD(updateGoal1.status, 200, "7B.7-F: Update goal returns 200");
+		eqD(updateGoal1.json?.goal?.latestRevisionNo, 2, "7B.7-F: Revision incremented to 2");
+		eqD(updateGoal1.json?.goal?.name, "Emergency MacBook Pro", "7B.7-F: Name updated");
+
+		// Stale revision update conflict
+		const staleUpdate = await httpCall(`/short-term-goals/${goal1Id}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-update-stale",
+			body: {
+				expectedRevisionNo: 1, // Stale!
+				name: "Stale Update",
+				occurredAt: "2026-06-02T11:05:00.000Z",
+			},
+		});
+		eqD(staleUpdate.status, 409, "7B.7-F: Stale expectedRevisionNo rejected with 409 SHORT_TERM_GOAL_REVISION_CONFLICT");
+
+		// Reorder goals: [Goal 2, Goal 1, Goal 3]
+		const reorderRes = await httpCall("/short-term-goals/reorder", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-reorder-1",
+			body: {
+				midasAccountId: midasAccIdA,
+				orderedGoalIds: [goal2Id, goal1Id, goal3Id],
+				occurredAt: "2026-06-02T11:30:00.000Z",
+			},
+		});
+		eqD(reorderRes.status, 200, "7B.7-G: Reorder goals returns 200");
+		eqD(reorderRes.json?.reorder?.orderedGoalIds, [goal2Id, goal1Id, goal3Id], "7B.7-G: Reorder sequence confirmed");
+
+		// Fund Goal 1 with 15,000.00
+		const fundGoal1 = await httpCall(`/short-term-goals/${goal1Id}/fund`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-fund-1",
+			body: {
+				amount: "15000.00",
+				occurredAt: "2026-06-02T12:00:00.000Z",
+				memo: "First MacBook savings",
+			},
+		});
+		eqD(fundGoal1.status, 200, "7B.7-H: Fund goal returns 200");
+
+		// Verify Goal 1 metrics after funding
+		const getGoal1AfterFund = await httpCall(`/short-term-goals/${goal1Id}`, { method: "GET", token: tokenA });
+		eqD(getGoal1AfterFund.json?.goal?.accumulatedAmount, "15000.00", "7B.7-H: Accumulated amount is 15,000.00");
+		eqD(getGoal1AfterFund.json?.goal?.remainingToTarget, "40000.00", "7B.7-H: Remaining to target is 40,000.00");
+		eqD(getGoal1AfterFund.json?.goal?.fundingStatus, "PARTIAL", "7B.7-H: Status is PARTIAL");
+
+		// Check Midas liquidity earmarking
+		const liqRes2 = await httpCall(`/midas/liquidity?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenA });
+		eqD(liqRes2.json?.liquidity?.totalEarmarked, "15000.00", "7B.7-H: Midas total earmarked updated to 15,000.00");
+		eqD(liqRes2.json?.liquidity?.unallocatedBalance, "85000.00", "7B.7-H: Unallocated balance reduced to 85,000.00");
+
+		// Try completing Goal 1 with non-zero balance (fails with 409)
+		const completeBlocked = await httpCall(`/short-term-goals/${goal1Id}/complete`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-complete-fail",
+			body: {
+				expectedRevisionNo: 2,
+				occurredAt: "2026-06-02T12:30:00.000Z",
+			},
+		});
+		eqD(completeBlocked.status, 409, "7B.7-I: Complete with non-zero balance rejected with 409");
+
+		// Release Goal 1 funding back to unallocated
+		const releaseGoal1 = await httpCall(`/short-term-goals/${goal1Id}/release`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-release-1",
+			body: {
+				amount: "15000.00",
+				occurredAt: "2026-06-02T13:00:00.000Z",
+				memo: "Release for completion",
+			},
+		});
+		eqD(releaseGoal1.status, 200, "7B.7-I: Release goal funding returns 200");
+
+		// Complete Goal 1 with zero balance
+		const completeGoal1 = await httpCall(`/short-term-goals/${goal1Id}/complete`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-complete-1",
+			body: {
+				expectedRevisionNo: 2,
+				occurredAt: "2026-06-02T13:30:00.000Z",
+				changeReason: "Purchased laptop with external savings",
+			},
+		});
+		eqD(completeGoal1.status, 200, "7B.7-I: Complete goal with zero balance returns 200");
+		eqD(completeGoal1.json?.goal?.status, "COMPLETED", "7B.7-I: Goal 1 status is COMPLETED");
+		eqD(completeGoal1.json?.goal?.priority, null, "7B.7-I: Completed goal has null priority");
+
+		// Cancel Goal 3 with zero balance
+		const cancelGoal3 = await httpCall(`/short-term-goals/${goal3Id}/cancel`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-cancel-1",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-06-02T14:00:00.000Z",
+				changeReason: "Postponed indefinitely",
+			},
+		});
+		eqD(cancelGoal3.status, 200, "7B.7-J: Cancel goal returns 200");
+		eqD(cancelGoal3.json?.goal?.status, "CANCELLED", "7B.7-J: Goal 3 status is CANCELLED");
+
+		// --- 4. Long-Term Investment Send Tasks ---
+		// Allocate 25,000.00 for Eurobond / ETF purchase
+		const createTaskRes = await httpCall("/long-term/tasks", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-task-create-1",
+			body: {
+				midasAccountId: midasAccIdA,
+				amount: "25000.00",
+				destinationLabel: "Interactive Brokers Eurobond",
+				note: "Monthly long-term tranche",
+				occurredAt: "2026-06-03T09:00:00.000Z",
+			},
+		});
+		eqD(createTaskRes.status, 201, "7B.7-K: POST /long-term/tasks creates send task");
+		const taskId1 = createTaskRes.json?.task?.taskId;
+		eqD(createTaskRes.json?.task?.status, "PENDING", "7B.7-K: Task status is PENDING");
+		eqD(createTaskRes.json?.task?.amount, "25000.00", "7B.7-K: Task amount is 25,000.00");
+
+		// Check Midas liquidity earmarking for PENDING_LONG_TERM
+		const liqRes3 = await httpCall(`/midas/liquidity?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenA });
+		eqD(liqRes3.json?.liquidity?.totalEarmarked, "25000.00", "7B.7-K: PENDING_LONG_TERM earmarked 25,000.00");
+		eqD(liqRes3.json?.liquidity?.unallocatedBalance, "75000.00", "7B.7-K: Unallocated balance reduced to 75,000.00");
+
+		// Detail view GET /long-term/tasks/:id
+		const getTask1 = await httpCall(`/long-term/tasks/${taskId1}`, { method: "GET", token: tokenA });
+		eqD(getTask1.status, 200, "7B.7-L: GET /long-term/tasks/:id returns 200");
+		eqD(getTask1.json?.task?.destinationLabel, "Interactive Brokers Eurobond", "7B.7-L: Destination label matches");
+
+		// Mark task as SENT (expectedRevisionNo: 1)
+		const markSentRes = await httpCall(`/long-term/tasks/${taskId1}/mark-sent`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-task-sent-1",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-06-03T10:00:00.000Z",
+			},
+		});
+		eqD(markSentRes.status, 200, "7B.7-M: Mark task as SENT returns 200");
+		eqD(markSentRes.json?.task?.status, "SENT", "7B.7-M: Task status is SENT");
+		chkD(isUuid(markSentRes.json?.task?.currentSendCanonicalTransactionId), "7B.7-M: Canonical send transaction posted");
+
+		// Verify physical balance deducted from Midas ledger account
+		const liqRes4 = await httpCall(`/midas/liquidity?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenA });
+		eqD(liqRes4.json?.liquidity?.physicalBalance, "75000.00", "7B.7-M: Physical balance reduced to 75,000.00 after send");
+		eqD(liqRes4.json?.liquidity?.totalEarmarked, "0.00", "7B.7-M: Total earmarked cleared to 0.00");
+
+		// Reopen task back to PENDING (expectedRevisionNo: 2)
+		const reopenRes = await httpCall(`/long-term/tasks/${taskId1}/reopen`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-task-reopen-1",
+			body: {
+				expectedRevisionNo: 2,
+				reasonNote: "Sent to wrong broker account, funds returned",
+				occurredAt: "2026-06-03T11:00:00.000Z",
+			},
+		});
+		eqD(reopenRes.status, 200, "7B.7-N: Reopen task returns 200");
+		eqD(reopenRes.json?.task?.status, "PENDING", "7B.7-N: Task reopened to PENDING");
+
+		// Cancel reopened task
+		const cancelTaskRes = await httpCall(`/long-term/tasks/${taskId1}/cancel`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-task-cancel-1",
+			body: {
+				expectedRevisionNo: 3,
+				reasonNote: "Cancelled investment tranche",
+				occurredAt: "2026-06-03T12:00:00.000Z",
+			},
+		});
+		eqD(cancelTaskRes.status, 200, "7B.7-O: Cancel task returns 200");
+		eqD(cancelTaskRes.json?.task?.status, "CANCELLED", "7B.7-O: Task status is CANCELLED");
+
+		// Verify liquidity restored to 100,000.00
+		const liqRes5 = await httpCall(`/midas/liquidity?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenA });
+		eqD(liqRes5.json?.liquidity?.physicalBalance, "100000.00", "7B.7-O: Physical balance restored to 100,000.00");
+		eqD(liqRes5.json?.liquidity?.unallocatedBalance, "100000.00", "7B.7-O: Unallocated balance restored to 100,000.00");
+
+		// --- 5. Keyset Pagination (100+ items traversal) ---
+		// Seed 105 goals
+		for (let i = 1; i <= 105; i++) {
+			await httpCall("/short-term-goals", {
+				method: "POST",
+				token: tokenA,
+				idempotencyKey: `bulk-goal-${i}`,
+				body: {
+					midasAccountId: midasAccIdA,
+					name: `Goal Item ${i.toString().padStart(3, "0")}`,
+					fundingTarget: `${1000 + i}.00`,
+					occurredAt: `2026-06-04T${(i % 24).toString().padStart(2, "0")}:00:00.000Z`,
+				},
+			});
+		}
+
+		// Traversal with limit=25
+		let collectedGoals = 0;
+		let goalCursor: string | null = null;
+		let pageCount = 0;
+		while (pageCount < 10) {
+			const url = goalCursor
+				? `/short-term-goals?midasAccountId=${midasAccIdA}&limit=25&after=${encodeURIComponent(goalCursor)}`
+				: `/short-term-goals?midasAccountId=${midasAccIdA}&limit=25`;
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.7-P: Goals page ${pageCount + 1} returns 200`);
+			const goals = pageRes.json?.goals ?? [];
+			collectedGoals += goals.length;
+			if (!pageRes.json?.hasMore || !pageRes.json?.nextCursor) {
+				break;
+			}
+			goalCursor = pageRes.json?.nextCursor;
+			pageCount++;
+		}
+		// 105 bulk goals + 1 active goal (Goal 2) = 106 active goals + 2 terminal goals = 108 goals total
+		eqD(collectedGoals, 108, "7B.7-P: Keyset pagination traversed all 108 goals deterministically");
+
+		// --- 6. Cross-User Isolation ---
+		const crossGoalRes = await httpCall(`/short-term-goals/${goal1Id}`, { method: "GET", token: tokenB });
+		eqD(crossGoalRes.status, 404, "7B.7-Q: Cross-user goal access returns 404");
+
+		const crossMidasRes = await httpCall(`/midas/liquidity?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenB });
+		eqD(crossMidasRes.status, 404, "7B.7-Q: Cross-user Midas liquidity returns 404");
+
+		const crossTaskRes = await httpCall(`/long-term/tasks/${taskId1}`, { method: "GET", token: tokenB });
+		eqD(crossTaskRes.status, 404, "7B.7-Q: Cross-user long-term task access returns 404");
+
+		// --- 7. GET Zero-Write Purity ---
+		const countAll7B7Tables = async () => {
+			const q = async (t: string) => {
+				const r = await pg.query<{ count: string }>(`select count(*)::text as count from ${t}`);
+				return Number.parseInt(r.rows[0].count, 10);
+			};
+			return (
+				(await q("midas_accounts")) +
+				(await q("midas_buckets")) +
+				(await q("midas_allocation_transfers")) +
+				(await q("short_term_goals")) +
+				(await q("short_term_goal_revisions")) +
+				(await q("short_term_goal_priority_revisions")) +
+				(await q("long_term_send_tasks")) +
+				(await q("long_term_send_task_revisions"))
+			);
+		};
+
+		const countBefore = await countAll7B7Tables();
+		await httpCall("/short-term-goals", { method: "GET", token: tokenA });
+		await httpCall(`/short-term-goals/${goal1Id}`, { method: "GET", token: tokenA });
+		await httpCall(`/midas/liquidity?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenA });
+		await httpCall(`/midas/transfers?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenA });
+		await httpCall("/long-term/tasks", { method: "GET", token: tokenA });
+		await httpCall(`/long-term/tasks/${taskId1}`, { method: "GET", token: tokenA });
+		const countAfter = await countAll7B7Tables();
+		eqD(countBefore, countAfter, "7B.7-R: Read-only GET endpoints perform exactly zero database writes");
+
+	} finally {
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -18059,6 +18614,7 @@ if (probed) {
 	await resolverRuntime7B4();
 	await resolverRuntime7B5();
 	await resolverRuntime7B6();
+	await resolverRuntime7B7();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

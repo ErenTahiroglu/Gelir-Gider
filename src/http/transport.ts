@@ -292,6 +292,57 @@ export const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	CAMPAIGN_NOT_QUALIFIED: "Campaign is not qualified for reward credit",
 	CAMPAIGN_REWARD_ALREADY_CREDITED: "Campaign reward has already been credited",
 	CAMPAIGN_INVALID_STATE: "Campaign state transition failed",
+	SHORT_TERM_GOAL_INVALID_INPUT: "Invalid short-term goal request",
+	SHORT_TERM_GOAL_NOT_FOUND: "Short-term goal not found",
+	SHORT_TERM_GOAL_NOT_ACTIVE: "Short-term goal is not active",
+	SHORT_TERM_GOAL_NON_ZERO_BALANCE:
+		"Cannot complete or cancel short-term goal with non-zero bucket balance",
+	SHORT_TERM_GOAL_BALANCE_NOT_ZERO:
+		"Cannot complete or cancel short-term goal with non-zero bucket balance",
+	SHORT_TERM_GOAL_BUCKET_NOT_FOUND: "Goal Midas bucket not found",
+	SHORT_TERM_GOAL_MIDAS_ACCOUNT_NOT_FOUND: "Midas account not found for goal",
+	SHORT_TERM_GOAL_MAX_BUDGET_EXCEEDED:
+		"Funding would exceed short-term goal maximum budget",
+	SHORT_TERM_GOAL_PRIORITY_COLLISION: "Goal priority collision",
+	SHORT_TERM_GOAL_PRIORITY_MISMATCH: "Goal priority list mismatch",
+	SHORT_TERM_GOAL_PRIORITY_CONFLICT: "Goal priority conflict",
+	SHORT_TERM_GOAL_REVISION_CONFLICT: "Short-term goal revision is stale",
+	SHORT_TERM_GOAL_INSUFFICIENT_FREE_BALANCE:
+		"Insufficient unallocated Midas balance to fund goal",
+	SHORT_TERM_GOAL_INSUFFICIENT_BALANCE:
+		"Insufficient short-term goal bucket balance to release",
+	SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT:
+		"Idempotency-Key was already used with a different goal request",
+	SHORT_TERM_GOAL_INVALID_STATE: "Short-term goal invalid state transition",
+	MIDAS_INVALID_INPUT: "Invalid Midas request",
+	MIDAS_ACCOUNT_NOT_FOUND: "Midas account not found",
+	MIDAS_ACCOUNT_CONFLICT: "Midas account conflict",
+	MIDAS_LEDGER_ACCOUNT_INVALID: "Invalid ledger account for Midas",
+	MIDAS_BUCKET_NOT_FOUND: "Midas bucket not found",
+	MIDAS_BUCKET_CONFLICT: "Midas bucket conflict",
+	MIDAS_INSUFFICIENT_FREE_BALANCE: "Insufficient unallocated Midas balance",
+	MIDAS_INSUFFICIENT_BUCKET_BALANCE: "Insufficient Midas bucket balance",
+	MIDAS_IDEMPOTENCY_CONFLICT:
+		"Idempotency-Key was already used with a different Midas request",
+	MIDAS_TRANSFER_NOT_FOUND: "Midas allocation transfer not found",
+	MIDAS_TRANSFER_ALREADY_REVERSED:
+		"Midas allocation transfer has already been reversed",
+	MIDAS_BUCKET_INACTIVE: "Target Midas bucket is inactive",
+	MIDAS_BUCKET_CAP_EXCEEDED: "Midas bucket maximum budget cap exceeded",
+	MIDAS_LONG_TERM_BUCKET_RESTRICTED:
+		"Generic Midas transfers cannot directly touch pending long-term bucket",
+	MIDAS_INVALID_STATE: "Midas state transition failed",
+	LONG_TERM_INVALID_INPUT: "Invalid long-term investment request",
+	LONG_TERM_TASK_NOT_FOUND: "Long-term investment task not found",
+	LONG_TERM_TASK_NOT_PENDING: "Long-term investment task is not pending",
+	LONG_TERM_TASK_NOT_SENT: "Long-term investment task is not in sent status",
+	LONG_TERM_TASK_CANCELLED: "Long-term investment task is cancelled",
+	LONG_TERM_REVISION_CONFLICT: "Long-term investment task revision is stale",
+	LONG_TERM_IDEMPOTENCY_CONFLICT:
+		"Idempotency-Key was already used with a different long-term request",
+	LONG_TERM_INSUFFICIENT_UNALLOCATED:
+		"Insufficient unallocated Midas liquidity for long-term investment",
+	LONG_TERM_INVALID_STATE: "Long-term investment state transition failed",
 	INVALID_ORIGIN: "Invalid request origin",
 	UNAUTHENTICATED: "Authentication required",
 	NOT_FOUND: "Route not found",

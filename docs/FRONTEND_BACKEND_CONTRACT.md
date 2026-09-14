@@ -1175,29 +1175,170 @@ interface CampaignSemanticDiffItemDto {
 
 ### 7B.7 — Short-Term Goals + Midas + Long-Term Investment
 
-```
-PLANNED  GET   /short-term-goals/:id
-PLANNED  GET   /short-term-goals        ?limit=&after=
-PLANNED  POST  /short-term-goals        (create)
-PLANNED  POST  /short-term-goals/:id    (update)
-PLANNED  POST  /short-term-goals/:id/complete  (complete)
-PLANNED  POST  /short-term-goals/:id/cancel    (cancel)
-PLANNED  POST  /short-term-goals/reorder       (reorder)
-PLANNED  POST  /short-term-goals/:id/fund      (fund)
-PLANNED  POST  /short-term-goals/:id/release   (release funding)
+The Short-Term Goals, Midas, and Long-Term Investment product surfaces provide bounded, user-scoped read models, lifecycle state machines, priority sequencing, earmark liquidity tracking, and send task execution boundaries.
 
-PLANNED  GET   /midas/liquidity
-PLANNED  GET   /midas/transfers         ?limit=&after=
-PLANNED  POST  /midas/transfers         (allocate transfer)
-PLANNED  POST  /midas/transfers/:id/reverse  (reverse transfer)
+#### 1. Endpoint Surface
 
-PLANNED  GET   /long-term/tasks/:id
-PLANNED  GET   /long-term/tasks         ?status=&limit=&after=
-PLANNED  POST  /long-term/tasks         (allocate investment)
-PLANNED  POST  /long-term/tasks/:id/mark-sent   (mark sent)
-PLANNED  POST  /long-term/tasks/:id/reopen      (reopen)
-PLANNED  POST  /long-term/tasks/:id/cancel      (cancel)
+##### Short-Term Goals (9 Endpoints)
 ```
+IMPLEMENTED  GET   /short-term-goals                           ?midasAccountId=&status=&limit=&after=
+IMPLEMENTED  GET   /short-term-goals/:id
+IMPLEMENTED  POST  /short-term-goals                           (create goal with optional initial priority)
+IMPLEMENTED  POST  /short-term-goals/:id                       (update metadata and funding target OCC)
+IMPLEMENTED  POST  /short-term-goals/:id/complete              (transition -> COMPLETED, requires 0.00 bucket balance)
+IMPLEMENTED  POST  /short-term-goals/:id/cancel                (transition -> CANCELLED, requires 0.00 bucket balance)
+IMPLEMENTED  POST  /short-term-goals/reorder                   (reorder active goal priority sequence)
+IMPLEMENTED  POST  /short-term-goals/:id/fund                  (allocate money into goal bucket)
+IMPLEMENTED  POST  /short-term-goals/:id/release               (release money from goal bucket)
+```
+
+##### Midas Liquidity & Earmarking (4 Endpoints)
+```
+IMPLEMENTED  GET   /midas/liquidity                            ?midasAccountId=
+IMPLEMENTED  GET   /midas/transfers                            ?midasAccountId=&bucketId=&limit=&after=
+IMPLEMENTED  POST  /midas/accounts (alias: /midas/setup)       (idempotent setup / link to ASSET ledger account)
+IMPLEMENTED  POST  /midas/transfers                            (allocate or transfer between buckets)
+IMPLEMENTED  POST  /midas/transfers/:id/reverse                (compensating reversal of transfer)
+```
+
+##### Long-Term Investment Tasks (6 Endpoints)
+```
+IMPLEMENTED  GET   /long-term/tasks                            ?status=&midasAccountId=&limit=&after=
+IMPLEMENTED  GET   /long-term/tasks/:id
+IMPLEMENTED  POST  /long-term/tasks                            (allocate funds into PENDING_LONG_TERM virtual task)
+IMPLEMENTED  POST  /long-term/tasks/:id/mark-sent              (transition -> SENT and create canonical ledger tx)
+IMPLEMENTED  POST  /long-term/tasks/:id/reopen                 (reopen SENT -> PENDING and void canonical ledger tx)
+IMPLEMENTED  POST  /long-term/tasks/:id/cancel                 (cancel PENDING task and release funds to unallocated)
+```
+
+#### 2. Product DTO Shapes
+
+##### `ShortTermGoalProductDto`
+```typescript
+interface ShortTermGoalProductDto {
+  goalId: string;
+  midasAccountId: string;
+  midasBucketId: string;
+  status: "ACTIVE" | "COMPLETED" | "CANCELLED";
+  name: string;
+  fundingTarget: string;       // 2 decimals (e.g. "50000.00")
+  accumulatedAmount: string;   // 2 decimals (e.g. "10000.00")
+  remainingToTarget: string;   // 2 decimals (e.g. "40000.00")
+  fundingStatus: "UNFUNDED" | "PARTIAL" | "FULLY_FUNDED";
+  progressPercentage: number;  // 0 to 100.0
+  targetDate: string | null;   // "YYYY-MM-DD"
+  maxBudget: string | null;    // 2 decimals
+  targetPrice: string | null;  // 2 decimals
+  productUrl: string | null;
+  note: string | null;
+  priority: number | null;     // 1-based integer for ACTIVE goals, null for terminal
+  latestRevisionNo: number;
+  createdAt: string;           // ISO 8601 UTC
+  updatedAt: string;           // ISO 8601 UTC
+}
+```
+
+##### `MidasLiquidityProductDto`
+```typescript
+interface MidasBucketProductDto {
+  bucketId: string;
+  code: string;
+  name: string;
+  bucketType: "CREDIT_CARD_RESERVE" | "SHORT_TERM_GOAL" | "MEDIUM_TERM_RESERVE" | "INCOME_BUFFER" | "PENDING_LONG_TERM" | "CORE_EMERGENCY_FUND";
+  balance: string; // 2 decimals
+}
+
+interface MidasLiquidityProductDto {
+  midasAccountId: string;
+  ledgerAccountId: string;
+  currency: string;
+  physicalBalance: string;     // 2 decimals (from posted ledger journal entries)
+  totalEarmarked: string;      // 2 decimals (sum of positive bucket balances)
+  unallocatedBalance: string;  // 2 decimals (physicalBalance - totalEarmarked)
+  buckets: MidasBucketProductDto[];
+}
+```
+
+##### `MidasAllocationTransferProductDto`
+```typescript
+interface MidasAllocationTransferProductDto {
+  transferId: string;
+  midasAccountId: string;
+  fromBucketId: string | null; // null = unallocated pool
+  toBucketId: string | null;   // null = unallocated pool
+  amount: string;              // 2 decimals
+  occurredAt: string;          // ISO 8601 UTC
+  reversalOfTransferId: string | null;
+  memo: string | null;
+  createdAt: string;           // ISO 8601 UTC
+}
+```
+
+##### `LongTermTaskProductDto`
+```typescript
+interface LongTermTaskProductDto {
+  taskId: string;
+  status: "PENDING" | "SENT" | "CANCELLED";
+  revisionNo: number;
+  amount: string;              // 2 decimals
+  destinationLabel: string | null;
+  note: string | null;
+  midasAccountId: string;
+  pendingBucketId: string;
+  allocatedAt: string;         // ISO 8601 UTC
+  sentAt: string | null;       // ISO 8601 UTC
+  latestMidasAllocationTransferId: string;
+  currentSendCanonicalTransactionId: string | null;
+  currentSendCanonicalRevisionId: string | null;
+  createdAt: string;           // ISO 8601 UTC
+}
+```
+
+#### 3. Error Codes & HTTP Mapping
+
+##### Short-Term Goals Error Codes
+| Code | HTTP Status | Description |
+|---|---|---|
+| `SHORT_TERM_GOAL_INVALID_INPUT` | 400 | Malformed UUID, invalid date, invalid amount, or closed body schema violation |
+| `SHORT_TERM_GOAL_NOT_FOUND` | 404 | Goal ID not found or belongs to another user |
+| `SHORT_TERM_GOAL_MIDAS_ACCOUNT_NOT_FOUND` | 404 | Parent Midas account not found or belongs to another user |
+| `SHORT_TERM_GOAL_NOT_ACTIVE` | 409 | Operation requires goal to be in ACTIVE status |
+| `SHORT_TERM_GOAL_NON_ZERO_BALANCE` | 409 | Cannot complete or cancel goal while linked bucket has non-zero balance |
+| `SHORT_TERM_GOAL_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict (`expectedRevisionNo` mismatch) |
+| `SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different payload |
+| `SHORT_TERM_GOAL_PRIORITY_COLLISION` | 409 | Priority reordering contains duplicate goal IDs or incomplete active goal set |
+| `SHORT_TERM_GOAL_INVALID_TRANSFER_BOUNDS` | 409 | Goal funding/release transfer violates account or bucket boundaries |
+| `SHORT_TERM_GOAL_MAX_BUDGET_EXCEEDED` | 409 | Funding transfer would exceed max budget cap for the goal |
+
+##### Midas Error Codes
+| Code | HTTP Status | Description |
+|---|---|---|
+| `MIDAS_INVALID_INPUT` | 400 | Invalid UUID, negative amount, or closed body schema violation |
+| `MIDAS_ACCOUNT_NOT_FOUND` | 404 | Midas account not found or belongs to another user |
+| `MIDAS_BUCKET_NOT_FOUND` | 404 | Bucket ID not found or belongs to another user |
+| `MIDAS_TRANSFER_NOT_FOUND` | 404 | Transfer ID not found or belongs to another user |
+| `MIDAS_ACCOUNT_CONFLICT` | 409 | User already has a Midas account linked to a different ledger account |
+| `MIDAS_LEDGER_ACCOUNT_INVALID` | 409 | Linked ledger account must be an active ASSET account matching user currency |
+| `MIDAS_BUCKET_CONFLICT` | 409 | Bucket code or singleton bucket constraint violation |
+| `MIDAS_INSUFFICIENT_FREE_BALANCE` | 409 | Insufficient unallocated balance for allocation transfer |
+| `MIDAS_INSUFFICIENT_BUCKET_BALANCE` | 409 | Source bucket has insufficient funds for transfer |
+| `MIDAS_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different parameters |
+| `MIDAS_TRANSFER_ALREADY_REVERSED` | 409 | Transfer has already been reversed |
+| `MIDAS_BUCKET_INACTIVE` | 409 | Cannot transfer into bucket linked to inactive goal |
+| `MIDAS_BUCKET_CAP_EXCEEDED` | 409 | Transfer exceeds maximum budget cap |
+| `MIDAS_LONG_TERM_BUCKET_RESTRICTED` | 409 | Direct transfers involving PENDING_LONG_TERM bucket are restricted to Long-Term service |
+
+##### Long-Term Error Codes
+| Code | HTTP Status | Description |
+|---|---|---|
+| `LONG_TERM_INVALID_INPUT` | 400 | Malformed UUID, invalid amount, or closed body schema violation |
+| `LONG_TERM_TASK_NOT_FOUND` | 404 | Long-term task not found or belongs to another user |
+| `LONG_TERM_TASK_NOT_PENDING` | 409 | Operation requires task to be in PENDING status |
+| `LONG_TERM_TASK_NOT_SENT` | 409 | Operation requires task to be in SENT status |
+| `LONG_TERM_TASK_CANCELLED` | 409 | Operation rejected because task is CANCELLED |
+| `LONG_TERM_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict (`expectedRevisionNo` mismatch) |
+| `LONG_TERM_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different payload |
+| `LONG_TERM_INSUFFICIENT_UNALLOCATED` | 409 | Insufficient unallocated balance in Midas account for long-term task |
 
 ### 7B.8 — Month-Close
 
