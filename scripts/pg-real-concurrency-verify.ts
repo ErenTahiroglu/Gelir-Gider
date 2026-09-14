@@ -601,7 +601,7 @@ async function run() {
 		await recordCreditCardPurchase({
 			db: dbA,
 			userId: USER_A,
-			cardId: campCard.card.id,
+			cardId: campCard.cardId,
 			amount: "250.00",
 			merchant: "Race Merchant",
 			description: "Qualifying spend",
@@ -625,10 +625,10 @@ async function run() {
 			requiredTransactionCount: 1,
 			minimumTransactionAmount: "10.00",
 			rewardKind: "REWARD_POINTS",
-			rewardAccountId: campRewardAcc.account.id,
+			rewardAccountId: campRewardAcc.account.rewardAccountId,
 			expectedRewardPoints: "1000.0000",
 			merchantScopeMode: "ALL_MERCHANTS",
-			cardIds: [campCard.card.id],
+			cardIds: [campCard.cardId],
 			occurredAt: new Date("2026-09-01T08:00:00Z"),
 			idempotencyKey: "camp-race-create",
 		});
@@ -741,7 +741,7 @@ async function run() {
 		const finalRewAcc = await getRewardAccount({
 			db: dbA,
 			userId: USER_A,
-			rewardAccountId: campRewardAcc.account.id,
+			rewardAccountId: campRewardAcc.account.rewardAccountId,
 		});
 		eq(finalRewAcc?.balancePoints, "1000.0000", "7B.6/6: reward account balance is exactly 1000.0000 points");
 
