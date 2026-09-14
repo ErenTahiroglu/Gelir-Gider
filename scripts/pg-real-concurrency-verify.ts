@@ -753,10 +753,11 @@ async function run() {
 
 		// Post-race DB usability: execute read progress on campaign
 		const progressAfterRace = await dbA.transaction((tx) =>
-			getCampaignProgressInTransaction(tx, {
-				userId: USER_A,
-				campaignPeriodId: campConfirmed.campaignPeriodId,
-			}),
+			getCampaignProgressInTransaction(
+				tx,
+				USER_A,
+				campConfirmed.campaignPeriodId,
+			),
 		);
 		eq(progressAfterRace.qualificationStatus, "REWARD_CREDITED", "7B.6/6: post-race progress is REWARD_CREDITED and DB is healthy");
 	} finally {
