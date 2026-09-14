@@ -1036,14 +1036,14 @@ async function run() {
 			}
 
 			// Exact-once assertions in PostgreSQL
-			const taskRow = (
+			const taskLatestRevRow = (
 				await controlClient.query(
-					"select status, revision_no from long_term_send_tasks where id = $1",
+					"select status, revision_no from long_term_send_task_revisions where task_id = $1 order by revision_no desc limit 1",
 					[allocatedTask.task.taskId],
 				)
 			).rows[0];
-			eq(taskRow.status, "SENT", "7B.7/8: exactly ONE task in DB with status SENT");
-			eq(taskRow.revision_no, 2, "7B.7/8: exactly ONE task in DB with revision 2");
+			eq(taskLatestRevRow.status, "SENT", "7B.7/8: latest task revision in DB has status SENT");
+			eq(taskLatestRevRow.revision_no, 2, "7B.7/8: latest task revision in DB has revision 2");
 
 			const taskRevsCount = (
 				await controlClient.query(
