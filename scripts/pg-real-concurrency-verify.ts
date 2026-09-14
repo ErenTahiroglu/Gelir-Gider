@@ -918,6 +918,16 @@ async function run() {
 		// --------------------------------------------------------------------------
 		console.log("\n--- Test 8: Real PG Long-Term Task Mark-Sent OCC Concurrency Race ---");
 
+		// Create PENDING_LONG_TERM bucket on the Midas account for long-term allocations
+		await createMidasBucket({
+			db: dbA,
+			userId: USER_A,
+			midasAccountId: midasAccSetup.id,
+			code: "PENDING_LONG_TERM",
+			name: "Pending Long-Term",
+			bucketType: "PENDING_LONG_TERM",
+		});
+
 		// Allocate long term task with amount 10.00 (we have 20.00 unallocated balance available)
 		const allocatedTask = await allocateLongTermInvestment({
 			db: dbA,
