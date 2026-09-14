@@ -5,11 +5,7 @@ import type { AppEnv } from "../config/env";
 import { getDatabaseUrl } from "../config/env";
 import { createDatabase } from "../db/client";
 import { LongTermError } from "../long-term/errors";
-import {
-	decodeLongTermTaskCursor,
-	encodeLongTermTaskCursor,
-	type LongTermTaskCursor,
-} from "../long-term/pagination";
+import { encodeLongTermTaskCursor } from "../long-term/pagination";
 import {
 	listBoundedLongTermTasks,
 	toLongTermTaskProductDto,
@@ -136,14 +132,6 @@ longTermRouter.get("/tasks", async (c) => {
 	}
 
 	const afterQuery = c.req.query("after");
-	let afterCursor: LongTermTaskCursor | undefined;
-	if (afterQuery !== undefined) {
-		try {
-			afterCursor = decodeLongTermTaskCursor(afterQuery);
-		} catch (err) {
-			return mapLongTermDomainError(c, err);
-		}
-	}
 
 	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
@@ -155,7 +143,7 @@ longTermRouter.get("/tasks", async (c) => {
 			status: statusFilter,
 			midasAccountId: midasAccountIdQuery,
 			limit: limitRes.limit,
-			afterCursor,
+			rawCursor: afterQuery,
 		});
 
 		const nextCursor =

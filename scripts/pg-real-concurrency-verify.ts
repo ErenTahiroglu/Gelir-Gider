@@ -1053,6 +1053,70 @@ async function run() {
 			).rows[0].n;
 			eq(taskRevsCount, 2, "7B.7/8: exactly TWO revisions exist (1 PENDING + 1 SENT, zero partial writes from loser)");
 
+			if (fulfilledLT) {
+				const winnerTxId = fulfilledLT.value.task.currentSendCanonicalTransactionId;
+				const winnerRevId = fulfilledLT.value.task.currentSendCanonicalRevisionId;
+
+				const canTxRows = (
+					await controlClient.query(
+						"select id, kind, user_id from canonical_transactions where id = $1",
+						[winnerTxId],
+					)
+				).rows;
+				eq(canTxRows.length, 1, "7B.7/8: exactly ONE canonical transaction exists for winning send");
+				eq(canTxRows[0]?.kind, "LONG_TERM_INVESTMENT_SEND", "7B.7/8: canonical transaction kind is LONG_TERM_INVESTMENT_SEND");
+
+				const canRevRows = (
+					await controlClient.query(
+						"select id, transaction_id, status from transaction_revisions where transaction_id = $1",
+						[winnerTxId],
+					)
+				).rows;
+				eq(canRevRows.length, 1, "7B.7/8: exactly ONE transaction revision exists for winning send");
+				eq(canRevRows[0]?.id, winnerRevId, "7B.7/8: canonical revision ID matches task snapshot");
+
+				const journalEntryRows = (
+					await controlClient.query(
+						"select id, canonical_transaction_id, canonical_revision_id from journal_entries where canonical_transaction_id = $1",
+						[winnerTxId],
+					)
+				).rows;
+				eq(journalEntryRows.length, 1, "7B.7/8: exactly ONE journal entry exists for winning send");
+
+				const journalLines = (
+					await controlClient.query(
+						"select account_id, side, amount::numeric as amount from journal_lines where entry_id = $1 order by side asc",
+						[journalEntryRows[0]?.id],
+					)
+				).rows;
+				eq(journalLines.length, 2, "7B.7/8: exactly 2 journal lines exist (balanced debit/credit)");
+				chk(
+					journalLines.some((l: any) => l.side === "DEBIT" && Number(l.amount) === 10.0),
+					"7B.7/8: DEBIT line for 10.00 exists",
+				);
+				chk(
+					journalLines.some((l: any) => l.side === "CREDIT" && Number(l.amount) === 10.0),
+					"7B.7/8: CREDIT line for 10.00 exists",
+				);
+
+				// Loser zero partial rows
+				const totalSendTxCount = (
+					await controlClient.query(
+						"select count(*)::int as n from canonical_transactions where payload->>'taskId' = $1",
+						[allocatedTask.task.taskId],
+					)
+				).rows[0].n;
+				eq(totalSendTxCount, 1, "7B.7/8: loser created 0 extra canonical transactions");
+
+				const totalJournalEntriesForTask = (
+					await controlClient.query(
+						"select count(*)::int as n from journal_entries j inner join transaction_revisions tr on j.canonical_revision_id = tr.id where tr.payload->>'taskId' = $1",
+						[allocatedTask.task.taskId],
+					)
+				).rows[0].n;
+				eq(totalJournalEntriesForTask, 1, "7B.7/8: loser created 0 extra journal entries/lines");
+			}
+
 			const taskInDb = await getLongTermInvestmentTask({
 				db: dbA,
 				userId: USER_A,

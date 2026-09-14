@@ -1224,7 +1224,7 @@ interface ShortTermGoalProductDto {
   fundingTarget: string;       // 2 decimals (e.g. "50000.00")
   accumulatedAmount: string;   // 2 decimals (e.g. "10000.00")
   remainingToTarget: string;   // 2 decimals (e.g. "40000.00")
-  fundingStatus: "UNFUNDED" | "PARTIAL" | "FULLY_FUNDED";
+  fundingStatus: "EMPTY" | "PARTIAL" | "TARGET_REACHED";
   progressPercentage: number;  // 0 to 100.0
   targetDate: string | null;   // "YYYY-MM-DD"
   maxBudget: string | null;    // 2 decimals
@@ -1294,12 +1294,30 @@ interface LongTermTaskProductDto {
 }
 ```
 
-#### 3. Error Codes & HTTP Mapping
+#### 3. Keyset Pagination & Scope-Bound Cursor Contract
+
+All 7B.7 listing endpoints (`GET /short-term-goals`, `GET /midas/transfers`, `GET /long-term/tasks`) use true bounded PostgreSQL keyset pagination (`limit + 1`, default 50, max 100).
+
+##### Cursor Isolation Requirements
+Cursors are opaque base64url-encoded tokens binding the exact normalized logical query scope:
+- **Short-Term Goals Cursor**: `{ v: 1, userId, midasAccountId, status, priority, createdAt, id }`
+- **Midas Transfers Cursor**: `{ v: 1, userId, midasAccountId, bucketId, occurredAt, id }`
+- **Long-Term Tasks Cursor**: `{ v: 1, userId, midasAccountId, status, createdAt, id }`
+
+##### Query Rejection Policy
+Any cursor scope mismatch returns the domain's sanitized `400` error (e.g. `SHORT_TERM_GOAL_INVALID_INPUT`, `MIDAS_INVALID_INPUT`, `LONG_TERM_INVALID_INPUT`):
+- Cross-user cursor reuse
+- Cross-Midas-account cursor reuse
+- Filter shift (e.g. cursor issued under `status=ACTIVE` reused under `status=COMPLETED` or omitted)
+- Bucket shift (e.g. Midas cursor issued with `bucketId=A` reused under `bucketId=B` or omitted)
+- Malformed or invalid version cursors
+
+#### 4. Error Codes & HTTP Mapping
 
 ##### Short-Term Goals Error Codes
 | Code | HTTP Status | Description |
 |---|---|---|
-| `SHORT_TERM_GOAL_INVALID_INPUT` | 400 | Malformed UUID, invalid date, invalid amount, or closed body schema violation |
+| `SHORT_TERM_GOAL_INVALID_INPUT` | 400 | Malformed UUID, invalid date, invalid amount, cursor scope mismatch, or closed body schema violation |
 | `SHORT_TERM_GOAL_NOT_FOUND` | 404 | Goal ID not found or belongs to another user |
 | `SHORT_TERM_GOAL_MIDAS_ACCOUNT_NOT_FOUND` | 404 | Parent Midas account not found or belongs to another user |
 | `SHORT_TERM_GOAL_NOT_ACTIVE` | 409 | Operation requires goal to be in ACTIVE status |
@@ -1307,13 +1325,12 @@ interface LongTermTaskProductDto {
 | `SHORT_TERM_GOAL_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict (`expectedRevisionNo` mismatch) |
 | `SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different payload |
 | `SHORT_TERM_GOAL_PRIORITY_COLLISION` | 409 | Priority reordering contains duplicate goal IDs or incomplete active goal set |
-| `SHORT_TERM_GOAL_INVALID_TRANSFER_BOUNDS` | 409 | Goal funding/release transfer violates account or bucket boundaries |
 | `SHORT_TERM_GOAL_MAX_BUDGET_EXCEEDED` | 409 | Funding transfer would exceed max budget cap for the goal |
 
 ##### Midas Error Codes
 | Code | HTTP Status | Description |
 |---|---|---|
-| `MIDAS_INVALID_INPUT` | 400 | Invalid UUID, negative amount, or closed body schema violation |
+| `MIDAS_INVALID_INPUT` | 400 | Invalid UUID, negative amount, cursor scope mismatch, or closed body schema violation |
 | `MIDAS_ACCOUNT_NOT_FOUND` | 404 | Midas account not found or belongs to another user |
 | `MIDAS_BUCKET_NOT_FOUND` | 404 | Bucket ID not found or belongs to another user |
 | `MIDAS_TRANSFER_NOT_FOUND` | 404 | Transfer ID not found or belongs to another user |
@@ -1331,7 +1348,7 @@ interface LongTermTaskProductDto {
 ##### Long-Term Error Codes
 | Code | HTTP Status | Description |
 |---|---|---|
-| `LONG_TERM_INVALID_INPUT` | 400 | Malformed UUID, invalid amount, or closed body schema violation |
+| `LONG_TERM_INVALID_INPUT` | 400 | Malformed UUID, invalid amount, cursor scope mismatch, or closed body schema violation |
 | `LONG_TERM_TASK_NOT_FOUND` | 404 | Long-term task not found or belongs to another user |
 | `LONG_TERM_TASK_NOT_PENDING` | 409 | Operation requires task to be in PENDING status |
 | `LONG_TERM_TASK_NOT_SENT` | 409 | Operation requires task to be in SENT status |

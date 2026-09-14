@@ -5,11 +5,7 @@ import type { AppEnv } from "../config/env";
 import { getDatabaseUrl } from "../config/env";
 import { createDatabase } from "../db/client";
 import { MidasError } from "../midas/errors";
-import {
-	decodeMidasTransferCursor,
-	encodeMidasTransferCursor,
-	type MidasTransferCursor,
-} from "../midas/pagination";
+import { encodeMidasTransferCursor } from "../midas/pagination";
 import {
 	listBoundedMidasAllocationTransfers,
 	toMidasLiquidityProductDto,
@@ -241,14 +237,6 @@ midasRouter.get("/transfers", async (c) => {
 	}
 
 	const afterQuery = c.req.query("after");
-	let afterCursor: MidasTransferCursor | undefined;
-	if (afterQuery !== undefined) {
-		try {
-			afterCursor = decodeMidasTransferCursor(afterQuery);
-		} catch (err) {
-			return mapMidasDomainError(c, err);
-		}
-	}
 
 	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
@@ -260,7 +248,7 @@ midasRouter.get("/transfers", async (c) => {
 			midasAccountId: midasAccountIdQuery,
 			bucketId: bucketIdQuery,
 			limit: limitRes.limit,
-			afterCursor,
+			rawCursor: afterQuery,
 		});
 
 		const nextCursor =

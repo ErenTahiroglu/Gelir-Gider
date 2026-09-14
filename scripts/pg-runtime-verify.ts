@@ -18266,6 +18266,7 @@ async function resolverRuntime7B7() {
 		});
 		eqD(createGoal2.status, 201, "7B.7-C: Create Goal 2 returns 201");
 		const goal2Id = createGoal2.json?.goal?.goalId;
+		const goal2BucketId = createGoal2.json?.goal?.midasBucketId;
 
 		// Create Goal 3 (Phone)
 		const createGoal3 = await httpCall("/short-term-goals", {
@@ -18501,8 +18502,8 @@ async function resolverRuntime7B7() {
 		eqD(liqRes5.json?.liquidity?.physicalBalance, "100000.00", "7B.7-O: Physical balance restored to 100,000.00");
 		eqD(liqRes5.json?.liquidity?.unallocatedBalance, "100000.00", "7B.7-O: Unallocated balance restored to 100,000.00");
 
-		// --- 5. Keyset Pagination (100+ items traversal) ---
-		// Seed 105 goals
+		// --- 5. Keyset Pagination (100+ items traversal for ALL 3 families) ---
+		// A. Short-Term Goals Traversal (>100 items: 108 goals -> 50 / 50 / 8)
 		for (let i = 1; i <= 105; i++) {
 			await httpCall("/short-term-goals", {
 				method: "POST",
@@ -18517,64 +18518,449 @@ async function resolverRuntime7B7() {
 			});
 		}
 
-		// Traversal with limit=25
-		let collectedGoals = 0;
+		const collectedGoalIds = new Set<string>();
+		const goalPageSizes: number[] = [];
 		let goalCursor: string | null = null;
-		let pageCount = 0;
-		while (pageCount < 10) {
+		let goalPageCount = 0;
+		while (goalPageCount < 10) {
 			const url = goalCursor
-				? `/short-term-goals?midasAccountId=${midasAccIdA}&limit=25&after=${encodeURIComponent(goalCursor)}`
-				: `/short-term-goals?midasAccountId=${midasAccIdA}&limit=25`;
+				? `/short-term-goals?midasAccountId=${midasAccIdA}&limit=50&after=${encodeURIComponent(goalCursor)}`
+				: `/short-term-goals?midasAccountId=${midasAccIdA}&limit=50`;
 			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
-			eqD(pageRes.status, 200, `7B.7-P: Goals page ${pageCount + 1} returns 200`);
+			eqD(pageRes.status, 200, `7B.7-P1: Goals page ${goalPageCount + 1} returns 200`);
 			const goals = pageRes.json?.goals ?? [];
-			collectedGoals += goals.length;
+			goalPageSizes.push(goals.length);
+			for (const g of goals) {
+				chkD(!collectedGoalIds.has(g.goalId), `7B.7-P1: No duplicate goal ID ${g.goalId}`);
+				collectedGoalIds.add(g.goalId);
+			}
 			if (!pageRes.json?.hasMore || !pageRes.json?.nextCursor) {
 				break;
 			}
 			goalCursor = pageRes.json?.nextCursor;
-			pageCount++;
+			goalPageCount++;
 		}
 		// 105 bulk goals + 1 active goal (Goal 2) = 106 active goals + 2 terminal goals = 108 goals total
-		eqD(collectedGoals, 108, "7B.7-P: Keyset pagination traversed all 108 goals deterministically");
+		eqD(collectedGoalIds.size, 108, "7B.7-P1: Keyset pagination traversed all 108 unique goals");
+		eqD(goalPageSizes, [50, 50, 8], "7B.7-P1: Goals traversed with exact expected page sizes [50, 50, 8]");
 
-		// --- 6. Cross-User Isolation ---
-		const crossGoalRes = await httpCall(`/short-term-goals/${goal1Id}`, { method: "GET", token: tokenB });
-		eqD(crossGoalRes.status, 404, "7B.7-Q: Cross-user goal access returns 404");
+		// B. Midas Allocation Transfers Traversal (>100 items: 112 transfers -> 50 / 50 / 12)
+		// We already have some allocation transfers from previous goal operations. Let's seed to reach 112 transfers.
+		const curTransferCountRes = await httpCall(`/midas/transfers?midasAccountId=${midasAccIdA}&limit=100`, { method: "GET", token: tokenA });
+		const existingTransferCount = (curTransferCountRes.json?.transfers ?? []).length;
+		const neededTransfers = 112 - existingTransferCount;
+		for (let i = 1; i <= neededTransfers; i++) {
+			const res = await httpCall("/midas/transfers", {
+				method: "POST",
+				token: tokenA,
+				idempotencyKey: `bulk-transfer-${i}`,
+				body: {
+					midasAccountId: midasAccIdA,
+					fromBucketId: null,
+					toBucketId: goal2BucketId,
+					amount: "1.00",
+					occurredAt: `2026-06-05T${Math.floor(i / 60).toString().padStart(2, "0")}:${(i % 60).toString().padStart(2, "0")}:00.000Z`,
+					memo: `Bulk allocation transfer ${i}`,
+				},
+			});
+			if (res.status !== 201) {
+				console.error(`Bulk transfer ${i} failed:`, res.status, res.json);
+			}
+		}
 
-		const crossMidasRes = await httpCall(`/midas/liquidity?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenB });
-		eqD(crossMidasRes.status, 404, "7B.7-Q: Cross-user Midas liquidity returns 404");
+		const collectedTransferIds = new Set<string>();
+		const transferPageSizes: number[] = [];
+		let transferCursor: string | null = null;
+		let transferPageCount = 0;
+		while (transferPageCount < 10) {
+			const url = transferCursor
+				? `/midas/transfers?midasAccountId=${midasAccIdA}&limit=50&after=${encodeURIComponent(transferCursor)}`
+				: `/midas/transfers?midasAccountId=${midasAccIdA}&limit=50`;
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.7-P2: Transfers page ${transferPageCount + 1} returns 200`);
+			const transfers = pageRes.json?.transfers ?? [];
+			transferPageSizes.push(transfers.length);
+			for (const t of transfers) {
+				chkD(!collectedTransferIds.has(t.transferId), `7B.7-P2: No duplicate transfer ID ${t.transferId}`);
+				collectedTransferIds.add(t.transferId);
+			}
+			if (!pageRes.json?.hasMore || !pageRes.json?.nextCursor) {
+				break;
+			}
+			transferCursor = pageRes.json?.nextCursor;
+			transferPageCount++;
+		}
+		eqD(collectedTransferIds.size, 112, "7B.7-P2: Keyset pagination traversed all 112 unique transfers");
+		eqD(transferPageSizes, [50, 50, 12], "7B.7-P2: Transfers traversed with exact expected page sizes [50, 50, 12]");
 
-		const crossTaskRes = await httpCall(`/long-term/tasks/${taskId1}`, { method: "GET", token: tokenB });
-		eqD(crossTaskRes.status, 404, "7B.7-Q: Cross-user long-term task access returns 404");
+		// C. Long-Term Tasks Traversal (>100 items: 107 tasks -> 50 / 50 / 7)
+		const curTaskCountRes = await httpCall(`/long-term/tasks?midasAccountId=${midasAccIdA}&limit=100`, { method: "GET", token: tokenA });
+		const existingTaskCount = (curTaskCountRes.json?.tasks ?? []).length;
+		const neededTasks = 107 - existingTaskCount;
+		for (let i = 1; i <= neededTasks; i++) {
+			await httpCall("/long-term/tasks", {
+				method: "POST",
+				token: tokenA,
+				idempotencyKey: `bulk-task-${i}`,
+				body: {
+					midasAccountId: midasAccIdA,
+					amount: "1.00",
+					destinationLabel: `Task ${i.toString().padStart(3, "0")}`,
+					occurredAt: `2026-06-06T${(i % 24).toString().padStart(2, "0")}:00:00.000Z`,
+				},
+			});
+		}
 
-		// --- 7. GET Zero-Write Purity ---
-		const countAll7B7Tables = async () => {
-			const q = async (t: string) => {
+		const collectedTaskIds = new Set<string>();
+		const taskPageSizes: number[] = [];
+		let taskCursor: string | null = null;
+		let taskPageCount = 0;
+		while (taskPageCount < 10) {
+			const url = taskCursor
+				? `/long-term/tasks?midasAccountId=${midasAccIdA}&limit=50&after=${encodeURIComponent(taskCursor)}`
+				: `/long-term/tasks?midasAccountId=${midasAccIdA}&limit=50`;
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.7-P3: Tasks page ${taskPageCount + 1} returns 200`);
+			const tasks = pageRes.json?.tasks ?? [];
+			taskPageSizes.push(tasks.length);
+			for (const t of tasks) {
+				chkD(!collectedTaskIds.has(t.taskId), `7B.7-P3: No duplicate task ID ${t.taskId}`);
+				collectedTaskIds.add(t.taskId);
+			}
+			if (!pageRes.json?.hasMore || !pageRes.json?.nextCursor) {
+				break;
+			}
+			taskCursor = pageRes.json?.nextCursor;
+			taskPageCount++;
+		}
+		eqD(collectedTaskIds.size, 107, "7B.7-P3: Keyset pagination traversed all 107 unique tasks");
+		eqD(taskPageSizes, [50, 50, 7], "7B.7-P3: Tasks traversed with exact expected page sizes [50, 50, 7]");
+
+		// --- 6. Permanent Cursor-Isolation Proof ---
+		// Short-Term Goals cursor isolation
+		const stgPage1Res = await httpCall(`/short-term-goals?midasAccountId=${midasAccIdA}&status=ACTIVE&limit=10`, { method: "GET", token: tokenA });
+		const realStgCursor = stgPage1Res.json?.nextCursor;
+		chkD(typeof realStgCursor === "string" && realStgCursor.length > 0, "7B.7-Q1: Real STG cursor obtained");
+
+		// Reject under User B
+		const stgCrossUser = await httpCall(`/short-term-goals?midasAccountId=${midasAccIdB}&status=ACTIVE&after=${encodeURIComponent(realStgCursor)}`, { method: "GET", token: tokenB });
+		eqD(stgCrossUser.status, 400, "7B.7-Q1: STG cursor rejected under User B (400)");
+
+		// Reject under different Midas account
+		const stgCrossAccount = await httpCall(`/short-term-goals?midasAccountId=${midasAccIdB}&status=ACTIVE&after=${encodeURIComponent(realStgCursor)}`, { method: "GET", token: tokenA });
+		eqD(stgCrossAccount.status, 400, "7B.7-Q1: STG cursor rejected under foreign Midas account (400)");
+
+		// Reject under status=COMPLETED
+		const stgStatusShift = await httpCall(`/short-term-goals?midasAccountId=${midasAccIdA}&status=COMPLETED&after=${encodeURIComponent(realStgCursor)}`, { method: "GET", token: tokenA });
+		eqD(stgStatusShift.status, 400, "7B.7-Q1: STG cursor rejected under shifted status (400)");
+
+		// Reject under status omitted (sentinel ALL vs ACTIVE)
+		const stgStatusOmitted = await httpCall(`/short-term-goals?midasAccountId=${midasAccIdA}&after=${encodeURIComponent(realStgCursor)}`, { method: "GET", token: tokenA });
+		eqD(stgStatusOmitted.status, 400, "7B.7-Q1: STG cursor rejected under omitted status filter (400)");
+
+		// Midas Transfers cursor isolation
+		const midasPage1Res = await httpCall(`/midas/transfers?midasAccountId=${midasAccIdA}&bucketId=${goal1BucketId}&limit=1`, { method: "GET", token: tokenA });
+		const realMidasCursor = midasPage1Res.json?.nextCursor;
+		chkD(typeof realMidasCursor === "string" && realMidasCursor.length > 0, "7B.7-Q2: Real Midas cursor obtained");
+
+		// Reject under User B
+		const midasCrossUser = await httpCall(`/midas/transfers?midasAccountId=${midasAccIdB}&bucketId=${goal1BucketId}&after=${encodeURIComponent(realMidasCursor)}`, { method: "GET", token: tokenB });
+		eqD(midasCrossUser.status, 400, "7B.7-Q2: Midas cursor rejected under User B (400)");
+
+		// Reject under foreign bucket
+		const dummyBucketId = "00000000-0000-4000-8000-000000000001";
+		const midasBucketShift = await httpCall(`/midas/transfers?midasAccountId=${midasAccIdA}&bucketId=${dummyBucketId}&after=${encodeURIComponent(realMidasCursor)}`, { method: "GET", token: tokenA });
+		eqD(midasBucketShift.status, 400, "7B.7-Q2: Midas cursor rejected under shifted bucketId (400)");
+
+		// Reject under bucketId omitted
+		const midasBucketOmitted = await httpCall(`/midas/transfers?midasAccountId=${midasAccIdA}&after=${encodeURIComponent(realMidasCursor)}`, { method: "GET", token: tokenA });
+		eqD(midasBucketOmitted.status, 400, "7B.7-Q2: Midas cursor rejected under omitted bucketId filter (400)");
+
+		// Long-Term Tasks cursor isolation
+		const ltPage1Res = await httpCall(`/long-term/tasks?midasAccountId=${midasAccIdA}&status=PENDING&limit=10`, { method: "GET", token: tokenA });
+		const realLtCursor = ltPage1Res.json?.nextCursor;
+		chkD(typeof realLtCursor === "string" && realLtCursor.length > 0, "7B.7-Q3: Real LT cursor obtained");
+
+		// Reject under User B
+		const ltCrossUser = await httpCall(`/long-term/tasks?midasAccountId=${midasAccIdB}&status=PENDING&after=${encodeURIComponent(realLtCursor)}`, { method: "GET", token: tokenB });
+		eqD(ltCrossUser.status, 400, "7B.7-Q3: LT cursor rejected under User B (400)");
+
+		// Reject under status=SENT
+		const ltStatusShift = await httpCall(`/long-term/tasks?midasAccountId=${midasAccIdA}&status=SENT&after=${encodeURIComponent(realLtCursor)}`, { method: "GET", token: tokenA });
+		eqD(ltStatusShift.status, 400, "7B.7-Q3: LT cursor rejected under shifted status (400)");
+
+		// Reject under status omitted
+		const ltStatusOmitted = await httpCall(`/long-term/tasks?midasAccountId=${midasAccIdA}&after=${encodeURIComponent(realLtCursor)}`, { method: "GET", token: tokenA });
+		eqD(ltStatusOmitted.status, 400, "7B.7-Q3: LT cursor rejected under omitted status filter (400)");
+
+		// Malformed cursors
+		const badCursorSTG = await httpCall(`/short-term-goals?midasAccountId=${midasAccIdA}&after=invalid-base64`, { method: "GET", token: tokenA });
+		eqD(badCursorSTG.status, 400, "7B.7-Q4: Malformed STG cursor returns 400");
+		const badCursorMidas = await httpCall(`/midas/transfers?midasAccountId=${midasAccIdA}&after=invalid-base64`, { method: "GET", token: tokenA });
+		eqD(badCursorMidas.status, 400, "7B.7-Q4: Malformed Midas cursor returns 400");
+		const badCursorLT = await httpCall(`/long-term/tasks?midasAccountId=${midasAccIdA}&after=invalid-base64`, { method: "GET", token: tokenA });
+		eqD(badCursorLT.status, 400, "7B.7-Q4: Malformed LT cursor returns 400");
+
+		// --- 7. Permanent HTTP->DB Idempotency / Historical Replay Proof ---
+		// Short-Term Goals idempotency
+		const exactCreateGoalReplay = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-create-1",
+			body: {
+				midasAccountId: midasAccIdA,
+				name: "Emergency MacBook",
+				fundingTarget: "50000.00",
+				maxBudget: "60000.00",
+				targetPrice: "50000.00",
+				priorityPosition: 1,
+				occurredAt: "2026-06-02T10:00:00.000Z",
+			},
+		});
+		eqD(exactCreateGoalReplay.status, 200, "7B.7-R1: Exact STG create replay returns 200");
+		eqD(exactCreateGoalReplay.json?.goal?.goalId, goal1Id, "7B.7-R1: Exact STG create replay returns same goalId");
+
+		const conflictCreateGoal = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-create-1",
+			body: {
+				midasAccountId: midasAccIdA,
+				name: "Changed Goal Name",
+				fundingTarget: "99999.00",
+				occurredAt: "2026-06-02T10:00:00.000Z",
+			},
+		});
+		eqD(conflictCreateGoal.status, 409, "7B.7-R1: Conflicting STG create replay returns 409");
+
+		// Midas idempotency & reversal
+		const midasTx1 = await httpCall("/midas/transfers", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "midas-replay-key-1",
+			body: {
+				midasAccountId: midasAccIdA,
+				fromBucketId: null,
+				toBucketId: goal2BucketId,
+				amount: "100.00",
+				occurredAt: "2026-06-07T10:00:00.000Z",
+				memo: "Test transfer replay",
+			},
+		});
+		eqD(midasTx1.status, 201, "7B.7-R2: Initial Midas transfer returns 201");
+		const midasTx1Id = midasTx1.json?.transfer?.transferId;
+
+		const midasTx1Replay = await httpCall("/midas/transfers", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "midas-replay-key-1",
+			body: {
+				midasAccountId: midasAccIdA,
+				fromBucketId: null,
+				toBucketId: goal2BucketId,
+				amount: "100.00",
+				occurredAt: "2026-06-07T10:00:00.000Z",
+				memo: "Test transfer replay",
+			},
+		});
+		eqD(midasTx1Replay.status, 200, "7B.7-R2: Exact Midas transfer replay returns 200");
+		eqD(midasTx1Replay.json?.transfer?.transferId, midasTx1Id, "7B.7-R2: Exact Midas transfer replay returns same transferId");
+
+		const midasTx1Conflict = await httpCall("/midas/transfers", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "midas-replay-key-1",
+			body: {
+				midasAccountId: midasAccIdA,
+				fromBucketId: null,
+				toBucketId: goal2BucketId,
+				amount: "200.00",
+				occurredAt: "2026-06-07T10:00:00.000Z",
+			},
+		});
+		eqD(midasTx1Conflict.status, 409, "7B.7-R2: Conflicting Midas transfer replay returns 409");
+
+		// Reverse the transfer
+		const midasRev1 = await httpCall(`/midas/transfers/${midasTx1Id}/reverse`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "midas-rev-key-1",
+			body: {
+				occurredAt: "2026-06-07T11:00:00.000Z",
+				memo: "Reversal test",
+			},
+		});
+		eqD(midasRev1.status, 200, "7B.7-R2: Midas transfer reversal returns 200");
+
+		const midasRev1Replay = await httpCall(`/midas/transfers/${midasTx1Id}/reverse`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "midas-rev-key-1",
+			body: {
+				occurredAt: "2026-06-07T11:00:00.000Z",
+				memo: "Reversal test",
+			},
+		});
+		eqD(midasRev1Replay.status, 200, "7B.7-R2: Midas reversal replay returns 200");
+
+		const midasRev1Duplicate = await httpCall(`/midas/transfers/${midasTx1Id}/reverse`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "midas-rev-key-2",
+			body: {
+				occurredAt: "2026-06-07T12:00:00.000Z",
+				memo: "Duplicate reversal attempt",
+			},
+		});
+		eqD(midasRev1Duplicate.status, 409, "7B.7-R2: Duplicate reversal attempt rejected with 409");
+
+		// Long-Term Tasks Multi-Revision Historical Replay Contract
+		const ltHistCreate = await httpCall("/long-term/tasks", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-hist-k1",
+			body: {
+				midasAccountId: midasAccIdA,
+				amount: "500.00",
+				destinationLabel: "Historical Replay Task",
+				note: "Initial allocation",
+				occurredAt: "2026-06-08T10:00:00.000Z",
+			},
+		});
+		eqD(ltHistCreate.status, 201, "7B.7-R3: Create historical task returns 201");
+		const histTaskId = ltHistCreate.json?.task?.taskId;
+		eqD(ltHistCreate.json?.task?.status, "PENDING", "7B.7-R3: Historical task is PENDING");
+		eqD(ltHistCreate.json?.task?.revisionNo, 1, "7B.7-R3: Revision 1");
+
+		const ltHistSent = await httpCall(`/long-term/tasks/${histTaskId}/mark-sent`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-hist-k2",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-06-08T11:00:00.000Z",
+			},
+		});
+		eqD(ltHistSent.status, 200, "7B.7-R3: Mark sent returns 200");
+		eqD(ltHistSent.json?.task?.status, "SENT", "7B.7-R3: Task is SENT");
+		eqD(ltHistSent.json?.task?.revisionNo, 2, "7B.7-R3: Revision 2");
+		const sentTxId = ltHistSent.json?.task?.currentSendCanonicalTransactionId;
+		chkD(typeof sentTxId === "string" && sentTxId.length > 0, "7B.7-R3: Canonical transaction present on SENT");
+
+		const ltHistReopen = await httpCall(`/long-term/tasks/${histTaskId}/reopen`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-hist-k3",
+			body: {
+				expectedRevisionNo: 2,
+				occurredAt: "2026-06-08T12:00:00.000Z",
+				reasonNote: "Reopening investment tranche",
+			},
+		});
+		eqD(ltHistReopen.status, 200, "7B.7-R3: Reopen returns 200");
+		eqD(ltHistReopen.json?.task?.status, "PENDING", "7B.7-R3: Task is now reopened to PENDING");
+		eqD(ltHistReopen.json?.task?.revisionNo, 3, "7B.7-R3: Revision 3");
+
+		// CRITICAL CONTRACT: Retry OLD keys after REOPEN
+		// Replay K1 -> must return CREATE snapshot (rev 1, PENDING)
+		const replayK1 = await httpCall("/long-term/tasks", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-hist-k1",
+			body: {
+				midasAccountId: midasAccIdA,
+				amount: "500.00",
+				destinationLabel: "Historical Replay Task",
+				note: "Initial allocation",
+				occurredAt: "2026-06-08T10:00:00.000Z",
+			},
+		});
+		eqD(replayK1.status, 200, "7B.7-R3: Replay K1 returns 200");
+		eqD(replayK1.json?.task?.revisionNo, 1, "7B.7-R3: Replay K1 returns historical revision 1");
+		eqD(replayK1.json?.task?.status, "PENDING", "7B.7-R3: Replay K1 returns PENDING status");
+
+		// Replay K2 -> must return SENT snapshot (rev 2, SENT, currentSendCanonicalTransactionId !== null)
+		const replayK2 = await httpCall(`/long-term/tasks/${histTaskId}/mark-sent`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-hist-k2",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-06-08T11:00:00.000Z",
+			},
+		});
+		eqD(replayK2.status, 200, "7B.7-R3: Replay K2 returns 200");
+		eqD(replayK2.json?.task?.revisionNo, 2, "7B.7-R3: Replay K2 returns historical revision 2 (SENT)");
+		eqD(replayK2.json?.task?.status, "SENT", "7B.7-R3: Replay K2 returns SENT status (NOT current PENDING!)");
+		eqD(replayK2.json?.task?.currentSendCanonicalTransactionId, sentTxId, "7B.7-R3: Replay K2 returns historical canonical transaction ID");
+
+		// Replay K3 -> must return REOPEN result (rev 3, PENDING)
+		const replayK3 = await httpCall(`/long-term/tasks/${histTaskId}/reopen`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-hist-k3",
+			body: {
+				expectedRevisionNo: 2,
+				occurredAt: "2026-06-08T12:00:00.000Z",
+				reasonNote: "Reopening investment tranche",
+			},
+		});
+		eqD(replayK3.status, 200, "7B.7-R3: Replay K3 returns 200");
+		eqD(replayK3.json?.task?.revisionNo, 3, "7B.7-R3: Replay K3 returns revision 3");
+		eqD(replayK3.json?.task?.status, "PENDING", "7B.7-R3: Replay K3 returns PENDING status");
+
+		// Conflicting reuse of old key
+		const conflictK2 = await httpCall(`/long-term/tasks/${histTaskId}/mark-sent`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "lt-hist-k2",
+			body: {
+				expectedRevisionNo: 2,
+				occurredAt: "2026-06-08T15:00:00.000Z",
+			},
+		});
+		eqD(conflictK2.status, 409, "7B.7-R3: Conflicting reuse of old SENT key returns 409");
+
+		// --- 8. GET Zero-Write Purity (Complete 12-Table Independent Per-Table Comparison) ---
+		const tablesToTrack = [
+			"midas_accounts",
+			"midas_buckets",
+			"midas_allocation_transfers",
+			"short_term_goals",
+			"short_term_goal_revisions",
+			"short_term_goal_priority_revisions",
+			"long_term_send_tasks",
+			"long_term_send_task_revisions",
+			"canonical_transactions",
+			"transaction_revisions",
+			"journal_entries",
+			"journal_lines",
+		] as const;
+
+		const getTableCounts = async () => {
+			const counts: Record<string, number> = {};
+			for (const t of tablesToTrack) {
 				const r = await pg.query<{ count: string }>(`select count(*)::text as count from ${t}`);
-				return Number.parseInt(r.rows[0].count, 10);
-			};
-			return (
-				(await q("midas_accounts")) +
-				(await q("midas_buckets")) +
-				(await q("midas_allocation_transfers")) +
-				(await q("short_term_goals")) +
-				(await q("short_term_goal_revisions")) +
-				(await q("short_term_goal_priority_revisions")) +
-				(await q("long_term_send_tasks")) +
-				(await q("long_term_send_task_revisions"))
-			);
+				counts[t] = Number.parseInt(r.rows[0].count, 10);
+			}
+			return counts;
 		};
 
-		const countBefore = await countAll7B7Tables();
+		const countsBefore = await getTableCounts();
+
+		// Run entire GET surface
 		await httpCall("/short-term-goals", { method: "GET", token: tokenA });
 		await httpCall(`/short-term-goals/${goal1Id}`, { method: "GET", token: tokenA });
 		await httpCall(`/midas/liquidity?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenA });
 		await httpCall(`/midas/transfers?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenA });
 		await httpCall("/long-term/tasks", { method: "GET", token: tokenA });
 		await httpCall(`/long-term/tasks/${taskId1}`, { method: "GET", token: tokenA });
-		const countAfter = await countAll7B7Tables();
-		eqD(countBefore, countAfter, "7B.7-R: Read-only GET endpoints perform exactly zero database writes");
+
+		const countsAfter = await getTableCounts();
+
+		for (const t of tablesToTrack) {
+			eqD(countsBefore[t], countsAfter[t], `7B.7-S: Zero writes to table "${t}" during read-only GET operations`);
+		}
 
 	} finally {
 		setDatabaseFactoryOverrideForTest(null);

@@ -112,6 +112,7 @@ export interface ListBoundedMidasAllocationTransfersParams {
 	bucketId?: string | undefined;
 	limit: number;
 	afterCursor?: MidasTransferCursor | undefined;
+	rawCursor?: string | undefined;
 }
 
 export interface ListBoundedMidasAllocationTransfersResult {
@@ -127,6 +128,7 @@ export async function listBoundedMidasAllocationTransfers({
 	bucketId,
 	limit,
 	afterCursor,
+	rawCursor,
 }: ListBoundedMidasAllocationTransfersParams): Promise<ListBoundedMidasAllocationTransfersResult> {
 	const canonicalUserId = normalizeCanonicalUuid(userId, "userId");
 
@@ -152,6 +154,32 @@ export async function listBoundedMidasAllocationTransfers({
 		resolvedMidasAccountId = acc.id;
 	}
 
+	const canonicalBucketId =
+		bucketId !== undefined
+			? normalizeCanonicalUuid(bucketId, "bucketId")
+			: undefined;
+
+	let effectiveCursor = afterCursor;
+	if (rawCursor !== undefined) {
+		const { decodeMidasTransferCursor } = await import("./pagination");
+		effectiveCursor = decodeMidasTransferCursor(rawCursor, {
+			userId: canonicalUserId,
+			midasAccountId: resolvedMidasAccountId,
+			bucketId: canonicalBucketId,
+		});
+	} else if (effectiveCursor) {
+		if (
+			effectiveCursor.userId !== canonicalUserId ||
+			effectiveCursor.midasAccountId !== resolvedMidasAccountId ||
+			effectiveCursor.bucketId !== (canonicalBucketId ?? "ALL")
+		) {
+			throw new MidasError(
+				"MIDAS_INVALID_INPUT",
+				"Invalid Midas transfer pagination cursor scope",
+			);
+		}
+	}
+
 	// Verify Midas account ownership
 	const [accRecord] = await db
 		.select({ id: midasAccounts.id })
@@ -173,8 +201,7 @@ export async function listBoundedMidasAllocationTransfers({
 		eq(midasAllocationTransfers.midasAccountId, resolvedMidasAccountId),
 	];
 
-	if (bucketId !== undefined) {
-		const canonicalBucketId = normalizeCanonicalUuid(bucketId, "bucketId");
+	if (canonicalBucketId !== undefined) {
 		conditions.push(
 			or(
 				eq(midasAllocationTransfers.fromBucketId, canonicalBucketId),
@@ -183,14 +210,14 @@ export async function listBoundedMidasAllocationTransfers({
 		);
 	}
 
-	if (afterCursor) {
-		const cursorDate = new Date(afterCursor.occurredAt);
+	if (effectiveCursor) {
+		const cursorDate = new Date(effectiveCursor.occurredAt);
 		conditions.push(
 			or(
 				lt(midasAllocationTransfers.occurredAt, cursorDate),
 				and(
 					eq(midasAllocationTransfers.occurredAt, cursorDate),
-					lt(midasAllocationTransfers.id, afterCursor.id),
+					lt(midasAllocationTransfers.id, effectiveCursor.id),
 				),
 			),
 		);
@@ -221,6 +248,10 @@ export async function listBoundedMidasAllocationTransfers({
 				? lastRow.occurredAt.toISOString()
 				: new Date(String(lastRow.occurredAt)).toISOString();
 		nextCursor = {
+			v: 1,
+			userId: canonicalUserId,
+			midasAccountId: resolvedMidasAccountId,
+			bucketId: canonicalBucketId ?? "ALL",
 			occurredAt: occurredAtIso,
 			id: lastRow.id,
 		};

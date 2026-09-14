@@ -7,11 +7,7 @@ import { createDatabase } from "../db/client";
 import type { ShortTermGoalStatus } from "../db/schema/short-term-goals";
 import { MidasError } from "../midas/errors";
 import { ShortTermGoalError } from "../short-term-goals/errors";
-import {
-	decodeShortTermGoalCursor,
-	encodeShortTermGoalCursor,
-	type ShortTermGoalCursor,
-} from "../short-term-goals/pagination";
+import { encodeShortTermGoalCursor } from "../short-term-goals/pagination";
 import {
 	listBoundedShortTermGoals,
 	toShortTermGoalProductDto,
@@ -240,14 +236,6 @@ shortTermGoalsRouter.get("/", async (c) => {
 	}
 
 	const afterQuery = c.req.query("after");
-	let afterCursor: ShortTermGoalCursor | undefined;
-	if (afterQuery !== undefined) {
-		try {
-			afterCursor = decodeShortTermGoalCursor(afterQuery);
-		} catch (err) {
-			return mapShortTermGoalsDomainError(c, err);
-		}
-	}
 
 	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
@@ -259,7 +247,7 @@ shortTermGoalsRouter.get("/", async (c) => {
 			midasAccountId: midasAccountIdQuery,
 			status: statusFilter,
 			limit: limitRes.limit,
-			afterCursor,
+			rawCursor: afterQuery,
 		});
 
 		const nextCursor =
