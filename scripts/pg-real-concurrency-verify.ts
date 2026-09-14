@@ -13,7 +13,7 @@
  *
  * Run: npm run test:pg:real
  */
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
@@ -61,13 +61,21 @@ const migDir = path.join(root, "migrations");
 
 let pass = 0;
 let fail = 0;
+const logOut = (msg: string) => {
+	console.log(msg);
+	if (process.env.GITHUB_STEP_SUMMARY) {
+		try {
+			appendFileSync(process.env.GITHUB_STEP_SUMMARY, msg + "\n");
+		} catch {}
+	}
+};
 const ok = (name: string, extra = "") => {
 	pass++;
-	console.log(`  ✓ ${name}${extra ? " " + extra : ""}`);
+	logOut(`  ✓ ${name}${extra ? " " + extra : ""}`);
 };
 const bad = (name: string, extra = "") => {
 	fail++;
-	console.log(`  ✗ ${name}${extra ? " " + extra : ""}`);
+	logOut(`  ✗ ${name}${extra ? " " + extra : ""}`);
 };
 
 const eq = (a: unknown, b: unknown, name: string) =>
@@ -1074,13 +1082,13 @@ async function run() {
 		} catch {}
 	}
 
-	console.log(`\nReal PostgreSQL Verification Summary: ${pass} passed, ${fail} failed\n`);
+	logOut(`\nReal PostgreSQL Verification Summary: ${pass} passed, ${fail} failed\n`);
 	if (fail > 0) {
 		process.exit(1);
 	}
 }
 
 run().catch((err) => {
-	console.error("Real PostgreSQL Concurrency Verification Fatal Error:", err);
+	logOut(`Real PostgreSQL Concurrency Verification Fatal Error: ${err instanceof Error ? err.stack : String(err)}`);
 	process.exit(1);
 });
