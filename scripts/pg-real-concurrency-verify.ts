@@ -1075,27 +1075,38 @@ async function run() {
 				eq(canRevRows.length, 1, "7B.7/8: exactly ONE transaction revision exists for winning send");
 				eq(canRevRows[0]?.id, winnerRevId, "7B.7/8: canonical revision ID matches task snapshot");
 
+				const bindingRows = (
+					await controlClient.query(
+						"select applied_journal_entry_id from transaction_ledger_bindings where transaction_id = $1 and revision_id = $2",
+						[winnerTxId, winnerRevId],
+					)
+				).rows;
+				eq(bindingRows.length, 1, "7B.7/8: exactly ONE transaction ledger binding exists for winning send");
+				const journalEntryId = bindingRows[0]?.applied_journal_entry_id;
+				chk(Boolean(journalEntryId), "7B.7/8: applied journal entry ID is present");
+
 				const journalEntryRows = (
 					await controlClient.query(
-						"select id, canonical_transaction_id, canonical_revision_id from journal_entries where canonical_transaction_id = $1",
-						[winnerTxId],
+						"select id, status from journal_entries where id = $1",
+						[journalEntryId],
 					)
 				).rows;
 				eq(journalEntryRows.length, 1, "7B.7/8: exactly ONE journal entry exists for winning send");
+				eq(journalEntryRows[0]?.status, "POSTED", "7B.7/8: journal entry status is POSTED");
 
 				const journalLines = (
 					await controlClient.query(
-						"select account_id, side, amount::numeric as amount from journal_lines where entry_id = $1 order by side asc",
-						[journalEntryRows[0]?.id],
+						"select account_id, debit::numeric as debit, credit::numeric as credit from journal_lines where journal_entry_id = $1 order by line_no asc",
+						[journalEntryId],
 					)
 				).rows;
 				eq(journalLines.length, 2, "7B.7/8: exactly 2 journal lines exist (balanced debit/credit)");
 				chk(
-					journalLines.some((l: any) => l.side === "DEBIT" && Number(l.amount) === 10.0),
+					journalLines.some((l: any) => Number(l.debit) === 10.0 && Number(l.credit) === 0),
 					"7B.7/8: DEBIT line for 10.00 exists",
 				);
 				chk(
-					journalLines.some((l: any) => l.side === "CREDIT" && Number(l.amount) === 10.0),
+					journalLines.some((l: any) => Number(l.credit) === 10.0 && Number(l.debit) === 0),
 					"7B.7/8: CREDIT line for 10.00 exists",
 				);
 
@@ -1110,11 +1121,11 @@ async function run() {
 
 				const totalJournalEntriesForTask = (
 					await controlClient.query(
-						"select count(*)::int as n from journal_entries j inner join transaction_revisions tr on j.canonical_revision_id = tr.id where tr.payload->>'taskId' = $1",
+						"select count(*)::int as n from transaction_ledger_bindings tlb inner join transaction_revisions tr on tlb.revision_id = tr.id where tr.payload->>'taskId' = $1",
 						[allocatedTask.task.taskId],
 					)
 				).rows[0].n;
-				eq(totalJournalEntriesForTask, 1, "7B.7/8: loser created 0 extra journal entries/lines");
+				eq(totalJournalEntriesForTask, 1, "7B.7/8: loser created 0 extra journal entries/bindings");
 			}
 
 			const taskInDb = await getLongTermInvestmentTask({
