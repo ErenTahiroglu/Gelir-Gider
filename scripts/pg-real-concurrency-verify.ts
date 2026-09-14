@@ -1102,7 +1102,7 @@ async function run() {
 				// Loser zero partial rows
 				const totalSendTxCount = (
 					await controlClient.query(
-						"select count(*)::int as n from canonical_transactions where payload->>'taskId' = $1",
+						"select count(distinct ct.id)::int as n from canonical_transactions ct inner join transaction_revisions tr on ct.id = tr.transaction_id where tr.payload->>'taskId' = $1",
 						[allocatedTask.task.taskId],
 					)
 				).rows[0].n;
