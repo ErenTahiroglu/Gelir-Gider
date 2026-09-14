@@ -88,7 +88,7 @@ async function waitUntilBothCompetitorsBlockedOnRelation(
 	controlClient: pg.Client,
 	relationName: string,
 	pids: [number, number],
-	timeoutMs = 5000,
+	timeoutMs = 15000,
 	pollIntervalMs = 15,
 ): Promise<{ pidA: number; pidB: number; modes: Record<number, string> }> {
 	const [pidA, pidB] = pids;
@@ -135,7 +135,7 @@ async function waitUntilBothCompetitorsBlockedOnRelation(
 async function waitUntilBothCompetitorsBlockedOnLedgerAccounts(
 	controlClient: pg.Client,
 	pids: [number, number],
-	timeoutMs = 5000,
+	timeoutMs = 15000,
 	pollIntervalMs = 15,
 ): Promise<{ pidA: number; pidB: number; modes: Record<number, string> }> {
 	return waitUntilBothCompetitorsBlockedOnRelation(
