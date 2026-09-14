@@ -605,7 +605,7 @@ async function run() {
 			amount: "250.00",
 			merchant: "Race Merchant",
 			description: "Qualifying spend",
-			purchaseCategory: "GROCERY",
+			purchaseCategory: "DISCRETIONARY_SPEND",
 			occurredAt: new Date("2026-09-10T12:00:00Z"),
 			idempotencyKey: "camp-race-purchase-1",
 		});
