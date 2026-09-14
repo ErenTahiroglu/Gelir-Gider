@@ -834,7 +834,7 @@ async function run() {
 		eq(initialLiquidity.totalEarmarked, "0.00", "7B.7/7: initial totalEarmarked is 0.00");
 
 		// Hold lock on midas_accounts via control connection
-		await controlClient.query("BEGIN; LOCK TABLE midas_accounts IN EXCLUSIVE MODE;");
+		await controlClient.query("BEGIN; LOCK TABLE midas_accounts IN ACCESS EXCLUSIVE MODE;");
 
 		const promiseMidasA = createMidasAllocationTransfer({
 			db: dbA,
@@ -935,7 +935,7 @@ async function run() {
 		eq(allocatedTask.task.revisionNo, 1, "7B.7/8: long-term task initial revisionNo is 1");
 
 		// Hold lock on long_term_send_tasks via control connection
-		await controlClient.query("BEGIN; LOCK TABLE long_term_send_tasks IN EXCLUSIVE MODE;");
+		await controlClient.query("BEGIN; LOCK TABLE long_term_send_tasks IN ACCESS EXCLUSIVE MODE;");
 
 		const promiseMarkSentA = markLongTermInvestmentSent({
 			db: dbA,
