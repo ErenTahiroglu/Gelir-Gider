@@ -44,6 +44,7 @@ import { createLedgerAccount } from "../src/ledger/accounts.ts";
 import { postJournalEntry } from "../src/ledger/posting.ts";
 import {
 	createMidasAccount,
+	createMidasBucket,
 	createMidasAllocationTransfer,
 	getMidasLiquidityState,
 } from "../src/midas/service.ts";
@@ -816,11 +817,21 @@ async function run() {
 			userId: USER_A,
 			ledgerAccountId: midasLedgerAcc.id,
 		});
-		eq(midasAccSetup.account.ledgerAccountId, midasLedgerAcc.id, "7B.7/7: Midas account created with ledgerAccountId");
+		eq(midasAccSetup.ledgerAccountId, midasLedgerAcc.id, "7B.7/7: Midas account created with ledgerAccountId");
+
+		// Create dedicated bucket for user transfer
+		const midasRaceBucket = await createMidasBucket({
+			db: dbA,
+			userId: USER_A,
+			midasAccountId: midasAccSetup.id,
+			code: "RACE_BUCKET",
+			name: "Race Bucket",
+			bucketType: "SHORT_TERM_GOAL",
+		});
 
 		const initialLiquidity = await getMidasLiquidityState({ db: dbA, userId: USER_A });
 		eq(initialLiquidity.unallocatedBalance, "100.00", "7B.7/7: initial unallocatedBalance is 100.00");
-		eq(initialLiquidity.earmarkedBalance, "0.00", "7B.7/7: initial earmarkedBalance is 0.00");
+		eq(initialLiquidity.totalEarmarked, "0.00", "7B.7/7: initial totalEarmarked is 0.00");
 
 		// Hold lock on midas_accounts via control connection
 		await controlClient.query("BEGIN; LOCK TABLE midas_accounts IN EXCLUSIVE MODE;");
@@ -828,6 +839,8 @@ async function run() {
 		const promiseMidasA = createMidasAllocationTransfer({
 			db: dbA,
 			userId: USER_A,
+			midasAccountId: midasAccSetup.id,
+			toBucketId: midasRaceBucket.id,
 			amount: "80.00",
 			occurredAt: new Date(),
 			idempotencyKey: "midas-race-key-a",
@@ -836,6 +849,8 @@ async function run() {
 		const promiseMidasB = createMidasAllocationTransfer({
 			db: dbB,
 			userId: USER_A,
+			midasAccountId: midasAccSetup.id,
+			toBucketId: midasRaceBucket.id,
 			amount: "80.00",
 			occurredAt: new Date(),
 			idempotencyKey: "midas-race-key-b",
@@ -871,7 +886,7 @@ async function run() {
 		chk(rejectedMidas !== undefined, "7B.7/7: exactly one competitor was rejected with insufficient balance");
 
 		if (fulfilledMidas) {
-			eq(fulfilledMidas.value.transfer.amount, "80.00", "7B.7/7: winner created transfer of 80.00");
+			eq(fulfilledMidas.value.amount, "80.00", "7B.7/7: winner created transfer of 80.00");
 			eq(fulfilledMidas.value.idempotentReplay, false, "7B.7/7: winner idempotentReplay = false");
 		}
 
@@ -892,13 +907,13 @@ async function run() {
 		const transferRowCount = (
 			await controlClient.query(
 				"select count(*)::int as n from midas_allocation_transfers where midas_account_id = $1",
-				[midasAccSetup.account.midasAccountId],
+				[midasAccSetup.id],
 			)
 		).rows[0].n;
 		eq(transferRowCount, 1, "7B.7/7: exactly ONE midas_allocation_transfers row exists in PostgreSQL");
 
 		const finalLiquidity = await getMidasLiquidityState({ db: dbA, userId: USER_A });
-		eq(finalLiquidity.earmarkedBalance, "80.00", "7B.7/7: final earmarked balance in PostgreSQL is exactly 80.00");
+		eq(finalLiquidity.totalEarmarked, "80.00", "7B.7/7: final totalEarmarked in PostgreSQL is exactly 80.00");
 		eq(finalLiquidity.unallocatedBalance, "20.00", "7B.7/7: final unallocated balance in PostgreSQL is exactly 20.00");
 
 		// --------------------------------------------------------------------------
@@ -906,16 +921,17 @@ async function run() {
 		// --------------------------------------------------------------------------
 		console.log("\n--- Test 8: Real PG Long-Term Task Mark-Sent OCC Concurrency Race ---");
 
-		// Allocate long term task with amount 50.00 (we have 80.00 earmarked balance in PENDING_LONG_TERM)
+		// Allocate long term task with amount 10.00 (we have 20.00 unallocated balance available)
 		const allocatedTask = await allocateLongTermInvestment({
 			db: dbA,
 			userId: USER_A,
-			amount: "50.00",
-			notes: "Race allocate",
+			midasAccountId: midasAccSetup.id,
+			amount: "10.00",
+			note: "Race allocate",
 			occurredAt: new Date("2026-09-02T10:00:00Z"),
 			idempotencyKey: "lt-race-alloc-init",
 		});
-		eq(allocatedTask.task.lifecycleStatus, "PENDING", "7B.7/8: long-term task allocated with lifecycleStatus PENDING");
+		eq(allocatedTask.task.status, "PENDING", "7B.7/8: long-term task allocated with status PENDING");
 		eq(allocatedTask.task.revisionNo, 1, "7B.7/8: long-term task initial revisionNo is 1");
 
 		// Hold lock on long_term_send_tasks via control connection
@@ -926,8 +942,6 @@ async function run() {
 			userId: USER_A,
 			taskId: allocatedTask.task.taskId,
 			expectedRevisionNo: 1,
-			brokerReference: "BRK-RACE-A",
-			notes: "Send race A",
 			occurredAt: new Date("2026-09-03T10:00:00Z"),
 			idempotencyKey: "lt-race-mark-sent-a",
 		});
@@ -937,8 +951,6 @@ async function run() {
 			userId: USER_A,
 			taskId: allocatedTask.task.taskId,
 			expectedRevisionNo: 1,
-			brokerReference: "BRK-RACE-B",
-			notes: "Send race B",
 			occurredAt: new Date("2026-09-03T10:00:00Z"),
 			idempotencyKey: "lt-race-mark-sent-b",
 		});
@@ -973,9 +985,12 @@ async function run() {
 		chk(rejectedLT !== undefined, "7B.7/8: exactly one competitor was rejected with revision conflict");
 
 		if (fulfilledLT) {
-			eq(fulfilledLT.value.task.lifecycleStatus, "SENT", "7B.7/8: winner transitioned task to SENT");
+			eq(fulfilledLT.value.task.status, "SENT", "7B.7/8: winner transitioned task to SENT");
 			eq(fulfilledLT.value.task.revisionNo, 2, "7B.7/8: winner updated revisionNo to 2");
-			chk(fulfilledLT.value.canonicalTransactionId.length > 0, "7B.7/8: winner created canonicalTransactionId");
+			chk(
+				(fulfilledLT.value.task.currentSendCanonicalTransactionId ?? "").length > 0,
+				"7B.7/8: winner created canonicalTransactionId",
+			);
 		}
 
 		if (rejectedLT) {
@@ -994,11 +1009,11 @@ async function run() {
 		// Exact-once assertions in PostgreSQL
 		const taskRow = (
 			await controlClient.query(
-				"select lifecycle_status, revision_no from long_term_send_tasks where id = $1",
+				"select status, revision_no from long_term_send_tasks where id = $1",
 				[allocatedTask.task.taskId],
 			)
 		).rows[0];
-		eq(taskRow.lifecycle_status, "SENT", "7B.7/8: exactly ONE task in DB with status SENT");
+		eq(taskRow.status, "SENT", "7B.7/8: exactly ONE task in DB with status SENT");
 		eq(taskRow.revision_no, 2, "7B.7/8: exactly ONE task in DB with revision 2");
 
 		const taskRevsCount = (
@@ -1014,7 +1029,7 @@ async function run() {
 			userId: USER_A,
 			taskId: allocatedTask.task.taskId,
 		});
-		eq(taskInDb?.lifecycleStatus, "SENT", "7B.7/8: post-race DB usability getLongTermInvestmentTask returns SENT");
+		eq(taskInDb?.status, "SENT", "7B.7/8: post-race DB usability getLongTermInvestmentTask returns SENT");
 		// Failure-safe lock and client cleanup
 		try {
 			await controlClient.query("ROLLBACK;");
