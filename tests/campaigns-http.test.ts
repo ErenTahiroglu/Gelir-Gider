@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as boundaryModule from "../src/campaigns/boundary";
 import { CampaignError } from "../src/campaigns/errors";
 import * as productReadModule from "../src/campaigns/product-read";
+import * as progressModule from "../src/campaigns/progress";
+import * as reviewCandidatesModule from "../src/campaigns/review-candidates";
 import * as serviceModule from "../src/campaigns/service";
 import * as sourcesModule from "../src/campaigns/sources";
 import * as dbClientModule from "../src/db/client";
@@ -498,6 +501,323 @@ describe("Campaigns Product HTTP Surface (Checkpoint 7B.6)", () => {
 			expect(data.campaign.campaignPeriodId).toBe(CAMPAIGN_ID);
 			expect(data.campaign.campaignFamilyId).toBeUndefined();
 			expect(data.campaign.revisionId).toBeUndefined();
+		});
+	});
+
+	// --- 8. Campaign Product DTO Contract Truth (Checkpoint 7B.6-R1) ---
+	describe("Campaign Product DTO Contract Truth (Checkpoint 7B.6-R1)", () => {
+		it("proves CampaignPeriodProductDto.parserConfidence is string | null, not number", async () => {
+			vi.spyOn(serviceModule, "getCampaignPeriod").mockResolvedValue({
+				campaignPeriodId: CAMPAIGN_ID,
+				campaignFamilyId: "internal-fam-id",
+				provider: "Bank Alpha",
+				familyKey: "BONUS_100",
+				periodKey: "2026-09",
+				revisionId: "internal-rev-id",
+				revisionNo: 1,
+				operation: "CREATE",
+				lifecycleStatus: "ACTIVE",
+				visibility: "VISIBLE",
+				title: "Bonus Campaign",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "TOTAL_SPEND",
+				targetSpendAmount: "500.00",
+				requiredTransactionCount: null,
+				minimumTransactionAmount: null,
+				stepSpendAmount: null,
+				rewardPointsPerStep: null,
+				maxSteps: null,
+				rewardKind: "REWARD_POINTS",
+				rewardAccountId: null,
+				expectedRewardPoints: "100.0000",
+				merchantScopeMode: "ALL_MERCHANTS",
+				requiredCanonicalMerchantNames: null,
+				allowedMccCodes: null,
+				rewardExpiryDate: null,
+				sourceSnapshotId: null,
+				parserType: "REGEX_V1",
+				parserVersion: "1.0.0",
+				parserConfidence: "0.9500",
+				note: null,
+				cardIds: [],
+				occurredAt: new Date(OCCURRED_AT),
+				createdAt: new Date(OCCURRED_AT),
+			});
+
+			const res = await app.request(
+				`/campaigns/${CAMPAIGN_ID}`,
+				{ method: "GET", headers: { Cookie: COOKIE } },
+				mockEnv,
+			);
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as {
+				campaign: productReadModule.CampaignPeriodProductDto;
+			};
+			expect(body.campaign.parserConfidence).toBe("0.9500");
+			expect(typeof body.campaign.parserConfidence).toBe("string");
+		});
+
+		it("proves CampaignProgressProductDto qualificationStatus uses NOT_STARTED and not NOT_QUALIFIED", async () => {
+			vi.spyOn(
+				boundaryModule,
+				"runCampaignsReadTransaction",
+			).mockImplementation(async (_db, fn) => {
+				// biome-ignore lint/suspicious/noExplicitAny: mock tx
+				return fn({} as any);
+			});
+			vi.spyOn(
+				progressModule,
+				"getCampaignProgressInTransaction",
+			).mockResolvedValue({
+				campaignPeriodId: CAMPAIGN_ID,
+				lifecycleStatus: "ACTIVE",
+				visibility: "VISIBLE",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "TOTAL_SPEND",
+				eligibleSpend: "0.00",
+				eligibleTransactionCount: 0,
+				requiredSpend: "500.00",
+				requiredTransactionCount: null,
+				stepsEarned: null,
+				maxSteps: null,
+				progressNumerator: "0.00",
+				progressDenominator: "500.00",
+				progressPercentage: 0,
+				qualificationStatus: "NOT_STARTED",
+				expectedRewardKind: "REWARD_POINTS",
+				expectedRewardPoints: "100.0000",
+				actualRewardPointsCredited: null,
+				needsReviewCount: 0,
+				needsReviewAmount: "0.00",
+				qualifyingPurchases: [],
+				needsReviewPurchases: [],
+			});
+
+			const res = await app.request(
+				`/campaigns/${CAMPAIGN_ID}/progress`,
+				{ method: "GET", headers: { Cookie: COOKIE } },
+				mockEnv,
+			);
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as {
+				progress: productReadModule.CampaignProgressProductDto;
+			};
+			expect(body.progress.qualificationStatus).toBe("NOT_STARTED");
+			expect(body.progress.qualificationStatus as string).not.toBe(
+				"NOT_QUALIFIED",
+			);
+		});
+
+		it("proves CampaignProgressProductDto progressDenominator is nullable and progressPercentage is number | null", async () => {
+			vi.spyOn(
+				boundaryModule,
+				"runCampaignsReadTransaction",
+			).mockImplementation(async (_db, fn) => {
+				// biome-ignore lint/suspicious/noExplicitAny: mock tx
+				return fn({} as any);
+			});
+			// Null denominator / percentage case
+			vi.spyOn(
+				progressModule,
+				"getCampaignProgressInTransaction",
+			).mockResolvedValueOnce({
+				campaignPeriodId: CAMPAIGN_ID,
+				lifecycleStatus: "ACTIVE",
+				visibility: "VISIBLE",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "REPEATABLE_SPEND",
+				eligibleSpend: "150.00",
+				eligibleTransactionCount: 1,
+				requiredSpend: null,
+				requiredTransactionCount: null,
+				stepsEarned: 1,
+				maxSteps: null,
+				progressNumerator: "150.00",
+				progressDenominator: null,
+				progressPercentage: null,
+				qualificationStatus: "IN_PROGRESS",
+				expectedRewardKind: "REWARD_POINTS",
+				expectedRewardPoints: null,
+				actualRewardPointsCredited: null,
+				needsReviewCount: 0,
+				needsReviewAmount: "0.00",
+				qualifyingPurchases: [],
+				needsReviewPurchases: [],
+			});
+
+			const res1 = await app.request(
+				`/campaigns/${CAMPAIGN_ID}/progress`,
+				{ method: "GET", headers: { Cookie: COOKIE } },
+				mockEnv,
+			);
+			expect(res1.status).toBe(200);
+			const body1 = (await res1.json()) as {
+				progress: productReadModule.CampaignProgressProductDto;
+			};
+			expect(body1.progress.progressDenominator).toBeNull();
+			expect(body1.progress.progressPercentage).toBeNull();
+
+			// Non-null denominator / numeric percentage case
+			vi.spyOn(
+				progressModule,
+				"getCampaignProgressInTransaction",
+			).mockResolvedValueOnce({
+				campaignPeriodId: CAMPAIGN_ID,
+				lifecycleStatus: "ACTIVE",
+				visibility: "VISIBLE",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "TOTAL_SPEND",
+				eligibleSpend: "250.00",
+				eligibleTransactionCount: 2,
+				requiredSpend: "500.00",
+				requiredTransactionCount: null,
+				stepsEarned: null,
+				maxSteps: null,
+				progressNumerator: "250.00",
+				progressDenominator: "500.00",
+				progressPercentage: 50,
+				qualificationStatus: "IN_PROGRESS",
+				expectedRewardKind: "REWARD_POINTS",
+				expectedRewardPoints: "100.0000",
+				actualRewardPointsCredited: null,
+				needsReviewCount: 0,
+				needsReviewAmount: "0.00",
+				qualifyingPurchases: [],
+				needsReviewPurchases: [],
+			});
+
+			const res2 = await app.request(
+				`/campaigns/${CAMPAIGN_ID}/progress`,
+				{ method: "GET", headers: { Cookie: COOKIE } },
+				mockEnv,
+			);
+			expect(res2.status).toBe(200);
+			const body2 = (await res2.json()) as {
+				progress: productReadModule.CampaignProgressProductDto;
+			};
+			expect(body2.progress.progressDenominator).toBe("500.00");
+			expect(typeof body2.progress.progressDenominator).toBe("string");
+			expect(body2.progress.progressPercentage).toBe(50);
+			expect(typeof body2.progress.progressPercentage).toBe("number");
+		});
+
+		it("proves CampaignProgressPurchaseProductDto purchaseDate is string | null and status uses exact eligibility vocabulary", async () => {
+			vi.spyOn(
+				productReadModule,
+				"listBoundedCampaignProgressPurchases",
+			).mockResolvedValue({
+				purchases: [
+					{
+						purchaseEventId: PURCHASE_EVENT_ID,
+						amount: "100.00",
+						purchaseDate: null,
+						merchant: "Market A",
+						status: "AUTO_ELIGIBLE",
+						override: null,
+					},
+					{
+						purchaseEventId: "66666666-6666-4666-8666-666666666666",
+						amount: "200.00",
+						purchaseDate: "2026-09-12",
+						merchant: "Market B",
+						status: "NEEDS_REVIEW",
+						override: null,
+					},
+					{
+						purchaseEventId: "77777777-7777-4777-8777-777777777777",
+						amount: "50.00",
+						purchaseDate: "2026-09-13",
+						merchant: "Market C",
+						status: "MANUAL_INCLUDED",
+						override: {
+							revisionNo: 1,
+							operation: "INCLUDE",
+							reasonNote: "Eligible category",
+							occurredAt: OCCURRED_AT,
+						},
+					},
+				],
+				hasMore: false,
+				nextCursor: null,
+			});
+
+			const res = await app.request(
+				`/campaigns/${CAMPAIGN_ID}/progress/purchases?bucket=QUALIFYING`,
+				{ method: "GET", headers: { Cookie: COOKIE } },
+				mockEnv,
+			);
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as {
+				purchases: productReadModule.CampaignProgressPurchaseProductDto[];
+			};
+			expect(body.purchases).toBeDefined();
+			expect(body.purchases).toHaveLength(3);
+			expect(body.purchases[0]?.purchaseDate).toBeNull();
+			expect(body.purchases[0]?.status).toBe("AUTO_ELIGIBLE");
+			expect(body.purchases[1]?.purchaseDate).toBe("2026-09-12");
+			expect(body.purchases[1]?.status).toBe("NEEDS_REVIEW");
+			expect(body.purchases[2]?.status).toBe("MANUAL_INCLUDED");
+			// Assert that none of the items have POSTED or VOID status
+			for (const p of body.purchases) {
+				expect(p.status as string).not.toBe("POSTED");
+				expect(p.status as string).not.toBe("VOID");
+			}
+		});
+
+		it("proves CampaignReviewCandidateProductDto.parserConfidence is string | null, not number", async () => {
+			vi.spyOn(
+				reviewCandidatesModule,
+				"getCampaignReviewCandidate",
+			).mockResolvedValue({
+				candidateId: CANDIDATE_ID,
+				campaignPeriodId: CAMPAIGN_ID,
+				sourceSnapshotId: SNAPSHOT_ID,
+				candidateHash: "hash-cand-1",
+				revisionId: "rev-cand-1",
+				revisionNo: 1,
+				operation: "CREATE",
+				status: "PENDING",
+				title: "Candidate Bonus",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "TOTAL_SPEND",
+				targetSpendAmount: "1000.00",
+				requiredTransactionCount: null,
+				minimumTransactionAmount: null,
+				stepSpendAmount: null,
+				rewardPointsPerStep: null,
+				maxSteps: null,
+				rewardKind: "REWARD_POINTS",
+				rewardAccountId: null,
+				expectedRewardPoints: "200.0000",
+				merchantScopeMode: "ALL_MERCHANTS",
+				requiredCanonicalMerchantNames: null,
+				allowedMccCodes: null,
+				rewardExpiryDate: null,
+				parserType: "HTML_EXTRACTOR",
+				parserVersion: "2.1.0",
+				parserConfidence: "0.8800",
+				proposedCardIds: [],
+				appliedCampaignRevisionId: null,
+				occurredAt: new Date(OCCURRED_AT),
+				createdAt: new Date(OCCURRED_AT),
+			});
+
+			const res = await app.request(
+				`/campaigns/review-candidates/${CANDIDATE_ID}`,
+				{ method: "GET", headers: { Cookie: COOKIE } },
+				mockEnv,
+			);
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as {
+				candidate: productReadModule.CampaignReviewCandidateProductDto;
+			};
+			expect(body.candidate.parserConfidence).toBe("0.8800");
+			expect(typeof body.candidate.parserConfidence).toBe("string");
 		});
 	});
 });

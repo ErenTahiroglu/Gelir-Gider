@@ -1017,7 +1017,7 @@ interface CampaignPeriodProductDto {
   sourceSnapshotId: string | null;
   parserType: string | null;
   parserVersion: string | null;
-  parserConfidence: number | null;
+  parserConfidence: string | null;
   note: string | null;
   cardIds: string[];
   occurredAt: string; // ISO 8601 UTC timestamp
@@ -1041,9 +1041,9 @@ interface CampaignProgressProductDto {
   stepsEarned: number | null;
   maxSteps: number | null;
   progressNumerator: string;         // e.g. "500.00" or "3"
-  progressDenominator: string;       // e.g. "1000.00" or "5"
-  progressPercentage: string;        // 2 decimals (e.g. "50.00")
-  qualificationStatus: "NOT_QUALIFIED" | "IN_PROGRESS" | "QUALIFIED_AWAITING_CREDIT" | "REWARD_CREDITED";
+  progressDenominator: string | null;       // e.g. "1000.00" or "5" or null
+  progressPercentage: number | null;        // e.g. 50 or null
+  qualificationStatus: "NOT_STARTED" | "IN_PROGRESS" | "QUALIFIED_AWAITING_CREDIT" | "REWARD_CREDITED";
   expectedRewardKind: "REWARD_POINTS" | "STATEMENT_CREDIT" | "INFORMATIONAL";
   expectedRewardPoints: string | null;       // 4 decimals
   actualRewardPointsCredited: string | null; // 4 decimals
@@ -1057,9 +1057,9 @@ interface CampaignProgressProductDto {
 interface CampaignProgressPurchaseProductDto {
   purchaseEventId: string;
   amount: string;          // 2 decimals
-  purchaseDate: string;    // "YYYY-MM-DD"
+  purchaseDate: string | null;    // "YYYY-MM-DD" or null
   merchant: string | null;
-  status: "POSTED" | "VOID";
+  status: "AUTO_ELIGIBLE" | "AUTO_INELIGIBLE" | "NEEDS_REVIEW" | "MANUAL_INCLUDED" | "MANUAL_EXCLUDED";
   override: {
     revisionNo: number;
     operation: "INCLUDE" | "EXCLUDE" | "CLEAR";
@@ -1124,7 +1124,7 @@ interface CampaignReviewCandidateProductDto {
   proposedCardIds: string[];
   parserType: string | null;
   parserVersion: string | null;
-  parserConfidence: number | null;
+  parserConfidence: string | null;
   occurredAt: string;
   createdAt: string;
 }
