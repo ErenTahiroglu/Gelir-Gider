@@ -76,14 +76,6 @@ const eq = (a: unknown, b: unknown, name: string) =>
 		: bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
 const chk = (c: boolean, name: string) => (c ? ok(name) : bad(name));
 
-async function getMigrationFiles(): Promise<string[]> {
-	const { readdirSync } = await import("node:fs");
-	const all = readdirSync(migDir)
-		.filter((f) => f.endsWith(".sql") && /^\d{4}_/.test(f))
-		.sort();
-	return all.map((f) => path.join(migDir, f));
-}
-
 /**
  * Deterministic database-observed wait barrier.
  *
@@ -182,19 +174,24 @@ async function run() {
 
 	// Apply migrations
 	console.log("Applying committed migration chain 0000..0071...");
-	const migFiles = await getMigrationFiles();
-	for (const migPath of migFiles) {
-		const sqlContent = readFileSync(migPath, "utf-8");
-		// Split by statement-breakpoint if present, or execute
-		const statements = sqlContent
-			.split("--> statement-breakpoint")
-			.map((s) => s.trim())
-			.filter((s) => s.length > 0);
-		for (const statement of statements) {
-			await testClient.query(statement);
+	const journal = JSON.parse(
+		readFileSync(path.join(migDir, "meta/_journal.json"), "utf8"),
+	) as { entries: { idx: number; tag: string }[] };
+	for (const entry of journal.entries) {
+		if (entry.idx > 71) break;
+		const raw = readFileSync(path.join(migDir, `${entry.tag}.sql`), "utf8");
+		for (const chunk of raw.split(/-->\s*statement-breakpoint/)) {
+			const stmt = chunk.trim();
+			if (!stmt) continue;
+			try {
+				await testClient.query(stmt);
+			} catch (e) {
+				console.error(`Migration ${entry.tag} failed on statement: ${stmt.slice(0, 300)}`);
+				throw e;
+			}
 		}
 	}
-	console.log(`Applied ${migFiles.length} migration files successfully.\n`);
+	console.log(`Applied ${journal.entries.length} migration files successfully.\n`);
 	await testClient.end();
 
 	// Establish 3 independent PostgreSQL connections:
