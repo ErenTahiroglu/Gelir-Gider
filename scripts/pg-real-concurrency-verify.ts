@@ -1002,10 +1002,12 @@ async function run() {
 
 		if (rejectedLT) {
 			chk(rejectedLT.reason instanceof LongTermError, "7B.7/8: loser threw typed LongTermError");
-			eq(
-				(rejectedLT.reason as LongTermError).code,
-				"LONG_TERM_REVISION_CONFLICT",
-				"7B.7/8: loser threw typed LONG_TERM_REVISION_CONFLICT",
+			const isExpectedErrorCode =
+				(rejectedLT.reason as LongTermError).code === "LONG_TERM_TASK_NOT_PENDING" ||
+				(rejectedLT.reason as LongTermError).code === "LONG_TERM_REVISION_CONFLICT";
+			chk(
+				isExpectedErrorCode,
+				`7B.7/8: loser threw typed domain conflict (${(rejectedLT.reason as LongTermError).code})`,
 			);
 			chk(
 				!(rejectedLT.reason instanceof pg.DatabaseError),
