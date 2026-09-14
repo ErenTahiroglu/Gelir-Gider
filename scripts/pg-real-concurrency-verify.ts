@@ -30,6 +30,16 @@ import {
 	recordRewardEarn,
 } from "../src/rewards/events.ts";
 import { RewardError } from "../src/rewards/errors.ts";
+import { createCreditCard } from "../src/credit-cards/service.ts";
+import { recordCreditCardPurchase } from "../src/credit-cards/purchases.ts";
+import {
+	createCampaignPeriod,
+	confirmCampaignPeriod,
+	confirmCampaignRewardCredited,
+	resolveActiveCampaignRewardCreditInTransaction,
+} from "../src/campaigns/service.ts";
+import { CampaignError } from "../src/campaigns/errors.ts";
+import { getCampaignProgressInTransaction } from "../src/campaigns/progress.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const migDir = path.join(root, "migrations");
@@ -474,7 +484,7 @@ async function run() {
 			occurredAt: new Date(),
 			idempotencyKey: "race-follow-up-earn",
 		});
-		eq(followUpEarn.event.signedPointEffect, "5000.0000".length === 9 ? "50.0000" : "50.0000", "7B.5-R1/4: follow-up earn creates event with 50.0000 points");
+		eq(followUpEarn.event.signedPointEffect, "50.0000", "7B.5-R1/4: follow-up earn creates event with 50.0000 points");
 		const usableAcc = await getRewardAccount({ db: dbA, userId: USER_A, rewardAccountId });
 		eq(usableAcc?.balancePoints, "70.0000", "7B.5-R1/4: subsequent earn succeeds and balance becomes 70.0000");
 
@@ -555,6 +565,200 @@ async function run() {
 			)
 		).rows[0].n;
 		eq(codeRowCount, 1, "7B.5-R1/5: exactly ONE reward_accounts row exists in PostgreSQL for RACE_CODE_DUP");
+
+		// --------------------------------------------------------------------------
+		// 6. REAL PG CAMPAIGN REWARD-CONFIRM RACE (DETERMINISTIC BARRIER)
+		// --------------------------------------------------------------------------
+		console.log("\n--- Test 6: Real PG Campaign Reward-Confirm Race ---");
+
+		// Set up prerequisite: active reward account, credit card, and qualifying purchase
+		const campRewardAcc = await createRewardAccount({
+			db: dbA,
+			userId: USER_A,
+			code: "CAMP_RACE_REW_ACC",
+			displayName: "Campaign Race Reward Account",
+			provider: "Bank Alpha",
+			unitName: "Points",
+			occurredAt: new Date(),
+			idempotencyKey: "camp-race-rew-acc",
+		});
+
+		const campCard = await createCreditCard({
+			db: dbA,
+			userId: USER_A,
+			code: "CARD_CAMP_RACE",
+			displayName: "Campaign Race Card",
+			cardBrand: "VISA",
+			last4: "4321",
+			creditLimit: "10000.00",
+			statementClosingDay: 25,
+			paymentDueDaysAfterClosing: 10,
+			occurredAt: new Date("2026-09-01T00:00:00Z"),
+			idempotencyKey: "camp-race-card",
+		});
+
+		// Record qualifying purchase of 250.00 on 2026-09-10
+		await recordCreditCardPurchase({
+			db: dbA,
+			userId: USER_A,
+			cardId: campCard.card.id,
+			amount: "250.00",
+			merchant: "Race Merchant",
+			description: "Qualifying spend",
+			purchaseCategory: "GROCERY",
+			occurredAt: new Date("2026-09-10T12:00:00Z"),
+			idempotencyKey: "camp-race-purchase-1",
+		});
+
+		// Create and confirm ACTIVE TOTAL_SPEND campaign with target 200.00 -> expected 1000.0000 points
+		const campCreated = await createCampaignPeriod({
+			db: dbA,
+			userId: USER_A,
+			provider: "Bank Alpha",
+			familyKey: "CAMP_RACE_FAMILY",
+			periodKey: "2026-09",
+			title: "Real PG Race Campaign",
+			startsOn: "2026-09-01",
+			endsOn: "2026-09-30",
+			ruleMode: "TOTAL_SPEND",
+			targetSpendAmount: "200.00",
+			requiredTransactionCount: 1,
+			minimumTransactionAmount: "10.00",
+			rewardKind: "REWARD_POINTS",
+			rewardAccountId: campRewardAcc.account.id,
+			expectedRewardPoints: "1000.0000",
+			merchantScopeMode: "ALL_MERCHANTS",
+			cardIds: [campCard.card.id],
+			occurredAt: new Date("2026-09-01T08:00:00Z"),
+			idempotencyKey: "camp-race-create",
+		});
+
+		const campConfirmed = await confirmCampaignPeriod({
+			db: dbA,
+			userId: USER_A,
+			campaignPeriodId: campCreated.campaignPeriodId,
+			expectedRevisionNo: 1,
+			note: "Confirm for race",
+			occurredAt: new Date("2026-09-01T08:30:00Z"),
+			idempotencyKey: "camp-race-confirm",
+		});
+
+		eq(campConfirmed.lifecycleStatus, "ACTIVE", "7B.6/6: campaign confirmed to ACTIVE");
+
+		// Acquire table lock in control session to hold competitors
+		await controlClient.query("BEGIN; LOCK TABLE campaign_periods IN EXCLUSIVE MODE;");
+
+		const promiseCampRewardA = confirmCampaignRewardCredited({
+			db: dbA,
+			userId: USER_A,
+			campaignPeriodId: campConfirmed.campaignPeriodId,
+			actualPointAmount: "1000.0000",
+			occurredAt: new Date(),
+			idempotencyKey: "camp-race-reward-key-a",
+		});
+
+		const promiseCampRewardB = confirmCampaignRewardCredited({
+			db: dbB,
+			userId: USER_A,
+			campaignPeriodId: campConfirmed.campaignPeriodId,
+			actualPointAmount: "1000.0000",
+			occurredAt: new Date(),
+			idempotencyKey: "camp-race-reward-key-b",
+		});
+
+		const blockedCampaigns = await waitUntilBothCompetitorsBlockedOnRelation(
+			controlClient,
+			"campaign_periods",
+			[pidA, pidB],
+		);
+		ok(
+			"7B.6/6: both independent PostgreSQL competitors observed waiting on campaign_periods before barrier release",
+			`(pidA=${blockedCampaigns.pidA} mode=${blockedCampaigns.modes[pidA]}, pidB=${blockedCampaigns.modes[pidB]})`,
+		);
+
+		// Release barrier
+		await controlClient.query("COMMIT;");
+
+		const [settledCampA, settledCampB] = await Promise.allSettled([
+			promiseCampRewardA,
+			promiseCampRewardB,
+		]);
+
+		const fulfilledCamp = [settledCampA, settledCampB].find((s) => s.status === "fulfilled") as
+			| PromiseFulfilledResult<Awaited<ReturnType<typeof confirmCampaignRewardCredited>>>
+			| undefined;
+		const rejectedCamp = [settledCampA, settledCampB].find((s) => s.status === "rejected") as
+			| PromiseRejectedResult
+			| undefined;
+
+		chk(fulfilledCamp !== undefined, "7B.6/6: exactly one competitor succeeded with campaign reward confirm");
+		chk(rejectedCamp !== undefined, "7B.6/6: exactly one competitor was rejected");
+
+		if (fulfilledCamp) {
+			eq(fulfilledCamp.value.operation, "CREATE", "7B.6/6: winner created reward credit operation CREATE");
+			eq(fulfilledCamp.value.actualPointAmount, "1000.0000", "7B.6/6: winner credited actualPointAmount 1000.0000");
+			eq(fulfilledCamp.value.revisionNo, 1, "7B.6/6: winner revisionNo = 1");
+		}
+
+		if (rejectedCamp) {
+			chk(rejectedCamp.reason instanceof CampaignError, "7B.6/6: loser threw typed CampaignError");
+			eq(
+				(rejectedCamp.reason as CampaignError).code,
+				"CAMPAIGN_NOT_QUALIFIED",
+				"7B.6/6: loser threw typed CAMPAIGN_NOT_QUALIFIED (re-evaluation after winner commit)",
+			);
+			chk(
+				!(rejectedCamp.reason instanceof pg.DatabaseError),
+				"7B.6/6: raw PostgreSQL 23505 / 25P02 did not escape",
+			);
+		}
+
+		// Exact-once assertions in PostgreSQL
+		const creditRowCount = (
+			await controlClient.query(
+				"select count(*)::int as n from campaign_reward_credits where campaign_period_id = $1",
+				[campConfirmed.campaignPeriodId],
+			)
+		).rows[0].n;
+		eq(creditRowCount, 1, "7B.6/6: exactly ONE campaign_reward_credits row exists");
+
+		const creditRevRowCount = (
+			await controlClient.query(
+				"select count(*)::int as n from campaign_reward_credit_revisions where credit_id = $1",
+				[fulfilledCamp?.value.creditId],
+			)
+		).rows[0].n;
+		eq(creditRevRowCount, 1, "7B.6/6: exactly ONE campaign_reward_credit_revisions row exists");
+
+		const rewardEventRowCount = (
+			await controlClient.query(
+				"select count(*)::int as n from reward_events where source_type = 'CAMPAIGN' and source_ref = $1",
+				[campConfirmed.campaignPeriodId],
+			)
+		).rows[0].n;
+		eq(rewardEventRowCount, 1, "7B.6/6: exactly ONE CAMPAIGN-owned reward_events row exists");
+
+		const finalRewAcc = await getRewardAccount({
+			db: dbA,
+			userId: USER_A,
+			rewardAccountId: campRewardAcc.account.id,
+		});
+		eq(finalRewAcc?.balancePoints, "1000.0000", "7B.6/6: reward account balance is exactly 1000.0000 points");
+
+		const activeCredit = await dbA.transaction((tx) =>
+			resolveActiveCampaignRewardCreditInTransaction(tx, campConfirmed.campaignPeriodId),
+		);
+		chk(activeCredit !== null, "7B.6/6: active credit resolver returns 1 active credit");
+		eq(activeCredit?.actualPointAmount, "1000.0000", "7B.6/6: active credit amount is 1000.0000");
+
+		// Post-race DB usability: execute read progress on campaign
+		const progressAfterRace = await dbA.transaction((tx) =>
+			getCampaignProgressInTransaction(tx, {
+				userId: USER_A,
+				campaignPeriodId: campConfirmed.campaignPeriodId,
+			}),
+		);
+		eq(progressAfterRace.qualificationStatus, "REWARD_CREDITED", "7B.6/6: post-race progress is REWARD_CREDITED and DB is healthy");
 	} finally {
 		// Failure-safe lock and client cleanup
 		try {

@@ -18,6 +18,7 @@ import {
 import { createDatabase } from "./db/client";
 import { authRouter } from "./http/auth-routes";
 import { budgetV2Router } from "./http/budget-v2-routes";
+import { campaignsRouter } from "./http/campaign-routes";
 import { creditCardRouter } from "./http/credit-card-routes";
 import { incomeRouter } from "./http/income-routes";
 import { ledgerRouter } from "./http/ledger-routes";
@@ -102,6 +103,7 @@ app.route("/income", incomeRouter);
 app.route("/credit-cards", creditCardRouter);
 app.route("/people", peopleRouter);
 app.route("/rewards", rewardsRouter);
+app.route("/campaigns", campaignsRouter);
 
 app.notFound((c) => {
 	return c.json(

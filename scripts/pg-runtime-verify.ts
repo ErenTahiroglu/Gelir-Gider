@@ -17039,6 +17039,994 @@ async function resolverRuntime7B5(): Promise<void> {
 	}
 }
 
+async function resolverRuntime7B6(): Promise<void> {
+	console.log("\n--- Checkpoint 7B.6: Campaigns Product HTTP Surface Runtime Verification ---");
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 71);
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const { createCreditCard } = await import("../src/credit-cards/service.ts");
+	const { createRewardAccount } = await import("../src/rewards/accounts.ts");
+	const { recordCreditCardPurchase } = await import("../src/credit-cards/purchases.ts");
+	const { recordCampaignSourceSnapshot } = await import("../src/campaigns/sources.ts");
+	const { createCampaignReviewCandidate } = await import("../src/campaigns/review-candidates.ts");
+
+	const eqD = (a: unknown, b: unknown, name: string) => {
+		if (a === b) {
+			ok(name);
+		} else {
+			bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+		}
+	};
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+	const isUuid = (val: unknown): val is string =>
+		typeof val === "string" &&
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
+
+	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
+	const db = drizzle(pg as any) as any;
+	setDatabaseFactoryOverrideForTest(() => db);
+
+	try {
+		const testEnv: AppEnv = {
+			DATABASE_URL: "postgres://fake-pglite/db",
+			WEBAUTHN_RP_ID: "localhost",
+			WEBAUTHN_RP_NAME: "Gelir Gider Test",
+			WEBAUTHN_ORIGIN: "http://localhost:8787",
+		};
+
+		const USER_A = "11111111-cccc-4ccc-8ccc-111111111111";
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now())",
+			[USER_A],
+		);
+
+		const { token: tokenA } = await createSession({ db, userId: USER_A });
+
+		const httpCall = async (
+			path: string,
+			opts: {
+				method?: string;
+				body?: unknown;
+				token?: string;
+				idempotencyKey?: string;
+				origin?: string;
+			} = {},
+		) => {
+			const headers: Record<string, string> = {};
+			if (opts.token) {
+				headers.Cookie = `__Host-gg_session=${opts.token}`;
+			}
+			if (opts.origin !== undefined) {
+				headers.Origin = opts.origin;
+			} else if (opts.method !== "GET" && opts.method !== "HEAD") {
+				headers.Origin = "http://localhost:8787";
+			}
+			if (opts.idempotencyKey) {
+				headers["Idempotency-Key"] = opts.idempotencyKey;
+			}
+			if (opts.body !== undefined) {
+				headers["Content-Type"] = "application/json";
+			}
+			const res = await app.request(
+				path,
+				{
+					method: opts.method ?? "GET",
+					headers,
+					body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+				},
+				testEnv,
+			);
+			let json: any = null;
+			try {
+				json = await res.json();
+			} catch {
+				// no-op
+			}
+			return { status: res.status, json, headers: res.headers };
+		};
+
+		// Seed a credit card for User A
+		const cardRes = await createCreditCard({
+			db,
+			userId: USER_A,
+			code: "CARDA",
+			displayName: "Garanti Bonus Card",
+			issuer: "Garanti BBVA",
+			statementDay: 15,
+			dueDay: 25,
+			creditLimit: "50000.00",
+			occurredAt: new Date("2026-06-01T10:00:00Z"),
+			idempotencyKey: "card-create-1",
+		});
+		const cardId = cardRes.cardId;
+
+		// Seed a reward account for User A
+		const rewAcc = await createRewardAccount({
+			db,
+			userId: USER_A,
+			code: "BONUS_POINTS",
+			displayName: "Bonus Points",
+			provider: "Garanti BBVA",
+			unitName: "Bonus",
+			defaultConversionRate: "0.010000",
+			occurredAt: new Date("2026-06-01T10:00:00Z"),
+			idempotencyKey: "rew-acc-init-1",
+		});
+		const rewardAccId = rewAcc.account.rewardAccountId;
+
+		// =========================================================================
+		// SCENARIO A: Campaign Create + Confirm + Lifecycle Mutations
+		// =========================================================================
+		// 1. Create Campaign Period -> 201, REVIEW_REQUIRED, VISIBLE, revisionNo 1
+		const createRes = await httpCall("/campaigns", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-create-1",
+			body: {
+				provider: "Garanti BBVA",
+				familyKey: "GARANTI_MARKET_2026",
+				periodKey: "2026_09",
+				title: "Garanti September Grocery",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "TOTAL_SPEND",
+				targetSpendAmount: "1000.00",
+				rewardKind: "REWARD_POINTS",
+				rewardAccountId: rewardAccId,
+				expectedRewardPoints: "100.0000",
+				merchantScopeMode: "ALL_MERCHANTS",
+				cardIds: [cardId],
+				occurredAt: "2026-09-01T10:00:00.000Z",
+			},
+		});
+		eqD(createRes.status, 201, "7B.6-A: Create campaign returns 201");
+		const camp1 = createRes.json?.campaign;
+		chkD(isUuid(camp1?.campaignPeriodId), "7B.6-A: campaignPeriodId is valid UUID");
+		eqD(camp1?.lifecycleStatus, "REVIEW_REQUIRED", "7B.6-A: Initial lifecycleStatus is REVIEW_REQUIRED");
+		eqD(camp1?.visibility, "VISIBLE", "7B.6-A: Initial visibility is VISIBLE");
+		eqD(camp1?.revisionNo, 1, "7B.6-A: Initial revisionNo is 1");
+		const camp1Id = camp1?.campaignPeriodId;
+
+		// 2. Exact Idempotent Replay on Create -> 201
+		const replayCreateRes = await httpCall("/campaigns", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-create-1",
+			body: {
+				provider: "Garanti BBVA",
+				familyKey: "GARANTI_MARKET_2026",
+				periodKey: "2026_09",
+				title: "Garanti September Grocery",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "TOTAL_SPEND",
+				targetSpendAmount: "1000.00",
+				rewardKind: "REWARD_POINTS",
+				rewardAccountId: rewardAccId,
+				expectedRewardPoints: "100.0000",
+				merchantScopeMode: "ALL_MERCHANTS",
+				cardIds: [cardId],
+				occurredAt: "2026-09-01T10:00:00.000Z",
+			},
+		});
+		eqD(replayCreateRes.status, 201, "7B.6-A: Create replay returns 201");
+		eqD(replayCreateRes.json?.campaign?.campaignPeriodId, camp1Id, "7B.6-A: Replayed campaign ID matches");
+
+		// 3. Idempotency Conflict (different payload, same key) -> 409 CAMPAIGN_IDEMPOTENCY_CONFLICT
+		const conflictCreateRes = await httpCall("/campaigns", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-create-1",
+			body: {
+				provider: "Garanti BBVA",
+				familyKey: "GARANTI_MARKET_2026",
+				periodKey: "2026_09",
+				title: "Different Title Same Key",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "TOTAL_SPEND",
+				targetSpendAmount: "1000.00",
+				rewardKind: "REWARD_POINTS",
+				rewardAccountId: rewardAccId,
+				expectedRewardPoints: "100.0000",
+				merchantScopeMode: "ALL_MERCHANTS",
+				cardIds: [cardId],
+				occurredAt: "2026-09-01T10:00:00.000Z",
+			},
+		});
+		eqD(conflictCreateRes.status, 409, "7B.6-A: Idempotency conflict on create returns 409");
+		eqD(conflictCreateRes.json?.error?.code, "CAMPAIGN_IDEMPOTENCY_CONFLICT", "7B.6-A: Error code is CAMPAIGN_IDEMPOTENCY_CONFLICT");
+
+		// 4. CONFIRM campaign -> ACTIVE, revisionNo 2
+		const confirmRes = await httpCall(`/campaigns/${camp1Id}/confirm`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-confirm-1",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-09-01T11:00:00.000Z",
+			},
+		});
+		eqD(confirmRes.status, 200, "7B.6-A: Confirm campaign returns 200");
+		eqD(confirmRes.json?.campaign?.lifecycleStatus, "ACTIVE", "7B.6-A: Confirmed lifecycleStatus is ACTIVE");
+		eqD(confirmRes.json?.campaign?.revisionNo, 2, "7B.6-A: Confirmed revisionNo is 2");
+
+		// 5. Stale OCC conflict on Confirm -> 409 CAMPAIGN_REVISION_CONFLICT
+		const staleConfirmRes = await httpCall(`/campaigns/${camp1Id}/confirm`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-confirm-stale",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-09-01T11:30:00.000Z",
+			},
+		});
+		eqD(staleConfirmRes.status, 409, "7B.6-A: Stale expectedRevisionNo returns 409");
+		eqD(staleConfirmRes.json?.error?.code, "CAMPAIGN_REVISION_CONFLICT", "7B.6-A: Conflict code is CAMPAIGN_REVISION_CONFLICT");
+
+		// 6. HIDE -> visibility HIDDEN, revisionNo 3
+		const hideRes = await httpCall(`/campaigns/${camp1Id}/hide`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-hide-1",
+			body: {
+				expectedRevisionNo: 2,
+				occurredAt: "2026-09-01T12:00:00.000Z",
+			},
+		});
+		eqD(hideRes.status, 200, "7B.6-A: Hide campaign returns 200");
+		eqD(hideRes.json?.campaign?.visibility, "HIDDEN", "7B.6-A: Visibility is HIDDEN");
+		eqD(hideRes.json?.campaign?.lifecycleStatus, "ACTIVE", "7B.6-A: LifecycleStatus remains ACTIVE");
+		eqD(hideRes.json?.campaign?.revisionNo, 3, "7B.6-A: Hide revisionNo is 3");
+
+		// 7. RESTORE -> visibility VISIBLE, revisionNo 4
+		const restoreRes = await httpCall(`/campaigns/${camp1Id}/restore`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-restore-1",
+			body: {
+				expectedRevisionNo: 3,
+				occurredAt: "2026-09-01T13:00:00.000Z",
+			},
+		});
+		eqD(restoreRes.status, 200, "7B.6-A: Restore campaign returns 200");
+		eqD(restoreRes.json?.campaign?.visibility, "VISIBLE", "7B.6-A: Visibility restored to VISIBLE");
+		eqD(restoreRes.json?.campaign?.revisionNo, 4, "7B.6-A: Restore revisionNo is 4");
+
+		// 8. AMEND -> complete snapshot, revisionNo 5, ACTIVE preserved
+		const amendRes = await httpCall(`/campaigns/${camp1Id}/amend`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-amend-1",
+			body: {
+				expectedRevisionNo: 4,
+				title: "Garanti September Super Grocery",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "TOTAL_SPEND",
+				targetSpendAmount: "1200.00",
+				rewardKind: "REWARD_POINTS",
+				rewardAccountId: rewardAccId,
+				expectedRewardPoints: "120.0000",
+				merchantScopeMode: "ALL_MERCHANTS",
+				cardIds: [cardId],
+				occurredAt: "2026-09-01T14:00:00.000Z",
+			},
+		});
+		eqD(amendRes.status, 200, "7B.6-A: Amend campaign returns 200");
+		eqD(amendRes.json?.campaign?.title, "Garanti September Super Grocery", "7B.6-A: Title amended");
+		eqD(amendRes.json?.campaign?.targetSpendAmount, "1200.00", "7B.6-A: Target spend updated");
+		eqD(amendRes.json?.campaign?.lifecycleStatus, "ACTIVE", "7B.6-A: ACTIVE lifecycle preserved");
+		eqD(amendRes.json?.campaign?.revisionNo, 5, "7B.6-A: Amend revisionNo is 5");
+
+		// 9. END -> lifecycleStatus ENDED, revisionNo 6
+		const endRes = await httpCall(`/campaigns/${camp1Id}/end`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-end-1",
+			body: {
+				expectedRevisionNo: 5,
+				occurredAt: "2026-10-01T00:00:00.000Z",
+			},
+		});
+		eqD(endRes.status, 200, "7B.6-A: End campaign returns 200");
+		eqD(endRes.json?.campaign?.lifecycleStatus, "ENDED", "7B.6-A: LifecycleStatus is ENDED");
+		eqD(endRes.json?.campaign?.revisionNo, 6, "7B.6-A: End revisionNo is 6");
+
+		// 10. CANCEL: Create second campaign and cancel it
+		const create2Res = await httpCall("/campaigns", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-create-2",
+			body: {
+				provider: "Akbank",
+				familyKey: "AKBANK_FUEL_2026",
+				periodKey: "2026_09",
+				title: "Akbank Fuel Campaign",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "TRANSACTION_COUNT",
+				requiredTransactionCount: 4,
+				minimumTransactionAmount: "250.00",
+				rewardKind: "REWARD_POINTS",
+				rewardAccountId: rewardAccId,
+				expectedRewardPoints: "50.0000",
+				merchantScopeMode: "ALL_MERCHANTS",
+				cardIds: [cardId],
+				occurredAt: "2026-09-01T10:00:00.000Z",
+			},
+		});
+		const camp2Id = create2Res.json?.campaign?.campaignPeriodId;
+		const cancelRes = await httpCall(`/campaigns/${camp2Id}/cancel`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-cancel-1",
+			body: {
+				expectedRevisionNo: 1,
+				occurredAt: "2026-09-01T15:00:00.000Z",
+			},
+		});
+		eqD(cancelRes.status, 200, "7B.6-A: Cancel campaign returns 200");
+		eqD(cancelRes.json?.campaign?.lifecycleStatus, "CANCELLED", "7B.6-A: LifecycleStatus is CANCELLED");
+		eqD(cancelRes.json?.campaign?.revisionNo, 2, "7B.6-A: Cancel revisionNo is 2");
+
+		// Detail GET /campaigns/:id
+		const getCamp1Res = await httpCall(`/campaigns/${camp1Id}`, { method: "GET", token: tokenA });
+		eqD(getCamp1Res.status, 200, "7B.6-A: GET /campaigns/:id returns 200");
+		eqD(getCamp1Res.json?.campaign?.campaignPeriodId, camp1Id, "7B.6-A: Detail ID matches");
+		eqD(getCamp1Res.json?.campaign?.lifecycleStatus, "ENDED", "7B.6-A: Detail reflects latest revision");
+
+		// =========================================================================
+		// SCENARIO B: Bounded Keyset Pagination (>100 campaigns traversal)
+		// =========================================================================
+		console.log("Seeding 105 campaigns for pagination test...");
+		await pg.exec("SET session_replication_role = replica;");
+		for (let i = 1; i <= 105; i++) {
+			const cId = `cccc1000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+			const famId = `ffff1000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+			const baseDate = new Date(Date.UTC(2026, 0, 1, 0, 0, i));
+			const hexFp = String(i).padStart(64, "0");
+			await pg.query(
+				`insert into campaign_families (id, user_id, provider, family_key, created_at) values ($1, $2, 'Bank', $3, $4)`,
+				[famId, USER_A, `FAM_${String(i).padStart(4, "0")}`, baseDate],
+			);
+			await pg.query(
+				`insert into campaign_periods (id, user_id, campaign_family_id, period_key, created_at) values ($1, $2, $3, '2026_01', $4)`,
+				[cId, USER_A, famId, baseDate],
+			);
+			await pg.query(
+				`insert into campaign_period_revisions (
+					id, user_id, campaign_period_id, revision_no, revision_fingerprint, idempotency_key, operation,
+					lifecycle_status, visibility, title, starts_on, ends_on, rule_mode, target_spend_amount,
+					required_transaction_count, minimum_transaction_amount, step_spend_amount, reward_points_per_step,
+					max_steps, reward_kind, reward_account_id, expected_reward_points, merchant_scope_mode,
+					required_canonical_merchant_names, allowed_mcc_codes, reward_expiry_date, source_snapshot_id,
+					parser_type, parser_version, parser_confidence, note, occurred_at, created_at
+				) values (
+					$1, $2, $3, 1, $4, $5, 'CREATE',
+					'REVIEW_REQUIRED', 'VISIBLE', $6, '2026-01-01', '2026-01-31', 'TOTAL_SPEND', '1000.00',
+					null, null, null, null,
+					null, 'REWARD_POINTS', $7, '100.0000', 'ALL_MERCHANTS',
+					null, null, null, null,
+					null, null, null, null, $8, $8
+				)`,
+				[
+					`aaaa1000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+					USER_A,
+					cId,
+					hexFp,
+					`idemp-camp-page-${i}`,
+					`Paged Campaign ${String(i).padStart(3, "0")}`,
+					rewardAccId,
+					baseDate,
+				],
+			);
+		}
+		await pg.exec("SET session_replication_role = origin;");
+
+		// Traverse all campaigns pages with limit=50
+		let campCursor: string | null = null;
+		let firstValidCampCursor: string | null = null;
+		const allFetchedCampIds: string[] = [];
+		let campPageCount = 0;
+		while (true) {
+			campPageCount++;
+			const url = campCursor
+				? `/campaigns?limit=50&after=${encodeURIComponent(campCursor)}`
+				: `/campaigns?limit=50`;
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.6-B: GET campaigns page ${campPageCount} returns 200`);
+			const items = pageRes.json?.campaigns ?? [];
+			for (const item of items) {
+				allFetchedCampIds.push(item.campaignPeriodId);
+			}
+			if (campPageCount === 1) {
+				firstValidCampCursor = pageRes.json?.nextCursor;
+				eqD(items.length, 50, "7B.6-B: Campaigns page 1 has 50 items");
+				eqD(pageRes.json?.hasMore, true, "7B.6-B: Campaigns page 1 hasMore is true");
+			}
+			if (!pageRes.json?.hasMore) {
+				eqD(pageRes.json?.nextCursor, null, "7B.6-B: Campaigns final page nextCursor is null");
+				break;
+			}
+			campCursor = pageRes.json?.nextCursor;
+		}
+		// 105 seeded + 2 created in Scenario A = 107 campaigns
+		const uniqueCampIds = new Set(allFetchedCampIds);
+		eqD(allFetchedCampIds.length, uniqueCampIds.size, "7B.6-B: Campaigns pagination returned zero duplicates");
+		eqD(allFetchedCampIds.length, 107, "7B.6-B: Exactly 107 unique campaign rows traversed (>100 traversal PASS)");
+
+		// Malformed cursor returns 400 CAMPAIGN_INVALID_INPUT
+		const badCursorRes = await httpCall("/campaigns?after=invalid-base64", { method: "GET", token: tokenA });
+		eqD(badCursorRes.status, 400, "7B.6-B: Malformed cursor returns 400");
+		eqD(badCursorRes.json?.error?.code, "CAMPAIGN_INVALID_INPUT", "7B.6-B: Error code is CAMPAIGN_INVALID_INPUT");
+
+		// =========================================================================
+		// SCENARIO C: Progress Aggregates (Rule Modes & Lifecycle Semantics)
+		// =========================================================================
+		// 1. Create a fresh ACTIVE campaign for progress testing (camp3: TOTAL_SPEND, target 1000.00)
+		const create3Res = await httpCall("/campaigns", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-create-3",
+			body: {
+				provider: "Garanti BBVA",
+				familyKey: "GARANTI_BONUS_2026",
+				periodKey: "2026_09",
+				title: "Garanti Active Shopping",
+				startsOn: "2026-09-01",
+				endsOn: "2026-09-30",
+				ruleMode: "TOTAL_SPEND",
+				targetSpendAmount: "1000.00",
+				rewardKind: "REWARD_POINTS",
+				rewardAccountId: rewardAccId,
+				expectedRewardPoints: "100.0000",
+				merchantScopeMode: "ALL_MERCHANTS",
+				cardIds: [cardId],
+				occurredAt: "2026-09-01T10:00:00.000Z",
+			},
+		});
+		const camp3Id = create3Res.json?.campaign?.campaignPeriodId;
+
+		// REVIEW_REQUIRED progress -> zeroed
+		const progReviewRes = await httpCall(`/campaigns/${camp3Id}/progress`, { method: "GET", token: tokenA });
+		eqD(progReviewRes.status, 200, "7B.6-C: GET progress on REVIEW_REQUIRED returns 200");
+		eqD(progReviewRes.json?.progress?.eligibleSpend, "0.00", "7B.6-C: REVIEW_REQUIRED eligibleSpend is 0.00");
+		eqD(progReviewRes.json?.progress?.qualificationStatus, "NOT_STARTED", "7B.6-C: REVIEW_REQUIRED qualificationStatus is NOT_STARTED");
+
+		// Confirm camp3 -> ACTIVE
+		await httpCall(`/campaigns/${camp3Id}/confirm`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-confirm-3",
+			body: { expectedRevisionNo: 1, occurredAt: "2026-09-01T11:00:00.000Z" },
+		});
+
+		// Seed a purchase of 400.00 TL for cardId
+		const p1 = await recordCreditCardPurchase({
+			db,
+			userId: USER_A,
+			cardId,
+			amount: "400.00",
+			purchaseCategory: "MANDATORY_EXPENSE",
+			merchant: "Migros",
+			description: "Groceries",
+			occurredAt: new Date("2026-09-05T12:00:00Z"),
+			idempotencyKey: "pur-prog-1",
+		});
+		const p1EventId = p1.eventId;
+
+		// Check ACTIVE progress with 400.00 spend
+		const progActiveRes = await httpCall(`/campaigns/${camp3Id}/progress`, { method: "GET", token: tokenA });
+		eqD(progActiveRes.status, 200, "7B.6-C: GET progress on ACTIVE returns 200");
+		eqD(progActiveRes.json?.progress?.eligibleSpend, "400.00", "7B.6-C: ACTIVE eligibleSpend is 400.00");
+		eqD(progActiveRes.json?.progress?.requiredSpend, "1000.00", "7B.6-C: requiredSpend is 1000.00");
+		eqD(progActiveRes.json?.progress?.progressPercentage, 40, "7B.6-C: progressPercentage is 40");
+		eqD(progActiveRes.json?.progress?.qualificationStatus, "IN_PROGRESS", "7B.6-C: qualificationStatus is IN_PROGRESS");
+		eqD(progActiveRes.json?.progress?.actualRewardPointsCredited, null, "7B.6-C: actualRewardPointsCredited is null");
+
+		// Check CANCELLED campaign progress (camp2 from Scenario A) -> zeroed / NOT_STARTED
+		const progCancelRes = await httpCall(`/campaigns/${camp2Id}/progress`, { method: "GET", token: tokenA });
+		eqD(progCancelRes.status, 200, "7B.6-C: GET progress on CANCELLED returns 200");
+		eqD(progCancelRes.json?.progress?.qualificationStatus, "NOT_STARTED", "7B.6-C: CANCELLED qualificationStatus is NOT_STARTED");
+
+		// =========================================================================
+		// SCENARIO D: Bounded Progress Purchases
+		// =========================================================================
+		// Seed 2 more purchases
+		await recordCreditCardPurchase({
+			db,
+			userId: USER_A,
+			cardId,
+			amount: "300.00",
+			purchaseCategory: "MANDATORY_EXPENSE",
+			merchant: "Carrefour",
+			description: "Groceries 2",
+			occurredAt: new Date("2026-09-06T12:00:00Z"),
+			idempotencyKey: "pur-prog-2",
+		});
+		await recordCreditCardPurchase({
+			db,
+			userId: USER_A,
+			cardId,
+			amount: "350.00",
+			purchaseCategory: "MANDATORY_EXPENSE",
+			merchant: "BIM",
+			description: "Groceries 3",
+			occurredAt: new Date("2026-09-07T12:00:00Z"),
+			idempotencyKey: "pur-prog-3",
+		});
+
+		// GET progress purchases bucket=QUALIFYING with limit=2
+		const purPage1 = await httpCall(`/campaigns/${camp3Id}/progress/purchases?bucket=QUALIFYING&limit=2`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(purPage1.status, 200, "7B.6-D: GET progress purchases page 1 returns 200");
+		eqD(purPage1.json?.purchases?.length, 2, "7B.6-D: Page 1 returns 2 purchases");
+		eqD(purPage1.json?.hasMore, true, "7B.6-D: Page 1 hasMore is true");
+		const purCursor1 = purPage1.json?.nextCursor;
+
+		const purPage2 = await httpCall(`/campaigns/${camp3Id}/progress/purchases?bucket=QUALIFYING&limit=2&after=${encodeURIComponent(purCursor1)}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(purPage2.status, 200, "7B.6-D: GET progress purchases page 2 returns 200");
+		eqD(purPage2.json?.purchases?.length, 1, "7B.6-D: Page 2 returns remaining 1 purchase");
+		eqD(purPage2.json?.hasMore, false, "7B.6-D: Page 2 hasMore is false");
+		eqD(purPage2.json?.nextCursor, null, "7B.6-D: Page 2 nextCursor is null");
+
+		// =========================================================================
+		// SCENARIO E: Purchase Overrides (EXCLUDE, CLEAR, Discoverability)
+		// =========================================================================
+		// Initially overrides list is empty
+		const getOverridesInitial = await httpCall(`/campaigns/${camp3Id}/overrides`, { method: "GET", token: tokenA });
+		eqD(getOverridesInitial.status, 200, "7B.6-E: GET overrides initial returns 200");
+		eqD(getOverridesInitial.json?.overrides?.length, 0, "7B.6-E: Initial overrides length is 0");
+
+		// 1. EXCLUDE purchase p1 (400.00 TL) with expectedRevisionNo: 0
+		const excludeRes = await httpCall(`/campaigns/${camp3Id}/purchases/${p1EventId}/override`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "override-exclude-p1",
+			body: {
+				operation: "EXCLUDE",
+				expectedRevisionNo: 0,
+				reasonNote: "Manual exclusion test",
+				occurredAt: "2026-09-08T10:00:00.000Z",
+			},
+		});
+		eqD(excludeRes.status, 200, "7B.6-E: Exclude override returns 200");
+		eqD(excludeRes.json?.override?.operation, "EXCLUDE", "7B.6-E: Override operation is EXCLUDE");
+		eqD(excludeRes.json?.override?.revisionNo, 1, "7B.6-E: Override revisionNo is 1");
+
+		// 2. Discoverability: GET /campaigns/:id/overrides returns the excluded override
+		const getOverridesExcluded = await httpCall(`/campaigns/${camp3Id}/overrides`, { method: "GET", token: tokenA });
+		eqD(getOverridesExcluded.status, 200, "7B.6-E: GET overrides returns 200");
+		eqD(getOverridesExcluded.json?.overrides?.length, 1, "7B.6-E: Found 1 override");
+		eqD(getOverridesExcluded.json?.overrides?.[0]?.operation, "EXCLUDE", "7B.6-E: Discovered override is EXCLUDE");
+		eqD(getOverridesExcluded.json?.overrides?.[0]?.purchaseEventId, p1EventId, "7B.6-E: Discovered override matches purchaseEventId");
+
+		// Progress reflects exclusion: 400 + 300 + 350 - 400 = 650.00
+		const progAfterExclude = await httpCall(`/campaigns/${camp3Id}/progress`, { method: "GET", token: tokenA });
+		eqD(progAfterExclude.json?.progress?.eligibleSpend, "650.00", "7B.6-E: eligibleSpend drops to 650.00 after exclusion");
+
+		// 3. Stale OCC on override -> 409 CAMPAIGN_REVISION_CONFLICT
+		const staleOverrideRes = await httpCall(`/campaigns/${camp3Id}/purchases/${p1EventId}/override`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "override-stale",
+			body: {
+				operation: "EXCLUDE",
+				expectedRevisionNo: 0,
+				occurredAt: "2026-09-08T11:00:00.000Z",
+			},
+		});
+		eqD(staleOverrideRes.status, 409, "7B.6-E: Stale expectedRevisionNo on override returns 409");
+		eqD(staleOverrideRes.json?.error?.code, "CAMPAIGN_REVISION_CONFLICT", "7B.6-E: Conflict code is CAMPAIGN_REVISION_CONFLICT");
+
+		// 4. CLEAR override with expectedRevisionNo: 1 -> restores automatic state
+		const clearRes = await httpCall(`/campaigns/${camp3Id}/purchases/${p1EventId}/override`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "override-clear-p1",
+			body: {
+				operation: "CLEAR",
+				expectedRevisionNo: 1,
+				occurredAt: "2026-09-08T12:00:00.000Z",
+			},
+		});
+		eqD(clearRes.status, 200, "7B.6-E: Clear override returns 200");
+		eqD(clearRes.json?.override?.operation, "CLEAR", "7B.6-E: Override operation is CLEAR");
+		eqD(clearRes.json?.override?.revisionNo, 2, "7B.6-E: Clear revisionNo is 2");
+
+		// Progress returns to full 1050.00 (400 + 300 + 350) -> QUALIFIED_AWAITING_CREDIT
+		const progAfterClear = await httpCall(`/campaigns/${camp3Id}/progress`, { method: "GET", token: tokenA });
+		eqD(progAfterClear.json?.progress?.eligibleSpend, "1050.00", "7B.6-E: eligibleSpend restored to 1050.00");
+		eqD(progAfterClear.json?.progress?.qualificationStatus, "QUALIFIED_AWAITING_CREDIT", "7B.6-E: qualificationStatus is QUALIFIED_AWAITING_CREDIT");
+
+		// =========================================================================
+		// SCENARIO F: Reward Credit Confirm, Manual Rewards VOID Rejection & Campaign Void
+		// =========================================================================
+		// 1. GET /campaigns/:id/reward-credit initially returns null
+		const getCreditInitial = await httpCall(`/campaigns/${camp3Id}/reward-credit`, { method: "GET", token: tokenA });
+		eqD(getCreditInitial.status, 200, "7B.6-F: GET reward-credit initial returns 200");
+		eqD(getCreditInitial.json?.credit, null, "7B.6-F: Initial reward credit is null");
+
+		// 2. Confirm Reward Credited (actual 100.0000 points)
+		const confirmCreditRes = await httpCall(`/campaigns/${camp3Id}/reward-credit/confirm`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-rew-confirm-1",
+			body: {
+				actualPointAmount: "100.0000",
+				reasonNote: "Campaign completed reward credited",
+				occurredAt: "2026-09-09T10:00:00.000Z",
+			},
+		});
+		eqD(confirmCreditRes.status, 200, "7B.6-F: Confirm reward credit returns 200");
+		const credit1 = confirmCreditRes.json?.credit;
+		chkD(isUuid(credit1?.creditId), "7B.6-F: creditId is valid UUID");
+		eqD(credit1?.revisionNo, 1, "7B.6-F: Credit revisionNo is 1");
+		eqD(credit1?.actualPointAmount, "100.0000", "7B.6-F: actualPointAmount is 100.0000");
+		const rewardEventId = credit1?.rewardEventId;
+		chkD(isUuid(rewardEventId), "7B.6-F: rewardEventId is valid UUID");
+
+		// Progress is now REWARD_CREDITED
+		const progAfterCredit = await httpCall(`/campaigns/${camp3Id}/progress`, { method: "GET", token: tokenA });
+		eqD(progAfterCredit.json?.progress?.qualificationStatus, "REWARD_CREDITED", "7B.6-F: qualificationStatus is REWARD_CREDITED");
+		eqD(progAfterCredit.json?.progress?.actualRewardPointsCredited, "100.0000", "7B.6-F: actualRewardPointsCredited is 100.0000");
+
+		// 3. GET /campaigns/:id/reward-credit returns the active credit
+		const getCreditActive = await httpCall(`/campaigns/${camp3Id}/reward-credit`, { method: "GET", token: tokenA });
+		eqD(getCreditActive.status, 200, "7B.6-F: GET reward-credit returns 200");
+		eqD(getCreditActive.json?.credit?.creditId, credit1?.creditId, "7B.6-F: Active credit ID matches");
+		eqD(getCreditActive.json?.credit?.revisionNo, 1, "7B.6-F: Active credit revisionNo is 1");
+
+		// 4. Attempt manual Rewards HTTP VOID on the CAMPAIGN-owned event -> 409 REWARD_EVENT_EXTERNALLY_MANAGED
+		const manualVoidAttempt = await httpCall(`/rewards/accounts/${rewardAccId}/events/${rewardEventId}/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "manual-void-camp-event",
+			body: {
+				expectedRevisionNo: 1,
+				reasonNote: "Attempt manual void",
+			},
+		});
+		eqD(manualVoidAttempt.status, 409, "7B.6-F: Manual Rewards HTTP void attempt on CAMPAIGN event returns 409");
+		eqD(manualVoidAttempt.json?.error?.code, "REWARD_EVENT_EXTERNALLY_MANAGED", "7B.6-F: Error code is REWARD_EVENT_EXTERNALLY_MANAGED");
+
+		// 5. Campaign Reward Credit VOID -> 200
+		const voidCreditRes = await httpCall(`/campaigns/${camp3Id}/reward-credit/void`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-rew-void-1",
+			body: {
+				expectedRevisionNo: 1,
+				reasonNote: "Bank clawed back campaign points",
+				occurredAt: "2026-09-10T10:00:00.000Z",
+			},
+		});
+		eqD(voidCreditRes.status, 200, "7B.6-F: Void campaign reward credit returns 200");
+		eqD(voidCreditRes.json?.credit?.revisionNo, 2, "7B.6-F: Returned credit revisionNo is 2");
+
+		// Progress returns to QUALIFIED_AWAITING_CREDIT
+		const progAfterVoid = await httpCall(`/campaigns/${camp3Id}/progress`, { method: "GET", token: tokenA });
+		eqD(progAfterVoid.json?.progress?.qualificationStatus, "QUALIFIED_AWAITING_CREDIT", "7B.6-F: Progress returns to QUALIFIED_AWAITING_CREDIT");
+		eqD(progAfterVoid.json?.progress?.actualRewardPointsCredited, null, "7B.6-F: actualRewardPointsCredited returns to null");
+
+		// GET /campaigns/:id/reward-credit returns null
+		const getCreditAfterVoid = await httpCall(`/campaigns/${camp3Id}/reward-credit`, { method: "GET", token: tokenA });
+		eqD(getCreditAfterVoid.json?.credit, null, "7B.6-F: GET reward-credit after void returns null");
+
+		// 6. Re-confirm creates a NEW reward event identity
+		const reconfirmRes = await httpCall(`/campaigns/${camp3Id}/reward-credit/confirm`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "camp-rew-confirm-2",
+			body: {
+				actualPointAmount: "100.0000",
+				occurredAt: "2026-09-11T10:00:00.000Z",
+			},
+		});
+		eqD(reconfirmRes.status, 200, "7B.6-F: Re-confirm reward credit returns 200");
+		const newRewardEventId = reconfirmRes.json?.credit?.rewardEventId;
+		chkD(newRewardEventId !== rewardEventId, "7B.6-F: Re-confirm created a distinct NEW reward event identity");
+
+		// =========================================================================
+		// SCENARIO G: Review Candidates, Semantic Diff, APPLY & DISMISS
+		// =========================================================================
+		// 1. Record a source snapshot
+		const snap1 = await recordCampaignSourceSnapshot({
+			db,
+			userId: USER_A,
+			provider: "Garanti BBVA",
+			sourceType: "MANUAL",
+			sourceUrl: "https://www.garantibbva.com.tr/kampanyalar/market-2026",
+			externalSourceId: "EXT-SNAP-1",
+			sourceTitle: "Garanti Market September Terms",
+			sourceText: "Spend 1500 TL on grocery, earn 150 bonus points.",
+			capturedAt: new Date("2026-09-01T08:00:00Z"),
+		});
+		const snap1Id = snap1.id;
+
+		// 2. Create Candidate 1 on camp3
+		const cand1 = await createCampaignReviewCandidate({
+			db,
+			userId: USER_A,
+			campaignPeriodId: camp3Id,
+			sourceSnapshotId: snap1Id,
+			title: "Garanti Market 1500 TL Campaign",
+			startsOn: "2026-09-01",
+			endsOn: "2026-09-30",
+			ruleMode: "TOTAL_SPEND",
+			targetSpendAmount: "1500.00",
+			rewardKind: "REWARD_POINTS",
+			rewardAccountId: rewardAccId,
+			expectedRewardPoints: "150.0000",
+			merchantScopeMode: "ALL_MERCHANTS",
+			proposedCardIds: [cardId],
+			occurredAt: new Date("2026-09-01T08:30:00Z"),
+			idempotencyKey: "cand-create-1",
+		});
+		const cand1Id = cand1.candidateId;
+
+		// 3. GET /campaigns/review-candidates
+		const listCandRes = await httpCall(`/campaigns/review-candidates?campaignPeriodId=${camp3Id}`, {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(listCandRes.status, 200, "7B.6-G: GET review-candidates returns 200");
+		eqD(listCandRes.json?.candidates?.length, 1, "7B.6-G: Found 1 candidate");
+		eqD(listCandRes.json?.candidates?.[0]?.candidateId, cand1Id, "7B.6-G: Candidate ID matches");
+
+		// 4. GET /campaigns/review-candidates/:id
+		const getCandRes = await httpCall(`/campaigns/review-candidates/${cand1Id}`, { method: "GET", token: tokenA });
+		eqD(getCandRes.status, 200, "7B.6-G: GET candidate detail returns 200");
+		eqD(getCandRes.json?.candidate?.status, "PENDING", "7B.6-G: Candidate status is PENDING");
+		eqD(getCandRes.json?.candidate?.title, "Garanti Market 1500 TL Campaign", "7B.6-G: Candidate title matches");
+
+		// 5. GET /campaigns/review-candidates/:id/diff
+		const getDiffRes = await httpCall(`/campaigns/review-candidates/${cand1Id}/diff`, { method: "GET", token: tokenA });
+		eqD(getDiffRes.status, 200, "7B.6-G: GET candidate diff returns 200");
+		chkD(Array.isArray(getDiffRes.json?.diff), "7B.6-G: Diff is array");
+		const targetSpendDiff = getDiffRes.json?.diff?.find((d: any) => d.field === "targetSpendAmount");
+		eqD(targetSpendDiff?.candidateValue, "1500.00", "7B.6-G: Semantic diff reflects proposed targetSpendAmount 1500.00");
+
+		// 6. POST /campaigns/review-candidates/:id/apply (expectedCampaignRevisionNo: 2)
+		const applyRes = await httpCall(`/campaigns/review-candidates/${cand1Id}/apply`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "cand-apply-1",
+			body: {
+				expectedCampaignRevisionNo: 2,
+				occurredAt: "2026-09-12T10:00:00.000Z",
+			},
+		});
+		eqD(applyRes.status, 200, "7B.6-G: Apply review candidate returns 200");
+		eqD(applyRes.json?.candidate?.status, "APPLIED", "7B.6-G: Candidate status becomes APPLIED");
+		eqD(applyRes.json?.campaign?.revisionNo, 3, "7B.6-G: Campaign revision updated to 3 via atomic AMEND");
+		eqD(applyRes.json?.campaign?.targetSpendAmount, "1500.00", "7B.6-G: Campaign targetSpendAmount updated to 1500.00");
+
+		// 7. Create Candidate 2 and DISMISS it
+		const cand2 = await createCampaignReviewCandidate({
+			db,
+			userId: USER_A,
+			campaignPeriodId: camp3Id,
+			sourceSnapshotId: snap1Id,
+			title: "Garanti Market Dismiss Test",
+			startsOn: "2026-09-01",
+			endsOn: "2026-09-30",
+			ruleMode: "TOTAL_SPEND",
+			targetSpendAmount: "2000.00",
+			rewardKind: "REWARD_POINTS",
+			rewardAccountId: rewardAccId,
+			expectedRewardPoints: "200.0000",
+			merchantScopeMode: "ALL_MERCHANTS",
+			proposedCardIds: [cardId],
+			occurredAt: new Date("2026-09-01T09:00:00Z"),
+			idempotencyKey: "cand-create-2",
+		});
+		const cand2Id = cand2.candidateId;
+
+		const dismissRes = await httpCall(`/campaigns/review-candidates/${cand2Id}/dismiss`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "cand-dismiss-1",
+			body: {
+				occurredAt: "2026-09-12T11:00:00.000Z",
+				note: "Dismissed by user preference",
+			},
+		});
+		eqD(dismissRes.status, 200, "7B.6-G: Dismiss candidate returns 200");
+		eqD(dismissRes.json?.candidate?.status, "DISMISSED", "7B.6-G: Candidate status becomes DISMISSED");
+
+		// Verify camp3 revision was NOT incremented by dismiss
+		const getCamp3AfterDismiss = await httpCall(`/campaigns/${camp3Id}`, { method: "GET", token: tokenA });
+		eqD(getCamp3AfterDismiss.json?.campaign?.revisionNo, 3, "7B.6-G: Campaign revision unchanged by DISMISS (remains 3)");
+
+		// 8. Seed 110 Review Candidates for pagination test (>100 candidates)
+		console.log("Seeding 110 review candidates for pagination test...");
+		await pg.exec("SET session_replication_role = replica;");
+		for (let i = 1; i <= 110; i++) {
+			const candId = `ccaa1000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+			const baseDate = new Date(Date.UTC(2026, 0, 1, 0, 0, i));
+			const hexFp = String(i).padStart(64, "0");
+			await pg.query(
+				`insert into campaign_review_candidates (id, user_id, campaign_period_id, source_snapshot_id, candidate_hash, created_at) values ($1, $2, $3, $4, $5, $6)`,
+				[candId, USER_A, camp3Id, snap1Id, hexFp, baseDate],
+			);
+			await pg.query(
+				`insert into campaign_review_candidate_revisions (
+					id, user_id, candidate_id, revision_no, revision_fingerprint, idempotency_key, operation, status,
+					applied_campaign_revision_id, title, starts_on, ends_on, rule_mode, target_spend_amount,
+					required_transaction_count, minimum_transaction_amount, step_spend_amount, reward_points_per_step,
+					max_steps, reward_kind, reward_account_id, expected_reward_points, merchant_scope_mode,
+					required_canonical_merchant_names, allowed_mcc_codes, reward_expiry_date, parser_type, parser_version,
+					parser_confidence, proposed_card_ids, occurred_at, created_at
+				) values (
+					$1, $2, $3, 1, $4, $5, 'CREATE', 'PENDING',
+					null, $6, '2026-09-01', '2026-09-30', 'TOTAL_SPEND', '1000.00',
+					null, null, null, null,
+					null, 'REWARD_POINTS', $7, '100.0000', 'ALL_MERCHANTS',
+					null, null, null, null, null,
+					null, $8, $9, $9
+				)`,
+				[
+					`bbbb2000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+					USER_A,
+					candId,
+					hexFp,
+					`idemp-cand-page-${i}`,
+					`Paged Candidate ${String(i).padStart(3, "0")}`,
+					rewardAccId,
+					JSON.stringify([cardId]),
+					baseDate,
+				],
+			);
+		}
+		await pg.exec("SET session_replication_role = origin;");
+
+		// Traverse all candidate pages with limit=50
+		let candCursor: string | null = null;
+		const allFetchedCandIds: string[] = [];
+		let candPageCount = 0;
+		while (true) {
+			candPageCount++;
+			const url = candCursor
+				? `/campaigns/review-candidates?limit=50&after=${encodeURIComponent(candCursor)}`
+				: `/campaigns/review-candidates?limit=50`;
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.6-G: GET review-candidates page ${candPageCount} returns 200`);
+			const items = pageRes.json?.candidates ?? [];
+			for (const item of items) {
+				allFetchedCandIds.push(item.candidateId);
+			}
+			if (candPageCount === 1) {
+				eqD(items.length, 50, "7B.6-G: Candidates page 1 has 50 items");
+				eqD(pageRes.json?.hasMore, true, "7B.6-G: Candidates page 1 hasMore is true");
+			}
+			if (!pageRes.json?.hasMore) {
+				eqD(pageRes.json?.nextCursor, null, "7B.6-G: Candidates final page nextCursor is null");
+				break;
+			}
+			candCursor = pageRes.json?.nextCursor;
+		}
+		// 110 seeded + 2 created in Scenario G = 112 candidates
+		const uniqueCandIds = new Set(allFetchedCandIds);
+		eqD(allFetchedCandIds.length, uniqueCandIds.size, "7B.6-G: Candidates pagination returned zero duplicates");
+		eqD(allFetchedCandIds.length, 112, "7B.6-G: Exactly 112 unique candidate rows traversed (>100 traversal PASS)");
+
+		// =========================================================================
+		// SCENARIO H: Source Snapshot Product Read
+		// =========================================================================
+		const getSnapRes = await httpCall(`/campaigns/source-snapshots/${snap1Id}`, { method: "GET", token: tokenA });
+		eqD(getSnapRes.status, 200, "7B.6-H: GET source snapshot returns 200");
+		eqD(getSnapRes.json?.sourceSnapshot?.sourceSnapshotId, snap1Id, "7B.6-H: Snapshot ID matches");
+		eqD(getSnapRes.json?.sourceSnapshot?.provider, "Garanti BBVA", "7B.6-H: Snapshot provider matches");
+		eqD(getSnapRes.json?.sourceSnapshot?.sourceTitle, "Garanti Market September Terms", "7B.6-H: Snapshot title matches");
+		eqD(getSnapRes.json?.sourceSnapshot?.userId, undefined, "7B.6-H: Sanitized snapshot does not expose userId");
+		eqD(getSnapRes.json?.sourceSnapshot?.contentHash, undefined, "7B.6-H: Sanitized snapshot does not expose contentHash");
+
+		// =========================================================================
+		// SCENARIO I: Same-Database Cross-User Security Proofs
+		// =========================================================================
+		const USER_B = "22222222-cccc-4ccc-8ccc-222222222222";
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User B', 'TRY', 'Europe/Istanbul', now())",
+			[USER_B],
+		);
+		const { token: tokenB } = await createSession({ db, userId: USER_B });
+
+		// User B attempts to GET User A's campaign -> 404
+		const crossCampRes = await httpCall(`/campaigns/${camp1Id}`, { method: "GET", token: tokenB });
+		eqD(crossCampRes.status, 404, "7B.6-I: User B cannot GET User A campaign (404 NOT_FOUND)");
+
+		// User B attempts to GET User A's progress -> 404
+		const crossProgRes = await httpCall(`/campaigns/${camp1Id}/progress`, { method: "GET", token: tokenB });
+		eqD(crossProgRes.status, 404, "7B.6-I: User B cannot GET User A progress (404 NOT_FOUND)");
+
+		// User B attempts to GET User A's progress purchases -> 404
+		const crossPurchRes = await httpCall(`/campaigns/${camp1Id}/progress/purchases?bucket=QUALIFYING`, { method: "GET", token: tokenB });
+		eqD(crossPurchRes.status, 404, "7B.6-I: User B cannot GET User A progress purchases (404 NOT_FOUND)");
+
+		// User B attempts to GET User A's overrides -> 404
+		const crossOverRes = await httpCall(`/campaigns/${camp1Id}/overrides`, { method: "GET", token: tokenB });
+		eqD(crossOverRes.status, 404, "7B.6-I: User B cannot GET User A overrides (404 NOT_FOUND)");
+
+		// User B attempts to GET User A's reward credit -> 404
+		const crossCredRes = await httpCall(`/campaigns/${camp1Id}/reward-credit`, { method: "GET", token: tokenB });
+		eqD(crossCredRes.status, 404, "7B.6-I: User B cannot GET User A reward credit (404 NOT_FOUND)");
+
+		// User B attempts to GET User A's candidate -> 404
+		const crossCandRes = await httpCall(`/campaigns/review-candidates/${cand1Id}`, { method: "GET", token: tokenB });
+		eqD(crossCandRes.status, 404, "7B.6-I: User B cannot GET User A candidate (404 NOT_FOUND)");
+
+		// User B attempts to GET User A's candidate diff -> 404
+		const crossDiffRes = await httpCall(`/campaigns/review-candidates/${cand1Id}/diff`, { method: "GET", token: tokenB });
+		eqD(crossDiffRes.status, 404, "7B.6-I: User B cannot GET User A candidate diff (404 NOT_FOUND)");
+
+		// User B attempts to GET User A's source snapshot -> 404
+		const crossSnapRes = await httpCall(`/campaigns/source-snapshots/${snap1Id}`, { method: "GET", token: tokenB });
+		eqD(crossSnapRes.status, 404, "7B.6-I: User B cannot GET User A source snapshot (404 NOT_FOUND)");
+
+		// User B with User A cursor sees 0 items
+		const crossCursorRes = await httpCall(`/campaigns?after=${encodeURIComponent(firstValidCampCursor!)}`, { method: "GET", token: tokenB });
+		eqD(crossCursorRes.status, 200, "7B.6-I: User B with User A cursor returns 200 for User B scope");
+		eqD((crossCursorRes.json?.campaigns ?? []).length, 0, "7B.6-I: User B sees 0 items from User A cursor (zero leakage)");
+
+		// User B attempts mutation on User A campaign -> 404
+		const crossMutRes = await httpCall(`/campaigns/${camp1Id}/confirm`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "cross-confirm-att",
+			body: { expectedRevisionNo: 6, occurredAt: "2026-09-15T10:00:00.000Z" },
+		});
+		eqD(crossMutRes.status, 404, "7B.6-I: User B cannot mutate User A campaign (404 NOT_FOUND)");
+
+		// =========================================================================
+		// SCENARIO J: Read-Only GET Proof (Zero DB Writes across all GET routes)
+		// =========================================================================
+		const countAllCampaignTables = async () => {
+			const q = async (table: string) => (await pg.query(`select count(*)::int as n from ${table}`)).rows[0].n as number;
+			return (
+				(await q("campaign_families")) +
+				(await q("campaign_periods")) +
+				(await q("campaign_period_revisions")) +
+				(await q("campaign_period_revision_cards")) +
+				(await q("campaign_purchase_overrides")) +
+				(await q("campaign_purchase_override_revisions")) +
+				(await q("campaign_reward_credits")) +
+				(await q("campaign_reward_credit_revisions")) +
+				(await q("campaign_source_snapshots")) +
+				(await q("campaign_review_candidates")) +
+				(await q("campaign_review_candidate_revisions"))
+			);
+		};
+
+		const countBefore = await countAllCampaignTables();
+		await httpCall("/campaigns", { method: "GET", token: tokenA });
+		await httpCall(`/campaigns/${camp3Id}`, { method: "GET", token: tokenA });
+		await httpCall(`/campaigns/${camp3Id}/progress`, { method: "GET", token: tokenA });
+		await httpCall(`/campaigns/${camp3Id}/progress/purchases?bucket=QUALIFYING`, { method: "GET", token: tokenA });
+		await httpCall(`/campaigns/${camp3Id}/overrides`, { method: "GET", token: tokenA });
+		await httpCall(`/campaigns/${camp3Id}/reward-credit`, { method: "GET", token: tokenA });
+		await httpCall("/campaigns/review-candidates", { method: "GET", token: tokenA });
+		await httpCall(`/campaigns/review-candidates/${cand1Id}`, { method: "GET", token: tokenA });
+		await httpCall(`/campaigns/review-candidates/${cand1Id}/diff`, { method: "GET", token: tokenA });
+		await httpCall(`/campaigns/source-snapshots/${snap1Id}`, { method: "GET", token: tokenA });
+		const countAfter = await countAllCampaignTables();
+		eqD(countBefore, countAfter, "7B.6-J: Read-only GET endpoints perform exactly zero database writes");
+
+	} finally {
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -17070,6 +18058,7 @@ if (probed) {
 	await resolverRuntime7B3R2();
 	await resolverRuntime7B4();
 	await resolverRuntime7B5();
+	await resolverRuntime7B6();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

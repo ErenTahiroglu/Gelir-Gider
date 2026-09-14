@@ -949,20 +949,229 @@ interface RewardEventProductDto {
 
 ### 7B.6 — Campaigns
 
-```
-PLANNED  GET   /campaigns/:id
-PLANNED  GET   /campaigns               ?limit=&after=
-PLANNED  POST  /campaigns               (create period)
-PLANNED  POST  /campaigns/:id/amend     (amend period)
+The Campaigns product surface provides bounded, user-scoped read models, lifecycle state machines, authoritative progress computation, manual purchase override management, cross-domain reward crediting with external ownership protection, and candidate review workflows (semantic diff, atomic apply, dismiss).
 
-PLANNED  GET   /campaigns/:id/progress
+> **Note on Internal Ingestion:** `POST /campaigns/source-snapshots` and `POST /campaigns/review-candidates` are internal domain operations that are not exposed as public HTTP endpoints. They will be invoked internally by the batch Import workflow in **7B.9**.
 
-PLANNED  GET   /campaigns/review-candidates/:id
-PLANNED  GET   /campaigns/review-candidates    ?limit=&after=
-PLANNED  POST  /campaigns/review-candidates    (create)
-PLANNED  POST  /campaigns/review-candidates/:id/apply    (apply)
-PLANNED  POST  /campaigns/review-candidates/:id/dismiss  (dismiss)
+#### 1. Endpoint Surface
+
 ```
+IMPLEMENTED  GET   /campaigns                                  ?status=&visibility=&provider=&creditCardId=&limit=&after=
+IMPLEMENTED  GET   /campaigns/:id
+IMPLEMENTED  POST  /campaigns                                  (direct manual campaign creation)
+IMPLEMENTED  POST  /campaigns/:id/confirm                      (confirm REVIEW_REQUIRED -> ACTIVE)
+IMPLEMENTED  POST  /campaigns/:id/amend                        (full replacement term snapshot OCC)
+IMPLEMENTED  POST  /campaigns/:id/hide                         (change visibility -> HIDDEN)
+IMPLEMENTED  POST  /campaigns/:id/restore                      (change visibility -> VISIBLE)
+IMPLEMENTED  POST  /campaigns/:id/end                          (transition lifecycle -> ENDED)
+IMPLEMENTED  POST  /campaigns/:id/cancel                       (transition lifecycle -> CANCELLED)
+
+IMPLEMENTED  GET   /campaigns/:id/progress                     (aggregate progress only)
+IMPLEMENTED  GET   /campaigns/:id/progress/purchases           ?bucket=QUALIFYING|NEEDS_REVIEW&limit=&after=
+IMPLEMENTED  GET   /campaigns/:id/overrides                    (bounded latest manual override view)
+IMPLEMENTED  POST  /campaigns/:id/purchases/:purchaseEventId/override (INCLUDE | EXCLUDE | CLEAR)
+
+IMPLEMENTED  GET   /campaigns/:id/reward-credit                (returns active credit DTO or null)
+IMPLEMENTED  POST  /campaigns/:id/reward-credit/confirm        (confirm reward credited & create CAMPAIGN Reward event)
+IMPLEMENTED  POST  /campaigns/:id/reward-credit/void           (void credit & atomically void linked Reward event)
+
+IMPLEMENTED  GET   /campaigns/review-candidates                ?campaignPeriodId=&status=&limit=&after=
+IMPLEMENTED  GET   /campaigns/review-candidates/:id
+IMPLEMENTED  GET   /campaigns/review-candidates/:id/diff       (safe semantic diff against current campaign)
+IMPLEMENTED  POST  /campaigns/review-candidates/:id/apply      (atomic single-tx: apply candidate + amend campaign)
+IMPLEMENTED  POST  /campaigns/review-candidates/:id/dismiss    (dismiss candidate; leaves campaign untouched)
+
+IMPLEMENTED  GET   /campaigns/source-snapshots/:id             (user-scoped source evidence read)
+```
+
+#### 2. Product DTO Shapes
+
+##### `CampaignPeriodProductDto`
+```typescript
+interface CampaignPeriodProductDto {
+  campaignPeriodId: string;
+  provider: string;
+  familyKey: string;
+  periodKey: string;
+  revisionNo: number;
+  operation: "CREATE" | "CONFIRM" | "AMEND" | "HIDE" | "RESTORE" | "END" | "CANCEL";
+  lifecycleStatus: "REVIEW_REQUIRED" | "ACTIVE" | "ENDED" | "CANCELLED";
+  visibility: "VISIBLE" | "HIDDEN";
+  title: string;
+  startsOn: string;  // "YYYY-MM-DD"
+  endsOn: string;    // "YYYY-MM-DD"
+  ruleMode: "TOTAL_SPEND" | "TRANSACTION_COUNT" | "REPEATABLE_SPEND";
+  targetSpendAmount: string | null;          // 2 decimals (e.g. "1000.00")
+  requiredTransactionCount: number | null;
+  minimumTransactionAmount: string | null;  // 2 decimals
+  stepSpendAmount: string | null;           // 2 decimals
+  rewardPointsPerStep: string | null;       // 4 decimals (e.g. "50.0000")
+  maxSteps: number | null;
+  rewardKind: "REWARD_POINTS" | "STATEMENT_CREDIT" | "INFORMATIONAL";
+  rewardAccountId: string | null;
+  expectedRewardPoints: string | null;      // 4 decimals
+  merchantScopeMode: "ALL_MERCHANTS" | "MERCHANT_ALIASES" | "MANUAL_REVIEW_REQUIRED";
+  requiredCanonicalMerchantNames: string[] | null;
+  allowedMccCodes: string[] | null;
+  rewardExpiryDate: string | null;          // "YYYY-MM-DD"
+  sourceSnapshotId: string | null;
+  parserType: string | null;
+  parserVersion: string | null;
+  parserConfidence: number | null;
+  note: string | null;
+  cardIds: string[];
+  occurredAt: string; // ISO 8601 UTC timestamp
+  createdAt: string;  // ISO 8601 UTC timestamp
+}
+```
+
+##### `CampaignProgressProductDto`
+```typescript
+interface CampaignProgressProductDto {
+  campaignPeriodId: string;
+  lifecycleStatus: "REVIEW_REQUIRED" | "ACTIVE" | "ENDED" | "CANCELLED";
+  visibility: "VISIBLE" | "HIDDEN";
+  startsOn: string;
+  endsOn: string;
+  ruleMode: "TOTAL_SPEND" | "TRANSACTION_COUNT" | "REPEATABLE_SPEND";
+  eligibleSpend: string;             // 2 decimals (e.g. "500.00")
+  eligibleTransactionCount: number;
+  requiredSpend: string | null;      // 2 decimals
+  requiredTransactionCount: number | null;
+  stepsEarned: number | null;
+  maxSteps: number | null;
+  progressNumerator: string;         // e.g. "500.00" or "3"
+  progressDenominator: string;       // e.g. "1000.00" or "5"
+  progressPercentage: string;        // 2 decimals (e.g. "50.00")
+  qualificationStatus: "NOT_QUALIFIED" | "IN_PROGRESS" | "QUALIFIED_AWAITING_CREDIT" | "REWARD_CREDITED";
+  expectedRewardKind: "REWARD_POINTS" | "STATEMENT_CREDIT" | "INFORMATIONAL";
+  expectedRewardPoints: string | null;       // 4 decimals
+  actualRewardPointsCredited: string | null; // 4 decimals
+  needsReviewCount: number;
+  needsReviewAmount: string;         // 2 decimals
+}
+```
+
+##### `CampaignProgressPurchaseProductDto`
+```typescript
+interface CampaignProgressPurchaseProductDto {
+  purchaseEventId: string;
+  amount: string;          // 2 decimals
+  purchaseDate: string;    // "YYYY-MM-DD"
+  merchant: string | null;
+  status: "POSTED" | "VOID";
+  override: {
+    revisionNo: number;
+    operation: "INCLUDE" | "EXCLUDE" | "CLEAR";
+    reasonNote: string | null;
+    occurredAt: string;
+  } | null;
+}
+```
+
+##### `CampaignOverrideProductDto`
+```typescript
+interface CampaignOverrideProductDto {
+  purchaseEventId: string;
+  revisionNo: number;
+  operation: "INCLUDE" | "EXCLUDE" | "CLEAR";
+  reasonNote: string | null;
+  occurredAt: string;
+}
+```
+
+##### `CampaignRewardCreditProductDto`
+```typescript
+interface CampaignRewardCreditProductDto {
+  creditId: string;
+  campaignPeriodId: string;
+  rewardAccountId: string;
+  revisionNo: number;
+  actualPointAmount: string;   // 4 decimals
+  expectedPointAmount: string; // 4 decimals
+  rewardEventId: string;
+  reasonNote: string | null;
+  occurredAt: string;
+}
+```
+
+##### `CampaignReviewCandidateProductDto`
+```typescript
+interface CampaignReviewCandidateProductDto {
+  candidateId: string;
+  campaignPeriodId: string;
+  sourceSnapshotId: string;
+  revisionNo: number;
+  operation: "CREATE" | "APPLY" | "DISMISS";
+  status: "PENDING" | "APPLIED" | "DISMISSED";
+  title: string;
+  startsOn: string;
+  endsOn: string;
+  ruleMode: "TOTAL_SPEND" | "TRANSACTION_COUNT" | "REPEATABLE_SPEND";
+  targetSpendAmount: string | null;
+  requiredTransactionCount: number | null;
+  minimumTransactionAmount: string | null;
+  stepSpendAmount: string | null;
+  rewardPointsPerStep: string | null;
+  maxSteps: number | null;
+  rewardKind: "REWARD_POINTS" | "STATEMENT_CREDIT" | "INFORMATIONAL";
+  rewardAccountId: string | null;
+  expectedRewardPoints: string | null;
+  merchantScopeMode: "ALL_MERCHANTS" | "MERCHANT_ALIASES" | "MANUAL_REVIEW_REQUIRED";
+  requiredCanonicalMerchantNames: string[] | null;
+  allowedMccCodes: string[] | null;
+  rewardExpiryDate: string | null;
+  proposedCardIds: string[];
+  parserType: string | null;
+  parserVersion: string | null;
+  parserConfidence: number | null;
+  occurredAt: string;
+  createdAt: string;
+}
+```
+
+##### `CampaignSourceSnapshotProductDto`
+```typescript
+interface CampaignSourceSnapshotProductDto {
+  sourceSnapshotId: string;
+  provider: string;
+  sourceType: "MANUAL" | "OFFICIAL_PUBLIC_PAGE" | "IMPORT";
+  sourceUrl: string | null;
+  externalSourceId: string | null;
+  sourceTitle: string | null;
+  sourceText: string | null;
+  capturedAt: string;
+  createdAt: string;
+}
+```
+
+##### `CampaignSemanticDiffItemDto`
+```typescript
+interface CampaignSemanticDiffItemDto {
+  field: string;
+  currentValue: unknown;
+  candidateValue: unknown;
+}
+```
+
+#### 3. Error Codes & HTTP Mapping
+
+| Code | HTTP Status | Description |
+|---|---|---|
+| `CAMPAIGN_INVALID_INPUT` | 400 | Malformed UUID, invalid date, invalid decimal precision, invalid query/cursor params, or closed body violation |
+| `CAMPAIGN_INVALID_RULE` | 400 | Campaign rule shape or reward shape validation failed |
+| `CAMPAIGN_NOT_FOUND` | 404 | Campaign period, review candidate, or source snapshot not found or belongs to another user |
+| `CAMPAIGN_PURCHASE_NOT_FOUND` | 404 | Purchase event ID not found or belongs to another user |
+| `CAMPAIGN_NOT_ACTIVE` | 409 | Operation requires ACTIVE campaign (e.g. review candidate apply, override, or reward credit) |
+| `CAMPAIGN_REVIEW_REQUIRED` | 409 | Operation rejected because campaign is still in REVIEW_REQUIRED status |
+| `CAMPAIGN_REVISION_CONFLICT` | 409 | Optimistic concurrency conflict (`expectedRevisionNo` or `expectedCampaignRevisionNo` mismatch) |
+| `CAMPAIGN_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different request payload |
+| `CAMPAIGN_PURCHASE_NEEDS_REVIEW` | 409 | Operation cannot proceed while purchases are in NEEDS_REVIEW status |
+| `CAMPAIGN_NOT_QUALIFIED` | 409 | Campaign does not meet authoritative qualification criteria for reward credit confirmation |
+| `CAMPAIGN_REWARD_ALREADY_CREDITED` | 409 | Campaign has already confirmed an active reward credit |
+| `CAMPAIGN_INVALID_STATE` | 500 | Internal financial/domain state consistency violation |
+
+---
 
 ### 7B.7 — Short-Term Goals + Midas + Long-Term Investment
 
