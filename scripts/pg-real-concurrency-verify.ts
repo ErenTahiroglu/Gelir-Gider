@@ -1068,7 +1068,7 @@ async function run() {
 
 				const canRevRows = (
 					await controlClient.query(
-						"select id, transaction_id, status from transaction_revisions where transaction_id = $1",
+						"select id, transaction_id from transaction_revisions where transaction_id = $1",
 						[winnerTxId],
 					)
 				).rows;
