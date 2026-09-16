@@ -9,6 +9,7 @@ import { MidasError } from "../midas/errors";
 import { ShortTermGoalError } from "../short-term-goals/errors";
 import { encodeShortTermGoalCursor } from "../short-term-goals/pagination";
 import {
+	buildShortTermGoalProductDtoForRevision,
 	listBoundedShortTermGoals,
 	toShortTermGoalProductDto,
 } from "../short-term-goals/product-read";
@@ -552,15 +553,20 @@ shortTermGoalsRouter.post(
 
 			const lifecycleResult = await updateShortTermGoal(updateParams);
 
-			const goalRecord = await getShortTermGoal({
+			// Build the response from the revision the idempotency key actually
+			// resolved to (not "current"), so a replay of an older key returns
+			// the source-authoritative historical snapshot it owns, even after
+			// later keys have advanced the goal further.
+			const goalDto = await buildShortTermGoalProductDtoForRevision(
 				db,
-				userId: auth.userId,
+				auth.userId,
 				goalId,
-			});
+				lifecycleResult.revisionId,
+			);
 
 			return c.json(
 				{
-					goal: toShortTermGoalProductDto(goalRecord),
+					goal: goalDto,
 					idempotentReplay: lifecycleResult.idempotentReplay,
 				},
 				200,

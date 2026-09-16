@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, gt, inArray, lt, or, sql } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { Database, DatabaseOrTransaction } from "../db/client";
 import { midasAccounts, midasAllocationTransfers } from "../db/schema/midas";
 import {
 	type ShortTermGoalFundingStatus,
@@ -8,7 +8,10 @@ import {
 	shortTermGoalRevisions,
 	shortTermGoals,
 } from "../db/schema/short-term-goals";
-import { parseMoneyString } from "../ledger/money";
+import {
+	parseMoneyString,
+	parseSignedAggregateMoneyString,
+} from "../ledger/money";
 import { validateCanonicalUuid } from "./calendar";
 import { ShortTermGoalError } from "./errors";
 import {
@@ -121,6 +124,68 @@ function deriveFundingMetrics(balanceCents: bigint, targetCents: bigint) {
 }
 
 // ============================================================================
+// Bounded ACTIVE Priority Page Extraction (PostgreSQL-side, no full-array load)
+// ============================================================================
+
+interface BoundedActivePriorityRow {
+	goalId: string;
+	priority: number;
+}
+
+/**
+ * Returns at most `limitPlusOne` ACTIVE-goal IDs from the manual priority
+ * ordering, starting immediately after `cursorGoalId` (or, if that ID is no
+ * longer present in the current ordering, after position `cursorFallback`).
+ * The complete `ordered_goal_ids` JSONB array never leaves PostgreSQL --
+ * position lookup and slicing both happen in SQL via `WITH ORDINALITY`.
+ */
+async function fetchBoundedActivePriorityPage(
+	tx: DatabaseOrTransaction,
+	userId: string,
+	midasAccountId: string,
+	cursorGoalId: string | null,
+	cursorFallback: number,
+	limitPlusOne: number,
+): Promise<BoundedActivePriorityRow[]> {
+	const query = sql`
+		WITH latest_priority AS (
+			SELECT ${shortTermGoalPriorityRevisions.orderedGoalIds} AS ordered_goal_ids
+			FROM ${shortTermGoalPriorityRevisions}
+			WHERE ${shortTermGoalPriorityRevisions.midasAccountId} = ${midasAccountId}
+				AND ${shortTermGoalPriorityRevisions.userId} = ${userId}
+			ORDER BY ${shortTermGoalPriorityRevisions.revisionNo} DESC
+			LIMIT 1
+		),
+		elems AS (
+			SELECT t.elem AS goal_id, t.ordinality::int AS ordinality
+			FROM latest_priority,
+				jsonb_array_elements_text(latest_priority.ordered_goal_ids) WITH ORDINALITY AS t(elem, ordinality)
+		),
+		cursor_pos AS (
+			SELECT ordinality FROM elems WHERE goal_id = ${cursorGoalId} LIMIT 1
+		)
+		SELECT goal_id, ordinality
+		FROM elems
+		WHERE ordinality > COALESCE((SELECT ordinality FROM cursor_pos), ${cursorFallback})
+		ORDER BY ordinality
+		LIMIT ${limitPlusOne}
+	`;
+
+	const rawResult = await tx.execute(query);
+	const rows = (Array.isArray(rawResult)
+		? rawResult
+		: ((rawResult as { rows?: unknown[] }).rows ?? [])) as unknown as Array<{
+		goal_id: string;
+		ordinality: number;
+	}>;
+
+	return rows.map((r) => ({
+		goalId: r.goal_id,
+		priority: Number(r.ordinality),
+	}));
+}
+
+// ============================================================================
 // Bounded Keyset Query
 // ============================================================================
 
@@ -215,46 +280,29 @@ export async function listBoundedShortTermGoals({
 			);
 		}
 
-		// 1. Fetch latest priority revision for active goals ordering
-		const [latestPriority] = await tx
-			.select({
-				id: shortTermGoalPriorityRevisions.id,
-				orderedGoalIds: shortTermGoalPriorityRevisions.orderedGoalIds,
-			})
-			.from(shortTermGoalPriorityRevisions)
-			.where(
-				and(
-					eq(
-						shortTermGoalPriorityRevisions.midasAccountId,
-						resolvedMidasAccountId,
-					),
-					eq(shortTermGoalPriorityRevisions.userId, validUserId),
-				),
-			)
-			.orderBy(desc(shortTermGoalPriorityRevisions.revisionNo))
-			.limit(1);
-
-		const orderedGoalIds = (latestPriority?.orderedGoalIds as string[]) ?? [];
+		// Priority number (1-based position in the manual ACTIVE ordering) is
+		// populated only for the bounded candidate IDs actually returned below --
+		// the complete ordered_goal_ids array is never loaded into this map.
 		const priorityMap = new Map<string, number>();
-		orderedGoalIds.forEach((id, idx) => {
-			priorityMap.set(id, idx + 1);
-		});
 
 		// 2. Select the bounded list of goal IDs (limit + 1)
 		const candidateGoalIds: string[] = [];
 
 		if (status === "ACTIVE") {
-			let startIndex = 0;
-			if (effectiveCursor) {
-				const idx = orderedGoalIds.indexOf(effectiveCursor.id);
-				if (idx !== -1) {
-					startIndex = idx + 1;
-				} else if (effectiveCursor.priority !== null) {
-					startIndex = effectiveCursor.priority;
-				}
+			const cursorGoalId = effectiveCursor?.id ?? null;
+			const cursorFallback = effectiveCursor?.priority ?? 0;
+			const activeRows = await fetchBoundedActivePriorityPage(
+				tx,
+				validUserId,
+				resolvedMidasAccountId,
+				cursorGoalId,
+				cursorFallback,
+				limit + 1,
+			);
+			for (const row of activeRows) {
+				candidateGoalIds.push(row.goalId);
+				priorityMap.set(row.goalId, row.priority);
 			}
-			const pageIds = orderedGoalIds.slice(startIndex, startIndex + limit + 1);
-			candidateGoalIds.push(...pageIds);
 		} else if (status === "COMPLETED" || status === "CANCELLED") {
 			// Terminal goals bounded query via SQL
 			const latestRevSubquery = tx
@@ -359,20 +407,26 @@ export async function listBoundedShortTermGoals({
 				candidateGoalIds.push(...terminalRows.map((r) => r.id));
 			} else {
 				// Starting from active section
-				let startActiveIndex = 0;
-				if (effectiveCursor && effectiveCursor.priority !== null) {
-					const idx = orderedGoalIds.indexOf(effectiveCursor.id);
-					if (idx !== -1) {
-						startActiveIndex = idx + 1;
-					} else {
-						startActiveIndex = effectiveCursor.priority;
-					}
-				}
-				const activeSlice = orderedGoalIds.slice(
-					startActiveIndex,
-					startActiveIndex + limit + 1,
+				const cursorGoalId =
+					effectiveCursor && effectiveCursor.priority !== null
+						? effectiveCursor.id
+						: null;
+				const cursorFallback =
+					effectiveCursor && effectiveCursor.priority !== null
+						? effectiveCursor.priority
+						: 0;
+				const activeRows = await fetchBoundedActivePriorityPage(
+					tx,
+					validUserId,
+					resolvedMidasAccountId,
+					cursorGoalId,
+					cursorFallback,
+					limit + 1,
 				);
-				candidateGoalIds.push(...activeSlice);
+				for (const row of activeRows) {
+					candidateGoalIds.push(row.goalId);
+					priorityMap.set(row.goalId, row.priority);
+				}
 
 				if (candidateGoalIds.length < limit + 1) {
 					const remainingNeeded = limit + 1 - candidateGoalIds.length;
@@ -441,9 +495,10 @@ export async function listBoundedShortTermGoals({
 			goalMap.set(g.id, g);
 		}
 
-		// 4. Fetch latest revisions for the bounded candidate IDs
+		// 4. Fetch exactly the current/latest revision per bounded candidate goal
+		// (PostgreSQL DISTINCT ON, not the full append-only revision history).
 		const revRows = await tx
-			.select()
+			.selectDistinctOn([shortTermGoalRevisions.goalId])
 			.from(shortTermGoalRevisions)
 			.where(
 				and(
@@ -451,16 +506,18 @@ export async function listBoundedShortTermGoals({
 					inArray(shortTermGoalRevisions.goalId, candidateGoalIds),
 				),
 			)
-			.orderBy(desc(shortTermGoalRevisions.revisionNo));
+			.orderBy(
+				shortTermGoalRevisions.goalId,
+				desc(shortTermGoalRevisions.revisionNo),
+			);
 
 		const latestRevMap = new Map<string, (typeof revRows)[0]>();
 		for (const r of revRows) {
-			if (!latestRevMap.has(r.goalId)) {
-				latestRevMap.set(r.goalId, r);
-			}
+			latestRevMap.set(r.goalId, r);
 		}
 
-		// 5. Fetch bucket balances for only the bounded candidate buckets
+		// 5. Aggregate bucket balances in PostgreSQL for only the bounded
+		// candidate buckets -- raw transfer-history rows never reach Node.
 		const bucketIds = goalRows.map((g) => g.midasBucketId);
 		const bucketBalanceMap = new Map<string, bigint>();
 		for (const bId of bucketIds) {
@@ -468,35 +525,38 @@ export async function listBoundedShortTermGoals({
 		}
 
 		if (bucketIds.length > 0) {
-			const transfers = await tx
-				.select({
-					fromBucketId: midasAllocationTransfers.fromBucketId,
-					toBucketId: midasAllocationTransfers.toBucketId,
-					amount: midasAllocationTransfers.amount,
-				})
-				.from(midasAllocationTransfers)
-				.where(
-					and(
-						eq(midasAllocationTransfers.midasAccountId, resolvedMidasAccountId),
-						or(
-							inArray(midasAllocationTransfers.toBucketId, bucketIds),
-							inArray(midasAllocationTransfers.fromBucketId, bucketIds),
-						),
-					),
-				);
+			const bucketIdList = sql.join(
+				bucketIds.map((id) => sql`${id}`),
+				sql`, `,
+			);
 
-			for (const t of transfers) {
-				const parsed = parseMoneyString(t.amount);
-				if (t.toBucketId && bucketBalanceMap.has(t.toBucketId)) {
+			const balanceQuery = sql`
+				SELECT bucket_id, COALESCE(SUM(delta), 0)::text AS total
+				FROM (
+					SELECT ${midasAllocationTransfers.toBucketId} AS bucket_id, ${midasAllocationTransfers.amount} AS delta
+					FROM ${midasAllocationTransfers}
+					WHERE ${midasAllocationTransfers.midasAccountId} = ${resolvedMidasAccountId}
+						AND ${midasAllocationTransfers.toBucketId} IN (${bucketIdList})
+					UNION ALL
+					SELECT ${midasAllocationTransfers.fromBucketId} AS bucket_id, -${midasAllocationTransfers.amount} AS delta
+					FROM ${midasAllocationTransfers}
+					WHERE ${midasAllocationTransfers.midasAccountId} = ${resolvedMidasAccountId}
+						AND ${midasAllocationTransfers.fromBucketId} IN (${bucketIdList})
+				) bucket_deltas
+				GROUP BY bucket_id
+			`;
+
+			const rawBalanceResult = await tx.execute(balanceQuery);
+			const balanceRows = (Array.isArray(rawBalanceResult)
+				? rawBalanceResult
+				: ((rawBalanceResult as { rows?: unknown[] }).rows ??
+					[])) as unknown as Array<{ bucket_id: string; total: string }>;
+
+			for (const row of balanceRows) {
+				if (bucketBalanceMap.has(row.bucket_id)) {
 					bucketBalanceMap.set(
-						t.toBucketId,
-						(bucketBalanceMap.get(t.toBucketId) ?? 0n) + parsed.cents,
-					);
-				}
-				if (t.fromBucketId && bucketBalanceMap.has(t.fromBucketId)) {
-					bucketBalanceMap.set(
-						t.fromBucketId,
-						(bucketBalanceMap.get(t.fromBucketId) ?? 0n) - parsed.cents,
+						row.bucket_id,
+						parseSignedAggregateMoneyString(row.total).cents,
 					);
 				}
 			}
@@ -571,6 +631,154 @@ export async function listBoundedShortTermGoals({
 			goals: page,
 			hasMore,
 			nextCursor,
+		};
+	});
+}
+
+// ============================================================================
+// Revision-Scoped DTO (historical-replay-safe mutation response)
+// ============================================================================
+
+/**
+ * Builds the product DTO for exactly one goal revision (by revisionId), not
+ * "whatever the latest revision currently is". This is the historical-replay
+ * fixture used by mutation routes: when an idempotency key resolves to an
+ * earlier revision (a later key has since advanced the goal further), the
+ * caller must see the source-authoritative snapshot owned by their key, not
+ * the goal's current live configuration. Funding metrics remain live -- the
+ * Midas allocation ledger is an independent append-only stream, not owned by
+ * any single goal-configuration revision.
+ */
+export async function buildShortTermGoalProductDtoForRevision(
+	db: Database,
+	userId: string,
+	goalId: string,
+	revisionId: string,
+): Promise<ShortTermGoalProductDto> {
+	const validUserId = validateCanonicalUuid(userId, "userId");
+	const validGoalId = validateCanonicalUuid(goalId, "goalId");
+
+	return await db.transaction(async (tx) => {
+		const [goal] = await tx
+			.select()
+			.from(shortTermGoals)
+			.where(
+				and(
+					eq(shortTermGoals.id, validGoalId),
+					eq(shortTermGoals.userId, validUserId),
+				),
+			)
+			.limit(1);
+		if (!goal) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_NOT_FOUND",
+				"Short-term goal not found",
+			);
+		}
+
+		const [rev] = await tx
+			.select()
+			.from(shortTermGoalRevisions)
+			.where(
+				and(
+					eq(shortTermGoalRevisions.id, revisionId),
+					eq(shortTermGoalRevisions.userId, validUserId),
+					eq(shortTermGoalRevisions.goalId, validGoalId),
+				),
+			)
+			.limit(1);
+		if (!rev) {
+			throw new ShortTermGoalError(
+				"SHORT_TERM_GOAL_NOT_FOUND",
+				"Short-term goal revision not found",
+			);
+		}
+
+		// Live bucket balance -- exactly one bucket, bounded aggregate.
+		const balanceQuery = sql`
+			SELECT COALESCE(SUM(delta), 0)::text AS total
+			FROM (
+				SELECT ${midasAllocationTransfers.amount} AS delta
+				FROM ${midasAllocationTransfers}
+				WHERE ${midasAllocationTransfers.midasAccountId} = ${goal.midasAccountId}
+					AND ${midasAllocationTransfers.toBucketId} = ${goal.midasBucketId}
+				UNION ALL
+				SELECT -${midasAllocationTransfers.amount} AS delta
+				FROM ${midasAllocationTransfers}
+				WHERE ${midasAllocationTransfers.midasAccountId} = ${goal.midasAccountId}
+					AND ${midasAllocationTransfers.fromBucketId} = ${goal.midasBucketId}
+			) bucket_deltas
+		`;
+		const rawBalanceResult = await tx.execute(balanceQuery);
+		const balanceRows = (Array.isArray(rawBalanceResult)
+			? rawBalanceResult
+			: ((rawBalanceResult as { rows?: unknown[] }).rows ??
+				[])) as unknown as Array<{ total: string }>;
+		const balanceCents = parseSignedAggregateMoneyString(
+			balanceRows[0]?.total ?? "0",
+		).cents;
+
+		const targetCents = parseMoneyString(rev.fundingTarget).cents;
+		const {
+			accumulatedAmount,
+			remainingToTarget,
+			fundingStatus,
+			progressPercentage,
+		} = deriveFundingMetrics(balanceCents, targetCents);
+
+		// Priority reflects the CURRENT manual ordering (best-effort, null if
+		// this revision's status is not ACTIVE or the goal is not present).
+		let priority: number | null = null;
+		if (rev.status === "ACTIVE") {
+			const posQuery = sql`
+				WITH latest_priority AS (
+					SELECT ${shortTermGoalPriorityRevisions.orderedGoalIds} AS ordered_goal_ids
+					FROM ${shortTermGoalPriorityRevisions}
+					WHERE ${shortTermGoalPriorityRevisions.midasAccountId} = ${goal.midasAccountId}
+						AND ${shortTermGoalPriorityRevisions.userId} = ${validUserId}
+					ORDER BY ${shortTermGoalPriorityRevisions.revisionNo} DESC
+					LIMIT 1
+				)
+				SELECT t.ordinality::int AS ordinality
+				FROM latest_priority,
+					jsonb_array_elements_text(latest_priority.ordered_goal_ids) WITH ORDINALITY AS t(elem, ordinality)
+				WHERE t.elem = ${validGoalId}
+				LIMIT 1
+			`;
+			const rawPosResult = await tx.execute(posQuery);
+			const posRows = (Array.isArray(rawPosResult)
+				? rawPosResult
+				: ((rawPosResult as { rows?: unknown[] }).rows ??
+					[])) as unknown as Array<{ ordinality: number }>;
+			priority = posRows[0] ? Number(posRows[0].ordinality) : null;
+		}
+
+		return {
+			goalId: goal.id,
+			midasAccountId: goal.midasAccountId,
+			midasBucketId: goal.midasBucketId,
+			status: rev.status as ShortTermGoalStatus,
+			name: rev.name,
+			fundingTarget: rev.fundingTarget,
+			accumulatedAmount,
+			remainingToTarget,
+			fundingStatus,
+			progressPercentage,
+			targetDate: rev.targetDate,
+			maxBudget: rev.maxBudget,
+			targetPrice: rev.targetPrice,
+			productUrl: rev.productUrl,
+			note: rev.note,
+			priority,
+			latestRevisionNo: rev.revisionNo,
+			createdAt:
+				goal.createdAt instanceof Date
+					? goal.createdAt.toISOString()
+					: String(goal.createdAt),
+			updatedAt:
+				rev.occurredAt instanceof Date
+					? rev.occurredAt.toISOString()
+					: String(rev.occurredAt),
 		};
 	});
 }

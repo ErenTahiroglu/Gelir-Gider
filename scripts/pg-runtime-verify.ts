@@ -18703,6 +18703,123 @@ async function resolverRuntime7B7() {
 		const badCursorLT = await httpCall(`/long-term/tasks?midasAccountId=${midasAccIdA}&after=invalid-base64`, { method: "GET", token: tokenA });
 		eqD(badCursorLT.status, 400, "7B.7-Q4: Malformed LT cursor returns 400");
 
+		// --- Unsupported cursor version (v:2) permanent HTTP/DB proof ---
+		const bumpCursorVersion = (rawCursor: string): string => {
+			const decoded = JSON.parse(
+				Buffer.from(rawCursor, "base64url").toString("utf8"),
+			);
+			decoded.v = 2;
+			return Buffer.from(JSON.stringify(decoded), "utf8").toString(
+				"base64url",
+			);
+		};
+
+		const stgV2Cursor = bumpCursorVersion(realStgCursor);
+		const stgV2Res = await httpCall(
+			`/short-term-goals?midasAccountId=${midasAccIdA}&status=ACTIVE&after=${encodeURIComponent(stgV2Cursor)}`,
+			{ method: "GET", token: tokenA },
+		);
+		eqD(stgV2Res.status, 400, "7B.7-Q5: STG v:2 cursor rejected (400)");
+		eqD(stgV2Res.json?.error?.code, "SHORT_TERM_GOAL_INVALID_INPUT", "7B.7-Q5: STG v:2 cursor error is SHORT_TERM_GOAL_INVALID_INPUT");
+
+		const midasV2Cursor = bumpCursorVersion(realMidasCursor);
+		const midasV2Res = await httpCall(
+			`/midas/transfers?midasAccountId=${midasAccIdA}&bucketId=${goal1BucketId}&after=${encodeURIComponent(midasV2Cursor)}`,
+			{ method: "GET", token: tokenA },
+		);
+		eqD(midasV2Res.status, 400, "7B.7-Q5: Midas v:2 cursor rejected (400)");
+		eqD(midasV2Res.json?.error?.code, "MIDAS_INVALID_INPUT", "7B.7-Q5: Midas v:2 cursor error is MIDAS_INVALID_INPUT");
+
+		const ltV2Cursor = bumpCursorVersion(realLtCursor);
+		const ltV2Res = await httpCall(
+			`/long-term/tasks?midasAccountId=${midasAccIdA}&status=PENDING&after=${encodeURIComponent(ltV2Cursor)}`,
+			{ method: "GET", token: tokenA },
+		);
+		eqD(ltV2Res.status, 400, "7B.7-Q5: Long-Term v:2 cursor rejected (400)");
+		eqD(ltV2Res.json?.error?.code, "LONG_TERM_INVALID_INPUT", "7B.7-Q5: Long-Term v:2 cursor error is LONG_TERM_INVALID_INPUT");
+
+		// --- Mixed ACTIVE/Terminal pagination page-boundary regression ---
+		// Force the page split to land exactly on the ACTIVE -> terminal seam:
+		// page 1 ends on the very last ACTIVE goal, page 2 must begin on the
+		// first terminal goal, with zero duplicates or skips across the seam.
+		// Uses User B's Midas account (midasAccIdB), which has zero short-term
+		// goals so far, for an exact small-count fixture free of interference
+		// from the earlier >100-item bulk traversal fixture on User A.
+		const bndActive1 = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "stg-bnd-active-1",
+			body: { midasAccountId: midasAccIdB, name: "Boundary Active 1", fundingTarget: "100.00", occurredAt: "2026-06-16T00:00:00.000Z" },
+		});
+		eqD(bndActive1.status, 201, "7B.7-T1: Boundary ACTIVE goal 1 created");
+		const bndActive2 = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "stg-bnd-active-2",
+			body: { midasAccountId: midasAccIdB, name: "Boundary Active 2", fundingTarget: "100.00", occurredAt: "2026-06-16T00:01:00.000Z" },
+		});
+		eqD(bndActive2.status, 201, "7B.7-T1: Boundary ACTIVE goal 2 created");
+		const bndActive3 = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "stg-bnd-active-3",
+			body: { midasAccountId: midasAccIdB, name: "Boundary Active 3", fundingTarget: "100.00", occurredAt: "2026-06-16T00:02:00.000Z" },
+		});
+		eqD(bndActive3.status, 201, "7B.7-T1: Boundary ACTIVE goal 3 created");
+
+		const activeOnlyRef = await httpCall(`/short-term-goals?midasAccountId=${midasAccIdB}&status=ACTIVE&limit=100`, { method: "GET", token: tokenB });
+		chkD(activeOnlyRef.json?.hasMore === false, "7B.7-T1: ACTIVE-only reference listing fits in a single page");
+		const activeOnlyIds = (activeOnlyRef.json?.goals ?? []).map((g: any) => g.goalId);
+		eqD(activeOnlyIds.length, 3, "7B.7-T1: Baseline ACTIVE count is exactly 3");
+
+		const bndGoal1 = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "stg-bnd-1",
+			body: { midasAccountId: midasAccIdB, name: "Boundary Terminal 1", fundingTarget: "100.00", occurredAt: "2026-06-16T00:10:00.000Z" },
+		});
+		const bndGoal1Id = bndGoal1.json?.goal?.goalId;
+		const completeBnd1 = await httpCall(`/short-term-goals/${bndGoal1Id}/complete`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "stg-bnd-1-complete",
+			body: { expectedRevisionNo: 1, occurredAt: "2026-06-16T00:15:00.000Z" },
+		});
+		eqD(completeBnd1.status, 200, "7B.7-T1: Boundary terminal goal 1 completed");
+
+		const bndGoal2 = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "stg-bnd-2",
+			body: { midasAccountId: midasAccIdB, name: "Boundary Terminal 2", fundingTarget: "100.00", occurredAt: "2026-06-16T00:20:00.000Z" },
+		});
+		const bndGoal2Id = bndGoal2.json?.goal?.goalId;
+		const completeBnd2 = await httpCall(`/short-term-goals/${bndGoal2Id}/complete`, {
+			method: "POST",
+			token: tokenB,
+			idempotencyKey: "stg-bnd-2-complete",
+			body: { expectedRevisionNo: 1, occurredAt: "2026-06-16T00:25:00.000Z" },
+		});
+		eqD(completeBnd2.status, 200, "7B.7-T1: Boundary terminal goal 2 completed");
+
+		const boundaryPage1 = await httpCall(`/short-term-goals?midasAccountId=${midasAccIdB}&limit=3`, { method: "GET", token: tokenB });
+		eqD(boundaryPage1.status, 200, "7B.7-T1: Boundary page 1 (status omitted) returns 200");
+		const page1Ids = (boundaryPage1.json?.goals ?? []).map((g: any) => g.goalId);
+		eqD(page1Ids, activeOnlyIds, "7B.7-T1: Boundary page 1 exactly matches the ACTIVE-only reference listing (final item is the last ACTIVE goal)");
+		chkD(boundaryPage1.json?.hasMore === true, "7B.7-T1: Boundary page 1 reports hasMore=true (terminal items remain beyond the seam)");
+		const page1Cursor = boundaryPage1.json?.nextCursor;
+		chkD(typeof page1Cursor === "string" && page1Cursor.length > 0, "7B.7-T1: Boundary page 1 nextCursor obtained");
+
+		const boundaryPage2 = await httpCall(`/short-term-goals?midasAccountId=${midasAccIdB}&limit=10&after=${encodeURIComponent(page1Cursor)}`, { method: "GET", token: tokenB });
+		eqD(boundaryPage2.status, 200, "7B.7-T1: Boundary page 2 (crossing the seam) returns 200");
+		const page2Items: Array<{ goalId: string; status: string }> = boundaryPage2.json?.goals ?? [];
+		eqD(page2Items.length, 2, "7B.7-T1: Boundary page 2 returns exactly the 2 terminal goals");
+		chkD(page2Items.every((g) => g.status !== "ACTIVE"), "7B.7-T1: Every item on boundary page 2 is terminal (crossed the seam correctly, not re-listing ACTIVE items)");
+		chkD(page2Items.some((g) => g.goalId === bndGoal1Id) && page2Items.some((g) => g.goalId === bndGoal2Id), "7B.7-T1: Boundary page 2 includes both newly-created boundary terminal goals");
+		const seamOverlap = page2Items.filter((g) => page1Ids.includes(g.goalId));
+		eqD(seamOverlap.length, 0, "7B.7-T1: Zero goal IDs duplicated across the ACTIVE/terminal page-boundary seam");
+		chkD(boundaryPage2.json?.hasMore === false, "7B.7-T1: Boundary page 2 is the final page (no further items)");
+
 		// --- 7. Permanent HTTP->DB Idempotency / Historical Replay Proof ---
 		// Short-Term Goals idempotency
 		const exactCreateGoalReplay = await httpCall("/short-term-goals", {
@@ -18734,6 +18851,169 @@ async function resolverRuntime7B7() {
 			},
 		});
 		eqD(conflictCreateGoal.status, 409, "7B.7-R1: Conflicting STG create replay returns 409");
+
+		// --- 7B. Short-Term Goals: UPDATE / FUND / RELEASE historical-replay proof ---
+		const createGoalR1B = await httpCall("/short-term-goals", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-create",
+			body: {
+				midasAccountId: midasAccIdA,
+				name: "R1B Goal",
+				fundingTarget: "10000.00",
+				occurredAt: "2026-06-15T00:00:00.000Z",
+			},
+		});
+		eqD(createGoalR1B.status, 201, "7B.7-R1B: Create dedicated goal returns 201");
+		const goalR1BId = createGoalR1B.json?.goal?.goalId;
+		const goalR1BBucketId = createGoalR1B.json?.goal?.midasBucketId;
+
+		// UPDATE chain: revision 1 -> K1 -> revision 2 -> K2 -> revision 3
+		const updateK1 = await httpCall(`/short-term-goals/${goalR1BId}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-update-k1",
+			body: {
+				expectedRevisionNo: 1,
+				name: "R1B Goal V1",
+				occurredAt: "2026-06-15T01:00:00.000Z",
+			},
+		});
+		eqD(updateK1.status, 200, "7B.7-R1B: UPDATE K1 returns 200");
+		eqD(updateK1.json?.goal?.latestRevisionNo, 2, "7B.7-R1B: UPDATE K1 produces revision 2");
+		eqD(updateK1.json?.goal?.name, "R1B Goal V1", "7B.7-R1B: UPDATE K1 name is V1");
+
+		const updateK2 = await httpCall(`/short-term-goals/${goalR1BId}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-update-k2",
+			body: {
+				expectedRevisionNo: 2,
+				name: "R1B Goal V2",
+				occurredAt: "2026-06-15T02:00:00.000Z",
+			},
+		});
+		eqD(updateK2.status, 200, "7B.7-R1B: UPDATE K2 returns 200");
+		eqD(updateK2.json?.goal?.latestRevisionNo, 3, "7B.7-R1B: UPDATE K2 produces revision 3");
+		eqD(updateK2.json?.goal?.name, "R1B Goal V2", "7B.7-R1B: UPDATE K2 name is V2");
+
+		// Exact replay of K1 (goal is now at revision 3 via K2) must return the
+		// historical snapshot K1 owns (revision 2, name V1) -- NOT current revision 3.
+		const replayUpdateK1 = await httpCall(`/short-term-goals/${goalR1BId}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-update-k1",
+			body: {
+				expectedRevisionNo: 1,
+				name: "R1B Goal V1",
+				occurredAt: "2026-06-15T01:00:00.000Z",
+			},
+		});
+		eqD(replayUpdateK1.status, 200, "7B.7-R1B: Replay UPDATE K1 returns 200");
+		eqD(replayUpdateK1.json?.idempotentReplay, true, "7B.7-R1B: Replay UPDATE K1 flagged as replay");
+		eqD(replayUpdateK1.json?.goal?.latestRevisionNo, 2, "7B.7-R1B: Replay UPDATE K1 returns historical revision 2 (NOT current revision 3)");
+		eqD(replayUpdateK1.json?.goal?.name, "R1B Goal V1", "7B.7-R1B: Replay UPDATE K1 returns historical name V1 (NOT current V2)");
+
+		// Conflicting reuse of K1 with a changed payload
+		const conflictUpdateK1 = await httpCall(`/short-term-goals/${goalR1BId}`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-update-k1",
+			body: {
+				expectedRevisionNo: 1,
+				name: "R1B Goal Malicious",
+				occurredAt: "2026-06-15T01:00:00.000Z",
+			},
+		});
+		eqD(conflictUpdateK1.status, 409, "7B.7-R1B: Conflicting UPDATE K1 reuse returns 409");
+
+		// FUND replay proof
+		const fundF1 = await httpCall(`/short-term-goals/${goalR1BId}/fund`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-fund-f1",
+			body: { amount: "3000.00", occurredAt: "2026-06-15T03:00:00.000Z" },
+		});
+		eqD(fundF1.status, 200, "7B.7-R1B: FUND F1 returns 200");
+		const fundF1TransferId = fundF1.json?.funding?.transferId;
+		chkD(typeof fundF1TransferId === "string" && fundF1TransferId.length > 0, "7B.7-R1B: FUND F1 returns a transferId");
+
+		const transfersAfterF1 = await pg.query<{ count: string }>(
+			"select count(*)::text as count from midas_allocation_transfers where to_bucket_id = $1",
+			[goalR1BBucketId],
+		);
+		eqD(Number.parseInt(transfersAfterF1.rows[0].count, 10), 1, "7B.7-R1B: Exactly ONE allocation transfer exists after FUND F1");
+
+		const replayFundF1 = await httpCall(`/short-term-goals/${goalR1BId}/fund`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-fund-f1",
+			body: { amount: "3000.00", occurredAt: "2026-06-15T03:00:00.000Z" },
+		});
+		eqD(replayFundF1.status, 200, "7B.7-R1B: Exact FUND F1 replay returns 200");
+		eqD(replayFundF1.json?.funding?.transferId, fundF1TransferId, "7B.7-R1B: Exact FUND F1 replay returns same transferId");
+		eqD(replayFundF1.json?.idempotentReplay, true, "7B.7-R1B: Exact FUND F1 replay flagged as replay");
+
+		const transfersAfterF1Replay = await pg.query<{ count: string }>(
+			"select count(*)::text as count from midas_allocation_transfers where to_bucket_id = $1",
+			[goalR1BBucketId],
+		);
+		eqD(Number.parseInt(transfersAfterF1Replay.rows[0].count, 10), 1, "7B.7-R1B: FUND F1 replay created NO second allocation transfer");
+
+		const conflictFundF1 = await httpCall(`/short-term-goals/${goalR1BId}/fund`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-fund-f1",
+			body: { amount: "9999.00", occurredAt: "2026-06-15T03:00:00.000Z" },
+		});
+		eqD(conflictFundF1.status, 409, "7B.7-R1B: Conflicting FUND F1 reuse returns 409");
+
+		const goalAfterFund = await httpCall(`/short-term-goals/${goalR1BId}`, { method: "GET", token: tokenA });
+		eqD(goalAfterFund.json?.goal?.accumulatedAmount, "3000.00", "7B.7-R1B: Goal accumulatedAmount is 3000.00 after FUND F1");
+
+		// RELEASE replay proof
+		const releaseR1 = await httpCall(`/short-term-goals/${goalR1BId}/release`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-release-r1",
+			body: { amount: "1000.00", occurredAt: "2026-06-15T04:00:00.000Z" },
+		});
+		eqD(releaseR1.status, 200, "7B.7-R1B: RELEASE R1 returns 200");
+		const releaseR1TransferId = releaseR1.json?.release?.transferId;
+		chkD(typeof releaseR1TransferId === "string" && releaseR1TransferId.length > 0, "7B.7-R1B: RELEASE R1 returns a transferId");
+
+		const transfersAfterR1 = await pg.query<{ count: string }>(
+			"select count(*)::text as count from midas_allocation_transfers where from_bucket_id = $1",
+			[goalR1BBucketId],
+		);
+		eqD(Number.parseInt(transfersAfterR1.rows[0].count, 10), 1, "7B.7-R1B: Exactly ONE release transfer exists after RELEASE R1");
+
+		const replayReleaseR1 = await httpCall(`/short-term-goals/${goalR1BId}/release`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-release-r1",
+			body: { amount: "1000.00", occurredAt: "2026-06-15T04:00:00.000Z" },
+		});
+		eqD(replayReleaseR1.status, 200, "7B.7-R1B: Exact RELEASE R1 replay returns 200");
+		eqD(replayReleaseR1.json?.release?.transferId, releaseR1TransferId, "7B.7-R1B: Exact RELEASE R1 replay returns same transferId");
+		eqD(replayReleaseR1.json?.idempotentReplay, true, "7B.7-R1B: Exact RELEASE R1 replay flagged as replay");
+
+		const transfersAfterR1Replay = await pg.query<{ count: string }>(
+			"select count(*)::text as count from midas_allocation_transfers where from_bucket_id = $1",
+			[goalR1BBucketId],
+		);
+		eqD(Number.parseInt(transfersAfterR1Replay.rows[0].count, 10), 1, "7B.7-R1B: RELEASE R1 replay created NO second release transfer");
+
+		const conflictReleaseR1 = await httpCall(`/short-term-goals/${goalR1BId}/release`, {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "stg-r1b-release-r1",
+			body: { amount: "9999.00", occurredAt: "2026-06-15T04:00:00.000Z" },
+		});
+		eqD(conflictReleaseR1.status, 409, "7B.7-R1B: Conflicting RELEASE R1 reuse returns 409");
+
+		const goalAfterRelease = await httpCall(`/short-term-goals/${goalR1BId}`, { method: "GET", token: tokenA });
+		eqD(goalAfterRelease.json?.goal?.accumulatedAmount, "2000.00", "7B.7-R1B: Goal accumulatedAmount is 2000.00 after RELEASE R1");
 
 		// Midas idempotency & reversal
 		const midasTx1 = await httpCall("/midas/transfers", {

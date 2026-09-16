@@ -1296,7 +1296,15 @@ interface LongTermTaskProductDto {
 
 #### 3. Keyset Pagination & Scope-Bound Cursor Contract
 
-All 7B.7 listing endpoints (`GET /short-term-goals`, `GET /midas/transfers`, `GET /long-term/tasks`) use true bounded PostgreSQL keyset pagination (`limit + 1`, default 50, max 100).
+All 7B.7 listing endpoints (`GET /short-term-goals`, `GET /midas/transfers`, `GET /long-term/tasks`) use true bounded PostgreSQL reads (`limit + 1`, default 50, max 100) — the application never materializes an unbounded candidate set before slicing to a page. The exact bounded shape per domain:
+
+- **Midas Transfers**: a single bounded keyset SQL query (`ORDER BY occurred_at DESC, id DESC LIMIT limit + 1`) over the transfer history. Unchanged since 7B.7.
+- **Long-Term Tasks**: a single bounded keyset SQL query (`ORDER BY created_at DESC, id ASC LIMIT limit + 1`) with user/status/Midas-account/cursor predicates applied in SQL.
+- **Short-Term Goals** — three cooperating bounded reads, not one query, because ACTIVE goals are manually (drag-and-drop) ordered rather than keyset-orderable:
+  - `status=COMPLETED` / `status=CANCELLED`: a bounded PostgreSQL keyset query (`ORDER BY created_at DESC, id ASC LIMIT limit + 1`), identical in shape to Long-Term's.
+  - `status=ACTIVE`: the manual priority ordering is stored as one JSONB array (`short_term_goal_priority_revisions.ordered_goal_ids`). PostgreSQL — not Node — locates the cursor's position and slices the next `limit + 1` IDs via `jsonb_array_elements_text(...) WITH ORDINALITY`; the full array is never loaded into the application.
+  - `status` omitted (`ALL`): ACTIVE-ordering page extraction (above) runs first; if it returns fewer than `limit + 1` IDs, the bounded terminal keyset query fills the remainder in the same request. A page can legitimately end on the last ACTIVE item and the next page begin on the first terminal item — this exact seam is covered by a permanent regression test.
+  - For all three Short-Term branches, once the bounded candidate goal IDs are known (≤ `limit + 1`), the current/latest revision per goal is fetched via a single `DISTINCT ON (goal_id)` query (not the full per-goal revision history), and each candidate's Midas bucket balance is computed via a single SQL `SUM`/`GROUP BY` aggregate (not raw transfer-history rows) — both bounded to the same ≤ `limit + 1` candidate set.
 
 ##### Cursor Isolation Requirements
 Cursors are opaque base64url-encoded tokens binding the exact normalized logical query scope:
@@ -1310,7 +1318,8 @@ Any cursor scope mismatch returns the domain's sanitized `400` error (e.g. `SHOR
 - Cross-Midas-account cursor reuse
 - Filter shift (e.g. cursor issued under `status=ACTIVE` reused under `status=COMPLETED` or omitted)
 - Bucket shift (e.g. Midas cursor issued with `bucketId=A` reused under `bucketId=B` or omitted)
-- Malformed or invalid version cursors
+- Malformed cursors (invalid base64url/JSON, missing/invalid fields)
+- Unsupported cursor version (`v != 1`) — permanent executable proof for all three domains
 
 #### 4. Error Codes & HTTP Mapping
 
