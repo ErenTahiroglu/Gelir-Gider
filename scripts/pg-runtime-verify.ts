@@ -2905,6 +2905,7 @@ async function resolverRuntime4B() {
 			incomeReceiptId: "b1000000-0000-4000-8000-000000000003",
 			supportRole: "PLANNED_FAMILY_GIFT",
 			idempotencyKey: "sup-gift-4b",
+			occurredAt: RECON_AT,
 		});
 		await classifySupportReceipt({
 			db: s.db,
@@ -2912,6 +2913,7 @@ async function resolverRuntime4B() {
 			incomeReceiptId: "b1000000-0000-4000-8000-000000000004",
 			supportRole: "DEFICIT_FAMILY_SUPPORT",
 			idempotencyKey: "sup-def-4b",
+			occurredAt: RECON_AT,
 		});
 		await s.replica();
 		const { pe: PE1, r: PE1_PAYREV } = await s.mkPay(
