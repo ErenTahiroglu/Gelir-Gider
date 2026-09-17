@@ -1194,7 +1194,7 @@ async function run() {
 				`insert into monthly_budget_plan_revisions
 				 (id, user_id, budget_plan_id, canonical_revision_id, revision_no, previous_budget_revision_id, operation, policy_version, currency,
 				  reference_income_amount, mandatory_ceiling_amount, discretionary_ceiling_amount, short_term_purchase_amount, medium_term_reserve_amount, long_term_investment_amount, reference_snapshot)
-				 values ($1, $2, $3, $4, 1, null, 'CREATE', 'PERSONAL_BUDGET_V1', 'TRY', '10000.00', '4000.00', '2000.00', '1000.00', '500.00', '500.00', '{}')`,
+				 values ($1, $2, $3, $4, 1, null, 'CREATE', 'PERSONAL_BUDGET_V1', 'TRY', '10000.00', '5000.00', '3000.00', '1000.00', '500.00', '500.00', '{}')`,
 				[mcPlanRevId, USER_A, mcPlanId, mcCanonRevId],
 			);
 			await controlClient.query("SET session_replication_role = origin;");
