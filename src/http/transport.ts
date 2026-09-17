@@ -343,6 +343,21 @@ export const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	LONG_TERM_INSUFFICIENT_UNALLOCATED:
 		"Insufficient unallocated Midas liquidity for long-term investment",
 	LONG_TERM_INVALID_STATE: "Long-term investment state transition failed",
+	MONTH_CLOSE_INVALID_INPUT: "Invalid month close request",
+	MONTH_CLOSE_PERIOD_NOT_ENDED: "Month period has not yet ended",
+	MONTH_CLOSE_BUDGET_PLAN_NOT_FOUND: "Monthly budget plan not found for period",
+	MONTH_CLOSE_BUDGET_PLAN_NOT_ACTIVE: "Monthly budget plan is not active",
+	MONTH_CLOSE_UNCLASSIFIED_EXPENSES:
+		"Unclassified expenses exist for this period",
+	MONTH_CLOSE_MIDAS_NOT_FOUND: "Midas account not found",
+	MONTH_CLOSE_INSUFFICIENT_LIQUIDITY:
+		"Insufficient unallocated Midas liquidity",
+	MONTH_CLOSE_STALE_PROPOSAL: "Month close proposal is stale",
+	MONTH_CLOSE_ALREADY_CLOSED: "Month close already exists for this period",
+	MONTH_CLOSE_IDEMPOTENCY_CONFLICT:
+		"Idempotency-Key was already used with a different request",
+	MONTH_CLOSE_INVALID_STATE: "Month close invalid state transition",
+	MONTH_CLOSE_NOT_FOUND: "Month close not found",
 	INVALID_ORIGIN: "Invalid request origin",
 	UNAUTHENTICATED: "Authentication required",
 	NOT_FOUND: "Route not found",

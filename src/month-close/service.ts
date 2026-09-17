@@ -19,14 +19,10 @@ import { MidasError } from "../midas/errors";
 import {
 	createMidasAllocationTransferInTransaction,
 	ensureMidasSingletonBucketInTransaction,
-	getMidasLiquidityStateInTransaction,
 	lockMidasAllocationStateInTransaction,
 } from "../midas/service";
 import { ShortTermGoalError } from "../short-term-goals/errors";
-import {
-	fundShortTermGoal,
-	listShortTermGoalsInTransaction,
-} from "../short-term-goals/service";
+import { fundShortTermGoal } from "../short-term-goals/service";
 import {
 	mapMidasError,
 	mapShortTermGoalError,
@@ -60,6 +56,10 @@ import {
 	computeMonthCloseUnusedCents,
 	formatMonthCloseCents,
 } from "./formula";
+import {
+	fetchRecommendedGoalForMonthClose,
+	getMidasAggregateLiquidityInTransaction,
+} from "./product-read";
 
 const MEDIUM_TERM_RESERVE_BUCKET_CODE = "MEDIUM_TERM_RESERVE";
 const MEDIUM_TERM_RESERVE_BUCKET_NAME = "Medium-Term Reserve";
@@ -499,19 +499,11 @@ async function resolveMonthCloseRoutingInTransaction(
 		return { status: "BLOCKED", reason: "MONTH_CLOSE_MIDAS_NOT_FOUND" };
 	}
 
-	const activeGoals = await listShortTermGoalsInTransaction({
+	const fundable = await fetchRecommendedGoalForMonthClose(
 		tx,
 		userId,
-		midasAccountId: midasAccount.id,
-		status: "ACTIVE",
-	});
-
-	const fundable = activeGoals.find((g) => {
-		const remaining = parseSignedAggregateMoneyString(
-			g.remainingToTarget,
-		).cents;
-		return remaining > 0n;
-	});
+		midasAccount.id,
+	);
 
 	if (fundable) {
 		const remainingCents = parseSignedAggregateMoneyString(
@@ -524,10 +516,10 @@ async function resolveMonthCloseRoutingInTransaction(
 			route: "SHORT_TERM_GOAL",
 			midasAccountId: midasAccount.id,
 			recommendedGoal: {
-				goalId: fundable.id,
-				revisionNo: fundable.latestRevisionNo,
-				priority: fundable.priority as number,
-				bucketId: fundable.midasBucketId,
+				goalId: fundable.goalId,
+				revisionNo: fundable.revisionNo,
+				priority: fundable.priority,
+				bucketId: fundable.bucketId,
 				name: fundable.name,
 				remainingToTarget: fundable.remainingToTarget,
 			},
@@ -748,11 +740,11 @@ export async function previewMonthClose(
 
 		let midasUnallocatedBalance: string | null = null;
 		if (routing.midasAccountId) {
-			const liquidity = await getMidasLiquidityStateInTransaction({
+			const liquidity = await getMidasAggregateLiquidityInTransaction(
 				tx,
 				userId,
-				midasAccountId: routing.midasAccountId,
-			});
+				routing.midasAccountId,
+			);
 			midasUnallocatedBalance = liquidity.unallocatedBalance;
 		}
 
@@ -1273,11 +1265,11 @@ export async function closeMonth(
 					"Midas account is required to route a non-zero month-close surplus",
 				);
 			}
-			const liquidity = await getMidasLiquidityStateInTransaction({
+			const liquidity = await getMidasAggregateLiquidityInTransaction(
 				tx,
 				userId,
-				midasAccountId: routing.midasAccountId,
-			});
+				routing.midasAccountId,
+			);
 			const unallocatedCents = parseSignedAggregateMoneyString(
 				liquidity.unallocatedBalance,
 			).cents;

@@ -82,12 +82,20 @@ vi.mock("../src/midas/service", async (importOriginal) => {
 	};
 });
 
-vi.mock("../src/short-term-goals/service", async (importOriginal) => {
+vi.mock("../src/month-close/product-read", async (importOriginal) => {
 	const actual =
-		await importOriginal<typeof import("../src/short-term-goals/service")>();
+		await importOriginal<typeof import("../src/month-close/product-read")>();
 	return {
 		...actual,
-		listShortTermGoalsInTransaction: vi.fn(async () => []),
+		fetchRecommendedGoalForMonthClose: vi.fn(async () => null),
+		getMidasAggregateLiquidityInTransaction: vi.fn(async () => ({
+			midasAccountId: MIDAS_ACCOUNT_ID,
+			ledgerAccountId: MIDAS_LEDGER_ACCOUNT_ID,
+			currency: "TRY",
+			physicalBalance: "10000.00",
+			totalEarmarked: "0.00",
+			unallocatedBalance: "10000.00",
+		})),
 	};
 });
 

@@ -229,15 +229,48 @@ export function mapLedgerError(err: LedgerError): never {
 }
 
 /**
+ * Unwraps nested .cause properties to recover original domain error instances
+ * if wrapped by Drizzle transaction wrappers.
+ */
+export function unwrapDomainError(err: unknown): unknown {
+	let current: unknown = err;
+	let depth = 0;
+	const visited = new Set<unknown>();
+
+	while (current && depth < 10 && !visited.has(current)) {
+		visited.add(current);
+		depth++;
+
+		if (
+			current instanceof MonthCloseError ||
+			current instanceof MidasError ||
+			current instanceof ShortTermGoalError ||
+			current instanceof LedgerError
+		) {
+			return current;
+		}
+
+		if (typeof current === "object" && current !== null && "cause" in current) {
+			current = (current as { cause?: unknown }).cause;
+		} else {
+			break;
+		}
+	}
+
+	return err;
+}
+
+/**
  * Maps recognized database errors, triggers, and constraint violations into
  * sanitized MonthCloseError instances. No raw SQL/constraint/query/credential
  * data may escape.
  */
 export function mapDbError(err: unknown): never {
-	if (err instanceof MonthCloseError) throw err;
-	if (err instanceof MidasError) mapMidasError(err);
-	if (err instanceof ShortTermGoalError) mapShortTermGoalError(err);
-	if (err instanceof LedgerError) mapLedgerError(err);
+	const unwrapped = unwrapDomainError(err);
+	if (unwrapped instanceof MonthCloseError) throw unwrapped;
+	if (unwrapped instanceof MidasError) mapMidasError(unwrapped);
+	if (unwrapped instanceof ShortTermGoalError) mapShortTermGoalError(unwrapped);
+	if (unwrapped instanceof LedgerError) mapLedgerError(unwrapped);
 	if (!isDatabaseBoundaryError(err)) {
 		throw err;
 	}
@@ -286,10 +319,12 @@ export async function runMonthCloseTransaction<T>(
 	try {
 		return await db.transaction(work);
 	} catch (err: unknown) {
-		if (err instanceof MonthCloseError) throw err;
-		if (err instanceof MidasError) mapMidasError(err);
-		if (err instanceof ShortTermGoalError) mapShortTermGoalError(err);
-		if (err instanceof LedgerError) mapLedgerError(err);
+		const unwrapped = unwrapDomainError(err);
+		if (unwrapped instanceof MonthCloseError) throw unwrapped;
+		if (unwrapped instanceof MidasError) mapMidasError(unwrapped);
+		if (unwrapped instanceof ShortTermGoalError)
+			mapShortTermGoalError(unwrapped);
+		if (unwrapped instanceof LedgerError) mapLedgerError(unwrapped);
 		if (isDatabaseBoundaryError(err)) mapDbError(err);
 		throw err;
 	}
@@ -304,12 +339,17 @@ export async function runMonthCloseReadTransaction<T>(
 	work: (tx: DatabaseTransaction) => Promise<T>,
 ): Promise<T> {
 	try {
-		return await db.transaction(work, { isolationLevel: "repeatable read" });
+		return await db.transaction(work, {
+			isolationLevel: "repeatable read",
+			accessMode: "read only",
+		});
 	} catch (err: unknown) {
-		if (err instanceof MonthCloseError) throw err;
-		if (err instanceof MidasError) mapMidasError(err);
-		if (err instanceof ShortTermGoalError) mapShortTermGoalError(err);
-		if (err instanceof LedgerError) mapLedgerError(err);
+		const unwrapped = unwrapDomainError(err);
+		if (unwrapped instanceof MonthCloseError) throw unwrapped;
+		if (unwrapped instanceof MidasError) mapMidasError(unwrapped);
+		if (unwrapped instanceof ShortTermGoalError)
+			mapShortTermGoalError(unwrapped);
+		if (unwrapped instanceof LedgerError) mapLedgerError(unwrapped);
 		if (isDatabaseBoundaryError(err)) mapDbError(err);
 		throw err;
 	}

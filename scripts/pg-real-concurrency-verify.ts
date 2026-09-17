@@ -55,6 +55,13 @@ import {
 	getLongTermInvestmentTask,
 } from "../src/long-term/service.ts";
 import { LongTermError } from "../src/long-term/errors.ts";
+import {
+	previewMonthClose,
+	applyMonthCloseInTransaction,
+	getMonthCloseDetail,
+} from "../src/month-close/service.ts";
+import { MonthCloseError } from "../src/month-close/errors.ts";
+import { createShortTermGoal } from "../src/short-term-goals/service.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const migDir = path.join(root, "migrations");
@@ -1137,6 +1144,183 @@ async function run() {
 		} catch (test8Err) {
 			console.error("[Test 8 Fatal Error]:", test8Err);
 			bad("Test 8 threw unexpected error", String(test8Err));
+		}
+
+		// --------------------------------------------------------------------------
+		// 9. REAL PG MONTH-CLOSE CONCURRENT CLOSE RACE (DETERMINISTIC BARRIER)
+		// --------------------------------------------------------------------------
+		console.log("\n--- Test 9: Real PG Month-Close Concurrent Close Race ---");
+		try {
+			// Resolve target Midas account ID
+			const targetMidasId =
+				midasAccSetupId ||
+				(
+					await controlClient.query(
+						"select id from midas_accounts where user_id = $1 limit 1",
+						[USER_A],
+					)
+				).rows[0]?.id;
+
+			// Seed monthly budget plan for an ended month (2026-07)
+			const mcPeriod = "2026-07";
+			const mcPeriodDate = "2026-07-01";
+			const mcPlanId = crypto.randomUUID();
+			const mcPlanRevId = crypto.randomUUID();
+			const mcCanonTxId = crypto.randomUUID();
+			const mcCanonRevId = crypto.randomUUID();
+
+			const mcCanonIdemp = `plan-canon-idemp-${mcPeriod}-${crypto.randomUUID()}`;
+			const mcCanonFingerprint = "f".repeat(64);
+
+			await controlClient.query("SET session_replication_role = replica;");
+			await controlClient.query(
+				"insert into canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at) values ($1, $2, 'MONTHLY_BUDGET_PLAN', $3, $4, now())",
+				[mcCanonTxId, USER_A, mcCanonIdemp, mcCanonFingerprint],
+			);
+			await controlClient.query(
+				"insert into monthly_budget_plans (id, user_id, period_month, canonical_transaction_id, created_at) values ($1, $2, $3, $4, now())",
+				[mcPlanId, USER_A, mcPeriodDate, mcCanonTxId],
+			);
+			await controlClient.query(
+				"insert into transaction_revisions (id, user_id, transaction_id, revision_no, operation, occurred_at, payload, revision_fingerprint, idempotency_key) values ($1, $2, $3, 1, 'CREATE', now(), '{}', $4, $5)",
+				[mcCanonRevId, USER_A, mcCanonTxId, mcCanonFingerprint, mcCanonIdemp],
+			);
+			await controlClient.query(
+				`insert into monthly_budget_plan_revisions
+				 (id, user_id, budget_plan_id, canonical_revision_id, revision_no, previous_budget_revision_id, operation, policy_version, currency,
+				  reference_income_amount, mandatory_ceiling_amount, discretionary_ceiling_amount, short_term_purchase_amount, medium_term_reserve_amount, long_term_investment_amount, reference_snapshot)
+				 values ($1, $2, $3, $4, 1, null, 'CREATE', 'PERSONAL_BUDGET_V1', 'TRY', '10000.00', '4000.00', '2000.00', '1000.00', '500.00', '500.00', '{}')`,
+				[mcPlanRevId, USER_A, mcPlanId, mcCanonRevId],
+			);
+			await controlClient.query("SET session_replication_role = origin;");
+
+			// Ensure active short term goal exists for routing/closing
+			const mcGoal = await createShortTermGoal({
+				db: dbA,
+				userId: USER_A,
+				midasAccountId: targetMidasId,
+				name: "Month Close Target Goal",
+				fundingTarget: "5000.00",
+				occurredAt: new Date("2026-07-01T00:00:00Z"),
+				idempotencyKey: "mc-race-stg-init",
+			});
+
+			// Preview month close to get proposal fingerprint
+			const previewRes = await previewMonthClose({
+				db: dbA,
+				userId: USER_A,
+				periodMonth: mcPeriod,
+			});
+			eq(previewRes.previewStatus, "READY", "7B.8/9: month close preview returns status READY");
+			chk(Boolean(previewRes.proposalFingerprint), "7B.8/9: proposal fingerprint generated");
+
+			// Hold exclusive table lock on monthly_budget_plans via control connection
+			await controlClient.query("BEGIN; LOCK TABLE monthly_budget_plans IN ACCESS EXCLUSIVE MODE;");
+
+			const promiseMCA = dbA.transaction((tx: any) =>
+				applyMonthCloseInTransaction(tx, {
+					userId: USER_A,
+					periodMonth: mcPeriod,
+					proposalFingerprint: previewRes.proposalFingerprint!,
+					decision: {
+						type: "FULL",
+						goalId: mcGoal.goal.goalId,
+					},
+					idempotencyKey: "mc-race-key-a",
+				}),
+			);
+
+			const promiseMCB = dbB.transaction((tx: any) =>
+				applyMonthCloseInTransaction(tx, {
+					userId: USER_A,
+					periodMonth: mcPeriod,
+					proposalFingerprint: previewRes.proposalFingerprint!,
+					decision: {
+						type: "FULL",
+						goalId: mcGoal.goal.goalId,
+					},
+					idempotencyKey: "mc-race-key-b",
+				}),
+			);
+
+			// Wait until BOTH competitor backend sessions are objectively observed waiting on monthly_budget_plans in pg_locks
+			const blockedMC = await waitUntilBothCompetitorsBlockedOnRelation(
+				controlClient,
+				"monthly_budget_plans",
+				[pidA, pidB],
+			);
+			ok(
+				"7B.8/9: both independent PostgreSQL competitors observed waiting on monthly_budget_plans before barrier release",
+				`(pidA=${blockedMC.pidA} mode=${blockedMC.modes[pidA]}, pidB=${blockedMC.modes[pidB]})`,
+			);
+
+			// Release barrier
+			await controlClient.query("COMMIT;");
+
+			const [settledMCA, settledMCB] = await Promise.allSettled([
+				promiseMCA,
+				promiseMCB,
+			]);
+
+			const fulfilledMC = [settledMCA, settledMCB].find((s) => s.status === "fulfilled") as
+				| PromiseFulfilledResult<Awaited<ReturnType<typeof applyMonthCloseInTransaction>>>
+				| undefined;
+			const rejectedMC = [settledMCA, settledMCB].find((s) => s.status === "rejected") as
+				| PromiseRejectedResult
+				| undefined;
+
+			chk(fulfilledMC !== undefined, "7B.8/9: exactly one competitor succeeded with month close");
+			chk(rejectedMC !== undefined, "7B.8/9: exactly one competitor was rejected with ALREADY_CLOSED");
+
+			if (fulfilledMC) {
+				eq(fulfilledMC.value.monthClose.periodMonth, mcPeriod, "7B.8/9: winner closed requested periodMonth");
+				eq(fulfilledMC.value.monthClose.status, "CLOSED", "7B.8/9: winner monthClose status is CLOSED");
+				eq(fulfilledMC.value.monthClose.decisionType, "FULL", "7B.8/9: winner decisionType is FULL");
+				eq(fulfilledMC.value.idempotentReplay, false, "7B.8/9: winner idempotentReplay = false");
+				chk(Boolean(fulfilledMC.value.monthClose.monthCloseId), "7B.8/9: winner generated monthCloseId");
+			}
+
+			if (rejectedMC) {
+				chk(rejectedMC.reason instanceof MonthCloseError, "7B.8/9: loser threw typed MonthCloseError");
+				eq(
+					(rejectedMC.reason as MonthCloseError).code,
+					"MONTH_CLOSE_ALREADY_CLOSED",
+					"7B.8/9: loser threw typed MONTH_CLOSE_ALREADY_CLOSED",
+				);
+				chk(
+					!(rejectedMC.reason instanceof pg.DatabaseError),
+					"7B.8/9: raw PostgreSQL 23505 / 25P02 did not escape",
+				);
+			}
+
+			// Exact-once assertions in PostgreSQL
+			const mcRowCount = (
+				await controlClient.query(
+					"select count(*)::int as n from month_closes where user_id = $1 and period_month = $2",
+					[USER_A, mcPeriodDate],
+				)
+			).rows[0].n;
+			eq(mcRowCount, 1, "7B.8/9: exactly ONE month_closes row exists for the period");
+
+			const mcRevRowCount = (
+				await controlClient.query(
+					"select count(*)::int as n from month_close_revisions mcr inner join month_closes mc on mcr.month_close_id = mc.id where mc.user_id = $1 and mc.period_month = $2",
+					[USER_A, mcPeriodDate],
+				)
+			).rows[0].n;
+			eq(mcRevRowCount, 1, "7B.8/9: exactly ONE month_close_revisions row exists (0 partial writes from loser)");
+
+			// Post-race DB usability: getMonthCloseDetail returns closed month
+			const mcDetail = await getMonthCloseDetail({
+				db: dbA,
+				userId: USER_A,
+				periodMonth: mcPeriod,
+			});
+			eq(mcDetail?.periodMonth, mcPeriod, "7B.8/9: post-race getMonthCloseDetail returns closed period");
+			eq(mcDetail?.status, "CLOSED", "7B.8/9: post-race getMonthCloseDetail status is CLOSED");
+		} catch (test9Err) {
+			console.error("[Test 9 Fatal Error]:", test9Err);
+			bad("Test 9 threw unexpected error", String(test9Err));
 		}
 	} catch (fatalErr) {
 		console.error("FATAL RUN ERROR:", fatalErr);

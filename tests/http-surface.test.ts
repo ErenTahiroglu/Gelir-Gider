@@ -33,7 +33,6 @@ describe("Production HTTP Surface & Routing Boundaries", () => {
 			"/budget",
 			"/imports",
 			"/goals",
-			"/month-close",
 			"/api/v1/ledger",
 			"/api/v1/finance",
 		];
@@ -49,7 +48,7 @@ describe("Production HTTP Surface & Routing Boundaries", () => {
 		}
 	});
 
-	it("ensures mounted 7B.1, 7B.2, 7B.3, 7B.4, 7B.5, 7B.6, and 7B.7 financial domain routes reject unauthenticated requests", async () => {
+	it("ensures mounted 7B.1, 7B.2, 7B.3, 7B.4, 7B.5, 7B.6, 7B.7, and 7B.8 financial domain routes reject unauthenticated requests", async () => {
 		const mountedPaths = [
 			"/transactions",
 			"/ledger/accounts",
@@ -64,6 +63,7 @@ describe("Production HTTP Surface & Routing Boundaries", () => {
 			"/short-term-goals",
 			"/midas/liquidity",
 			"/long-term/tasks",
+			"/month-close",
 		];
 		for (const path of mountedPaths) {
 			const res = await app.request(path);

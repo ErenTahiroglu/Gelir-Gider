@@ -19250,6 +19250,702 @@ async function resolverRuntime7B7() {
 	}
 }
 
+async function resolverRuntime7B8() {
+	console.log("\n== CHECKPOINT 7B.8: MONTH-CLOSE PRODUCT SURFACE & PGLITE RUNTIME VERIFICATION ==");
+	const { PGlite } = await import("@electric-sql/pglite");
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const { createSession } = await import("../src/auth/sessions.ts");
+	const { createProductLedgerAccount } = await import("../src/ledger/product-accounts.ts");
+	const { postJournalEntry } = await import("../src/ledger/posting.ts");
+
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 71);
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+
+	const eqD = (a: unknown, b: unknown, name: string) => {
+		if (JSON.stringify(a) === JSON.stringify(b)) {
+			ok(name);
+		} else {
+			bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+		}
+	};
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	// biome-ignore lint/suspicious/noExplicitAny: pg-core drizzle instance
+	const db = drizzle(pg as any) as any;
+	setDatabaseFactoryOverrideForTest(() => db);
+
+	try {
+		const testEnv: AppEnv = {
+			DATABASE_URL: "postgres://mock:mock@localhost:5432/mock",
+			BACKUP_BUCKET: {} as any,
+			AUTH_RATE_LIMITER: {} as any,
+			APP_ORIGIN: "http://localhost:8787",
+			WEBAUTHN_ORIGIN: "http://localhost:8787",
+			WEBAUTHN_RP_ID: "localhost",
+			WEBAUTHN_RP_NAME: "Gelir-Gider",
+		};
+
+		const USER_A = "11111111-eeee-4eee-8eee-111111111111";
+		const USER_B = "22222222-eeee-4eee-8eee-222222222222";
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now())",
+			[USER_A],
+		);
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User B', 'TRY', 'Europe/Istanbul', now())",
+			[USER_B],
+		);
+
+		const { token: tokenA } = await createSession({ db, userId: USER_A });
+		const { token: tokenB } = await createSession({ db, userId: USER_B });
+
+		const httpCall = async (
+			path: string,
+			opts: {
+				method?: string;
+				body?: unknown;
+				token?: string;
+				idempotencyKey?: string;
+				origin?: string;
+			} = {},
+		) => {
+			const headers: Record<string, string> = {};
+			if (opts.token) {
+				headers.Cookie = `__Host-gg_session=${opts.token}`;
+			}
+			if (opts.origin !== undefined) {
+				headers.Origin = opts.origin;
+			} else if (opts.method !== "GET" && opts.method !== "HEAD") {
+				headers.Origin = "http://localhost:8787";
+			}
+			if (opts.idempotencyKey) {
+				headers["Idempotency-Key"] = opts.idempotencyKey;
+			}
+			if (opts.body !== undefined) {
+				headers["Content-Type"] = "application/json";
+			}
+			const res = await app.request(
+				path,
+				{
+					method: opts.method ?? "GET",
+					headers,
+					body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+				},
+				testEnv,
+			);
+			let json: any = null;
+			try {
+				json = await res.json();
+			} catch {}
+			return { status: res.status, json, headers: res.headers };
+		};
+
+		// 1. Provision expense system accounts for User A and User B
+		const { ensureUserExpenseSystemAccountsInTransaction } = await import(
+			"../src/ledger/system-expense-accounts"
+		);
+		const sysAccountsA = await db.transaction((tx: any) =>
+			ensureUserExpenseSystemAccountsInTransaction(tx, USER_A),
+		);
+		const sysAccountsB = await db.transaction((tx: any) =>
+			ensureUserExpenseSystemAccountsInTransaction(tx, USER_B),
+		);
+
+		// Provision Midas Checking accounts with initial liquidity
+		const checkingAccA = await createProductLedgerAccount({
+			db,
+			userId: USER_A,
+			code: "MIDAS_CHK_A",
+			name: "Midas Checking Account A",
+			accountType: "ASSET",
+		});
+		const equityAccA = await createLedgerAccount({
+			db,
+			userId: USER_A,
+			code: "EQUITY_A",
+			name: "Opening Equity A",
+			accountType: "EQUITY",
+		});
+		await postJournalEntry({
+			db,
+			userId: USER_A,
+			occurredAt: new Date("2026-01-01T00:00:00.000Z"),
+			memo: "Opening Midas liquidity",
+			idempotencyKey: "open-midas-liq-a",
+			lines: [
+				{ accountId: checkingAccA.account.id, side: "DEBIT", amount: "100000.00" },
+				{ accountId: equityAccA.id, side: "CREDIT", amount: "100000.00" },
+			],
+		});
+
+		const { createMidasAccount } = await import("../src/midas/service");
+		const midasAccA = await createMidasAccount({
+			db,
+			userId: USER_A,
+			ledgerAccountId: checkingAccA.account.id,
+		});
+		const midasAccIdA = midasAccA.id;
+
+		// Helpers for setting up budget plans and journal expenses
+		const seedBudgetPlan = async (
+			userId: string,
+			periodMonth: string,
+			options: {
+				mandatoryCeiling?: string;
+				discretionaryCeiling?: string;
+				referenceIncome?: string;
+				operation?: "CREATE" | "VOID";
+			} = {},
+		) => {
+			const periodMonthDate = `${periodMonth}-01`;
+			const planId = crypto.randomUUID();
+			const canonTxId = crypto.randomUUID();
+			const canonRevId = crypto.randomUUID();
+			const planRevId = crypto.randomUUID();
+
+			const mandatoryCeiling = options.mandatoryCeiling ?? "5000.00";
+			const discretionaryCeiling = options.discretionaryCeiling ?? "3000.00";
+			const referenceIncome = options.referenceIncome ?? "10000.00";
+			const op = options.operation ?? "CREATE";
+			const canonIdemp = `plan-canon-idemp-${periodMonth}-${crypto.randomUUID()}`;
+			const canonFingerprint = "a".repeat(64);
+
+			await pg.query("SET session_replication_role = replica");
+			await pg.query(
+				"insert into canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at) values ($1, $2, 'MONTHLY_BUDGET_PLAN', $3, $4, now())",
+				[canonTxId, userId, canonIdemp, canonFingerprint],
+			);
+			await pg.query(
+				"insert into monthly_budget_plans (id, user_id, period_month, canonical_transaction_id, created_at) values ($1, $2, $3, $4, now())",
+				[planId, userId, periodMonthDate, canonTxId],
+			);
+			await pg.query(
+				"insert into transaction_revisions (id, user_id, transaction_id, revision_no, operation, occurred_at, payload, revision_fingerprint, idempotency_key) values ($1, $2, $3, 1, 'CREATE', now(), '{}', $4, $5)",
+				[canonRevId, userId, canonTxId, canonFingerprint, canonIdemp],
+			);
+			await pg.query(
+				`insert into monthly_budget_plan_revisions
+				 (id, user_id, budget_plan_id, canonical_revision_id, revision_no, previous_budget_revision_id, operation, policy_version, currency,
+				  reference_income_amount, mandatory_ceiling_amount, discretionary_ceiling_amount, short_term_purchase_amount, medium_term_reserve_amount, long_term_investment_amount, reference_snapshot)
+				 values ($1, $2, $3, $4, 1, null, $5, 'PERSONAL_BUDGET_V1', 'TRY', $6, $7, $8, '1000.00', '500.00', '500.00', '{}')`,
+				[planRevId, userId, planId, canonRevId, op, referenceIncome, mandatoryCeiling, discretionaryCeiling],
+			);
+			await pg.query("SET session_replication_role = origin");
+
+			return { planId, planRevId };
+		};
+
+		const postExpense = async (
+			userId: string,
+			accountId: string,
+			amount: string,
+			occurredAt: string,
+		) => {
+			const entryId = crypto.randomUUID();
+			const postingFingerprint = "b".repeat(64);
+			await pg.query("SET session_replication_role = replica");
+			await pg.query(
+				"insert into journal_entries (id, user_id, status, currency, occurred_at, memo, idempotency_key, posting_fingerprint, posted_at, created_at) values ($1, $2, 'POSTED', 'TRY', $3, 'Test expense', $4, $5, now(), now())",
+				[entryId, userId, occurredAt, `expense-idemp-${crypto.randomUUID()}`, postingFingerprint],
+			);
+			await pg.query(
+				"insert into journal_lines (id, journal_entry_id, account_id, line_no, debit, credit) values ($1, $2, $3, 1, $4, 0)",
+				[crypto.randomUUID(), entryId, accountId, amount],
+			);
+			await pg.query(
+				"insert into journal_lines (id, journal_entry_id, account_id, line_no, debit, credit) values ($1, $2, $3, 2, 0, $4)",
+				[crypto.randomUUID(), entryId, equityAccA.id, amount],
+			);
+			await pg.query("SET session_replication_role = origin");
+		};
+
+		// --- 1. Preview Endpoints & Strict Read-Only Semantics ---
+		console.log("--- 1. Preview Endpoints ---");
+		// Seed future plan for 2026-10 (not yet ended)
+		await seedBudgetPlan(USER_A, "2026-10");
+		const prevFutRes = await httpCall("/month-close/preview?periodMonth=2026-10", { method: "GET", token: tokenA });
+		eqD(prevFutRes.status, 200, "7B.8-A: Preview allowed before period ends (200 OK)");
+		chkD(Boolean(prevFutRes.json?.proposalFingerprint), "7B.8-A: Proposal fingerprint returned in preview");
+		eqD(prevFutRes.json?.periodMonth, "2026-10", "7B.8-A: Correct periodMonth in preview");
+		eqD(prevFutRes.json?.blockedReason, null, "7B.8-A: blockedReason is null for unblocked future period");
+
+		// Blocked preview: unclassified expenses > 0
+		await postExpense(USER_A, sysAccountsA.UNCLASSIFIED_EXPENSE, "50.00", "2026-10-15T12:00:00.000Z");
+		const prevUnclassRes = await httpCall("/month-close/preview?periodMonth=2026-10", { method: "GET", token: tokenA });
+		eqD(prevUnclassRes.status, 200, "7B.8-B: Blocked preview returns 200 OK with details");
+		eqD(prevUnclassRes.json?.route, "BLOCKED", "7B.8-B: Blocked route is BLOCKED");
+		eqD(prevUnclassRes.json?.blockedReason, "MONTH_CLOSE_UNCLASSIFIED_EXPENSES", "7B.8-B: blockedReason is MONTH_CLOSE_UNCLASSIFIED_EXPENSES");
+		eqD(prevUnclassRes.json?.unclassifiedExpense, "50.00", "7B.8-B: unclassifiedExpense real value 50.00 returned");
+
+		// Blocked preview: inactive budget plan
+		await seedBudgetPlan(USER_A, "2026-11", { operation: "VOID" });
+		const prevVoidPlanRes = await httpCall("/month-close/preview?periodMonth=2026-11", { method: "GET", token: tokenA });
+		eqD(prevVoidPlanRes.status, 200, "7B.8-C: Void budget plan preview returns 200");
+		eqD(prevVoidPlanRes.json?.route, "BLOCKED", "7B.8-C: Route is BLOCKED");
+		eqD(prevVoidPlanRes.json?.blockedReason, "MONTH_CLOSE_BUDGET_PLAN_NOT_ACTIVE", "7B.8-C: blockedReason is MONTH_CLOSE_BUDGET_PLAN_NOT_ACTIVE");
+
+		// Blocked preview: missing budget plan
+		const prevMissingPlanRes = await httpCall("/month-close/preview?periodMonth=2026-12", { method: "GET", token: tokenA });
+		eqD(prevMissingPlanRes.status, 200, "7B.8-D: Missing budget plan preview returns 200");
+		eqD(prevMissingPlanRes.json?.route, "BLOCKED", "7B.8-D: Route is BLOCKED");
+		eqD(prevMissingPlanRes.json?.blockedReason, "MONTH_CLOSE_BUDGET_PLAN_NOT_FOUND", "7B.8-D: blockedReason is MONTH_CLOSE_BUDGET_PLAN_NOT_FOUND");
+
+		// Unauthenticated preview -> 401
+		const unauthPrev = await httpCall("/month-close/preview?periodMonth=2026-10", { method: "GET" });
+		eqD(unauthPrev.status, 401, "7B.8-E: Unauthenticated preview returns 401");
+
+		// Malformed preview queries
+		const malfPrev1 = await httpCall("/month-close/preview?periodMonth=invalid", { method: "GET", token: tokenA });
+		eqD(malfPrev1.status, 400, "7B.8-F: Malformed periodMonth query returns 400");
+		const malfPrev2 = await httpCall("/month-close/preview?periodMonth=2026-10&extra=1", { method: "GET", token: tokenA });
+		eqD(malfPrev2.status, 400, "7B.8-F: Extra query param on preview returns 400");
+
+		// --- 2. Period Gate for Mutation (Close) ---
+		console.log("--- 2. Period Gate for Mutation ---");
+		const closeNotEndedRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-not-ended-1",
+			body: {
+				periodMonth: "2026-10",
+				expectedProposalFingerprint: prevFutRes.json?.proposalFingerprint,
+				decision: "FULL",
+				occurredAt: "2026-10-15T12:00:00.000Z",
+			},
+		});
+		eqD(closeNotEndedRes.status, 409, "7B.8-G: Closing non-ended period returns 409");
+		eqD(closeNotEndedRes.json?.error?.code, "MONTH_CLOSE_PERIOD_NOT_ENDED", "7B.8-G: Error code is MONTH_CLOSE_PERIOD_NOT_ENDED");
+
+		// --- 3. Economic Decisions on Ended Periods ---
+		console.log("--- 3. Economic Decisions ---");
+		// Create Short-Term Goals for User A
+		const { createShortTermGoal, completeShortTermGoal, releaseShortTermGoalFunding } = await import("../src/short-term-goals/service");
+		const goal1 = await createShortTermGoal({
+			db,
+			userId: USER_A,
+			midasAccountId: midasAccIdA,
+			name: "Goal 1 - Laptop",
+			fundingTarget: "1500.00",
+			occurredAt: new Date("2026-05-01T00:00:00.000Z"),
+			idempotencyKey: "goal-1-init",
+		});
+
+		// Period 2026-05: SHORT_TERM_GOAL + FULL
+		await seedBudgetPlan(USER_A, "2026-05", { mandatoryCeiling: "5000.00", discretionaryCeiling: "3000.00" });
+		await postExpense(USER_A, sysAccountsA.MANDATORY_EXPENSE, "4000.00", "2026-05-10T12:00:00.000Z");
+		await postExpense(USER_A, sysAccountsA.DISCRETIONARY_EXPENSE, "2000.00", "2026-05-12T12:00:00.000Z");
+		// Surplus: mandatory unused 1000 + discretionary unused 1000 = 2000.00. Goal 1 remaining = 1500.00. Full offer = 1500.00, unrouted = 500.00
+
+		const prevMay = await httpCall("/month-close/preview?periodMonth=2026-05", { method: "GET", token: tokenA });
+		eqD(prevMay.status, 200, "7B.8-H: Preview 2026-05 returns 200");
+		eqD(prevMay.json?.route, "SHORT_TERM_GOAL", "7B.8-H: Route is SHORT_TERM_GOAL");
+		eqD(prevMay.json?.closeSurplus, "2000.00", "7B.8-H: closeSurplus is 2000.00");
+		eqD(prevMay.json?.fullOfferAmount, "1500.00", "7B.8-H: fullOfferAmount is 1500.00");
+		eqD(prevMay.json?.unroutedRemainderIfFull, "500.00", "7B.8-H: unroutedRemainderIfFull is 500.00");
+
+		const closeMayRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-may-key-1",
+			body: {
+				periodMonth: "2026-05",
+				expectedProposalFingerprint: prevMay.json?.proposalFingerprint,
+				decision: "FULL",
+				occurredAt: "2026-06-01T12:00:00.000Z",
+			},
+		});
+		eqD(closeMayRes.status, 201, "7B.8-I: Fresh close 2026-05 FULL returns 201 Created");
+		eqD(closeMayRes.json?.idempotentReplay, false, "7B.8-I: idempotentReplay is false");
+		eqD(closeMayRes.json?.monthClose?.decision, "FULL", "7B.8-I: Decision is FULL");
+		eqD(closeMayRes.json?.monthClose?.appliedAmount, "1500.00", "7B.8-I: appliedAmount is 1500.00");
+		eqD(closeMayRes.json?.monthClose?.unroutedAmount, "500.00", "7B.8-I: unroutedAmount is 500.00");
+		chkD(Boolean(closeMayRes.json?.monthClose?.midasAllocationTransferId), "7B.8-I: Midas transfer ID present");
+
+		// Exact Replay of 2026-05
+		const replayMayRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-may-key-1",
+			body: {
+				periodMonth: "2026-05",
+				expectedProposalFingerprint: prevMay.json?.proposalFingerprint,
+				decision: "FULL",
+				occurredAt: "2026-06-01T12:00:00.000Z",
+			},
+		});
+		eqD(replayMayRes.status, 200, "7B.8-J: Exact replay returns 200 OK");
+		eqD(replayMayRes.json?.idempotentReplay, true, "7B.8-J: idempotentReplay is true");
+		eqD(replayMayRes.json?.monthClose?.monthCloseId, closeMayRes.json?.monthClose?.monthCloseId, "7B.8-J: Same monthCloseId on replay");
+		eqD(replayMayRes.json?.monthClose?.midasAllocationTransferId, closeMayRes.json?.monthClose?.midasAllocationTransferId, "7B.8-J: Same transfer ID on replay");
+
+		// Conflicting reuse of same idempotency key
+		const conflictMayRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-may-key-1",
+			body: {
+				periodMonth: "2026-05",
+				expectedProposalFingerprint: prevMay.json?.proposalFingerprint,
+				decision: "SKIP",
+				occurredAt: "2026-06-01T12:00:00.000Z",
+			},
+		});
+		eqD(conflictMayRes.status, 409, "7B.8-K: Conflicting reuse of idempotency key returns 409");
+		eqD(conflictMayRes.json?.error?.code, "MONTH_CLOSE_IDEMPOTENCY_CONFLICT", "7B.8-K: Error code is MONTH_CLOSE_IDEMPOTENCY_CONFLICT");
+
+		// Distinct key for already closed period
+		const alreadyClosedMayRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-may-diff-key",
+			body: {
+				periodMonth: "2026-05",
+				expectedProposalFingerprint: prevMay.json?.proposalFingerprint,
+				decision: "FULL",
+				occurredAt: "2026-06-01T12:00:00.000Z",
+			},
+		});
+		eqD(alreadyClosedMayRes.status, 409, "7B.8-L: Distinct key on already closed period returns 409");
+		eqD(alreadyClosedMayRes.json?.error?.code, "MONTH_CLOSE_ALREADY_CLOSED", "7B.8-L: Error code is MONTH_CLOSE_ALREADY_CLOSED");
+
+		// Period 2026-06: SHORT_TERM_GOAL + PARTIAL
+		const goal2 = await createShortTermGoal({
+			db,
+			userId: USER_A,
+			midasAccountId: midasAccIdA,
+			name: "Goal 2 - Camera",
+			fundingTarget: "1500.00",
+			occurredAt: new Date("2026-06-01T00:00:00.000Z"),
+			idempotencyKey: "goal-2-init",
+		});
+		await seedBudgetPlan(USER_A, "2026-06", { mandatoryCeiling: "5000.00", discretionaryCeiling: "3000.00" });
+		await postExpense(USER_A, sysAccountsA.MANDATORY_EXPENSE, "4000.00", "2026-06-10T12:00:00.000Z");
+		await postExpense(USER_A, sysAccountsA.DISCRETIONARY_EXPENSE, "2000.00", "2026-06-12T12:00:00.000Z");
+
+		const prevJune = await httpCall("/month-close/preview?periodMonth=2026-06", { method: "GET", token: tokenA });
+		const closeJuneRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-june-partial-1",
+			body: {
+				periodMonth: "2026-06",
+				expectedProposalFingerprint: prevJune.json?.proposalFingerprint,
+				decision: "PARTIAL",
+				partialAmount: "600.00",
+				occurredAt: "2026-07-01T12:00:00.000Z",
+			},
+		});
+		eqD(closeJuneRes.status, 201, "7B.8-M: Fresh close 2026-06 PARTIAL returns 201 Created");
+		eqD(closeJuneRes.json?.monthClose?.decision, "PARTIAL", "7B.8-M: Decision is PARTIAL");
+		eqD(closeJuneRes.json?.monthClose?.appliedAmount, "600.00", "7B.8-M: appliedAmount is 600.00");
+		eqD(closeJuneRes.json?.monthClose?.unroutedAmount, "1400.00", "7B.8-M: unroutedAmount is 1400.00");
+
+		// Period 2026-07: SHORT_TERM_GOAL + SKIP
+		await seedBudgetPlan(USER_A, "2026-07", { mandatoryCeiling: "5000.00", discretionaryCeiling: "3000.00" });
+		await postExpense(USER_A, sysAccountsA.MANDATORY_EXPENSE, "4000.00", "2026-07-10T12:00:00.000Z");
+		await postExpense(USER_A, sysAccountsA.DISCRETIONARY_EXPENSE, "2000.00", "2026-07-12T12:00:00.000Z");
+
+		const prevJuly = await httpCall("/month-close/preview?periodMonth=2026-07", { method: "GET", token: tokenA });
+		const closeJulyRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-july-skip-1",
+			body: {
+				periodMonth: "2026-07",
+				expectedProposalFingerprint: prevJuly.json?.proposalFingerprint,
+				decision: "SKIP",
+				occurredAt: "2026-08-01T12:00:00.000Z",
+			},
+		});
+		eqD(closeJulyRes.status, 201, "7B.8-N: Fresh close 2026-07 SKIP returns 201 Created");
+		eqD(closeJulyRes.json?.monthClose?.decision, "SKIP", "7B.8-N: Decision is SKIP");
+		eqD(closeJulyRes.json?.monthClose?.appliedAmount, "0.00", "7B.8-N: appliedAmount is 0.00");
+		eqD(closeJulyRes.json?.monthClose?.unroutedAmount, "2000.00", "7B.8-N: unroutedAmount is 2000.00");
+		eqD(closeJulyRes.json?.monthClose?.midasAllocationTransferId, null, "7B.8-N: midasAllocationTransferId is null for SKIP");
+
+		// Period 2026-08: MEDIUM_TERM_RESERVE + AUTO_MEDIUM
+		// Release Goal 2 funding (600.00) and complete Goal 2 so there is no active fundable goal
+		await releaseShortTermGoalFunding({
+			db,
+			userId: USER_A,
+			goalId: goal2.goalId,
+			amount: "600.00",
+			occurredAt: new Date("2026-08-01T00:00:00.000Z"),
+			idempotencyKey: "release-goal-2-for-aug",
+		});
+		await completeShortTermGoal({
+			db,
+			userId: USER_A,
+			goalId: goal2.goalId,
+			expectedRevisionNo: goal2.revisionNo,
+			occurredAt: new Date("2026-08-01T00:00:00.000Z"),
+			idempotencyKey: "complete-goal-2-for-aug",
+		});
+
+		await seedBudgetPlan(USER_A, "2026-08", { mandatoryCeiling: "5000.00", discretionaryCeiling: "3000.00" });
+		await postExpense(USER_A, sysAccountsA.MANDATORY_EXPENSE, "4200.00", "2026-08-10T12:00:00.000Z");
+		await postExpense(USER_A, sysAccountsA.DISCRETIONARY_EXPENSE, "2600.00", "2026-08-12T12:00:00.000Z");
+		// Surplus: 800 + 400 = 1200.00 -> MEDIUM_TERM_RESERVE
+
+		const prevAug = await httpCall("/month-close/preview?periodMonth=2026-08", { method: "GET", token: tokenA });
+		eqD(prevAug.json?.route, "MEDIUM_TERM_RESERVE", "7B.8-O: Route is MEDIUM_TERM_RESERVE");
+		eqD(prevAug.json?.closeSurplus, "1200.00", "7B.8-O: closeSurplus is 1200.00");
+
+		const closeAugRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-aug-medium-1",
+			body: {
+				periodMonth: "2026-08",
+				expectedProposalFingerprint: prevAug.json?.proposalFingerprint,
+				occurredAt: "2026-09-01T12:00:00.000Z",
+			},
+		});
+		eqD(closeAugRes.status, 201, "7B.8-O: Fresh close 2026-08 MEDIUM_TERM_RESERVE returns 201 Created");
+		eqD(closeAugRes.json?.monthClose?.decision, "AUTO_MEDIUM", "7B.8-O: Decision is AUTO_MEDIUM");
+		eqD(closeAugRes.json?.monthClose?.appliedAmount, "1200.00", "7B.8-O: appliedAmount is 1200.00");
+		chkD(Boolean(closeAugRes.json?.monthClose?.midasAllocationTransferId), "7B.8-O: Midas transfer ID present");
+
+		// Period 2026-04: NONE + NO_ACTION (zero surplus)
+		await seedBudgetPlan(USER_A, "2026-04", { mandatoryCeiling: "5000.00", discretionaryCeiling: "3000.00" });
+		await postExpense(USER_A, sysAccountsA.MANDATORY_EXPENSE, "5000.00", "2026-04-10T12:00:00.000Z");
+		await postExpense(USER_A, sysAccountsA.DISCRETIONARY_EXPENSE, "3000.00", "2026-04-12T12:00:00.000Z");
+
+		const prevApr = await httpCall("/month-close/preview?periodMonth=2026-04", { method: "GET", token: tokenA });
+		eqD(prevApr.json?.route, "NONE", "7B.8-P: Route is NONE for zero surplus");
+		eqD(prevApr.json?.closeSurplus, "0.00", "7B.8-P: closeSurplus is 0.00");
+
+		const closeAprRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-apr-none-1",
+			body: {
+				periodMonth: "2026-04",
+				expectedProposalFingerprint: prevApr.json?.proposalFingerprint,
+				occurredAt: "2026-05-01T12:00:00.000Z",
+			},
+		});
+		eqD(closeAprRes.status, 201, "7B.8-P: Fresh close 2026-04 NONE returns 201 Created");
+		eqD(closeAprRes.json?.monthClose?.decision, "NO_ACTION", "7B.8-P: Decision is NO_ACTION");
+		eqD(closeAprRes.json?.monthClose?.appliedAmount, "0.00", "7B.8-P: appliedAmount is 0.00");
+		eqD(closeAprRes.json?.monthClose?.midasAllocationTransferId, null, "7B.8-P: Transfer is null");
+
+		// --- 4. Stale Proposal Rejection ---
+		console.log("--- 4. Stale Proposal Rejection ---");
+		await seedBudgetPlan(USER_A, "2026-03", { mandatoryCeiling: "5000.00", discretionaryCeiling: "3000.00" });
+		await postExpense(USER_A, sysAccountsA.MANDATORY_EXPENSE, "4000.00", "2026-03-10T12:00:00.000Z");
+		const prevMar = await httpCall("/month-close/preview?periodMonth=2026-03", { method: "GET", token: tokenA });
+		const staleFingerprint = prevMar.json?.proposalFingerprint;
+
+		// Mutate state: post additional expense in March 2026
+		await postExpense(USER_A, sysAccountsA.MANDATORY_EXPENSE, "500.00", "2026-03-15T12:00:00.000Z");
+
+		const closeStaleRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-mar-stale-key",
+			body: {
+				periodMonth: "2026-03",
+				expectedProposalFingerprint: staleFingerprint,
+				occurredAt: "2026-04-01T12:00:00.000Z",
+			},
+		});
+		eqD(closeStaleRes.status, 409, "7B.8-Q: Stale proposal close rejected with 409");
+		eqD(closeStaleRes.json?.error?.code, "MONTH_CLOSE_STALE_PROPOSAL", "7B.8-Q: Error code is MONTH_CLOSE_STALE_PROPOSAL");
+
+		// --- 5. Insufficient Liquidity at Apply Time ---
+		console.log("--- 5. Apply-Time Liquidity Rejection ---");
+		await seedBudgetPlan(USER_A, "2026-02", { mandatoryCeiling: "5000.00", discretionaryCeiling: "3000.00" });
+		await postExpense(USER_A, sysAccountsA.MANDATORY_EXPENSE, "4000.00", "2026-02-10T12:00:00.000Z");
+		const prevFeb = await httpCall("/month-close/preview?periodMonth=2026-02", { method: "GET", token: tokenA });
+
+		// Earmark almost all Midas balance away to another bucket
+		const { createMidasBucket, createMidasAllocationTransfer } = await import("../src/midas/service");
+		const drainBucket = await createMidasBucket({
+			db,
+			userId: USER_A,
+			midasAccountId: midasAccIdA,
+			code: "DRAIN_BUCKET",
+			name: "Drain Bucket",
+			bucketType: "SHORT_TERM_GOAL",
+		});
+		// Get current liquidity
+		const curLiqRes = await httpCall(`/midas/liquidity?midasAccountId=${midasAccIdA}`, { method: "GET", token: tokenA });
+		const unallocated = Number(curLiqRes.json?.liquidity?.unallocatedBalance ?? "0");
+		if (unallocated > 100) {
+			await createMidasAllocationTransfer({
+				db,
+				userId: USER_A,
+				midasAccountId: midasAccIdA,
+				toBucketId: drainBucket.id,
+				amount: (unallocated - 50).toFixed(2),
+				occurredAt: new Date(),
+				idempotencyKey: "drain-midas-balance",
+			});
+		}
+
+		// Close 2026-02 requiring 4000.00 surplus routing (surplus is 4000, only ~50 unallocated)
+		const closeInsolvRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-feb-insolvent-key",
+			body: {
+				periodMonth: "2026-02",
+				expectedProposalFingerprint: prevFeb.json?.proposalFingerprint,
+				occurredAt: "2026-03-01T12:00:00.000Z",
+			},
+		});
+		eqD(closeInsolvRes.status, 409, "7B.8-R: Insufficient liquidity close rejected with 409");
+		eqD(closeInsolvRes.json?.error?.code, "MONTH_CLOSE_INSUFFICIENT_LIQUIDITY", "7B.8-R: Error code is MONTH_CLOSE_INSUFFICIENT_LIQUIDITY");
+
+		// --- 6. Detail Isolation ---
+		console.log("--- 6. Detail Isolation ---");
+		const detOwn = await httpCall("/month-close/2026-05", { method: "GET", token: tokenA });
+		eqD(detOwn.status, 200, "7B.8-S: Own month close detail returns 200");
+		eqD(detOwn.json?.monthClose?.periodMonth, "2026-05", "7B.8-S: Period month is 2026-05");
+
+		const detForeign = await httpCall("/month-close/2026-05", { method: "GET", token: tokenB });
+		eqD(detForeign.status, 404, "7B.8-T: Foreign user cannot see User A's month close (404)");
+
+		const detMissing = await httpCall("/month-close/2099-01", { method: "GET", token: tokenA });
+		eqD(detMissing.status, 404, "7B.8-U: Nonexistent month close returns 404");
+
+		// --- 7. Bounded Keyset Listing & 100+ Records Traversal ---
+		console.log("--- 7. Bounded Keyset Listing & 100+ Traversal ---");
+		// We already have some closes: 2026-04, 2026-05, 2026-06, 2026-07, 2026-08 (5 closes).
+		// Let's seed 102 historical closes to reach 107 total closes.
+		await pg.query("SET session_replication_role = replica");
+		for (let i = 1; i <= 102; i++) {
+			const year = 2000 + Math.floor((i - 1) / 12);
+			const month = (((i - 1) % 12) + 1).toString().padStart(2, "0");
+			const periodStr = `${year}-${month}-01`;
+			const histPlanId = crypto.randomUUID();
+			const histCloseId = crypto.randomUUID();
+			const histRevId = crypto.randomUUID();
+
+			await pg.query(
+				"insert into monthly_budget_plans (id, user_id, period_month, canonical_transaction_id, created_at) values ($1, $2, $3, $4, now())",
+				[histPlanId, USER_A, periodStr, crypto.randomUUID()],
+			);
+			await pg.query(
+				"insert into month_closes (id, user_id, period_month, budget_plan_id, created_at) values ($1, $2, $3, $4, now())",
+				[histCloseId, USER_A, periodStr, histPlanId],
+			);
+			await pg.query(
+				`insert into month_close_revisions
+				 (id, user_id, month_close_id, revision_no, previous_revision_id, operation, status, budget_plan_revision_no,
+				  policy_version, currency, reference_income, mandatory_ceiling, mandatory_expense, mandatory_unused,
+				  discretionary_ceiling, discretionary_expense, discretionary_unused, unclassified_expense, close_surplus,
+				  route, decision, full_offer_amount, applied_amount, unrouted_amount, proposal_fingerprint,
+				  idempotency_key, revision_fingerprint, occurred_at, created_at)
+				 values ($1, $2, $3, 1, null, 'CLOSE', 'CLOSED', 1,
+				  'PERSONAL_BUDGET_V1', 'TRY', '10000.00', '5000.00', '5000.00', '0.00',
+				  '3000.00', '3000.00', '0.00', '0.00', '0.00',
+				  'NONE', 'NO_ACTION', '0.00', '0.00', '0.00', $4,
+				  $5, $6, now(), now())`,
+				[histRevId, USER_A, histCloseId, "c".repeat(64), `hist-idemp-${i}`, "d".repeat(64)],
+			);
+		}
+		await pg.query("SET session_replication_role = origin");
+
+		const collectedPeriods = new Set<string>();
+		const pageSizes: number[] = [];
+		let listCursor: string | null = null;
+		let pageCount = 0;
+
+		while (pageCount < 10) {
+			const url = listCursor
+				? `/month-close?limit=50&after=${encodeURIComponent(listCursor)}`
+				: "/month-close?limit=50";
+			const pageRes = await httpCall(url, { method: "GET", token: tokenA });
+			eqD(pageRes.status, 200, `7B.8-V: Month-close page ${pageCount + 1} returns 200`);
+			const closes = pageRes.json?.monthCloses ?? [];
+			pageSizes.push(closes.length);
+			for (const c of closes) {
+				chkD(!collectedPeriods.has(c.periodMonth), `7B.8-V: No duplicate periodMonth ${c.periodMonth}`);
+				collectedPeriods.add(c.periodMonth);
+			}
+			if (!pageRes.json?.hasMore || !pageRes.json?.nextCursor) {
+				break;
+			}
+			listCursor = pageRes.json?.nextCursor;
+			pageCount++;
+		}
+
+		eqD(collectedPeriods.size, 107, "7B.8-V: Traversed all 107 unique month-close records");
+		eqD(pageSizes, [50, 50, 7], "7B.8-V: Exact expected page sizes [50, 50, 7]");
+
+		// Range filters
+		const rangeRes = await httpCall("/month-close?periodMonthFrom=2026-05&periodMonthUntil=2026-07", { method: "GET", token: tokenA });
+		eqD(rangeRes.status, 200, "7B.8-W: Filtered list returns 200");
+		eqD((rangeRes.json?.monthCloses ?? []).length, 3, "7B.8-W: Range filter returns exactly 3 records");
+
+		// Cursor validations
+		const malfCursorRes = await httpCall("/month-close?after=not-valid-base64", { method: "GET", token: tokenA });
+		eqD(malfCursorRes.status, 400, "7B.8-X: Malformed cursor returns 400");
+
+		const v2Cursor = Buffer.from(JSON.stringify({ v: 2, userId: USER_A, periodMonthFrom: null, periodMonthUntil: null, periodMonth: "2026-05" })).toString("base64url");
+		const v2CursorRes = await httpCall(`/month-close?after=${v2Cursor}`, { method: "GET", token: tokenA });
+		eqD(v2CursorRes.status, 400, "7B.8-X: v:2 cursor rejected with 400");
+
+		const crossUserCursor = Buffer.from(JSON.stringify({ v: 1, userId: USER_B, periodMonthFrom: null, periodMonthUntil: null, periodMonth: "2026-05" })).toString("base64url");
+		const crossUserCursorRes = await httpCall(`/month-close?after=${crossUserCursor}`, { method: "GET", token: tokenA });
+		eqD(crossUserCursorRes.status, 400, "7B.8-X: Cross-user cursor rejected with 400");
+
+		const scopeShiftCursor = Buffer.from(JSON.stringify({ v: 1, userId: USER_A, periodMonthFrom: "2026-01", periodMonthUntil: null, periodMonth: "2026-05" })).toString("base64url");
+		const scopeShiftRes = await httpCall(`/month-close?periodMonthFrom=2026-02&after=${scopeShiftCursor}`, { method: "GET", token: tokenA });
+		eqD(scopeShiftRes.status, 400, "7B.8-X: Scope-shift cursor rejected with 400");
+
+		// --- 8. Table-by-Table Zero-Write Purity ---
+		console.log("--- 8. Table-by-Table Zero-Write Audit ---");
+		const tablesToTrackMonthClose = [
+			"month_closes",
+			"month_close_revisions",
+			"monthly_budget_plans",
+			"monthly_budget_plan_revisions",
+			"midas_accounts",
+			"midas_buckets",
+			"midas_allocation_transfers",
+			"short_term_goals",
+			"short_term_goal_revisions",
+			"short_term_goal_priority_revisions",
+			"canonical_transactions",
+			"transaction_revisions",
+			"journal_entries",
+			"journal_lines",
+		] as const;
+
+		const getTableCounts = async () => {
+			const counts: Record<string, number> = {};
+			for (const t of tablesToTrackMonthClose) {
+				const r = await pg.query<{ count: string }>(`select count(*)::text as count from ${t}`);
+				counts[t] = Number.parseInt(r.rows[0].count, 10);
+			}
+			return counts;
+		};
+
+		const countsBefore = await getTableCounts();
+
+		// Execute full public GET surface
+		await httpCall("/month-close/preview?periodMonth=2026-10", { method: "GET", token: tokenA });
+		await httpCall("/month-close/2026-05", { method: "GET", token: tokenA });
+		await httpCall("/month-close?limit=50", { method: "GET", token: tokenA });
+
+		const countsAfter = await getTableCounts();
+
+		for (const t of tablesToTrackMonthClose) {
+			eqD(countsBefore[t], countsAfter[t], `7B.8-Y: Zero writes to table "${t}" during read-only GET operations`);
+		}
+
+	} finally {
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -19283,6 +19979,7 @@ if (probed) {
 	await resolverRuntime7B5();
 	await resolverRuntime7B6();
 	await resolverRuntime7B7();
+	await resolverRuntime7B8();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
