@@ -1199,6 +1199,34 @@ async function run() {
 			);
 			await controlClient.query("SET session_replication_role = origin;");
 
+			// Ensure target Midas account has sufficient unallocated liquidity for month-close routing
+			const [midasRow] = (
+				await controlClient.query(
+					"select ledger_account_id from midas_accounts where id = $1",
+					[targetMidasId],
+				)
+			).rows;
+			const [equityRow] = (
+				await controlClient.query(
+					"select id from ledger_accounts where user_id = $1 and account_type = 'EQUITY' limit 1",
+					[USER_A],
+				)
+			).rows;
+
+			if (midasRow?.ledger_account_id && equityRow?.id) {
+				await postJournalEntry({
+					db: dbA,
+					userId: USER_A,
+					occurredAt: new Date("2026-07-01T00:00:00Z"),
+					memo: "Month Close Seed Liquidity",
+					idempotencyKey: `mc-race-seed-liquidity-${crypto.randomUUID()}`,
+					lines: [
+						{ accountId: midasRow.ledger_account_id, side: "DEBIT", amount: "50000.00" },
+						{ accountId: equityRow.id, side: "CREDIT", amount: "50000.00" },
+					],
+				});
+			}
+
 			// Ensure active short term goal exists for routing/closing
 			const mcGoal = await createShortTermGoal({
 				db: dbA,
@@ -1207,7 +1235,7 @@ async function run() {
 				name: "Month Close Target Goal",
 				fundingTarget: "5000.00",
 				occurredAt: new Date("2026-07-01T00:00:00Z"),
-				idempotencyKey: "mc-race-stg-init",
+				idempotencyKey: `mc-race-stg-init-${crypto.randomUUID()}`,
 			});
 
 			// Preview month close to get proposal fingerprint
@@ -1308,6 +1336,14 @@ async function run() {
 			).rows[0].n;
 			eq(mcRevRowCount, 1, "7B.8/9: exactly ONE month_close_revisions row exists (0 partial writes from loser)");
 
+			const transferRowCount = (
+				await controlClient.query(
+					"select count(*)::int as n from midas_allocation_transfers mat inner join month_close_revisions mcr on mat.id = mcr.midas_allocation_transfer_id inner join month_closes mc on mcr.month_close_id = mc.id where mc.user_id = $1 and mc.period_month = $2",
+					[USER_A, mcPeriodDate],
+				)
+			).rows[0].n;
+			eq(transferRowCount, 1, "7B.8/9: exactly ONE economic transfer exists for winning nonzero route");
+
 			// Post-race DB usability: getMonthClose returns closed month
 			const mcDetail = await getMonthClose({
 				db: dbA,
@@ -1316,7 +1352,9 @@ async function run() {
 			});
 			eq(mcDetail?.periodMonth, mcPeriod, "7B.8/9: post-race getMonthClose returns closed period");
 			eq(mcDetail?.decision, "FULL", "7B.8/9: post-race getMonthClose decision is FULL");
+			eq(mcDetail?.route, "SHORT_TERM_GOAL", "7B.8/9: post-race getMonthClose route is SHORT_TERM_GOAL");
 			chk(Boolean(mcDetail?.monthCloseId), "7B.8/9: post-race getMonthClose has valid monthCloseId");
+			chk(Boolean(mcDetail?.midasAllocationTransferId), "7B.8/9: post-race getMonthClose has valid midasAllocationTransferId");
 		} catch (test9Err) {
 			console.error("[Test 9 Fatal Error]:", test9Err);
 			bad("Test 9 threw unexpected error", String(test9Err));
