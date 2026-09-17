@@ -57,8 +57,8 @@ import {
 import { LongTermError } from "../src/long-term/errors.ts";
 import {
 	previewMonthClose,
-	applyMonthCloseInTransaction,
-	getMonthCloseDetail,
+	closeMonth,
+	getMonthClose,
 } from "../src/month-close/service.ts";
 import { MonthCloseError } from "../src/month-close/errors.ts";
 import { createShortTermGoal } from "../src/short-term-goals/service.ts";
@@ -172,7 +172,12 @@ async function run() {
 	// Test basic connection
 	const testClient = new pg.Client({ connectionString: dbUrl });
 	try {
-		await testClient.connect();
+		await Promise.race([
+			testClient.connect(),
+			new Promise((_, rej) =>
+				setTimeout(() => rej(new Error(`Connection timed out after 2000ms connecting to ${dbUrl}`)), 2000),
+			),
+		]);
 	} catch (err) {
 		if (process.env.CI) {
 			console.error(`Fatal: Failed to connect to PostgreSQL service at ${dbUrl} in CI:`, err);
@@ -1211,37 +1216,31 @@ async function run() {
 				userId: USER_A,
 				periodMonth: mcPeriod,
 			});
-			eq(previewRes.previewStatus, "READY", "7B.8/9: month close preview returns status READY");
+			eq(previewRes.blockedReason, null, "7B.8/9: month close preview blockedReason is null");
 			chk(Boolean(previewRes.proposalFingerprint), "7B.8/9: proposal fingerprint generated");
 
 			// Hold exclusive table lock on monthly_budget_plans via control connection
 			await controlClient.query("BEGIN; LOCK TABLE monthly_budget_plans IN ACCESS EXCLUSIVE MODE;");
 
-			const promiseMCA = dbA.transaction((tx: any) =>
-				applyMonthCloseInTransaction(tx, {
-					userId: USER_A,
-					periodMonth: mcPeriod,
-					proposalFingerprint: previewRes.proposalFingerprint!,
-					decision: {
-						type: "FULL",
-						goalId: mcGoal.goal.goalId,
-					},
-					idempotencyKey: "mc-race-key-a",
-				}),
-			);
+			const promiseMCA = closeMonth({
+				db: dbA,
+				userId: USER_A,
+				periodMonth: mcPeriod,
+				expectedProposalFingerprint: previewRes.proposalFingerprint,
+				decision: "FULL",
+				occurredAt: new Date("2026-08-01T12:00:00.000Z"),
+				idempotencyKey: "mc-race-key-a",
+			});
 
-			const promiseMCB = dbB.transaction((tx: any) =>
-				applyMonthCloseInTransaction(tx, {
-					userId: USER_A,
-					periodMonth: mcPeriod,
-					proposalFingerprint: previewRes.proposalFingerprint!,
-					decision: {
-						type: "FULL",
-						goalId: mcGoal.goal.goalId,
-					},
-					idempotencyKey: "mc-race-key-b",
-				}),
-			);
+			const promiseMCB = closeMonth({
+				db: dbB,
+				userId: USER_A,
+				periodMonth: mcPeriod,
+				expectedProposalFingerprint: previewRes.proposalFingerprint,
+				decision: "FULL",
+				occurredAt: new Date("2026-08-01T12:00:00.000Z"),
+				idempotencyKey: "mc-race-key-b",
+			});
 
 			// Wait until BOTH competitor backend sessions are objectively observed waiting on monthly_budget_plans in pg_locks
 			const blockedMC = await waitUntilBothCompetitorsBlockedOnRelation(
@@ -1263,7 +1262,7 @@ async function run() {
 			]);
 
 			const fulfilledMC = [settledMCA, settledMCB].find((s) => s.status === "fulfilled") as
-				| PromiseFulfilledResult<Awaited<ReturnType<typeof applyMonthCloseInTransaction>>>
+				| PromiseFulfilledResult<Awaited<ReturnType<typeof closeMonth>>>
 				| undefined;
 			const rejectedMC = [settledMCA, settledMCB].find((s) => s.status === "rejected") as
 				| PromiseRejectedResult
@@ -1274,8 +1273,7 @@ async function run() {
 
 			if (fulfilledMC) {
 				eq(fulfilledMC.value.monthClose.periodMonth, mcPeriod, "7B.8/9: winner closed requested periodMonth");
-				eq(fulfilledMC.value.monthClose.status, "CLOSED", "7B.8/9: winner monthClose status is CLOSED");
-				eq(fulfilledMC.value.monthClose.decisionType, "FULL", "7B.8/9: winner decisionType is FULL");
+				eq(fulfilledMC.value.monthClose.decision, "FULL", "7B.8/9: winner decision is FULL");
 				eq(fulfilledMC.value.idempotentReplay, false, "7B.8/9: winner idempotentReplay = false");
 				chk(Boolean(fulfilledMC.value.monthClose.monthCloseId), "7B.8/9: winner generated monthCloseId");
 			}
@@ -1310,14 +1308,15 @@ async function run() {
 			).rows[0].n;
 			eq(mcRevRowCount, 1, "7B.8/9: exactly ONE month_close_revisions row exists (0 partial writes from loser)");
 
-			// Post-race DB usability: getMonthCloseDetail returns closed month
-			const mcDetail = await getMonthCloseDetail({
+			// Post-race DB usability: getMonthClose returns closed month
+			const mcDetail = await getMonthClose({
 				db: dbA,
 				userId: USER_A,
 				periodMonth: mcPeriod,
 			});
-			eq(mcDetail?.periodMonth, mcPeriod, "7B.8/9: post-race getMonthCloseDetail returns closed period");
-			eq(mcDetail?.status, "CLOSED", "7B.8/9: post-race getMonthCloseDetail status is CLOSED");
+			eq(mcDetail?.periodMonth, mcPeriod, "7B.8/9: post-race getMonthClose returns closed period");
+			eq(mcDetail?.decision, "FULL", "7B.8/9: post-race getMonthClose decision is FULL");
+			chk(Boolean(mcDetail?.monthCloseId), "7B.8/9: post-race getMonthClose has valid monthCloseId");
 		} catch (test9Err) {
 			console.error("[Test 9 Fatal Error]:", test9Err);
 			bad("Test 9 threw unexpected error", String(test9Err));

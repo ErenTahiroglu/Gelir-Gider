@@ -1370,7 +1370,7 @@ Any cursor scope mismatch returns the domain's sanitized `400` error (e.g. `SHOR
 
 ```
 ACTIVE  GET   /month-close/preview     ?periodMonth=YYYY-MM
-ACTIVE  GET   /month-close             ?limit=&after=
+ACTIVE  GET   /month-close             ?limit=&after=&periodMonthFrom=&periodMonthUntil=
 ACTIVE  GET   /month-close/:periodMonth
 ACTIVE  POST  /month-close             (apply close decision)
 ```
@@ -1378,75 +1378,190 @@ ACTIVE  POST  /month-close             (apply close decision)
 #### 1. Endpoints & Route Summary
 
 ##### `GET /month-close/preview?periodMonth=YYYY-MM`
-Returns an authenticated, read-only preview of the Month-Close proposal for the requested ended calendar month (`periodMonth` format: `YYYY-MM`).
+Returns an authenticated, read-only preview of the Month-Close proposal for the requested calendar month (`periodMonth` format: `YYYY-MM`).
 - **Access mode:** Executed inside a PostgreSQL-enforced `REPEATABLE READ READ ONLY` transaction (zero database mutations).
+- **Period gate:** Preview is allowed before or after period end (computes live snapshot at query time). If unclosed and eligible, `blockedReason` is `null`.
 - **Responses:**
-  - `200 OK`: Proposal preview calculated. Contains `previewStatus` (`READY` or `BLOCKED`), `blockerCode` (if blocked), calculation breakdown (`unallocatedLiquidTRY`, `carryOverReserveTRY`, `excessLiquidTRY`, `mediumTermReserveTRY`, `longTermInvestmentTRY`), and recommended STG decision (`FULL`, `PARTIAL`, `SKIP`, `AUTO_MEDIUM`, `NO_ACTION`).
-  - `400 Bad Request`: Invalid or future `periodMonth`.
-  - `409 Conflict`: Period already closed (`MONTH_CLOSE_ALREADY_CLOSED`).
+  - `200 OK`: Proposal preview calculated. Returns `MonthCloseProposal`:
+    ```json
+    {
+      "periodMonth": "2026-08",
+      "budgetPlanId": "uuid",
+      "budgetPlanRevisionNo": 1,
+      "policyVersion": "PERSONAL_BUDGET_V1",
+      "currency": "TRY",
+      "referenceIncome": "10000.00",
+      "mandatory": { "planned": "4000.00", "actual": "3500.00", "variance": "500.00" },
+      "discretionary": { "planned": "2000.00", "actual": "1800.00", "variance": "200.00" },
+      "unclassifiedExpense": "0.00",
+      "closeSurplus": "700.00",
+      "midasAccountId": "uuid-or-null",
+      "midasUnallocatedBalance": "1000.00",
+      "route": "SHORT_TERM_GOAL",
+      "recommendedGoal": {
+        "goalId": "uuid",
+        "name": "Emergency Fund",
+        "targetAmount": "5000.00",
+        "currentAmount": "2000.00",
+        "remainingNeeded": "3000.00"
+      },
+      "fullOfferAmount": "700.00",
+      "unroutedRemainderIfFull": "0.00",
+      "proposalFingerprint": "64-character-hex-sha256",
+      "blockedReason": null
+    }
+    ```
+  - `400 Bad Request`: Invalid `periodMonth` format or query parameter validation failure (`MONTH_CLOSE_INVALID_INPUT`).
+  - `409 Conflict`: Period already closed (`MONTH_CLOSE_ALREADY_CLOSED`), missing/inactive budget plan (`MONTH_CLOSE_BUDGET_PLAN_NOT_FOUND` / `MONTH_CLOSE_BUDGET_PLAN_NOT_ACTIVE`), unclassified expenses (`MONTH_CLOSE_UNCLASSIFIED_EXPENSES`), or missing Midas account (`MONTH_CLOSE_MIDAS_NOT_FOUND`).
 
-##### `GET /month-close?limit=&after=`
-Returns a paginated list of closed month-close records for the authenticated user, ordered strictly by `periodMonth DESC`.
+##### `GET /month-close?limit=&after=&periodMonthFrom=&periodMonthUntil=`
+Returns a bounded, keyset-paginated list of closed month-close records for the authenticated user, ordered strictly by `periodMonth DESC`.
 - **Query parameters:**
   - `limit` (optional): Integer `1..100` (default: 50).
   - `after` (optional): Opaque base64url cursor.
+  - `periodMonthFrom` (optional): Bounding start month string (`YYYY-MM`).
+  - `periodMonthUntil` (optional): Bounding end month string (`YYYY-MM`).
 - **Responses:**
-  - `200 OK`: `{ items: MonthCloseProductDto[], nextCursor: string | null }`.
-  - `400 Bad Request`: Malformed cursor, unsupported cursor version (`v != 1`), or cross-user scope mismatch.
+  - `200 OK`:
+    ```json
+    {
+      "monthCloses": [
+        {
+          "monthCloseId": "uuid",
+          "userId": "uuid",
+          "periodMonth": "2026-08",
+          "budgetPlanId": "uuid",
+          "budgetPlanRevisionNo": 1,
+          "policyVersion": "PERSONAL_BUDGET_V1",
+          "currency": "TRY",
+          "referenceIncome": "10000.00",
+          "mandatory": { "planned": "4000.00", "actual": "3500.00", "variance": "500.00" },
+          "discretionary": { "planned": "2000.00", "actual": "1800.00", "variance": "200.00" },
+          "unclassifiedExpense": "0.00",
+          "closeSurplus": "700.00",
+          "route": "SHORT_TERM_GOAL",
+          "decision": "FULL",
+          "midasAccountId": "uuid",
+          "targetGoalId": "uuid",
+          "targetGoalRevisionNo": 1,
+          "targetBucketId": "uuid",
+          "fullOfferAmount": "700.00",
+          "appliedAmount": "700.00",
+          "unroutedAmount": "0.00",
+          "midasAllocationTransferId": "uuid",
+          "proposalFingerprint": "64-character-hex-sha256",
+          "occurredAt": "2026-09-01T12:00:00.000Z",
+          "createdAt": "2026-09-01T12:00:00.000Z"
+        }
+      ],
+      "limit": 50,
+      "hasMore": false,
+      "nextCursor": null
+    }
+    ```
+  - `400 Bad Request`: Malformed cursor, unsupported cursor version (`v != 1`), cross-user cursor tampering, or filter-scope mismatch (`MONTH_CLOSE_INVALID_INPUT`).
 
 ##### `GET /month-close/:periodMonth`
-Returns the full detail of a closed month for the authenticated user.
+Returns the product detail DTO of a closed month for the authenticated user.
 - **Path parameters:**
-  - `periodMonth`: Ended month string (`YYYY-MM`).
+  - `periodMonth`: Closed month string (`YYYY-MM`).
 - **Responses:**
-  - `200 OK`: `MonthCloseDetailDto` (closed month state, revision, allocation transfers, canonical transaction bindings).
-  - `400 Bad Request`: Invalid format.
-  - `404 Not Found`: No month-close record exists for the requested period.
+  - `200 OK`:
+    ```json
+    {
+      "monthClose": {
+        "monthCloseId": "uuid",
+        "userId": "uuid",
+        "periodMonth": "2026-08",
+        "budgetPlanId": "uuid",
+        "budgetPlanRevisionNo": 1,
+        "policyVersion": "PERSONAL_BUDGET_V1",
+        "currency": "TRY",
+        "referenceIncome": "10000.00",
+        "mandatory": { "planned": "4000.00", "actual": "3500.00", "variance": "500.00" },
+        "discretionary": { "planned": "2000.00", "actual": "1800.00", "variance": "200.00" },
+        "unclassifiedExpense": "0.00",
+        "closeSurplus": "700.00",
+        "route": "SHORT_TERM_GOAL",
+        "decision": "FULL",
+        "midasAccountId": "uuid",
+        "targetGoalId": "uuid",
+        "targetGoalRevisionNo": 1,
+        "targetBucketId": "uuid",
+        "fullOfferAmount": "700.00",
+        "appliedAmount": "700.00",
+        "unroutedAmount": "0.00",
+        "midasAllocationTransferId": "uuid",
+        "proposalFingerprint": "64-character-hex-sha256",
+        "occurredAt": "2026-09-01T12:00:00.000Z",
+        "createdAt": "2026-09-01T12:00:00.000Z"
+      }
+    }
+    ```
+  - `400 Bad Request`: Invalid `periodMonth` format (`MONTH_CLOSE_INVALID_INPUT`).
+  - `404 Not Found`: No month-close record exists for the requested period (`MONTH_CLOSE_NOT_FOUND`).
 
 ##### `POST /month-close`
 Applies the month-close decision and closes the budget period.
-- **Headers:** `Idempotency-Key` (or in JSON body `idempotencyKey`).
+- **Headers:** `Idempotency-Key` (header only, 1..128 characters).
 - **Request body (`CloseMonthInput`):**
   ```json
   {
     "periodMonth": "2026-08",
-    "proposalFingerprint": "64-character-hex-sha256",
-    "decision": {
-      "type": "FULL | PARTIAL | SKIP | AUTO_MEDIUM | NO_ACTION",
-      "goalId": "optional-uuid-for-full-or-partial",
-      "customAmount": "optional-decimal-for-partial"
-    },
-    "idempotencyKey": "unique-idempotency-key"
+    "expectedProposalFingerprint": "64-character-hex-sha256",
+    "decision": "FULL",
+    "partialAmount": "500.00",
+    "occurredAt": "2026-09-01T12:00:00.000Z"
   }
   ```
+  - `periodMonth` (required): Ended month (`YYYY-MM`).
+  - `expectedProposalFingerprint` (required): 64-hex SHA-256 string from preview.
+  - `decision` (optional for non-STG routes, required `"FULL" | "PARTIAL" | "SKIP"` when route is `SHORT_TERM_GOAL`).
+  - `partialAmount` (required only when decision is `"PARTIAL"`, forbidden otherwise).
+  - `occurredAt` (required): ISO 8601 timestamp representing the closing occurrence time.
 - **Responses:**
-  - `201 Created`: Month close applied. Returns `{ monthClose: MonthCloseProductDto, idempotentReplay: false }`.
-  - `200 OK`: Exact idempotent replay with identical parameters. Returns `{ monthClose: MonthCloseProductDto, idempotentReplay: true }`.
-  - `400 Bad Request`: Schema validation failure, goalId missing for FULL/PARTIAL, invalid amount.
+  - `201 Created`: Fresh month close applied. Returns `{ monthClose: MonthCloseProductDto, idempotentReplay: false }`.
+  - `200 OK`: Exact idempotent replay with identical retry-sensitive parameters (including `occurredAt` and decision). Returns `{ monthClose: MonthCloseProductDto, idempotentReplay: true }`.
+  - `400 Bad Request`: Malformed period, missing required fields, partialAmount missing when decision is PARTIAL, partialAmount provided when decision is not PARTIAL, invalid timestamp, missing or invalid `Idempotency-Key` header (`MONTH_CLOSE_INVALID_INPUT`).
   - `409 Conflict`:
-    - `MONTH_CLOSE_ALREADY_CLOSED`: Month is already closed.
-    - `MONTH_CLOSE_PROPOSAL_STALE`: Proposal fingerprint mismatch (underlying budget state changed).
-    - `MONTH_CLOSE_IDEMPOTENCY_CONFLICT`: Idempotency key reused with different parameters.
-    - `MONTH_CLOSE_LIQUIDITY_INSUFFICIENT`: Insufficient liquidity at apply time.
+    - `MONTH_CLOSE_PERIOD_NOT_ENDED`: Period has not yet ended in Europe/Istanbul timezone.
+    - `MONTH_CLOSE_ALREADY_CLOSED`: Period is already closed (and key is distinct or replay failed).
+    - `MONTH_CLOSE_STALE_PROPOSAL`: Proposal fingerprint mismatch (budget state or figures mutated).
+    - `MONTH_CLOSE_IDEMPOTENCY_CONFLICT`: Idempotency key reused with different payload parameters.
+    - `MONTH_CLOSE_INSUFFICIENT_LIQUIDITY`: Insufficient unallocated Midas liquidity at apply time.
+    - `MONTH_CLOSE_BUDGET_PLAN_NOT_FOUND` / `MONTH_CLOSE_BUDGET_PLAN_NOT_ACTIVE`: Budget plan missing or inactive.
+    - `MONTH_CLOSE_UNCLASSIFIED_EXPENSES`: Unclassified expenses exist for the period.
+    - `MONTH_CLOSE_MIDAS_NOT_FOUND`: Midas account missing.
 
 #### 2. Keyset Pagination & Cursor Isolation
-Cursors are opaque base64url-encoded JSON payloads binding the authenticated user scope:
-- **Cursor schema (`v: 1`):** `{ v: 1, userId: string, periodMonth: string }`
-- **Rejection policy:** Mismatched `userId`, unsupported `v != 1`, or invalid JSON/base64url fails closed immediately with `MONTH_CLOSE_INVALID_INPUT` (`400`).
+Cursors are opaque base64url-encoded JSON payloads binding the authenticated user scope and active filters:
+- **Cursor schema (`v: 1`):**
+  ```json
+  {
+    "v": 1,
+    "userId": "uuid",
+    "periodMonthFrom": "2026-01" | null,
+    "periodMonthUntil": "2026-12" | null,
+    "periodMonth": "2026-08"
+  }
+  ```
+- **Rejection policy:** Mismatched `userId`, unsupported `v != 1`, filter-scope tampering, or invalid JSON/base64url fails closed immediately with `MONTH_CLOSE_INVALID_INPUT` (`400`).
 
 #### 3. Error Codes & HTTP Mapping
 | Code | HTTP Status | Description |
 |---|---|---|
-| `MONTH_CLOSE_INVALID_INPUT` | 400 | Malformed period format, invalid UUID, cursor scope mismatch, or body schema violation |
+| `MONTH_CLOSE_INVALID_INPUT` | 400 | Malformed period format, invalid UUID, cursor scope mismatch, missing header, or body schema violation |
 | `MONTH_CLOSE_NOT_FOUND` | 404 | Month-close record not found for the requested period |
-| `MONTH_CLOSE_ALREADY_CLOSED` | 409 | Period is already closed |
 | `MONTH_CLOSE_PERIOD_NOT_ENDED` | 409 | Period has not yet ended in Europe/Istanbul timezone |
-| `MONTH_CLOSE_PROPOSAL_STALE` | 409 | Proposal fingerprint mismatch (budget state mutated after preview) |
-| `MONTH_CLOSE_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different parameters |
-| `MONTH_CLOSE_LIQUIDITY_INSUFFICIENT` | 409 | Insufficient liquid funds to execute month-close transfers |
-| `MONTH_CLOSE_GOAL_INVALID` | 409 | Specified goal is not in ACTIVE status or belongs to another user |
-| `MONTH_CLOSE_GOAL_CAP_EXCEEDED` | 409 | Allocated transfer exceeds goal target amount or budget cap |
-| `MONTH_CLOSE_BLOCKED` | 409 | Month close cannot be applied due to domain blockers (missing baseline, unreconciled items) |
+| `MONTH_CLOSE_BUDGET_PLAN_NOT_FOUND` | 409 | Active budget plan not found for the period |
+| `MONTH_CLOSE_BUDGET_PLAN_NOT_ACTIVE` | 409 | Monthly budget plan is not in active state |
+| `MONTH_CLOSE_UNCLASSIFIED_EXPENSES` | 409 | Period contains unclassified expenses preventing clean closure |
+| `MONTH_CLOSE_MIDAS_NOT_FOUND` | 409 | User does not have a provisioned Midas account |
+| `MONTH_CLOSE_INSUFFICIENT_LIQUIDITY` | 409 | Insufficient unallocated Midas liquidity to execute month-close transfer |
+| `MONTH_CLOSE_STALE_PROPOSAL` | 409 | Proposal fingerprint mismatch (budget state mutated after preview) |
+| `MONTH_CLOSE_ALREADY_CLOSED` | 409 | Period is already closed |
+| `MONTH_CLOSE_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different payload or route |
+| `MONTH_CLOSE_INVALID_STATE` | 500 | Inconsistent month-close internal state or invariant violation |
 
 ### 7B.9 — Notifications + Imports
 
