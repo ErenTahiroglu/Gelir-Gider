@@ -1401,7 +1401,7 @@ async function run() {
 				occurredAt: new Date("2026-08-01T00:00:00Z"),
 				idempotencyKey: `stg-test-card-key-${crypto.randomUUID()}`,
 			});
-			const stgCardId = stgCardRes.card.cardId;
+			const stgCardId = stgCardRes.cardId;
 
 			const stgRewardAccRes = await createRewardAccount({
 				db: dbA,
@@ -1662,11 +1662,22 @@ async function run() {
 			const ctx11 = crypto.randomUUID();
 			const crev11 = crypto.randomUUID();
 			const prev11Id = crypto.randomUUID();
+			const mc11CanonIdemp = `plan-canon-idemp-11-${crypto.randomUUID()}`;
+			const mc11CanonFingerprint = "f".repeat(64);
 
+			await controlClient.query("SET session_replication_role = replica;");
+			await controlClient.query(
+				"insert into canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at) values ($1, $2, 'MONTHLY_BUDGET_PLAN', $3, $4, now()) on conflict do nothing",
+				[ctx11, USER_A, mc11CanonIdemp, mc11CanonFingerprint],
+			);
 			await controlClient.query(
 				`insert into monthly_budget_plans (id, user_id, period_month, canonical_transaction_id, created_at)
 				 values ($1, $2, $3, $4, now()) on conflict do nothing`,
 				[plan11Id, USER_A, mc11PeriodDate, ctx11],
+			);
+			await controlClient.query(
+				"insert into transaction_revisions (id, user_id, transaction_id, revision_no, operation, occurred_at, payload, revision_fingerprint, idempotency_key) values ($1, $2, $3, 1, 'CREATE', now(), '{}', $4, $5) on conflict do nothing",
+				[crev11, USER_A, ctx11, mc11CanonFingerprint, mc11CanonIdemp],
 			);
 			await controlClient.query(
 				`insert into monthly_budget_plan_revisions
@@ -1676,6 +1687,7 @@ async function run() {
 				  '5000.00', '2000.00', '1000.00', '1000.00', '1000.00', '0.00', '{}') on conflict do nothing`,
 				[prev11Id, USER_A, plan11Id, crev11],
 			);
+			await controlClient.query("SET session_replication_role = origin;");
 
 			const prevRes11 = await previewMonthClose({
 				db: dbA,
@@ -1712,11 +1724,22 @@ async function run() {
 			const ctx12 = crypto.randomUUID();
 			const crev12 = crypto.randomUUID();
 			const prev12Id = crypto.randomUUID();
+			const mc12CanonIdemp = `plan-canon-idemp-12-${crypto.randomUUID()}`;
+			const mc12CanonFingerprint = "f".repeat(64);
 
+			await controlClient.query("SET session_replication_role = replica;");
+			await controlClient.query(
+				"insert into canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at) values ($1, $2, 'MONTHLY_BUDGET_PLAN', $3, $4, now()) on conflict do nothing",
+				[ctx12, USER_A, mc12CanonIdemp, mc12CanonFingerprint],
+			);
 			await controlClient.query(
 				`insert into monthly_budget_plans (id, user_id, period_month, canonical_transaction_id, created_at)
 				 values ($1, $2, $3, $4, now()) on conflict do nothing`,
 				[plan12Id, USER_A, mc12PeriodDate, ctx12],
+			);
+			await controlClient.query(
+				"insert into transaction_revisions (id, user_id, transaction_id, revision_no, operation, occurred_at, payload, revision_fingerprint, idempotency_key) values ($1, $2, $3, 1, 'CREATE', now(), '{}', $4, $5) on conflict do nothing",
+				[crev12, USER_A, ctx12, mc12CanonFingerprint, mc12CanonIdemp],
 			);
 			await controlClient.query(
 				`insert into monthly_budget_plan_revisions
@@ -1726,6 +1749,7 @@ async function run() {
 				  '5000.00', '2000.00', '1000.00', '1000.00', '1000.00', '0.00', '{}') on conflict do nothing`,
 				[prev12Id, USER_A, plan12Id, crev12],
 			);
+			await controlClient.query("SET session_replication_role = origin;");
 
 			const prevRes12 = await previewMonthClose({
 				db: dbA,
