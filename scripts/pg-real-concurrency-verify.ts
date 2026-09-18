@@ -1757,7 +1757,7 @@ async function run() {
 			});
 			eq(prevRes12.unappliedPriorAdjustments, "-150.00", "7B.9 MC-01: unapplied prior adjustments carried to preview");
 
-			await controlClient.query("BEGIN; LOCK TABLE month_close_adjustments IN ACCESS EXCLUSIVE MODE;");
+			await controlClient.query("BEGIN; LOCK TABLE monthly_budget_plans IN ACCESS EXCLUSIVE MODE;");
 
 			const promiseMC11A = closeMonth({
 				db: dbA,
@@ -1779,11 +1779,11 @@ async function run() {
 
 			const blockedMC11 = await waitUntilBothCompetitorsBlockedOnRelation(
 				controlClient,
-				"month_close_adjustments",
+				"monthly_budget_plans",
 				[pidA, pidB],
 			);
 			ok(
-				"7B.9 MC-01: both independent competitors observed waiting on month_close_adjustments in pg_locks",
+				"7B.9 MC-01: both independent competitors observed waiting on monthly_budget_plans in pg_locks",
 				`(pidA=${blockedMC11.pidA}, pidB=${blockedMC11.pidB})`,
 			);
 
