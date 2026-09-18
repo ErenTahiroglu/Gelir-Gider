@@ -20,6 +20,7 @@ export * from "./ledger";
 export * from "./long-term";
 export * from "./midas";
 export * from "./month-close";
+export * from "./month-close-adjustments";
 export * from "./notifications";
 export * from "./people";
 export * from "./rewards";

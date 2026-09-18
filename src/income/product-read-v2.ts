@@ -9,7 +9,6 @@ import {
 	incomeEntitlementRevisions,
 	incomeEntitlements,
 	incomeSettlementBatchRevisions,
-	type SettlementAllocationItem,
 } from "../db/schema/income-entitlements";
 import { formatCentsToMoney, parseMoneyString } from "../ledger/money";
 import {
@@ -282,39 +281,48 @@ export async function listBoundedIncomeEntitlements({
 		}
 	}
 
-	// 3. Fetch latest settlement allocations for user across active batches
-	const allBatchRevs = await db
-		.select({
-			settlementBatchId: incomeSettlementBatchRevisions.settlementBatchId,
-			revisionNo: incomeSettlementBatchRevisions.revisionNo,
-			allocations: incomeSettlementBatchRevisions.allocations,
-		})
-		.from(incomeSettlementBatchRevisions)
-		.where(eq(incomeSettlementBatchRevisions.userId, userId))
-		.orderBy(
-			incomeSettlementBatchRevisions.settlementBatchId,
-			desc(incomeSettlementBatchRevisions.revisionNo),
-		);
-
-	const latestBatches = new Map<string, SettlementAllocationItem[]>();
-	for (const r of allBatchRevs) {
-		if (!latestBatches.has(r.settlementBatchId)) {
-			latestBatches.set(
-				r.settlementBatchId,
-				Array.isArray(r.allocations)
-					? (r.allocations as SettlementAllocationItem[])
-					: [],
-			);
-		}
-	}
-
+	// 3. Fetch latest settlement allocations scoped strictly to the page's entitlement IDs
 	const allocMap = new Map<string, bigint>();
-	for (const allocs of latestBatches.values()) {
-		for (const alloc of allocs) {
-			if (alloc?.entitlementId && alloc?.amount) {
-				const cents = parseMoneyString(alloc.amount).cents;
-				const current = allocMap.get(alloc.entitlementId) ?? 0n;
-				allocMap.set(alloc.entitlementId, current + cents);
+	if (entitlementIds.length > 0) {
+		const allocQuery = sql`
+			WITH latest_batches AS (
+				SELECT DISTINCT ON (${incomeSettlementBatchRevisions.settlementBatchId})
+					${incomeSettlementBatchRevisions.settlementBatchId},
+					${incomeSettlementBatchRevisions.revisionNo},
+					${incomeSettlementBatchRevisions.allocations}
+				FROM ${incomeSettlementBatchRevisions}
+				WHERE ${incomeSettlementBatchRevisions.userId} = ${userId}
+				ORDER BY ${incomeSettlementBatchRevisions.settlementBatchId}, ${incomeSettlementBatchRevisions.revisionNo} DESC
+			),
+			unrolled_allocs AS (
+				SELECT
+					(elem->>'entitlementId')::text AS entitlement_id,
+					(elem->>'amount')::numeric AS amount
+				FROM latest_batches,
+				jsonb_array_elements(allocations) AS elem
+			)
+			SELECT
+				entitlement_id,
+				COALESCE(SUM(ROUND(amount * 100)), 0)::text AS total_allocated_cents
+			FROM unrolled_allocs
+			WHERE entitlement_id IN (${sql.join(
+				entitlementIds.map((id) => sql`${id}`),
+				sql`, `,
+			)})
+			GROUP BY entitlement_id
+		`;
+		const rawAllocResult = await db.execute(allocQuery);
+		const allocRows = (Array.isArray(rawAllocResult)
+			? rawAllocResult
+			: ((rawAllocResult as { rows?: unknown[] }).rows ??
+				[])) as unknown as Array<{
+			entitlement_id: string;
+			total_allocated_cents: string;
+		}>;
+
+		for (const r of allocRows) {
+			if (r?.entitlement_id) {
+				allocMap.set(r.entitlement_id, BigInt(r.total_allocated_cents ?? "0"));
 			}
 		}
 	}

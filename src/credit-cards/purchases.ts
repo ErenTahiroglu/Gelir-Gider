@@ -650,31 +650,29 @@ export async function recordCreditCardPurchaseInTransaction({
 
 	// 3. If Short-term goal, verify goal exists and is ACTIVE
 	if (validGoalId) {
-		const [goal] = await tx
-			.select({
-				id: shortTermGoals.id,
-				status: shortTermGoalRevisions.status,
-			})
+		const [goalHeader] = await tx
+			.select({ id: shortTermGoals.id })
 			.from(shortTermGoals)
-			.innerJoin(
-				shortTermGoalRevisions,
-				eq(shortTermGoalRevisions.goalId, shortTermGoals.id),
-			)
 			.where(
 				and(
 					eq(shortTermGoals.id, validGoalId),
 					eq(shortTermGoals.userId, validUserId),
 				),
 			)
-			.orderBy(desc(shortTermGoalRevisions.revisionNo))
-			.limit(1);
-		if (!goal) {
+			.for("share");
+		if (!goalHeader) {
 			throw new CreditCardError(
 				"CREDIT_CARD_INVALID_INPUT",
 				`Short-term goal "${validGoalId}" not found`,
 			);
 		}
-		if (goal.status !== "ACTIVE") {
+		const [goalRev] = await tx
+			.select({ status: shortTermGoalRevisions.status })
+			.from(shortTermGoalRevisions)
+			.where(eq(shortTermGoalRevisions.goalId, validGoalId))
+			.orderBy(desc(shortTermGoalRevisions.revisionNo))
+			.limit(1);
+		if (goalRev?.status !== "ACTIVE") {
 			throw new CreditCardError(
 				"CREDIT_CARD_INVALID_INPUT",
 				`Short-term goal "${validGoalId}" is not ACTIVE`,
@@ -1248,25 +1246,29 @@ export async function updateCreditCardPurchaseInTransaction({
 
 	// Verify short-term goal if applicable
 	if (validGoalId) {
-		const [goal] = await tx
-			.select({
-				id: shortTermGoals.id,
-				status: shortTermGoalRevisions.status,
-			})
+		const [goalHeader] = await tx
+			.select({ id: shortTermGoals.id })
 			.from(shortTermGoals)
-			.innerJoin(
-				shortTermGoalRevisions,
-				eq(shortTermGoalRevisions.goalId, shortTermGoals.id),
-			)
 			.where(
 				and(
 					eq(shortTermGoals.id, validGoalId),
 					eq(shortTermGoals.userId, validUserId),
 				),
 			)
+			.for("share");
+		if (!goalHeader) {
+			throw new CreditCardError(
+				"CREDIT_CARD_INVALID_INPUT",
+				`Short-term goal "${validGoalId}" not found`,
+			);
+		}
+		const [goalRev] = await tx
+			.select({ status: shortTermGoalRevisions.status })
+			.from(shortTermGoalRevisions)
+			.where(eq(shortTermGoalRevisions.goalId, validGoalId))
 			.orderBy(desc(shortTermGoalRevisions.revisionNo))
 			.limit(1);
-		if (goal?.status !== "ACTIVE") {
+		if (goalRev?.status !== "ACTIVE") {
 			throw new CreditCardError(
 				"CREDIT_CARD_INVALID_INPUT",
 				`Short-term goal "${validGoalId}" is not active`,

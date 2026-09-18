@@ -1,6 +1,7 @@
 import { and, desc, eq, gte, inArray, lt, lte, or, sql } from "drizzle-orm";
 import type { Database } from "../db/client";
 import { creditCardPurchaseSplitParticipants } from "../db/schema/credit-card-splits";
+import { journalEntries, journalLines } from "../db/schema/ledger";
 import {
 	type PersonObligationDirection,
 	type PersonRelationship,
@@ -13,8 +14,12 @@ import {
 	personSettlementRevisions,
 	personSettlements,
 } from "../db/schema/people";
-import { getLedgerAccountBalanceInTransaction } from "../ledger/balances";
-import { parsePositiveMoneyString } from "../ledger/money";
+
+import {
+	formatSignedCentsToMoney,
+	parseAggregateMoneyString,
+	parsePositiveMoneyString,
+} from "../ledger/money";
 import { runPeopleReadTransaction } from "./boundary";
 import type { ObligationReadModel } from "./obligations";
 import type {
@@ -291,6 +296,47 @@ export async function listBoundedPeople({
 				: [];
 		const linkByPersonId = new Map(links.map((l) => [l.personId, l]));
 
+		// Collect all receivable and payable account IDs across the page
+		const allAccountIds: string[] = [];
+		for (const link of links) {
+			if (link.receivableAccountId)
+				allAccountIds.push(link.receivableAccountId);
+			if (link.payableAccountId) allAccountIds.push(link.payableAccountId);
+		}
+
+		const totalsMap = new Map<
+			string,
+			{ debitCents: bigint; creditCents: bigint }
+		>();
+		if (allAccountIds.length > 0) {
+			const aggregatedLines = await tx
+				.select({
+					accountId: journalLines.accountId,
+					debitSum: sql<string>`COALESCE(SUM(${journalLines.debit}), 0.00)`,
+					creditSum: sql<string>`COALESCE(SUM(${journalLines.credit}), 0.00)`,
+				})
+				.from(journalLines)
+				.innerJoin(
+					journalEntries,
+					eq(journalLines.journalEntryId, journalEntries.id),
+				)
+				.where(
+					and(
+						eq(journalEntries.userId, validUserId),
+						eq(journalEntries.status, "POSTED"),
+						inArray(journalLines.accountId, allAccountIds),
+					),
+				)
+				.groupBy(journalLines.accountId);
+
+			for (const r of aggregatedLines) {
+				totalsMap.set(r.accountId, {
+					debitCents: parseAggregateMoneyString(r.debitSum).cents,
+					creditCents: parseAggregateMoneyString(r.creditSum).cents,
+				});
+			}
+		}
+
 		const dtos: PersonProductDto[] = [];
 		for (const row of pageRows) {
 			const link = linkByPersonId.get(row.personId);
@@ -298,18 +344,19 @@ export async function listBoundedPeople({
 			let payableBalance = "0.00";
 
 			if (link) {
-				const recBal = await getLedgerAccountBalanceInTransaction({
-					tx,
-					userId: validUserId,
-					accountId: link.receivableAccountId,
-				});
-				const payBal = await getLedgerAccountBalanceInTransaction({
-					tx,
-					userId: validUserId,
-					accountId: link.payableAccountId,
-				});
-				receivableBalance = recBal.balance;
-				payableBalance = payBal.balance;
+				const recTotals = totalsMap.get(link.receivableAccountId) ?? {
+					debitCents: 0n,
+					creditCents: 0n,
+				};
+				const recSignedCents = recTotals.debitCents - recTotals.creditCents;
+				receivableBalance = formatSignedCentsToMoney(recSignedCents);
+
+				const payTotals = totalsMap.get(link.payableAccountId) ?? {
+					debitCents: 0n,
+					creditCents: 0n,
+				};
+				const paySignedCents = payTotals.creditCents - payTotals.debitCents;
+				payableBalance = formatSignedCentsToMoney(paySignedCents);
 			}
 
 			dtos.push({

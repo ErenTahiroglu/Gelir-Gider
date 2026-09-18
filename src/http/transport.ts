@@ -411,3 +411,25 @@ export function sameOriginMutationGuard(): MiddlewareHandler<{
 		return next();
 	};
 }
+
+/**
+ * Strict query parameter validation: ensures no undeclared query parameters
+ * exist and no query parameter is duplicated in the query string.
+ */
+export function validateStrictQueryParams(
+	c: { req: { url: string } },
+	allowedKeys: readonly string[],
+): boolean {
+	const url = new URL(c.req.url);
+	const seen = new Set<string>();
+	for (const key of url.searchParams.keys()) {
+		if (seen.has(key)) {
+			return false;
+		}
+		seen.add(key);
+		if (!allowedKeys.includes(key)) {
+			return false;
+		}
+	}
+	return true;
+}

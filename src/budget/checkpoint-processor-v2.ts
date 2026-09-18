@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, lt } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, lt } from "drizzle-orm";
 import type { Database } from "../db/client";
 import {
 	budgetV2CheckpointRequests,
@@ -135,26 +135,30 @@ export async function processPendingBudgetV2CheckpointRequests(
 	params: ProcessPendingCheckpointRequestsParams,
 ): Promise<ProcessPendingCheckpointRequestsResult> {
 	const { db } = params;
-
-	const allRequests = await db
-		.select()
+	const pendingRequests = await db
+		.select({
+			id: budgetV2CheckpointRequests.id,
+			userId: budgetV2CheckpointRequests.userId,
+			periodMonth: budgetV2CheckpointRequests.periodMonth,
+			paymentEventId: budgetV2CheckpointRequests.paymentEventId,
+			checkpointAt: budgetV2CheckpointRequests.checkpointAt,
+			createdAt: budgetV2CheckpointRequests.createdAt,
+		})
 		.from(budgetV2CheckpointRequests)
+		.leftJoin(
+			budgetV2CheckpointSnapshots,
+			eq(budgetV2CheckpointRequests.id, budgetV2CheckpointSnapshots.requestId),
+		)
+		.where(isNull(budgetV2CheckpointSnapshots.requestId))
 		.orderBy(
 			asc(budgetV2CheckpointRequests.userId),
 			asc(budgetV2CheckpointRequests.periodMonth),
 			asc(budgetV2CheckpointRequests.checkpointAt),
 			asc(budgetV2CheckpointRequests.id),
-		);
-	const persistedRequestIds = new Set(
-		(
-			await db
-				.select({ requestId: budgetV2CheckpointSnapshots.requestId })
-				.from(budgetV2CheckpointSnapshots)
-		).map((r) => r.requestId),
-	);
-	const pendingIds = new Set(
-		allRequests.filter((r) => !persistedRequestIds.has(r.id)).map((r) => r.id),
-	);
+		)
+		.limit(100);
+
+	const pendingIds = new Set(pendingRequests.map((r) => r.id));
 
 	const result: ProcessPendingCheckpointRequestsResult = {
 		pendingDiscovered: pendingIds.size,
@@ -167,21 +171,33 @@ export async function processPendingBudgetV2CheckpointRequests(
 	};
 	if (pendingIds.size === 0) return result;
 
-	// Group ALL requests by user+period (chronological). A request whose
-	// snapshot already exists is still carried so identity-aware collision
-	// detection can dedupe it against its own snapshot.
-	const groups = new Map<string, RequestRow[]>();
-	for (const r of allRequests) {
-		const key = groupKey(r.userId, r.periodMonth);
-		const list = groups.get(key) ?? [];
-		list.push(r);
-		groups.set(key, list);
+	// Extract unique (userId, periodMonth) pairs from pendingRequests
+	const distinctGroups: Array<{ userId: string; periodMonth: string }> = [];
+	const seenGroupKeys = new Set<string>();
+	for (const p of pendingRequests) {
+		const k = groupKey(p.userId, p.periodMonth);
+		if (!seenGroupKeys.has(k)) {
+			seenGroupKeys.add(k);
+			distinctGroups.push({ userId: p.userId, periodMonth: p.periodMonth });
+		}
 	}
 
-	for (const [, groupRequests] of groups) {
-		const { userId, periodMonth } = groupRequests[0] as RequestRow;
-		if (!groupRequests.some((r) => pendingIds.has(r.id))) continue; // nothing to do
+	for (const { userId, periodMonth } of distinctGroups) {
 		result.periodsProcessed += 1;
+
+		const groupRequests = await db
+			.select()
+			.from(budgetV2CheckpointRequests)
+			.where(
+				and(
+					eq(budgetV2CheckpointRequests.userId, userId),
+					eq(budgetV2CheckpointRequests.periodMonth, periodMonth),
+				),
+			)
+			.orderBy(
+				asc(budgetV2CheckpointRequests.checkpointAt),
+				asc(budgetV2CheckpointRequests.id),
+			);
 
 		// Persisted snapshots already in this (user, period) chain.
 		let chain: SnapshotRow[] = await db

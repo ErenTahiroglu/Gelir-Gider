@@ -499,7 +499,7 @@ export async function runDatabaseBackup(
 	let uploaded = false;
 	try {
 		const snapshot = await db.transaction(
-			async (tx) => exportDatabaseSnapshot(tx),
+			async (tx) => exportDatabaseSnapshot(tx, params.maxPlaintextBytes),
 			{ isolationLevel: "repeatable read", accessMode: "read only" },
 		);
 

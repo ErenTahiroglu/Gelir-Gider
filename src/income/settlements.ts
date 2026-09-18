@@ -9,6 +9,10 @@ import {
 	type SettlementAllocationItem,
 } from "../db/schema/income-entitlements";
 import {
+	canonicalTransactions,
+	transactionRevisions,
+} from "../db/schema/transactions";
+import {
 	formatCentsToMoney,
 	type ParsedMoney,
 	parseMoneyString,
@@ -193,6 +197,177 @@ export async function createIncomeSettlement(
 	}
 
 	return await db.transaction(async (tx) => {
+		const canonicalPayload: Record<string, unknown> = {
+			incomeReceiptId: canonicalReceiptId,
+			allocations: normalizedAllocations,
+			note: normalizedNote,
+		};
+
+		// 0. Replay-before-live check
+		const [existingTx] = await tx
+			.select()
+			.from(canonicalTransactions)
+			.where(
+				and(
+					eq(canonicalTransactions.userId, userId),
+					eq(
+						canonicalTransactions.creationIdempotencyKey,
+						trimmedIdempotencyKey,
+					),
+				),
+			)
+			.limit(1);
+
+		if (existingTx) {
+			const [rev1] = await tx
+				.select({ occurredAt: transactionRevisions.occurredAt })
+				.from(transactionRevisions)
+				.where(
+					and(
+						eq(transactionRevisions.transactionId, existingTx.id),
+						eq(transactionRevisions.revisionNo, 1),
+					),
+				)
+				.limit(1);
+
+			let canonRes: CanonicalTransactionOperationResult;
+			try {
+				canonRes = await createCanonicalTransactionInTransaction({
+					tx,
+					userId,
+					kind: "INCOME_SETTLEMENT",
+					idempotencyKey: trimmedIdempotencyKey,
+					occurredAt: rev1?.occurredAt ?? existingTx.createdAt,
+					payload: canonicalPayload,
+					source: provenance,
+				});
+			} catch (err) {
+				if (
+					err instanceof CanonicalTransactionError &&
+					err.code === "TRANSACTION_IDEMPOTENCY_CONFLICT"
+				) {
+					throw new IncomeError(
+						"INCOME_IDEMPOTENCY_CONFLICT",
+						"Settlement creation replayed with changed parameters",
+					);
+				}
+				throw err;
+			}
+
+			if (canonRes.idempotentReplay) {
+				const [existingBatch] = await tx
+					.select()
+					.from(incomeSettlementBatches)
+					.where(
+						and(
+							eq(
+								incomeSettlementBatches.canonicalTransactionId,
+								canonRes.transactionId,
+							),
+							eq(incomeSettlementBatches.userId, userId),
+						),
+					)
+					.limit(1);
+
+				if (!existingBatch) {
+					throw new IncomeError(
+						"INCOME_SETTLEMENT_NOT_FOUND",
+						"Settlement batch missing on canonical replay",
+					);
+				}
+
+				const [latestBatchRev] = await tx
+					.select()
+					.from(incomeSettlementBatchRevisions)
+					.where(
+						eq(
+							incomeSettlementBatchRevisions.canonicalRevisionId,
+							canonRes.revisionId,
+						),
+					)
+					.limit(1);
+
+				if (!latestBatchRev) {
+					throw new IncomeError(
+						"INCOME_SETTLEMENT_NOT_FOUND",
+						"Settlement batch revision missing on canonical replay",
+					);
+				}
+
+				const storedAllocations = (latestBatchRev.allocations ??
+					[]) as SettlementAllocationItem[];
+				let totalAllocatedCents = 0n;
+				for (const a of storedAllocations) {
+					totalAllocatedCents += parseMoneyString(a.amount).cents;
+				}
+
+				const [receiptRev] = await tx
+					.select()
+					.from(incomeReceiptRevisions)
+					.where(
+						and(
+							eq(incomeReceiptRevisions.incomeReceiptId, canonicalReceiptId),
+							eq(incomeReceiptRevisions.userId, userId),
+						),
+					)
+					.orderBy(desc(incomeReceiptRevisions.revisionNo))
+					.limit(1);
+
+				const receiptAmount = receiptRev?.amount ?? "0.00";
+				const receiptCents = parseMoneyString(receiptAmount).cents;
+				const unallocatedCents =
+					receiptCents > totalAllocatedCents
+						? receiptCents - totalAllocatedCents
+						: 0n;
+
+				const entBreakdown: IncomeReceiptSettlementAllocationItem[] = [];
+				for (const a of storedAllocations) {
+					const [ent] = await tx
+						.select()
+						.from(incomeEntitlements)
+						.where(
+							and(
+								eq(incomeEntitlements.id, a.entitlementId),
+								eq(incomeEntitlements.userId, userId),
+							),
+						)
+						.limit(1);
+					const [entRev] = await tx
+						.select()
+						.from(incomeEntitlementRevisions)
+						.where(
+							and(
+								eq(incomeEntitlementRevisions.entitlementId, a.entitlementId),
+								eq(incomeEntitlementRevisions.userId, userId),
+							),
+						)
+						.orderBy(desc(incomeEntitlementRevisions.revisionNo))
+						.limit(1);
+
+					entBreakdown.push({
+						entitlementId: a.entitlementId,
+						periodMonth: ent?.periodMonth ?? "",
+						entitlementAmount: entRev?.amount ?? a.amount,
+						allocatedAmount: a.amount,
+						entitlementOutstandingAfterAllReceipts: "0.00",
+					});
+				}
+
+				return {
+					idempotentReplay: true,
+					settlement: {
+						incomeReceiptId: canonicalReceiptId,
+						receiptAmount,
+						allocatedAmount: formatCentsToMoney(totalAllocatedCents),
+						unallocatedAmount: formatCentsToMoney(unallocatedCents),
+						settlementBatchId: existingBatch.id,
+						revisionNo: latestBatchRev.revisionNo,
+						allocations: entBreakdown,
+					},
+				};
+			}
+		}
+
 		// 1. Acquire row locks on receipt and all target entitlements FIRST
 		const targetEntitlementIds = normalizedAllocations.map(
 			(a) => a.entitlementId,
@@ -331,12 +506,6 @@ export async function createIncomeSettlement(
 				),
 			});
 		}
-
-		const canonicalPayload: Record<string, unknown> = {
-			incomeReceiptId: receipt.id,
-			allocations: normalizedAllocations,
-			note: normalizedNote,
-		};
 
 		let canonRes: CanonicalTransactionOperationResult;
 		try {

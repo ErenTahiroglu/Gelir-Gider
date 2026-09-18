@@ -193,12 +193,11 @@ async function run() {
 	console.log(`Connected to: ${versionRes.rows[0].version}\n`);
 
 	// Apply migrations
-	console.log("Applying committed migration chain 0000..0071...");
 	const journal = JSON.parse(
 		readFileSync(path.join(migDir, "meta/_journal.json"), "utf8"),
 	) as { entries: { idx: number; tag: string }[] };
+	console.log(`Applying committed migration chain 0000..${journal.entries[journal.entries.length - 1]?.tag.slice(0, 4)}...`);
 	for (const entry of journal.entries) {
-		if (entry.idx > 71) break;
 		const raw = readFileSync(path.join(migDir, `${entry.tag}.sql`), "utf8");
 		for (const chunk of raw.split(/-->\s*statement-breakpoint/)) {
 			const stmt = chunk.trim();

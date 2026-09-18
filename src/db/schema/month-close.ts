@@ -135,6 +135,18 @@ export const monthCloseRevisions = pgTable(
 			precision: 18,
 			scale: 2,
 		}).notNull(),
+		unappliedPriorAdjustments: numeric("unapplied_prior_adjustments", {
+			precision: 18,
+			scale: 2,
+		})
+			.default("0.00")
+			.notNull(),
+		adjustedRoutableSurplus: numeric("adjusted_routable_surplus", {
+			precision: 18,
+			scale: 2,
+		})
+			.default("0.00")
+			.notNull(),
 
 		route: varchar("route", { length: 20 }).notNull(),
 		decision: varchar("decision", { length: 20 }).notNull(),
@@ -256,8 +268,12 @@ export const monthCloseRevisions = pgTable(
 			sql`${table.closeSurplus} = ${table.mandatoryUnused} + ${table.discretionaryUnused}`,
 		),
 		check(
+			"month_close_revisions_adjusted_routable_check",
+			sql`${table.adjustedRoutableSurplus} >= 0 AND ${table.adjustedRoutableSurplus} = GREATEST(${table.closeSurplus} + ${table.unappliedPriorAdjustments}, 0)`,
+		),
+		check(
 			"month_close_revisions_unrouted_check",
-			sql`${table.unroutedAmount} = ${table.closeSurplus} - ${table.appliedAmount}`,
+			sql`${table.unroutedAmount} = ${table.adjustedRoutableSurplus} - ${table.appliedAmount}`,
 		),
 		check(
 			"month_close_revisions_applied_nonneg_check",
@@ -297,8 +313,8 @@ export const monthCloseRevisions = pgTable(
 				(${table.route} = 'SHORT_TERM_GOAL' AND ${table.decision} = 'FULL' AND ${table.appliedAmount} = ${table.fullOfferAmount} AND ${table.midasAllocationTransferId} IS NOT NULL)
 				OR (${table.route} = 'SHORT_TERM_GOAL' AND ${table.decision} = 'PARTIAL' AND ${table.appliedAmount} > 0 AND ${table.appliedAmount} < ${table.fullOfferAmount} AND ${table.midasAllocationTransferId} IS NOT NULL)
 				OR (${table.route} = 'SHORT_TERM_GOAL' AND ${table.decision} = 'SKIP' AND ${table.appliedAmount} = 0 AND ${table.midasAllocationTransferId} IS NULL)
-				OR (${table.route} = 'MEDIUM_TERM_RESERVE' AND ${table.decision} = 'AUTO_MEDIUM' AND ${table.appliedAmount} = ${table.closeSurplus} AND ${table.midasAllocationTransferId} IS NOT NULL)
-				OR (${table.route} = 'NONE' AND ${table.decision} = 'NO_ACTION' AND ${table.closeSurplus} = 0 AND ${table.appliedAmount} = 0 AND ${table.midasAllocationTransferId} IS NULL)
+				OR (${table.route} = 'MEDIUM_TERM_RESERVE' AND ${table.decision} = 'AUTO_MEDIUM' AND ${table.appliedAmount} = ${table.adjustedRoutableSurplus} AND ((${table.adjustedRoutableSurplus} > 0 AND ${table.midasAllocationTransferId} IS NOT NULL) OR (${table.adjustedRoutableSurplus} = 0 AND ${table.midasAllocationTransferId} IS NULL)))
+				OR (${table.route} = 'NONE' AND ${table.decision} = 'NO_ACTION' AND ${table.adjustedRoutableSurplus} = 0 AND ${table.appliedAmount} = 0 AND ${table.midasAllocationTransferId} IS NULL)
 			`,
 		),
 		check(

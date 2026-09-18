@@ -17,6 +17,7 @@ import {
 	isUuid,
 	parseBoundedLimit,
 	parseCanonicalInstant,
+	validateStrictQueryParams,
 } from "./transport";
 
 type TransactionsEnv = {
@@ -61,6 +62,18 @@ transactionsRouter.use("*", bodyLimit({ maxSize: BODY_LIMIT_BYTES }));
 
 // 1. GET /transactions -- Bounded transaction list
 transactionsRouter.get("/", async (c) => {
+	if (
+		!validateStrictQueryParams(c, [
+			"limit",
+			"status",
+			"kind",
+			"beforeOccurredAt",
+			"beforeTransactionId",
+		])
+	) {
+		return fail(c, "TRANSACTION_INVALID_INPUT", 400);
+	}
+
 	const limitRes = parseBoundedLimit(c.req.query("limit"), {
 		defaultLimit: 50,
 		maxLimit: 100,
@@ -132,6 +145,10 @@ transactionsRouter.get("/", async (c) => {
 
 // 2. GET /transactions/:transactionId -- Transaction detail
 transactionsRouter.get("/:transactionId", async (c) => {
+	if (!validateStrictQueryParams(c, [])) {
+		return fail(c, "TRANSACTION_INVALID_INPUT", 400);
+	}
+
 	const txId = c.req.param("transactionId");
 	if (!isUuid(txId)) return fail(c, "TRANSACTION_INVALID_INPUT", 400);
 
@@ -165,6 +182,10 @@ transactionsRouter.get("/:transactionId", async (c) => {
 
 // 3. GET /transactions/:transactionId/revisions -- Bounded revision history
 transactionsRouter.get("/:transactionId/revisions", async (c) => {
+	if (!validateStrictQueryParams(c, ["limit", "beforeRevisionNo"])) {
+		return fail(c, "TRANSACTION_INVALID_INPUT", 400);
+	}
+
 	const txId = c.req.param("transactionId");
 	if (!isUuid(txId)) return fail(c, "TRANSACTION_INVALID_INPUT", 400);
 

@@ -39,6 +39,8 @@ export interface RunNotificationSchedulerParams {
 	db: Database;
 	scheduledAt: Date;
 	transport: PushTransport;
+	maxEvents?: number | undefined;
+	maxDispatches?: number | undefined;
 }
 
 export interface NotificationSchedulerSummary {
@@ -308,7 +310,7 @@ async function processEventSubscription(
 	currentHourSlot: Date,
 	summary: NotificationSchedulerSummary,
 	transportPreparedState: { prepared: boolean },
-): Promise<void> {
+): Promise<boolean> {
 	// Phase 15-R2 Section C: global VAPID/config preflight -- performed
 	// BEFORE the first dispatch reservation of this run. If it throws, zero
 	// dispatch reservations, zero attempts, and zero network calls happen for
@@ -325,7 +327,7 @@ async function processEventSubscription(
 		currentHourSlot,
 		summary,
 	);
-	if (reservation.kind !== "RESERVED") return;
+	if (reservation.kind !== "RESERVED") return false;
 
 	let sendResult: PushSendResult;
 	try {
@@ -396,6 +398,8 @@ async function processEventSubscription(
 			"Push service rejected VAPID credentials (401/403); aborting scheduler run",
 		);
 	}
+
+	return true;
 }
 
 /**
@@ -408,7 +412,13 @@ async function processEventSubscription(
 export async function runNotificationScheduler(
 	params: RunNotificationSchedulerParams,
 ): Promise<NotificationSchedulerSummary> {
-	const { db, scheduledAt, transport } = params;
+	const {
+		db,
+		scheduledAt,
+		transport,
+		maxEvents = 100,
+		maxDispatches = 100,
+	} = params;
 	const { localDate, localHour } = getIstanbulLocalDateAndHour(scheduledAt);
 
 	if (!isAtOrAfterNotificationDeliveryHour(localHour)) {
@@ -436,8 +446,15 @@ export async function runNotificationScheduler(
 	// least one event for today), never on an empty run or the pre-12:00
 	// early return above.
 	const transportPreparedState = { prepared: false };
+	let dispatchesAttempted = 0;
+	let eventsProcessed = 0;
 
 	for (const rawEvent of events) {
+		if (eventsProcessed >= maxEvents || dispatchesAttempted >= maxDispatches) {
+			break;
+		}
+		eventsProcessed++;
+
 		const event: NotificationEventReadModel = {
 			id: rawEvent.id,
 			userId: rawEvent.userId,
@@ -455,7 +472,9 @@ export async function runNotificationScheduler(
 		if (activeSubscriptions.length === 0) continue;
 
 		for (const subscription of activeSubscriptions) {
-			await processEventSubscription(
+			if (dispatchesAttempted >= maxDispatches) break;
+
+			const dispatched = await processEventSubscription(
 				db,
 				transport,
 				event,
@@ -465,6 +484,9 @@ export async function runNotificationScheduler(
 				summary,
 				transportPreparedState,
 			);
+			if (dispatched) {
+				dispatchesAttempted++;
+			}
 		}
 	}
 

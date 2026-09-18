@@ -55,6 +55,8 @@ export interface MonthCloseProductDto {
 	discretionary: MonthCloseAmountBreakdown;
 	unclassifiedExpense: string;
 	closeSurplus: string;
+	unappliedPriorAdjustments: string;
+	adjustedRoutableSurplus: string;
 	route: MonthCloseRoute;
 	decision: MonthCloseDecision;
 	midasAccountId: string | null;
@@ -83,6 +85,8 @@ export function toMonthCloseProductDto(model: {
 	discretionary: MonthCloseAmountBreakdown;
 	unclassifiedExpense: string;
 	closeSurplus: string;
+	unappliedPriorAdjustments?: string | null;
+	adjustedRoutableSurplus?: string | null;
 	route: MonthCloseRoute;
 	decision: MonthCloseDecision;
 	midasAccountId: string | null;
@@ -119,6 +123,9 @@ export function toMonthCloseProductDto(model: {
 		discretionary: model.discretionary,
 		unclassifiedExpense: model.unclassifiedExpense,
 		closeSurplus: model.closeSurplus,
+		unappliedPriorAdjustments: model.unappliedPriorAdjustments ?? "0.00",
+		adjustedRoutableSurplus:
+			model.adjustedRoutableSurplus ?? model.closeSurplus,
 		route: model.route,
 		decision: model.decision,
 		midasAccountId: model.midasAccountId,
@@ -571,6 +578,8 @@ export async function listBoundedMonthCloses({
 				},
 				unclassifiedExpense: r.rev.unclassifiedExpense,
 				closeSurplus: r.rev.closeSurplus,
+				unappliedPriorAdjustments: r.rev.unappliedPriorAdjustments,
+				adjustedRoutableSurplus: r.rev.adjustedRoutableSurplus,
 				route: r.rev.route as MonthCloseRoute,
 				decision: r.rev.decision as MonthCloseDecision,
 				midasAccountId: r.rev.midasAccountId,

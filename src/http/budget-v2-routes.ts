@@ -31,6 +31,7 @@ import {
 	readJsonObject,
 	sameOriginMutationGuard,
 	UUID_RE,
+	validateStrictQueryParams,
 } from "./transport";
 
 /**
@@ -153,6 +154,10 @@ budgetV2Router.post(
 // --- GET /budget-v2/checkpoints --------------------------------------
 
 budgetV2Router.get("/checkpoints", async (c) => {
+	if (!validateStrictQueryParams(c, ["limit"])) {
+		return fail(c, "BUDGET_INVALID_INPUT", 400);
+	}
+
 	const rawLimit = c.req.query("limit");
 	const limit = parseBoundedLimit(rawLimit, {
 		defaultLimit: TIMELINE_DEFAULT_LIMIT,
@@ -181,6 +186,10 @@ budgetV2Router.get("/checkpoints", async (c) => {
 budgetV2Router.get(
 	"/checkpoints/:paymentEventId/decision-center",
 	async (c) => {
+		if (!validateStrictQueryParams(c, [])) {
+			return fail(c, "BUDGET_INVALID_INPUT", 400);
+		}
+
 		const paymentEventId = c.req.param("paymentEventId");
 		if (!UUID_RE.test(paymentEventId)) {
 			return fail(c, "BUDGET_INVALID_INPUT", 400);

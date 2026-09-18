@@ -592,7 +592,9 @@ describe("Campaigns Product HTTP Surface (Checkpoint 7B.6)", () => {
 				needsReviewCount: 0,
 				needsReviewAmount: "0.00",
 				qualifyingPurchases: [],
+				qualifyingPurchasesTruncated: false,
 				needsReviewPurchases: [],
+				needsReviewPurchasesTruncated: false,
 			});
 
 			const res = await app.request(
@@ -645,7 +647,9 @@ describe("Campaigns Product HTTP Surface (Checkpoint 7B.6)", () => {
 				needsReviewCount: 0,
 				needsReviewAmount: "0.00",
 				qualifyingPurchases: [],
+				qualifyingPurchasesTruncated: false,
 				needsReviewPurchases: [],
+				needsReviewPurchasesTruncated: false,
 			});
 
 			const res1 = await app.request(
@@ -687,7 +691,9 @@ describe("Campaigns Product HTTP Surface (Checkpoint 7B.6)", () => {
 				needsReviewCount: 0,
 				needsReviewAmount: "0.00",
 				qualifyingPurchases: [],
+				qualifyingPurchasesTruncated: false,
 				needsReviewPurchases: [],
+				needsReviewPurchasesTruncated: false,
 			});
 
 			const res2 = await app.request(

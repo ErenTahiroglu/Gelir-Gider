@@ -62,5 +62,10 @@ jobs:
           DATABASE_URL: "postgres://dummy:dummy@localhost:5432/dummy"
         run: npx drizzle-kit generate
 
-      - name: Ensure Clean Working Tree
-        run: git diff --exit-code
+      - name: Ensure Clean Working Tree (No Tracked or Untracked Schema Drift)
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Schema drift or uncommitted files detected:"
+            git status --porcelain
+            exit 1
+          fi

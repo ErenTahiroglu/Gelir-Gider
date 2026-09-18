@@ -49,6 +49,7 @@ import {
 	readIdempotencyKey,
 	readJsonObject,
 	sameOriginMutationGuard,
+	validateStrictQueryParams,
 } from "./transport";
 
 type IncomeEnv = {
@@ -113,6 +114,17 @@ incomeRouter.post(
 
 // 1.1 GET /income/sources -- Bounded income sources list
 incomeRouter.get("/sources", async (c) => {
+	if (
+		!validateStrictQueryParams(c, [
+			"limit",
+			"includeArchived",
+			"beforeCreatedAt",
+			"beforeSourceId",
+		])
+	) {
+		return fail(c, "INCOME_INVALID_INPUT", 400);
+	}
+
 	const limitRes = parseBoundedLimit(c.req.query("limit"), {
 		defaultLimit: 50,
 		maxLimit: 100,
@@ -177,6 +189,10 @@ incomeRouter.get("/sources", async (c) => {
 
 // 1.2 GET /income/sources/:sourceId -- Source detail
 incomeRouter.get("/sources/:sourceId", async (c) => {
+	if (!validateStrictQueryParams(c, [])) {
+		return fail(c, "INCOME_INVALID_INPUT", 400);
+	}
+
 	const sourceId = c.req.param("sourceId");
 	if (!isUuid(sourceId)) return fail(c, "INCOME_INVALID_INPUT", 400);
 
@@ -445,6 +461,20 @@ incomeRouter.post("/sources/:sourceId/archive", async (c) => {
 
 // 2.1 GET /income/entitlements -- Bounded entitlement list
 incomeRouter.get("/entitlements", async (c) => {
+	if (
+		!validateStrictQueryParams(c, [
+			"limit",
+			"sourceId",
+			"periodMonthFrom",
+			"periodMonthUntil",
+			"overdueAsOf",
+			"beforePeriodMonth",
+			"beforeEntitlementId",
+		])
+	) {
+		return fail(c, "INCOME_INVALID_INPUT", 400);
+	}
+
 	const limitRes = parseBoundedLimit(c.req.query("limit"), {
 		defaultLimit: 50,
 		maxLimit: 100,
@@ -544,6 +574,10 @@ incomeRouter.get("/entitlements", async (c) => {
 
 // 2.2 GET /income/entitlements/:entitlementId -- Entitlement detail
 incomeRouter.get("/entitlements/:entitlementId", async (c) => {
+	if (!validateStrictQueryParams(c, ["overdueAsOf"])) {
+		return fail(c, "INCOME_INVALID_INPUT", 400);
+	}
+
 	const entitlementId = c.req.param("entitlementId");
 	if (!isUuid(entitlementId)) return fail(c, "INCOME_INVALID_INPUT", 400);
 
@@ -896,6 +930,20 @@ incomeRouter.post("/entitlements/:entitlementId/void", async (c) => {
 
 // 3.1 GET /income/receipts -- Bounded income receipts list
 incomeRouter.get("/receipts", async (c) => {
+	if (
+		!validateStrictQueryParams(c, [
+			"limit",
+			"sourceId",
+			"from",
+			"to",
+			"includeVoided",
+			"beforeReceivedAt",
+			"beforeIncomeReceiptId",
+		])
+	) {
+		return fail(c, "INCOME_INVALID_INPUT", 400);
+	}
+
 	const limitRes = parseBoundedLimit(c.req.query("limit"), {
 		defaultLimit: 50,
 		maxLimit: 100,
@@ -989,6 +1037,10 @@ incomeRouter.get("/receipts", async (c) => {
 
 // 3.2 GET /income/receipts/:incomeReceiptId -- Receipt detail
 incomeRouter.get("/receipts/:incomeReceiptId", async (c) => {
+	if (!validateStrictQueryParams(c, [])) {
+		return fail(c, "INCOME_INVALID_INPUT", 400);
+	}
+
 	const incomeReceiptId = c.req.param("incomeReceiptId");
 	if (!isUuid(incomeReceiptId)) return fail(c, "INCOME_INVALID_INPUT", 400);
 
@@ -1300,6 +1352,10 @@ incomeRouter.post("/receipts/:incomeReceiptId/void", async (c) => {
 
 // 4.1 GET /income/receipts/:incomeReceiptId/settlement -- Get receipt settlement
 incomeRouter.get("/receipts/:incomeReceiptId/settlement", async (c) => {
+	if (!validateStrictQueryParams(c, [])) {
+		return fail(c, "INCOME_INVALID_INPUT", 400);
+	}
+
 	const incomeReceiptId = c.req.param("incomeReceiptId");
 	if (!isUuid(incomeReceiptId)) return fail(c, "INCOME_INVALID_INPUT", 400);
 
@@ -1542,6 +1598,10 @@ incomeRouter.post(
 
 // 5.1 GET /income/reference -- Monthly reference baseline calculation
 incomeRouter.get("/reference", async (c) => {
+	if (!validateStrictQueryParams(c, ["asOf"])) {
+		return fail(c, "INCOME_INVALID_INPUT", 400);
+	}
+
 	const rawAsOf = c.req.query("asOf");
 	let asOf: string;
 	if (rawAsOf !== undefined) {

@@ -429,18 +429,21 @@ describe("Transactions & Ledger HTTP Product Boundary (Checkpoint 7B.1-R1 Read-O
 			vi.spyOn(
 				ledgerBalancesModule,
 				"listLedgerAccountBalances",
-			).mockResolvedValue([
-				{
-					accountId: ACC_ID1,
-					code: "1000",
-					name: "Cash",
-					accountType: "ASSET",
-					normalBalance: "DEBIT",
-					currency: "TRY",
-					archived: false,
-					balance: "1500.50",
-				},
-			]);
+			).mockResolvedValue({
+				accounts: [
+					{
+						accountId: ACC_ID1,
+						code: "1000",
+						name: "Cash",
+						accountType: "ASSET",
+						normalBalance: "DEBIT",
+						currency: "TRY",
+						archived: false,
+						balance: "1500.50",
+					},
+				],
+				nextCursor: null,
+			});
 
 			const res = await app.request(
 				"/ledger/accounts?includeArchived=true",

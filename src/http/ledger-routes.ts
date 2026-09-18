@@ -16,9 +16,11 @@ import {
 	errorEnvelope,
 	hasOnlyKeys,
 	isUuid,
+	parseBoundedLimit,
 	parseCanonicalInstant,
 	readJsonObject,
 	sameOriginMutationGuard,
+	validateStrictQueryParams,
 } from "./transport";
 
 type LedgerEnv = {
@@ -64,8 +66,14 @@ ledgerRouter.use("*", sameOriginMutationGuard());
 ledgerRouter.use("*", requireAuthenticatedSession);
 ledgerRouter.use("*", bodyLimit({ maxSize: BODY_LIMIT_BYTES }));
 
-// 1. GET /ledger/accounts -- List ledger account balances
+// 1. GET /ledger/accounts -- List ledger account balances with keyset pagination
 ledgerRouter.get("/accounts", async (c) => {
+	if (
+		!validateStrictQueryParams(c, ["includeArchived", "asOf", "limit", "after"])
+	) {
+		return fail(c, "LEDGER_INVALID_INPUT", 400);
+	}
+
 	const rawIncludeArchived = c.req.query("includeArchived");
 	let includeArchived = false;
 	if (rawIncludeArchived !== undefined) {
@@ -87,18 +95,35 @@ ledgerRouter.get("/accounts", async (c) => {
 		asOf = parsed;
 	}
 
+	const rawLimit = c.req.query("limit");
+	const limitRes = parseBoundedLimit(rawLimit, {
+		defaultLimit: 50,
+		maxLimit: 100,
+	});
+	if (!limitRes.ok) return fail(c, "LEDGER_INVALID_INPUT", 400);
+
+	const after = c.req.query("after");
+
 	try {
 		const db = createDatabase(getDatabaseUrl(c.env));
 		const userId = c.get("auth").userId;
 
-		const accounts = await listLedgerAccountBalances({
+		const result = await listLedgerAccountBalances({
 			db,
 			userId,
+			limit: limitRes.limit,
+			rawCursor: after,
 			...(asOf !== undefined ? { asOf } : {}),
 			includeArchived,
 		});
 
-		return c.json({ accounts }, 200);
+		return c.json(
+			{
+				accounts: result.accounts,
+				nextCursor: result.nextCursor,
+			},
+			200,
+		);
 	} catch (err) {
 		return mapDomainError(c, err);
 	}
@@ -106,6 +131,10 @@ ledgerRouter.get("/accounts", async (c) => {
 
 // 2. GET /ledger/accounts/:accountId/balance -- Single ledger account balance
 ledgerRouter.get("/accounts/:accountId/balance", async (c) => {
+	if (!validateStrictQueryParams(c, ["asOf"])) {
+		return fail(c, "LEDGER_INVALID_INPUT", 400);
+	}
+
 	const accountId = c.req.param("accountId");
 	if (!isUuid(accountId)) return fail(c, "LEDGER_INVALID_INPUT", 400);
 

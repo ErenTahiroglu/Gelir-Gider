@@ -397,8 +397,31 @@ Returns `200 OK` with `{ "transactionId": "uuid", "revisions": [...], "nextCurso
 - Specialized domains retain mutation authority.
 
 #### 5.6.5 GET /ledger/accounts
-- Query parameters: `includeArchived` (strict boolean `"true"` | `"false"`), `asOf` (optional UTC ISO instant)
-- Response (`200 OK`): `{ "accounts": [ { "accountId": "uuid", "code": "...", "name": "...", "accountType": "...", "normalBalance": "DEBIT|CREDIT", "currency": "TRY", "balance": "150.75", "archived": false } ] }`
+- Query parameters:
+  - `includeArchived` (optional): strict boolean `"true"` | `"false"` (default: `"false"`)
+  - `asOf` (optional): UTC ISO instant (`YYYY-MM-DDTHH:mm:ss.sssZ`)
+  - `limit` (optional): integer `1..100` (default: 50)
+  - `after` (optional): opaque base64url keyset cursor
+- Response (`200 OK`):
+  ```json
+  {
+    "accounts": [
+      {
+        "accountId": "uuid",
+        "code": "USR_CASH",
+        "name": "Main Cash Wallet",
+        "accountType": "ASSET",
+        "normalBalance": "DEBIT",
+        "currency": "TRY",
+        "balance": "150.75",
+        "archived": false
+      }
+    ],
+    "limit": 50,
+    "hasMore": false,
+    "nextCursor": null
+  }
+  ```
 
 #### 5.6.6 GET /ledger/accounts/:accountId/balance
 - Query parameters: `asOf` (optional UTC ISO instant)
@@ -1407,6 +1430,8 @@ Returns an authenticated, read-only preview of the Month-Close proposal for the 
       },
       "unclassifiedExpense": "0.00",
       "closeSurplus": "700.00",
+      "unappliedPriorAdjustments": "0.00",
+      "adjustedRoutableSurplus": "700.00",
       "midasAccountId": "uuid",
       "midasUnallocatedBalance": "1000.00",
       "route": "SHORT_TERM_GOAL",
@@ -1445,6 +1470,8 @@ Returns an authenticated, read-only preview of the Month-Close proposal for the 
       },
       "unclassifiedExpense": "150.00",
       "closeSurplus": "550.00",
+      "unappliedPriorAdjustments": "0.00",
+      "adjustedRoutableSurplus": "550.00",
       "midasAccountId": null,
       "midasUnallocatedBalance": null,
       "route": "BLOCKED",
@@ -1468,6 +1495,8 @@ Returns an authenticated, read-only preview of the Month-Close proposal for the 
       "discretionary": null,
       "unclassifiedExpense": null,
       "closeSurplus": null,
+      "unappliedPriorAdjustments": "0.00",
+      "adjustedRoutableSurplus": null,
       "midasAccountId": null,
       "midasUnallocatedBalance": null,
       "route": "BLOCKED",
@@ -1515,6 +1544,8 @@ Returns a bounded, keyset-paginated list of closed month-close records for the a
           },
           "unclassifiedExpense": "0.00",
           "closeSurplus": "700.00",
+          "unappliedPriorAdjustments": "0.00",
+          "adjustedRoutableSurplus": "700.00",
           "route": "SHORT_TERM_GOAL",
           "decision": "FULL",
           "midasAccountId": "uuid",
@@ -1568,6 +1599,8 @@ Returns the product detail DTO of a closed month for the authenticated user.
         },
         "unclassifiedExpense": "0.00",
         "closeSurplus": "700.00",
+        "unappliedPriorAdjustments": "0.00",
+        "adjustedRoutableSurplus": "700.00",
         "route": "SHORT_TERM_GOAL",
         "decision": "FULL",
         "midasAccountId": "uuid",

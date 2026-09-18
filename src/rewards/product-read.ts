@@ -17,8 +17,10 @@ import {
 	parseConversionRate,
 	roundHalfUpToEconomicCents,
 } from "./decimal";
-import type { RewardEventReadModel } from "./events";
-import { deriveRewardPointBalanceInTransaction } from "./events";
+import {
+	deriveRewardPointBalancesBatchInTransaction,
+	type RewardEventReadModel,
+} from "./events";
 import type { RewardAccountCursor, RewardEventCursor } from "./pagination";
 
 const POSITIVE_EVENT_TYPES = new Set<RewardEventType>([
@@ -263,12 +265,15 @@ export async function listBoundedRewardAccounts({
 		const hasMore = rows.length > limit;
 		const pageRows = hasMore ? rows.slice(0, limit) : rows;
 
+		const accountIds = pageRows.map((r) => r.rewardAccountId);
+		const balancesMap = await deriveRewardPointBalancesBatchInTransaction(
+			tx,
+			accountIds,
+		);
+
 		const dtos: RewardAccountProductDto[] = [];
 		for (const row of pageRows) {
-			const balanceUnits = await deriveRewardPointBalanceInTransaction(
-				tx,
-				row.rewardAccountId,
-			);
+			const balanceUnits = balancesMap.get(row.rewardAccountId) ?? 0n;
 			const balancePoints = formatUnitsToDecimal(balanceUnits, 4);
 			const rate = parseConversionRate(row.defaultConversionRate);
 			const estimatedValueCents = roundHalfUpToEconomicCents(

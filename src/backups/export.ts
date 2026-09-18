@@ -94,17 +94,35 @@ export interface ExportDatabaseSnapshotResult {
  */
 export async function exportDatabaseSnapshot(
 	tx: DatabaseTransaction,
+	maxPlaintextBytes?: number | undefined,
 ): Promise<ExportDatabaseSnapshotResult> {
 	const descriptors = getBackupTableDescriptors();
 	const tables: TableSnapshot[] = [];
+	const maxBytes = maxPlaintextBytes ?? DEFAULT_MAX_PLAINTEXT_BYTES;
+	let cumulativePlaintextSizeBytes = 0;
+
 	for (const descriptor of descriptors) {
-		tables.push(await exportTable(tx, descriptor.tableName, descriptor.table));
+		const tableSnapshot = await exportTable(
+			tx,
+			descriptor.tableName,
+			descriptor.table,
+		);
+		tables.push(tableSnapshot);
+
+		const tableBytes = new TextEncoder().encode(
+			JSON.stringify(tableSnapshot.rows),
+		).length;
+		cumulativePlaintextSizeBytes += tableBytes;
+
+		if (cumulativePlaintextSizeBytes > maxBytes) {
+			throw new BackupError(
+				"BACKUP_TOO_LARGE",
+				"Backup snapshot plaintext exceeds the maximum allowed size",
+			);
+		}
 	}
-	const plaintextSizeBytes = tables.reduce(
-		(sum, t) => sum + new TextEncoder().encode(JSON.stringify(t.rows)).length,
-		0,
-	);
-	return { tables, plaintextSizeBytes };
+
+	return { tables, plaintextSizeBytes: cumulativePlaintextSizeBytes };
 }
 
 export interface BuildSnapshotPayloadParams {

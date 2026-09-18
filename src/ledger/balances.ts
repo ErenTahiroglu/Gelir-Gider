@@ -1,4 +1,4 @@
-import { and, eq, isNull, lte, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lte, sql } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	journalEntries,
@@ -7,6 +7,10 @@ import {
 } from "../db/schema/ledger";
 import { LedgerError } from "./errors";
 import { formatSignedCentsToMoney, parseAggregateMoneyString } from "./money";
+import {
+	decodeLedgerAccountCursor,
+	encodeLedgerAccountCursor,
+} from "./pagination";
 
 export interface GetLedgerAccountBalanceParams {
 	db: Database;
@@ -33,8 +37,15 @@ export interface LedgerAccountBalanceResult {
 export interface ListLedgerAccountBalancesParams {
 	db: Database;
 	userId: string;
-	asOf?: Date;
-	includeArchived?: boolean;
+	limit?: number | undefined;
+	rawCursor?: string | undefined;
+	asOf?: Date | undefined;
+	includeArchived?: boolean | undefined;
+}
+
+export interface ListLedgerAccountBalancesResult {
+	accounts: LedgerAccountBalanceListItem[];
+	nextCursor: string | null;
 }
 
 export interface LedgerAccountBalanceListItem {
@@ -162,15 +173,17 @@ export async function getLedgerAccountBalance({
 }
 
 /**
- * Lists exact balances for all ledger accounts belonging to the user,
- * ordered deterministically by account code.
+ * Lists exact balances for ledger accounts belonging to the user with keyset pagination,
+ * ordered deterministically by account code and account id.
  */
 export async function listLedgerAccountBalances({
 	db,
 	userId,
+	limit = 50,
+	rawCursor,
 	asOf,
 	includeArchived = false,
-}: ListLedgerAccountBalancesParams): Promise<LedgerAccountBalanceListItem[]> {
+}: ListLedgerAccountBalancesParams): Promise<ListLedgerAccountBalancesResult> {
 	if (!userId || userId.trim() === "") {
 		throw new LedgerError("LEDGER_USER_NOT_FOUND", "User ID is required");
 	}
@@ -182,13 +195,27 @@ export async function listLedgerAccountBalances({
 		throw new LedgerError("LEDGER_INVALID_ENTRY", "Invalid asOf Date provided");
 	}
 
-	// Fetch all accounts
+	const boundedLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+	const fetchCount = boundedLimit + 1;
+
+	// Fetch accounts
 	const accountConditions = [eq(ledgerAccounts.userId, userId)];
 	if (!includeArchived) {
 		accountConditions.push(isNull(ledgerAccounts.archivedAt));
 	}
 
-	const accounts = await db
+	if (rawCursor !== undefined) {
+		const decoded = decodeLedgerAccountCursor(rawCursor, {
+			userId,
+			includeArchived,
+			asOf: asOf ? asOf.toISOString() : null,
+		});
+		accountConditions.push(
+			sql`(${ledgerAccounts.code} > ${decoded.code} OR (${ledgerAccounts.code} = ${decoded.code} AND ${ledgerAccounts.id} > ${decoded.id}))`,
+		);
+	}
+
+	const rows = await db
 		.select({
 			id: ledgerAccounts.id,
 			code: ledgerAccounts.code,
@@ -200,16 +227,22 @@ export async function listLedgerAccountBalances({
 		})
 		.from(ledgerAccounts)
 		.where(and(...accountConditions))
-		.orderBy(ledgerAccounts.code);
+		.orderBy(asc(ledgerAccounts.code), asc(ledgerAccounts.id))
+		.limit(fetchCount);
 
-	if (accounts.length === 0) {
-		return [];
+	if (rows.length === 0) {
+		return { accounts: [], nextCursor: null };
 	}
 
-	// Aggregate line totals per account for POSTED entries
+	const hasNextPage = rows.length > boundedLimit;
+	const pageAccounts = hasNextPage ? rows.slice(0, boundedLimit) : rows;
+	const pageAccountIds = pageAccounts.map((a) => a.id);
+
+	// Aggregate line totals ONLY for the accounts on this page
 	const lineConditions = [
 		eq(journalEntries.userId, userId),
 		eq(journalEntries.status, "POSTED"),
+		inArray(journalLines.accountId, pageAccountIds),
 	];
 
 	if (asOf) {
@@ -240,7 +273,7 @@ export async function listLedgerAccountBalances({
 		]),
 	);
 
-	return accounts.map((acc) => {
+	const items: LedgerAccountBalanceListItem[] = pageAccounts.map((acc) => {
 		const totals = totalsMap.get(acc.id) ?? {
 			debitCents: 0n,
 			creditCents: 0n,
@@ -262,4 +295,22 @@ export async function listLedgerAccountBalances({
 			balance: formatSignedCentsToMoney(signedCents),
 		};
 	});
+
+	let nextCursor: string | null = null;
+	const lastAcc = pageAccounts[pageAccounts.length - 1];
+	if (hasNextPage && lastAcc) {
+		nextCursor = encodeLedgerAccountCursor({
+			v: 1,
+			userId,
+			includeArchived,
+			asOf: asOf ? asOf.toISOString() : null,
+			code: lastAcc.code,
+			id: lastAcc.id,
+		});
+	}
+
+	return {
+		accounts: items,
+		nextCursor,
+	};
 }

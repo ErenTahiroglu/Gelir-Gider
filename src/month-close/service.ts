@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, lt, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, isNull, lt, lte, sql } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	monthlyBudgetPlanRevisions,
@@ -12,6 +12,10 @@ import {
 	monthCloseRevisions,
 	monthCloses,
 } from "../db/schema/month-close";
+import {
+	monthCloseAdjustmentApplications,
+	monthCloseAdjustments,
+} from "../db/schema/month-close-adjustments";
 import { parseSignedAggregateMoneyString } from "../ledger/money";
 import { lockLedgerAccountsInTransaction } from "../ledger/posting";
 import { resolveUserExpenseSystemAccountsReadOnlyInTransaction } from "../ledger/system-expense-accounts";
@@ -51,6 +55,7 @@ import {
 	type MonthCloseRecommendedGoalFingerprintInput,
 } from "./fingerprint";
 import {
+	computeAdjustedRoutableSurplusCents,
 	computeMonthCloseFullOffer,
 	computeMonthCloseSurplusCents,
 	computeMonthCloseUnusedCents,
@@ -90,6 +95,8 @@ export interface MonthCloseProposal {
 	discretionary: MonthCloseAmountBreakdown | null;
 	unclassifiedExpense: string | null;
 	closeSurplus: string | null;
+	unappliedPriorAdjustments?: string | null;
+	adjustedRoutableSurplus?: string | null;
 	midasAccountId: string | null;
 	midasUnallocatedBalance: string | null;
 	route: MonthCloseRoute | "BLOCKED";
@@ -113,6 +120,8 @@ export interface MonthCloseReadModel {
 	discretionary: MonthCloseAmountBreakdown;
 	unclassifiedExpense: string;
 	closeSurplus: string;
+	unappliedPriorAdjustments?: string;
+	adjustedRoutableSurplus?: string;
 	route: MonthCloseRoute;
 	decision: MonthCloseDecision;
 	midasAccountId: string | null;
@@ -268,6 +277,86 @@ interface MonthCloseFigures {
 	discretionaryUnusedCents: bigint;
 	unclassifiedExpenseCents: bigint;
 	closeSurplusCents: bigint;
+	unappliedPriorAdjustmentsCents: bigint;
+	adjustedRoutableSurplusCents: bigint;
+}
+
+export interface PriorAdjustmentSummary {
+	unappliedAdjustments: Array<typeof monthCloseAdjustments.$inferSelect>;
+	totalAdjustmentCents: bigint;
+}
+
+export async function fetchUnappliedPriorAdjustmentsInTransaction(
+	tx: DatabaseTransaction,
+	userId: string,
+	periodMonth: string,
+): Promise<PriorAdjustmentSummary> {
+	const periodMonthDate = periodMonthToDateString(periodMonth);
+	const rows = await tx
+		.select()
+		.from(monthCloseAdjustments)
+		.where(
+			and(
+				eq(monthCloseAdjustments.userId, userId),
+				isNull(monthCloseAdjustments.appliedInMonthCloseId),
+				lt(monthCloseAdjustments.closedPeriodMonth, periodMonthDate),
+			),
+		)
+		.orderBy(
+			asc(monthCloseAdjustments.closedPeriodMonth),
+			asc(monthCloseAdjustments.createdAt),
+		);
+
+	let totalAdjustmentCents = 0n;
+	for (const r of rows) {
+		totalAdjustmentCents += parseSignedAggregateMoneyString(
+			r.adjustmentAmount,
+		).cents;
+	}
+
+	return {
+		unappliedAdjustments: rows,
+		totalAdjustmentCents,
+	};
+}
+
+export async function recordPostCloseAdjustmentIfClosedInTransaction(
+	tx: DatabaseTransaction,
+	params: {
+		userId: string;
+		periodMonth: string;
+		adjustmentAmount: string;
+		reasonCode: string;
+		sourceRef: string;
+	},
+): Promise<typeof monthCloseAdjustments.$inferSelect | null> {
+	const periodMonthDate = periodMonthToDateString(params.periodMonth);
+	const [closed] = await tx
+		.select({ id: monthCloses.id })
+		.from(monthCloses)
+		.where(
+			and(
+				eq(monthCloses.userId, params.userId),
+				eq(monthCloses.periodMonth, periodMonthDate),
+			),
+		)
+		.limit(1);
+
+	if (!closed) return null;
+
+	const [adj] = await tx
+		.insert(monthCloseAdjustments)
+		.values({
+			userId: params.userId,
+			closedPeriodMonth: periodMonthDate,
+			adjustmentAmount: params.adjustmentAmount,
+			reasonCode: params.reasonCode,
+			sourceRef: params.sourceRef,
+			appliedInMonthCloseId: null,
+		})
+		.returning();
+
+	return adj ?? null;
 }
 
 /**
@@ -348,6 +437,7 @@ function buildMonthCloseFigures(
 	mandatoryExpenseCents: bigint,
 	discretionaryExpenseCents: bigint,
 	unclassifiedExpenseCents: bigint,
+	unappliedPriorAdjustmentsCents: bigint = 0n,
 ): MonthCloseFigures {
 	const mandatoryCeilingCents = parseSignedAggregateMoneyString(
 		plan.mandatoryCeiling,
@@ -370,6 +460,11 @@ function buildMonthCloseFigures(
 		discretionaryUnusedCents,
 	);
 
+	const adjustedRoutableSurplusCents = computeAdjustedRoutableSurplusCents(
+		closeSurplusCents,
+		unappliedPriorAdjustmentsCents,
+	);
+
 	return {
 		plan,
 		mandatoryExpenseCents,
@@ -378,6 +473,8 @@ function buildMonthCloseFigures(
 		discretionaryUnusedCents,
 		unclassifiedExpenseCents,
 		closeSurplusCents,
+		unappliedPriorAdjustmentsCents,
+		adjustedRoutableSurplusCents,
 	};
 }
 
@@ -443,11 +540,18 @@ async function resolveMonthCloseFiguresInTransaction(
 		end,
 	);
 
+	const priorAdjs = await fetchUnappliedPriorAdjustmentsInTransaction(
+		tx,
+		userId,
+		periodMonth,
+	);
+
 	const figures = buildMonthCloseFigures(
 		planResult,
 		mandatoryExpenseCents,
 		discretionaryExpenseCents,
 		unclassifiedExpenseCents,
+		priorAdjs.totalAdjustmentCents,
 	);
 
 	if (unclassifiedExpenseCents > 0n) {
@@ -569,6 +673,10 @@ async function buildProposalFingerprint(
 		discretionaryUnused: centsToMoney(figures.discretionaryUnusedCents),
 		unclassifiedExpense: centsToMoney(figures.unclassifiedExpenseCents),
 		closeSurplus: centsToMoney(figures.closeSurplusCents),
+		unappliedPriorAdjustments: centsToMoney(
+			figures.unappliedPriorAdjustmentsCents,
+		),
+		adjustedRoutableSurplus: centsToMoney(figures.adjustedRoutableSurplusCents),
 		route: routing.route,
 		recommendedGoal,
 	});
@@ -631,6 +739,12 @@ export async function previewMonthClose(
 				},
 				unclassifiedExpense: centsToMoney(resolved.unclassifiedExpenseCents),
 				closeSurplus: centsToMoney(resolved.closeSurplusCents),
+				unappliedPriorAdjustments: centsToMoney(
+					resolved.unappliedPriorAdjustmentsCents,
+				),
+				adjustedRoutableSurplus: centsToMoney(
+					resolved.adjustedRoutableSurplusCents,
+				),
 				midasAccountId: null,
 				midasUnallocatedBalance: null,
 				route: "BLOCKED",
@@ -657,6 +771,8 @@ export async function previewMonthClose(
 				discretionaryUnused: "0.00",
 				unclassifiedExpense: "0.00",
 				closeSurplus: "0.00",
+				unappliedPriorAdjustments: "0.00",
+				adjustedRoutableSurplus: "0.00",
 				route: "NONE",
 				recommendedGoal: null,
 			});
@@ -671,6 +787,8 @@ export async function previewMonthClose(
 				discretionary: null,
 				unclassifiedExpense: null,
 				closeSurplus: null,
+				unappliedPriorAdjustments: null,
+				adjustedRoutableSurplus: null,
 				midasAccountId: null,
 				midasUnallocatedBalance: null,
 				route: "BLOCKED",
@@ -685,7 +803,7 @@ export async function previewMonthClose(
 		const routing = await resolveMonthCloseRoutingInTransaction(
 			tx,
 			userId,
-			resolved.closeSurplusCents,
+			resolved.adjustedRoutableSurplusCents,
 		);
 
 		if (routing.status === "BLOCKED") {
@@ -720,6 +838,12 @@ export async function previewMonthClose(
 				},
 				unclassifiedExpense: centsToMoney(resolved.unclassifiedExpenseCents),
 				closeSurplus: centsToMoney(resolved.closeSurplusCents),
+				unappliedPriorAdjustments: centsToMoney(
+					resolved.unappliedPriorAdjustmentsCents,
+				),
+				adjustedRoutableSurplus: centsToMoney(
+					resolved.adjustedRoutableSurplusCents,
+				),
 				midasAccountId: null,
 				midasUnallocatedBalance: null,
 				route: "BLOCKED",
@@ -767,6 +891,12 @@ export async function previewMonthClose(
 			},
 			unclassifiedExpense: centsToMoney(resolved.unclassifiedExpenseCents),
 			closeSurplus: centsToMoney(resolved.closeSurplusCents),
+			unappliedPriorAdjustments: centsToMoney(
+				resolved.unappliedPriorAdjustmentsCents,
+			),
+			adjustedRoutableSurplus: centsToMoney(
+				resolved.adjustedRoutableSurplusCents,
+			),
 			midasAccountId: routing.midasAccountId,
 			midasUnallocatedBalance,
 			route: routing.route,
@@ -813,6 +943,8 @@ function buildReadModel(
 		},
 		unclassifiedExpense: rev.unclassifiedExpense,
 		closeSurplus: rev.closeSurplus,
+		unappliedPriorAdjustments: rev.unappliedPriorAdjustments ?? "0.00",
+		adjustedRoutableSurplus: rev.adjustedRoutableSurplus ?? rev.closeSurplus,
 		route: rev.route as MonthCloseRoute,
 		decision: rev.decision as MonthCloseDecision,
 		midasAccountId: rev.midasAccountId,
@@ -1145,6 +1277,12 @@ export async function closeMonth(
 			);
 		}
 
+		const priorAdjs = await fetchUnappliedPriorAdjustmentsInTransaction(
+			tx,
+			userId,
+			periodMonth,
+		);
+
 		const resolved: { status: "OK" } & MonthCloseFigures = {
 			status: "OK",
 			...buildMonthCloseFigures(
@@ -1152,6 +1290,7 @@ export async function closeMonth(
 				mandatoryExpenseCents,
 				discretionaryExpenseCents,
 				unclassifiedExpenseCents,
+				priorAdjs.totalAdjustmentCents,
 			),
 		};
 
@@ -1159,7 +1298,7 @@ export async function closeMonth(
 		const routing = await resolveMonthCloseRoutingInTransaction(
 			tx,
 			userId,
-			resolved.closeSurplusCents,
+			resolved.adjustedRoutableSurplusCents,
 		);
 		if (routing.status === "BLOCKED") {
 			throw new MonthCloseError(
@@ -1227,7 +1366,7 @@ export async function closeMonth(
 				routing.route === "MEDIUM_TERM_RESERVE" ? "AUTO_MEDIUM" : "NO_ACTION";
 			appliedAmountCents =
 				routing.route === "MEDIUM_TERM_RESERVE"
-					? resolved.closeSurplusCents
+					? resolved.adjustedRoutableSurplusCents
 					: 0n;
 		}
 
@@ -1332,7 +1471,8 @@ export async function closeMonth(
 			}
 		}
 
-		const unroutedAmountCents = resolved.closeSurplusCents - appliedAmountCents;
+		const unroutedAmountCents =
+			resolved.adjustedRoutableSurplusCents - appliedAmountCents;
 
 		const [insertedRev] = await tx
 			.insert(monthCloseRevisions)
@@ -1355,6 +1495,12 @@ export async function closeMonth(
 				discretionaryUnused: centsToMoney(resolved.discretionaryUnusedCents),
 				unclassifiedExpense: centsToMoney(resolved.unclassifiedExpenseCents),
 				closeSurplus: centsToMoney(resolved.closeSurplusCents),
+				unappliedPriorAdjustments: centsToMoney(
+					resolved.unappliedPriorAdjustmentsCents,
+				),
+				adjustedRoutableSurplus: centsToMoney(
+					resolved.adjustedRoutableSurplusCents,
+				),
 				route: routing.route,
 				decision: effectiveDecision,
 				midasAccountId: routing.midasAccountId,
@@ -1386,6 +1532,20 @@ export async function closeMonth(
 				"MONTH_CLOSE_INVALID_STATE",
 				"Failed to create month-close revision",
 			);
+		}
+
+		for (const adj of priorAdjs.unappliedAdjustments) {
+			await tx
+				.update(monthCloseAdjustments)
+				.set({ appliedInMonthCloseId: monthCloseId })
+				.where(eq(monthCloseAdjustments.id, adj.id));
+
+			await tx.insert(monthCloseAdjustmentApplications).values({
+				userId,
+				monthCloseId,
+				adjustmentId: adj.id,
+				appliedAmount: adj.adjustmentAmount,
+			});
 		}
 
 		return {

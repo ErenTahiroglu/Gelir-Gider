@@ -1,7 +1,4 @@
-import {
-	type CreditCardPurchaseRecord,
-	listCreditCardPurchasesInTransaction,
-} from "../credit-cards/purchases";
+import { listCreditCardPurchasesInTransaction } from "../credit-cards/purchases";
 import type { Database, DatabaseTransaction } from "../db/client";
 import { runCampaignsReadTransaction } from "./boundary";
 import { validateCampaignCanonicalUuid } from "./calendar";
@@ -11,7 +8,7 @@ import {
 	parseCampaignAggregateMoneyString,
 } from "./decimal";
 import { CampaignError } from "./errors";
-import { resolveCanonicalMerchantNameInTransaction } from "./merchant";
+import { resolveCanonicalMerchantNamesBatchInTransaction } from "./merchant";
 import {
 	applyPurchaseOverride,
 	type CampaignOverrideOperation,
@@ -64,6 +61,8 @@ export interface CampaignProgressReadModel {
 	needsReviewAmount: string;
 	qualifyingPurchases: CampaignQualifyingPurchase[];
 	needsReviewPurchases: CampaignQualifyingPurchase[];
+	qualifyingPurchasesTruncated: boolean;
+	needsReviewPurchasesTruncated: boolean;
 }
 
 /**
@@ -178,6 +177,8 @@ function zeroedProgressReadModel(
 		needsReviewAmount: "0.00",
 		qualifyingPurchases: [],
 		needsReviewPurchases: [],
+		qualifyingPurchasesTruncated: false,
+		needsReviewPurchasesTruncated: false,
 	};
 }
 
@@ -245,30 +246,15 @@ export async function getCampaignProgressInTransaction(
 		);
 
 	// Section L: paginate through every matching purchase per bound card
-	// rather than a single capped call -- a campaign card with more than one
-	// page of matching purchases must never silently lose purchases past the
-	// first page. Runs entirely inside the same REPEATABLE READ transaction
-	// as everything else in this computation.
-	const allPurchases: CreditCardPurchaseRecord[] = [];
-	for (const cardId of latest.cardIds) {
-		const cardPurchases = await collectAllPagesInTransaction(
-			(offset, limit) =>
-				listCreditCardPurchasesInTransaction({
-					tx,
-					userId,
-					cardId,
-					status: "POSTED",
-					purchaseDateFrom: rev.startsOn,
-					purchaseDateUntil: rev.endsOn,
-					limit,
-					offset,
-				}),
-			CAMPAIGN_PURCHASE_PROGRESS_PAGE_SIZE,
-		);
-		allPurchases.push(
-			...cardPurchases.filter((p) => p.eventType === "PURCHASE"),
-		);
-	}
+	// in bounded pages without accumulating all purchases into a single memory array.
+	// Runs entirely inside the same REPEATABLE READ transaction.
+	const MAX_SAMPLE_PURCHASES = 50;
+	const qualifying: CampaignQualifyingPurchase[] = [];
+	const needsReview: CampaignQualifyingPurchase[] = [];
+	const countedAmountsCents: bigint[] = [];
+	let needsReviewCents = 0n;
+	let totalQualifyingCount = 0;
+	let totalNeedsReviewCount = 0;
 
 	const requiredCanonicalMerchantNames = new Set(
 		(rev.requiredCanonicalMerchantNames as string[] | null) ?? [],
@@ -279,59 +265,93 @@ export async function getCampaignProgressInTransaction(
 		? parseCampaignAggregateMoneyString(rev.minimumTransactionAmount).cents
 		: null;
 
-	const qualifying: CampaignQualifyingPurchase[] = [];
-	const needsReview: CampaignQualifyingPurchase[] = [];
-	const countedAmountsCents: bigint[] = [];
-	let needsReviewCents = 0n;
-
-	for (const purchase of allPurchases) {
-		const amountCents = parseCampaignAggregateMoneyString(
-			purchase.amount,
-		).cents;
-
-		let merchantResolvedMatch: boolean | null = null;
-		if (rev.merchantScopeMode === "MERCHANT_ALIASES") {
-			const canonical = await resolveCanonicalMerchantNameInTransaction(
+	for (const cardId of latest.cardIds) {
+		let offset = 0;
+		while (true) {
+			const cardPurchases = await listCreditCardPurchasesInTransaction({
 				tx,
 				userId,
-				purchase.merchant,
-			);
-			merchantResolvedMatch =
-				canonical !== null && requiredCanonicalMerchantNames.has(canonical);
-		}
+				cardId,
+				status: "POSTED",
+				purchaseDateFrom: rev.startsOn,
+				purchaseDateUntil: rev.endsOn,
+				limit: CAMPAIGN_PURCHASE_PROGRESS_PAGE_SIZE,
+				offset,
+			});
 
-		const automatic = deriveAutomaticEligibility({
-			merchantScopeMode: rev.merchantScopeMode as
-				| "ALL_MERCHANTS"
-				| "MERCHANT_ALIASES"
-				| "MANUAL_REVIEW_REQUIRED",
-			merchantResolvedMatch,
-			mccRequired,
-			amountCents,
-			minimumTransactionAmountCents,
-		});
+			const purchases = cardPurchases.filter((p) => p.eventType === "PURCHASE");
 
-		const overrideOp = (overridesByPurchase.get(purchase.eventId) ??
-			null) as CampaignOverrideOperation | null;
-		const finalStatus = applyPurchaseOverride(
-			automatic,
-			overrideOp === "CLEAR" ? null : overrideOp,
-		);
+			let merchantMap: Map<string, string | null> | null = null;
+			if (
+				rev.merchantScopeMode === "MERCHANT_ALIASES" &&
+				purchases.length > 0
+			) {
+				merchantMap = await resolveCanonicalMerchantNamesBatchInTransaction(
+					tx,
+					userId,
+					purchases.map((p) => p.merchant),
+				);
+			}
 
-		const entry: CampaignQualifyingPurchase = {
-			purchaseEventId: purchase.eventId,
-			amount: purchase.amount,
-			purchaseDate: purchase.purchaseDate,
-			merchant: purchase.merchant,
-			status: finalStatus,
-		};
+			for (const purchase of purchases) {
+				const amountCents = parseCampaignAggregateMoneyString(
+					purchase.amount,
+				).cents;
 
-		if (purchaseCountsTowardProgress(finalStatus)) {
-			qualifying.push(entry);
-			countedAmountsCents.push(amountCents);
-		} else if (finalStatus === "NEEDS_REVIEW") {
-			needsReview.push(entry);
-			needsReviewCents += amountCents;
+				let merchantResolvedMatch: boolean | null = null;
+				if (rev.merchantScopeMode === "MERCHANT_ALIASES") {
+					const canonical = purchase.merchant
+						? (merchantMap?.get(purchase.merchant) ?? null)
+						: null;
+					merchantResolvedMatch =
+						canonical !== null && requiredCanonicalMerchantNames.has(canonical);
+				}
+
+				const automatic = deriveAutomaticEligibility({
+					merchantScopeMode: rev.merchantScopeMode as
+						| "ALL_MERCHANTS"
+						| "MERCHANT_ALIASES"
+						| "MANUAL_REVIEW_REQUIRED",
+					merchantResolvedMatch,
+					mccRequired,
+					amountCents,
+					minimumTransactionAmountCents,
+				});
+
+				const overrideOp = (overridesByPurchase.get(purchase.eventId) ??
+					null) as CampaignOverrideOperation | null;
+				const finalStatus = applyPurchaseOverride(
+					automatic,
+					overrideOp === "CLEAR" ? null : overrideOp,
+				);
+
+				const entry: CampaignQualifyingPurchase = {
+					purchaseEventId: purchase.eventId,
+					amount: purchase.amount,
+					purchaseDate: purchase.purchaseDate,
+					merchant: purchase.merchant,
+					status: finalStatus,
+				};
+
+				if (purchaseCountsTowardProgress(finalStatus)) {
+					totalQualifyingCount++;
+					countedAmountsCents.push(amountCents);
+					if (qualifying.length < MAX_SAMPLE_PURCHASES) {
+						qualifying.push(entry);
+					}
+				} else if (finalStatus === "NEEDS_REVIEW") {
+					totalNeedsReviewCount++;
+					needsReviewCents += amountCents;
+					if (needsReview.length < MAX_SAMPLE_PURCHASES) {
+						needsReview.push(entry);
+					}
+				}
+			}
+
+			if (cardPurchases.length < CAMPAIGN_PURCHASE_PROGRESS_PAGE_SIZE) {
+				break;
+			}
+			offset += cardPurchases.length;
 		}
 	}
 
@@ -469,10 +489,12 @@ export async function getCampaignProgressInTransaction(
 			| "INFORMATIONAL",
 		expectedRewardPoints,
 		actualRewardPointsCredited: activeCredit?.actualPointAmount ?? null,
-		needsReviewCount: needsReview.length,
+		needsReviewCount: totalNeedsReviewCount,
 		needsReviewAmount: formatCampaignCentsToMoney(needsReviewCents),
 		qualifyingPurchases: qualifying,
 		needsReviewPurchases: needsReview,
+		qualifyingPurchasesTruncated: totalQualifyingCount > qualifying.length,
+		needsReviewPurchasesTruncated: totalNeedsReviewCount > needsReview.length,
 	};
 }
 

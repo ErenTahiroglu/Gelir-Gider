@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import type { DatabaseTransaction } from "../db/client";
 import { merchantAliases } from "../db/schema/campaigns";
 import { CampaignError } from "./errors";
@@ -72,6 +72,67 @@ export async function resolveCanonicalMerchantNameInTransaction(
 		.limit(1);
 
 	return latest?.canonicalMerchantName ?? null;
+}
+
+/**
+ * Batch resolves raw purchase merchant strings to canonical merchant names.
+ */
+export async function resolveCanonicalMerchantNamesBatchInTransaction(
+	tx: DatabaseTransaction,
+	userId: string,
+	rawMerchants: (string | null)[],
+): Promise<Map<string, string | null>> {
+	const resultMap = new Map<string, string | null>();
+	const aliasToRaw = new Map<string, string[]>();
+
+	for (const raw of rawMerchants) {
+		if (raw === null) {
+			continue;
+		}
+		const normalized = normalizeMerchantAlias(raw);
+		if (normalized === "") {
+			resultMap.set(raw, null);
+			continue;
+		}
+		const list = aliasToRaw.get(normalized) ?? [];
+		list.push(raw);
+		aliasToRaw.set(normalized, list);
+	}
+
+	const normalizedAliases = Array.from(aliasToRaw.keys());
+	if (normalizedAliases.length === 0) {
+		return resultMap;
+	}
+
+	const rows = await tx
+		.selectDistinctOn([merchantAliases.rawNormalizedAlias], {
+			rawNormalizedAlias: merchantAliases.rawNormalizedAlias,
+			canonicalMerchantName: merchantAliases.canonicalMerchantName,
+		})
+		.from(merchantAliases)
+		.where(
+			and(
+				eq(merchantAliases.userId, userId),
+				inArray(merchantAliases.rawNormalizedAlias, normalizedAliases),
+			),
+		)
+		.orderBy(
+			merchantAliases.rawNormalizedAlias,
+			desc(merchantAliases.createdAt),
+		);
+
+	const canonicalByAlias = new Map(
+		rows.map((r) => [r.rawNormalizedAlias, r.canonicalMerchantName]),
+	);
+
+	for (const [alias, raws] of aliasToRaw) {
+		const canonical = canonicalByAlias.get(alias) ?? null;
+		for (const raw of raws) {
+			resultMap.set(raw, canonical);
+		}
+	}
+
+	return resultMap;
 }
 
 /**

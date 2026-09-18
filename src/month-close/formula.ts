@@ -59,6 +59,17 @@ export function computeMonthCloseFullOffer(
 }
 
 /**
+ * Computes adjustedRoutableSurplus = max(0, closeSurplus + unappliedPriorAdjustments) (MC-01 Option C).
+ */
+export function computeAdjustedRoutableSurplusCents(
+	closeSurplusCents: bigint,
+	unappliedPriorAdjustmentsCents: bigint,
+): bigint {
+	const total = closeSurplusCents + unappliedPriorAdjustmentsCents;
+	return total > 0n ? total : 0n;
+}
+
+/**
  * Formats integer (possibly negative, for defensive display only) cents
  * into an exact decimal money string.
  */

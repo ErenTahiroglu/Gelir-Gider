@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import type {
 	Database,
 	DatabaseOrTransaction,
@@ -86,42 +86,94 @@ export async function deriveRewardPointBalanceInTransaction(
 	tx: DatabaseOrTransaction,
 	rewardAccountId: string,
 ): Promise<bigint> {
-	const eventRows = await tx
-		.select({ id: rewardEvents.id, eventType: rewardEvents.eventType })
-		.from(rewardEvents)
-		.where(eq(rewardEvents.rewardAccountId, rewardAccountId));
+	const rawResult = await tx.execute<{ total_units: string }>(sql`
+		WITH latest_event_revs AS (
+			SELECT DISTINCT ON (${rewardEvents.id})
+				${rewardEvents.id} AS event_id,
+				${rewardEvents.eventType} AS event_type,
+				${rewardEventRevisions.pointAmount} AS point_amount,
+				${rewardEventRevisions.operation} AS operation
+			FROM ${rewardEvents}
+			INNER JOIN ${rewardEventRevisions} ON ${rewardEventRevisions.rewardEventId} = ${rewardEvents.id}
+			WHERE ${rewardEvents.rewardAccountId} = ${rewardAccountId}
+			ORDER BY ${rewardEvents.id}, ${rewardEventRevisions.revisionNo} DESC
+		)
+		SELECT
+			COALESCE(SUM(
+				CASE
+					WHEN event_type IN ('OPENING_BALANCE', 'EARN', 'ADJUSTMENT_CREDIT') THEN ROUND(point_amount::numeric * 10000)
+					ELSE -ROUND(point_amount::numeric * 10000)
+				END
+			), 0)::text AS total_units
+		FROM latest_event_revs
+		WHERE operation != 'VOID'
+	`);
 
-	if (eventRows.length === 0) return 0n;
+	const rows = (Array.isArray(rawResult)
+		? rawResult
+		: ((rawResult as { rows?: unknown[] }).rows ?? [])) as unknown as Array<{
+		total_units: string;
+	}>;
 
-	const eventIds = eventRows.map((e) => e.id);
-	const revisionRows = await tx
-		.select()
-		.from(rewardEventRevisions)
-		.where(inArray(rewardEventRevisions.rewardEventId, eventIds));
+	return BigInt(rows[0]?.total_units ?? "0");
+}
 
-	const latestByEvent = new Map<string, (typeof revisionRows)[number]>();
-	for (const rev of revisionRows) {
-		const existing = latestByEvent.get(rev.rewardEventId);
-		if (!existing || rev.revisionNo > existing.revisionNo) {
-			latestByEvent.set(rev.rewardEventId, rev);
+export async function deriveRewardPointBalancesBatchInTransaction(
+	tx: DatabaseOrTransaction,
+	rewardAccountIds: string[],
+): Promise<Map<string, bigint>> {
+	const resultMap = new Map<string, bigint>();
+	for (const id of rewardAccountIds) {
+		resultMap.set(id, 0n);
+	}
+	if (rewardAccountIds.length === 0) return resultMap;
+
+	const rawResult = await tx.execute<{
+		reward_account_id: string;
+		total_units: string;
+	}>(sql`
+		WITH latest_event_revs AS (
+			SELECT DISTINCT ON (${rewardEvents.id})
+				${rewardEvents.id} AS event_id,
+				${rewardEvents.rewardAccountId} AS reward_account_id,
+				${rewardEvents.eventType} AS event_type,
+				${rewardEventRevisions.pointAmount} AS point_amount,
+				${rewardEventRevisions.operation} AS operation
+			FROM ${rewardEvents}
+			INNER JOIN ${rewardEventRevisions} ON ${rewardEventRevisions.rewardEventId} = ${rewardEvents.id}
+			WHERE ${rewardEvents.rewardAccountId} IN (${sql.join(
+				rewardAccountIds.map((id) => sql`${id}`),
+				sql`, `,
+			)})
+			ORDER BY ${rewardEvents.id}, ${rewardEventRevisions.revisionNo} DESC
+		)
+		SELECT
+			reward_account_id,
+			COALESCE(SUM(
+				CASE
+					WHEN event_type IN ('OPENING_BALANCE', 'EARN', 'ADJUSTMENT_CREDIT') THEN ROUND(point_amount::numeric * 10000)
+					ELSE -ROUND(point_amount::numeric * 10000)
+				END
+			), 0)::text AS total_units
+		FROM latest_event_revs
+		WHERE operation != 'VOID'
+		GROUP BY reward_account_id
+	`);
+
+	const rows = (Array.isArray(rawResult)
+		? rawResult
+		: ((rawResult as { rows?: unknown[] }).rows ?? [])) as unknown as Array<{
+		reward_account_id: string;
+		total_units: string;
+	}>;
+
+	for (const r of rows) {
+		if (r?.reward_account_id) {
+			resultMap.set(r.reward_account_id, BigInt(r.total_units ?? "0"));
 		}
 	}
 
-	let totalBalanceUnits = 0n;
-	for (const event of eventRows) {
-		const latestRev = latestByEvent.get(event.id);
-		if (!latestRev) continue;
-		if (latestRev.operation === "VOID") continue;
-
-		const pointQty = parsePointQuantity(latestRev.pointAmount);
-		if (POSITIVE_EVENT_TYPES.has(event.eventType as RewardEventType)) {
-			totalBalanceUnits += pointQty.units;
-		} else {
-			totalBalanceUnits -= pointQty.units;
-		}
-	}
-
-	return totalBalanceUnits;
+	return resultMap;
 }
 
 // ============================================================================
@@ -738,28 +790,29 @@ async function createRewardPurchaseInTransaction(
 	// before this transaction ever started. Only the DB-dependent
 	// ownership/ACTIVE-status lookup remains here.
 	if (args.shortTermGoalId) {
-		const [goal] = await tx
-			.select({ id: shortTermGoals.id, status: shortTermGoalRevisions.status })
+		const [goalHeader] = await tx
+			.select({ id: shortTermGoals.id })
 			.from(shortTermGoals)
-			.innerJoin(
-				shortTermGoalRevisions,
-				eq(shortTermGoalRevisions.goalId, shortTermGoals.id),
-			)
 			.where(
 				and(
 					eq(shortTermGoals.id, args.shortTermGoalId),
 					eq(shortTermGoals.userId, args.userId),
 				),
 			)
-			.orderBy(desc(shortTermGoalRevisions.revisionNo))
-			.limit(1);
-		if (!goal) {
+			.for("share");
+		if (!goalHeader) {
 			throw new RewardError(
 				"REWARD_INVALID_INPUT",
 				`Short-term goal "${args.shortTermGoalId}" not found`,
 			);
 		}
-		if (goal.status !== "ACTIVE") {
+		const [goalRev] = await tx
+			.select({ status: shortTermGoalRevisions.status })
+			.from(shortTermGoalRevisions)
+			.where(eq(shortTermGoalRevisions.goalId, args.shortTermGoalId))
+			.orderBy(desc(shortTermGoalRevisions.revisionNo))
+			.limit(1);
+		if (goalRev?.status !== "ACTIVE") {
 			throw new RewardError(
 				"REWARD_INVALID_INPUT",
 				`Short-term goal "${args.shortTermGoalId}" is not ACTIVE`,

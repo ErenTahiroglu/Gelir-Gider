@@ -375,7 +375,7 @@ async function runtime() {
 	const db = new PGlite();
 	await db.query("SET timezone='UTC'");
 	try {
-		await applyChain(db, 71);
+		await applyChain(db, 72);
 		ok("migration chain 0000..0071 applied to an empty PostgreSQL database");
 	} catch (e) {
 		bad("migration chain apply", "\n" + (e as Error).message);
@@ -1057,7 +1057,7 @@ async function resolverRuntime() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -1459,7 +1459,7 @@ async function resolverRuntime4A() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	const F = "f".repeat(64);
@@ -2232,7 +2232,7 @@ async function make4bScenario() {
 	} = B4_IDS;
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -13286,7 +13286,7 @@ async function resolverRuntime7B2R1() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -13300,7 +13300,7 @@ async function resolverRuntime7B2R1() {
 	);
 
 	// A. Fresh user begins with ZERO accounts
-	const initialAccounts = await listLedgerAccountBalances({ db, userId: FRESH_U });
+	const initialAccounts = (await listLedgerAccountBalances({ db, userId: FRESH_U })).accounts;
 	eqD(initialAccounts.length, 0, "7B.2-R1/1: fresh authenticated user starts with exactly 0 ledger accounts");
 
 	// B. Product ASSET creation via public product boundary
@@ -13474,7 +13474,7 @@ async function resolverRuntime7B2R1() {
 	eqD(bSalaryPostRec.balance, "65000.00", "7B.2-R1/12: INCOME account balance CREDIT increased by exact 65000.00");
 
 	// 4. Verify listLedgerAccountBalances
-	const finalAccounts = await listLedgerAccountBalances({ db, userId: FRESH_U });
+	const finalAccounts = (await listLedgerAccountBalances({ db, userId: FRESH_U })).accounts;
 	eqD(finalAccounts.length, 3, "7B.2-R1/13: fresh user has 3 product accounts (CASH, SALARY, FAKE_SYS)");
 	const cashAccInList = finalAccounts.find((a) => a.code === "USR_CASH");
 	const salAccInList = finalAccounts.find((a) => a.code === "USR_SALARY");
@@ -13513,7 +13513,7 @@ async function resolverRuntime7B2R2() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	// Drop test-only singleton constraint in disposable DB so User A and User B can coexist in the same database
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
@@ -14003,7 +14003,7 @@ async function resolverRuntime7B3() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 
@@ -14606,7 +14606,7 @@ async function resolverRuntime7B3R1() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 
@@ -15151,7 +15151,7 @@ async function resolverRuntime7B3R2() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
@@ -15476,7 +15476,7 @@ async function resolverRuntime7B4() {
 	console.log("\n--- RESOLVER RUNTIME 7B.4 (People + Family Product HTTP Surface) ---");
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 	const { drizzle } = await import("drizzle-orm/pglite");
@@ -16404,7 +16404,7 @@ async function resolverRuntime7B5(): Promise<void> {
 	console.log("\n--- Checkpoint 7B.5: Rewards Product HTTP Surface Runtime Verification ---");
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 	const { drizzle } = await import("drizzle-orm/pglite");
@@ -17045,7 +17045,7 @@ async function resolverRuntime7B6(): Promise<void> {
 	console.log("\n--- Checkpoint 7B.6: Campaigns Product HTTP Surface Runtime Verification ---");
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 	const { drizzle } = await import("drizzle-orm/pglite");
@@ -18042,7 +18042,7 @@ async function resolverRuntime7B7() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 
@@ -19260,7 +19260,7 @@ async function resolverRuntime7B8() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 71);
+	await applyChain(pg, 72);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 
@@ -19839,11 +19839,13 @@ async function resolverRuntime7B8() {
 				 (id, user_id, month_close_id, revision_no, previous_revision_id, operation, status, budget_plan_revision_no,
 				  policy_version, currency, reference_income, mandatory_ceiling, mandatory_expense, mandatory_unused,
 				  discretionary_ceiling, discretionary_expense, discretionary_unused, unclassified_expense, close_surplus,
+				  unapplied_prior_adjustments, adjusted_routable_surplus,
 				  route, decision, full_offer_amount, applied_amount, unrouted_amount, proposal_fingerprint,
 				  idempotency_key, revision_fingerprint, occurred_at, created_at)
 				 values ($1, $2, $3, 1, null, 'CLOSE', 'CLOSED', 1,
 				  'PERSONAL_BUDGET_V1', 'TRY', '10000.00', '5000.00', '5000.00', '0.00',
 				  '3000.00', '3000.00', '0.00', '0.00', '0.00',
+				  '0.00', '0.00',
 				  'NONE', 'NO_ACTION', '0.00', '0.00', '0.00', $4,
 				  $5, $6, now(), now())`,
 				[histRevId, USER_A, histCloseId, "c".repeat(64), `hist-idemp-${i}`, "d".repeat(64)],
@@ -19946,6 +19948,269 @@ async function resolverRuntime7B8() {
 	}
 }
 
+async function resolverRuntime7B8R1() {
+	console.log("\n== CHECKPOINT 7B.8-R1: POST-CLOSE ADJUSTMENT MODEL (MC-01 OPTION C) RUNTIME VERIFICATION ==");
+	const { PGlite } = await import("@electric-sql/pglite");
+	const { drizzle } = await import("drizzle-orm/pglite");
+	const { createSession } = await import("../src/auth/sessions.ts");
+	const { createProductLedgerAccount } = await import("../src/ledger/product-accounts.ts");
+	const { postJournalEntry } = await import("../src/ledger/posting.ts");
+	const { recordPostCloseAdjustmentIfClosedInTransaction } = await import("../src/month-close/service.ts");
+
+	const pg = new PGlite();
+	await pg.query("SET timezone='UTC'");
+	await applyChain(pg, 72);
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+
+	const eqD = (a: unknown, b: unknown, name: string) => {
+		if (JSON.stringify(a) === JSON.stringify(b)) {
+			ok(name);
+		} else {
+			bad(name, `got ${JSON.stringify(a)} expected ${JSON.stringify(b)}`);
+		}
+	};
+	const chkD = (c: boolean, name: string) => (c ? ok(name) : bad(name));
+
+	const db = drizzle(pg as any) as any;
+	setDatabaseFactoryOverrideForTest(() => db);
+
+	try {
+		const testEnv: AppEnv = {
+			DATABASE_URL: "postgres://mock:mock@localhost:5432/mock",
+			BACKUP_BUCKET: {} as any,
+			AUTH_RATE_LIMITER: {} as any,
+			APP_ORIGIN: "http://localhost:8787",
+			WEBAUTHN_ORIGIN: "http://localhost:8787",
+			WEBAUTHN_RP_ID: "localhost",
+			WEBAUTHN_RP_NAME: "Gelir-Gider",
+		};
+
+		const USER_A = "11111111-eeee-4eee-8eee-111111111111";
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, 'User A', 'TRY', 'Europe/Istanbul', now())",
+			[USER_A],
+		);
+		const { token: tokenA } = await createSession({ db, userId: USER_A });
+
+		const httpCall = async (
+			path: string,
+			opts: {
+				method?: string;
+				body?: unknown;
+				token?: string;
+				idempotencyKey?: string;
+				origin?: string;
+			} = {},
+		) => {
+			const headers: Record<string, string> = {};
+			if (opts.token) {
+				headers.Cookie = `__Host-gg_session=${opts.token}`;
+			}
+			if (opts.origin !== undefined) {
+				headers.Origin = opts.origin;
+			} else if (opts.method !== "GET" && opts.method !== "HEAD") {
+				headers.Origin = "http://localhost:8787";
+			}
+			if (opts.idempotencyKey) {
+				headers["Idempotency-Key"] = opts.idempotencyKey;
+			}
+			if (opts.body !== undefined) {
+				headers["Content-Type"] = "application/json";
+			}
+			const res = await app.request(
+				path,
+				{
+					method: opts.method ?? "GET",
+					headers,
+					body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+				},
+				testEnv,
+			);
+			let json: any = null;
+			try {
+				json = await res.json();
+			} catch {}
+			return { status: res.status, json, headers: res.headers };
+		};
+
+		const { ensureUserExpenseSystemAccountsInTransaction } = await import(
+			"../src/ledger/system-expense-accounts.ts"
+		);
+		await db.transaction((tx: any) =>
+			ensureUserExpenseSystemAccountsInTransaction(tx, USER_A),
+		);
+
+		const checkingAccA = await createProductLedgerAccount({
+			db,
+			userId: USER_A,
+			code: "MIDAS_CHK_A",
+			name: "Midas Checking Account A",
+			accountType: "ASSET",
+		});
+		const equityAccA = await createLedgerAccount({
+			db,
+			userId: USER_A,
+			code: "EQUITY_A",
+			name: "Opening Equity A",
+			accountType: "EQUITY",
+		});
+		await postJournalEntry({
+			db,
+			userId: USER_A,
+			occurredAt: new Date("2026-01-01T00:00:00.000Z"),
+			memo: "Opening Midas liquidity",
+			idempotencyKey: "open-midas-liq-a",
+			lines: [
+				{ accountId: checkingAccA.account.id, side: "DEBIT", amount: "100000.00" },
+				{ accountId: equityAccA.id, side: "CREDIT", amount: "100000.00" },
+			],
+		});
+
+		const { createMidasAccount } = await import("../src/midas/service.ts");
+		await createMidasAccount({
+			db,
+			userId: USER_A,
+			ledgerAccountId: checkingAccA.account.id,
+		});
+
+		const seedBudgetPlan = async (
+			userId: string,
+			periodMonth: string,
+			options: {
+				mandatoryCeiling?: string;
+				discretionaryCeiling?: string;
+				referenceIncome?: string;
+			} = {},
+		) => {
+			const periodMonthDate = `${periodMonth}-01`;
+			const planId = crypto.randomUUID();
+			const canonTxId = crypto.randomUUID();
+			const canonRevId = crypto.randomUUID();
+			const planRevId = crypto.randomUUID();
+
+			const mandatoryCeiling = options.mandatoryCeiling ?? "5000.00";
+			const discretionaryCeiling = options.discretionaryCeiling ?? "3000.00";
+			const referenceIncome = options.referenceIncome ?? "10000.00";
+			const remainingCents = Math.round((Number(referenceIncome) - Number(mandatoryCeiling) - Number(discretionaryCeiling)) * 100);
+			const shortTermCents = Math.floor(remainingCents / 2);
+			const medTermCents = Math.floor(remainingCents / 4);
+			const longTermCents = remainingCents - shortTermCents - medTermCents;
+			const shortTerm = (shortTermCents / 100).toFixed(2);
+			const medTerm = (medTermCents / 100).toFixed(2);
+			const longTerm = (longTermCents / 100).toFixed(2);
+			const canonIdemp = `plan-canon-idemp-${periodMonth}-${crypto.randomUUID()}`;
+			const canonFingerprint = "a".repeat(64);
+
+			await pg.query("SET session_replication_role = replica");
+			await pg.query(
+				"insert into canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at) values ($1, $2, 'MONTHLY_BUDGET_PLAN', $3, $4, now())",
+				[canonTxId, userId, canonIdemp, canonFingerprint],
+			);
+			await pg.query(
+				"insert into monthly_budget_plans (id, user_id, period_month, canonical_transaction_id, created_at) values ($1, $2, $3, $4, now())",
+				[planId, userId, periodMonthDate, canonTxId],
+			);
+			await pg.query(
+				"insert into transaction_revisions (id, user_id, transaction_id, revision_no, operation, occurred_at, payload, revision_fingerprint, idempotency_key) values ($1, $2, $3, 1, 'CREATE', now(), '{}', $4, $5)",
+				[canonRevId, userId, canonTxId, canonFingerprint, canonIdemp],
+			);
+			await pg.query(
+				`insert into monthly_budget_plan_revisions
+				 (id, user_id, budget_plan_id, canonical_revision_id, revision_no, previous_budget_revision_id, operation, policy_version, currency,
+				  reference_income_amount, mandatory_ceiling_amount, discretionary_ceiling_amount, short_term_purchase_amount, medium_term_reserve_amount, long_term_investment_amount, reference_snapshot)
+				 values ($1, $2, $3, $4, 1, null, 'CREATE', 'PERSONAL_BUDGET_V1', 'TRY', $5, $6, $7, $8, $9, $10, '{}')`,
+				[planRevId, userId, planId, canonRevId, referenceIncome, mandatoryCeiling, discretionaryCeiling, shortTerm, medTerm, longTerm],
+			);
+			await pg.query("SET session_replication_role = origin");
+
+			return { planId, planRevId };
+		};
+
+		// 1. Close 2026-05
+		await seedBudgetPlan(USER_A, "2026-05", { mandatoryCeiling: "5000.00", discretionaryCeiling: "3000.00" });
+		const prevMay = await httpCall("/month-close/preview?periodMonth=2026-05", { method: "GET", token: tokenA });
+		eqD(prevMay.status, 200, "7B.8-R1: Preview 2026-05 returns 200");
+
+		const closeMayRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-may-r1-key",
+			body: {
+				periodMonth: "2026-05",
+				expectedProposalFingerprint: prevMay.json?.proposalFingerprint,
+				occurredAt: "2026-06-01T12:00:00.000Z",
+			},
+		});
+		eqD(closeMayRes.status, 201, "7B.8-R1: Close 2026-05 succeeds");
+
+		// 2. Record a post-close adjustment of -300.00 on closed month 2026-05
+		const adj = await db.transaction((tx: any) =>
+			recordPostCloseAdjustmentIfClosedInTransaction(tx, {
+				userId: USER_A,
+				periodMonth: "2026-05",
+				adjustmentAmount: "-300.00",
+				reasonCode: "RETROACTIVE_PURCHASE_ADJUSTMENT",
+				sourceRef: "txn-123",
+			}),
+		);
+		chkD(Boolean(adj), "7B.8-R1: Post-close adjustment created for closed period 2026-05");
+
+		// 3. Verify closed month 2026-05 remains immutable
+		const mayDetail = await httpCall("/month-close/2026-05", { method: "GET", token: tokenA });
+		eqD(mayDetail.status, 200, "7B.8-R1: 2026-05 month close detail returns 200");
+		eqD(mayDetail.json?.monthClose?.closeSurplus, "8000.00", "7B.8-R1: 2026-05 closeSurplus is unchanged");
+		eqD(mayDetail.json?.monthClose?.appliedAmount, "8000.00", "7B.8-R1: 2026-05 appliedAmount is unchanged");
+
+		// 4. Seed and preview 2026-06: carry-forward unapplied adjustment
+		await seedBudgetPlan(USER_A, "2026-06", { mandatoryCeiling: "4000.00", discretionaryCeiling: "2000.00" });
+		const prevJune = await httpCall("/month-close/preview?periodMonth=2026-06", { method: "GET", token: tokenA });
+		eqD(prevJune.status, 200, "7B.8-R1: Preview 2026-06 returns 200");
+		eqD(prevJune.json?.closeSurplus, "6000.00", "7B.8-R1: 2026-06 native surplus is 6000.00");
+		eqD(prevJune.json?.unappliedPriorAdjustments, "-300.00", "7B.8-R1: Unapplied prior adjustment -300.00 carried forward");
+		eqD(prevJune.json?.adjustedRoutableSurplus, "5700.00", "7B.8-R1: adjustedRoutableSurplus = 5700.00 (6000 - 300)");
+		eqD(prevJune.json?.fullOfferAmount, "5700.00", "7B.8-R1: Routing fullOfferAmount equals adjustedRoutableSurplus 5700.00");
+
+		// 5. Close 2026-06: reconciles adjustment
+		const closeJuneRes = await httpCall("/month-close", {
+			method: "POST",
+			token: tokenA,
+			idempotencyKey: "close-june-r1-key",
+			body: {
+				periodMonth: "2026-06",
+				expectedProposalFingerprint: prevJune.json?.proposalFingerprint,
+				occurredAt: "2026-07-01T12:00:00.000Z",
+			},
+		});
+		eqD(closeJuneRes.status, 201, "7B.8-R1: Close 2026-06 succeeds with adjustment reconciliation");
+		eqD(closeJuneRes.json?.monthClose?.appliedAmount, "5700.00", "7B.8-R1: 2026-06 appliedAmount is 5700.00");
+
+		// 6. Verify adjustment is marked applied and application record exists
+		const [adjAfter] = await pg.query<{ applied_in_month_close_id: string }>(
+			"select applied_in_month_close_id from month_close_adjustments where id = $1",
+			[adj.id],
+		).then((r: any) => r.rows);
+		eqD(adjAfter.applied_in_month_close_id, closeJuneRes.json?.monthClose?.monthCloseId, "7B.8-R1: Adjustment applied_in_month_close_id matches 2026-06 monthCloseId");
+
+		const [appRow] = await pg.query<{ adjustment_id: string; month_close_id: string }>(
+			"select adjustment_id, month_close_id from month_close_adjustment_applications where adjustment_id = $1",
+			[adj.id],
+		).then((r: any) => r.rows);
+		chkD(Boolean(appRow), "7B.8-R1: month_close_adjustment_applications row exists");
+
+		// 7. Preview 2026-07: unapplied adjustment is now 0.00
+		await seedBudgetPlan(USER_A, "2026-07", { mandatoryCeiling: "3000.00", discretionaryCeiling: "1000.00" });
+		const prevJuly = await httpCall("/month-close/preview?periodMonth=2026-07", { method: "GET", token: tokenA });
+		eqD(prevJuly.status, 200, "7B.8-R1: Preview 2026-07 returns 200");
+		eqD(prevJuly.json?.unappliedPriorAdjustments, "0.00", "7B.8-R1: Unapplied adjustments for 2026-07 is 0.00");
+		eqD(prevJuly.json?.adjustedRoutableSurplus, "4000.00", "7B.8-R1: adjustedRoutableSurplus equals native surplus 4000.00");
+
+	} finally {
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -19980,6 +20245,7 @@ if (probed) {
 	await resolverRuntime7B6();
 	await resolverRuntime7B7();
 	await resolverRuntime7B8();
+	await resolverRuntime7B8R1();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

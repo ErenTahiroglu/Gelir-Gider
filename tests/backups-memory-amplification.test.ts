@@ -1,3 +1,4 @@
+import { getTableConfig, type PgTable } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import {
 	buildSnapshotPayload,
@@ -5,6 +6,7 @@ import {
 	exportDatabaseSnapshot,
 } from "../src/backups/export";
 import { getBackupTableDescriptors } from "../src/backups/registry";
+import type { DatabaseTransaction } from "../src/db/client";
 import {
 	type AmplificationResult,
 	buildStaticProfileTx,
@@ -37,7 +39,7 @@ import {
 // ============================================================================
 
 describe("backup size guard timing", () => {
-	it("exportDatabaseSnapshot fully materializes an over-limit dataset; only buildSnapshotPayload enforces the 25 MiB ceiling", async () => {
+	it("exportDatabaseSnapshot aborts early during table materialization when dataset exceeds the 25 MiB ceiling", async () => {
 		// ~26 MiB of synthetic rows in the first registry table.
 		const rawByTable = makeSyntheticRawRows(26 * MIB, 1);
 		const registryNames = getBackupTableDescriptors().map((d) => d.tableName);
@@ -45,40 +47,26 @@ describe("backup size guard timing", () => {
 		const bigRows = rawByTable[firstName] ?? [];
 		expect(bigRows.length).toBeGreaterThan(1000);
 
-		const { tx } = buildStaticProfileTx(bigRows);
-
-		// exportDatabaseSnapshot does NOT throw for an over-limit dataset...
-		const snapshot = await exportDatabaseSnapshot(tx);
-
-		// ...it has already materialized EVERY registry table (normalized,
-		// sorted, per-table SHA-256 hashed) ...
-		expect(snapshot.tables).toHaveLength(registryNames.length);
-		const firstSnapshot = snapshot.tables.find(
-			(t) => t.tableName === firstName,
-		);
-		expect(firstSnapshot?.rows.length).toBe(bigRows.length);
-		expect(firstSnapshot?.tableContentHash).toMatch(/^[0-9a-f]{64}$/);
-
-		// ...and it has run its own full JSON + TextEncoder pass to compute a
-		// plaintext size that is ALREADY well over the 25 MiB ceiling.
-		expect(snapshot.plaintextSizeBytes).toBeGreaterThan(
-			DEFAULT_MAX_PLAINTEXT_BYTES,
-		);
-
-		// The ceiling is enforced only now, by buildSnapshotPayload, which
-		// re-serializes the whole payload (manifest + tables) a second time
-		// before throwing.
-		await expect(
-			buildSnapshotPayload({
-				formatVersion: "V1",
-				backupId: "20260907",
-				createdAt: "2026-09-07T02:17:00.000Z",
-				tables: snapshot.tables,
+		let tablesQueriedCount = 0;
+		const tx = {
+			select: () => ({
+				from: (table: PgTable) => {
+					tablesQueriedCount++;
+					const name = getTableConfig(table).name;
+					return Promise.resolve(name === firstName ? bigRows : []);
+				},
 			}),
-		).rejects.toMatchObject({
+		} as unknown as DatabaseTransaction;
+
+		// exportDatabaseSnapshot MUST throw BACKUP_TOO_LARGE early during materialization...
+		await expect(exportDatabaseSnapshot(tx)).rejects.toMatchObject({
 			name: "BackupError",
 			code: "BACKUP_TOO_LARGE",
 		});
+
+		// ...and prove that it stopped immediately at the 1st table without materializing the remaining 100+ tables!
+		expect(tablesQueriedCount).toBe(1);
+		expect(tablesQueriedCount).toBeLessThan(registryNames.length);
 	});
 
 	it("a within-limit dataset passes through both stages unchanged", async () => {

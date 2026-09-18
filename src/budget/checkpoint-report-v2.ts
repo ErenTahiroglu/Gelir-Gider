@@ -1,4 +1,4 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, lte } from "drizzle-orm";
 import { resolveAuthoritativePurchaseSplitAsOf } from "../credit-cards/purchase-split-read";
 import {
 	getStatementReconciliationAsOf,
@@ -1226,19 +1226,22 @@ interface PurchaseEventRow {
 async function loadPurchaseEvents(
 	db: Database,
 	userId: string,
+	upTo?: Date,
 ): Promise<PurchaseEventRow[]> {
+	const conditions = [
+		eq(creditCardLiabilityEvents.userId, userId),
+		eq(creditCardLiabilityEvents.eventType, "PURCHASE"),
+	];
+	if (upTo) {
+		conditions.push(lte(creditCardLiabilityEvents.createdAt, upTo));
+	}
 	const rows = await db
 		.select({
 			eventId: creditCardLiabilityEvents.id,
 			creditCardId: creditCardLiabilityEvents.creditCardId,
 		})
 		.from(creditCardLiabilityEvents)
-		.where(
-			and(
-				eq(creditCardLiabilityEvents.userId, userId),
-				eq(creditCardLiabilityEvents.eventType, "PURCHASE"),
-			),
-		);
+		.where(and(...conditions));
 	return rows;
 }
 
@@ -2626,13 +2629,38 @@ async function buildSurplusUseAttribution(
 export async function buildBudgetV2CheckpointReport(
 	params: CheckpointReportParams,
 ): Promise<BudgetV2CheckpointReport> {
-	const { db } = params;
 	const userId = normalizeUuid(params.userId, "userId");
 	const periodMonth = validateBudgetPeriodMonth(params.periodMonth);
 	const triggerPaymentEventId = normalizeUuid(
 		params.triggerPaymentEventId,
 		"triggerPaymentEventId",
 	);
+
+	const validatedParams: CheckpointReportParams = {
+		...params,
+		userId,
+		periodMonth,
+		triggerPaymentEventId,
+	};
+
+	const { db } = params;
+	if (db && typeof (db as Database).transaction === "function") {
+		return await (db as Database).transaction(
+			async (tx) =>
+				buildBudgetV2CheckpointReportInternal({
+					...validatedParams,
+					db: tx as unknown as Database,
+				}),
+			{ isolationLevel: "repeatable read", accessMode: "read only" },
+		);
+	}
+	return await buildBudgetV2CheckpointReportInternal(validatedParams);
+}
+
+async function buildBudgetV2CheckpointReportInternal(
+	params: CheckpointReportParams,
+): Promise<BudgetV2CheckpointReport> {
+	const { db, userId, periodMonth, triggerPaymentEventId } = params;
 
 	const trigger = await resolveTrigger(
 		db,
@@ -2691,7 +2719,7 @@ export async function buildBudgetV2CheckpointReport(
 	});
 
 	const cardMetaOf = makeCardMetaAsOf(db, userId, checkpointAt);
-	const purchaseEvents = await loadPurchaseEvents(db, userId);
+	const purchaseEvents = await loadPurchaseEvents(db, userId, win.periodEnd);
 
 	const income = await buildIntervalIncome(db, userId, win, checkpointAt);
 	const purchases = await buildIntervalPurchases(

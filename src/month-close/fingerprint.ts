@@ -30,6 +30,8 @@ export interface MonthCloseProposalFingerprintParams {
 	discretionaryUnused: string;
 	unclassifiedExpense: string;
 	closeSurplus: string;
+	unappliedPriorAdjustments?: string;
+	adjustedRoutableSurplus?: string;
 	route: "SHORT_TERM_GOAL" | "MEDIUM_TERM_RESERVE" | "NONE";
 	recommendedGoal: MonthCloseRecommendedGoalFingerprintInput | null;
 }
@@ -58,6 +60,8 @@ export async function calculateMonthCloseProposalFingerprint(
 		params.discretionaryUnused,
 		params.unclassifiedExpense,
 		params.closeSurplus,
+		params.unappliedPriorAdjustments ?? "0.00",
+		params.adjustedRoutableSurplus ?? params.closeSurplus,
 		params.route,
 		params.recommendedGoal
 			? [

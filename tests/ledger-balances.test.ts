@@ -268,7 +268,9 @@ describe("Ledger Balances Read Model (Phase 4B & 4B-R1)", () => {
 						if (table === ledgerAccounts) {
 							return {
 								where: vi.fn().mockReturnValue({
-									orderBy: vi.fn().mockResolvedValue(mockAccounts),
+									orderBy: vi.fn().mockReturnValue({
+										limit: vi.fn().mockResolvedValue(mockAccounts),
+									}),
 								}),
 							};
 						}
@@ -305,8 +307,8 @@ describe("Ledger Balances Read Model (Phase 4B & 4B-R1)", () => {
 				userId: "user-1",
 			});
 
-			expect(result).toHaveLength(3);
-			expect(result[0]).toEqual({
+			expect(result.accounts).toHaveLength(3);
+			expect(result.accounts[0]).toEqual({
 				accountId: "acc-1",
 				code: "ASSET_BANK",
 				name: "Bank",
@@ -316,7 +318,7 @@ describe("Ledger Balances Read Model (Phase 4B & 4B-R1)", () => {
 				archived: false,
 				balance: "19999999999999999.98",
 			});
-			expect(result[1]).toEqual({
+			expect(result.accounts[1]).toEqual({
 				accountId: "acc-2",
 				code: "EXPENSE_FOOD",
 				name: "Food",
@@ -326,7 +328,7 @@ describe("Ledger Balances Read Model (Phase 4B & 4B-R1)", () => {
 				archived: false,
 				balance: "200.00",
 			});
-			expect(result[2]).toEqual({
+			expect(result.accounts[2]).toEqual({
 				accountId: "acc-3",
 				code: "LIABILITY_LOAN",
 				name: "Loan",
