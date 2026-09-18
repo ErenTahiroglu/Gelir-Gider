@@ -23,8 +23,8 @@ SET snapshot_allocations = (
     jsonb_build_object(
       'entitlementId', elem->>'entitlementId',
       'allocatedAmount', elem->>'amount',
-      'periodMonth', COALESCE(ie.period_month, ''),
-      'entitlementAmount', COALESCE(ier.amount, '0.00'),
+      'periodMonth', COALESCE(ie.period_month::text, ''),
+      'entitlementAmount', COALESCE(ier.amount::text, '0.00'),
       'entitlementOutstandingAfterAllReceipts', '0.00'
     )
   ), '[]'::jsonb)
