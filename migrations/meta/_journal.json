@@ -519,6 +519,13 @@
       "when": 1789712992060,
       "tag": "0073_condemned_ironclad",
       "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1789713500000,
+      "tag": "0074_fix_legacy_adjustments_and_settlement_replays",
+      "breakpoints": true
     }
   ]
 }

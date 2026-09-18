@@ -41,8 +41,12 @@ export interface CampaignOverrideCursorScope {
 
 export function encodeCampaignPeriodCursor(
 	cursor: CampaignPeriodCursor,
+	scope?: CampaignPeriodCursorScope,
 ): string {
-	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+	return Buffer.from(
+		JSON.stringify({ ...cursor, ...(scope ?? {}) }),
+		"utf8",
+	).toString("base64url");
 }
 
 export function decodeCampaignPeriodCursor(
@@ -62,8 +66,11 @@ export function decodeCampaignPeriodCursor(
 		) {
 			throw new Error("Invalid campaign period cursor payload");
 		}
-		if (expectedScope?.userId && typeof parsed.userId === "string") {
-			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+		if (expectedScope?.userId !== undefined) {
+			if (
+				typeof parsed.userId !== "string" ||
+				parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
@@ -81,8 +88,12 @@ export function decodeCampaignPeriodCursor(
 
 export function encodeCampaignReviewCandidateCursor(
 	cursor: CampaignReviewCandidateCursor,
+	scope?: CampaignReviewCandidateCursorScope,
 ): string {
-	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+	return Buffer.from(
+		JSON.stringify({ ...cursor, ...(scope ?? {}) }),
+		"utf8",
+	).toString("base64url");
 }
 
 export function decodeCampaignReviewCandidateCursor(
@@ -102,18 +113,19 @@ export function decodeCampaignReviewCandidateCursor(
 		) {
 			throw new Error("Invalid campaign review candidate cursor payload");
 		}
-		if (expectedScope?.userId && typeof parsed.userId === "string") {
-			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+		if (expectedScope?.userId !== undefined) {
+			if (
+				typeof parsed.userId !== "string" ||
+				parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
-		if (
-			expectedScope?.campaignPeriodId &&
-			typeof parsed.campaignPeriodId === "string"
-		) {
+		if (expectedScope?.campaignPeriodId !== undefined) {
 			if (
+				typeof parsed.campaignPeriodId !== "string" ||
 				parsed.campaignPeriodId.toLowerCase() !==
-				expectedScope.campaignPeriodId.toLowerCase()
+					expectedScope.campaignPeriodId.toLowerCase()
 			) {
 				throw new Error("Cursor scope mismatch");
 			}
@@ -132,8 +144,12 @@ export function decodeCampaignReviewCandidateCursor(
 
 export function encodeCampaignProgressPurchaseCursor(
 	cursor: CampaignProgressPurchaseCursor,
+	scope?: CampaignProgressPurchaseCursorScope,
 ): string {
-	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+	return Buffer.from(
+		JSON.stringify({ ...cursor, ...(scope ?? {}) }),
+		"utf8",
+	).toString("base64url");
 }
 
 export function decodeCampaignProgressPurchaseCursor(
@@ -153,13 +169,19 @@ export function decodeCampaignProgressPurchaseCursor(
 		) {
 			throw new Error("Invalid campaign progress purchase cursor payload");
 		}
-		if (expectedScope?.userId && typeof parsed.userId === "string") {
-			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+		if (expectedScope?.userId !== undefined) {
+			if (
+				typeof parsed.userId !== "string" ||
+				parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
-		if (expectedScope?.cardId && typeof parsed.cardId === "string") {
-			if (parsed.cardId.toLowerCase() !== expectedScope.cardId.toLowerCase()) {
+		if (expectedScope?.cardId !== undefined) {
+			if (
+				typeof parsed.cardId !== "string" ||
+				parsed.cardId.toLowerCase() !== expectedScope.cardId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
@@ -177,8 +199,12 @@ export function decodeCampaignProgressPurchaseCursor(
 
 export function encodeCampaignOverrideCursor(
 	cursor: CampaignOverrideCursor,
+	scope?: CampaignOverrideCursorScope,
 ): string {
-	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+	return Buffer.from(
+		JSON.stringify({ ...cursor, ...(scope ?? {}) }),
+		"utf8",
+	).toString("base64url");
 }
 
 export function decodeCampaignOverrideCursor(
@@ -196,18 +222,19 @@ export function decodeCampaignOverrideCursor(
 		) {
 			throw new Error("Invalid campaign override cursor payload");
 		}
-		if (expectedScope?.userId && typeof parsed.userId === "string") {
-			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+		if (expectedScope?.userId !== undefined) {
+			if (
+				typeof parsed.userId !== "string" ||
+				parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
-		if (
-			expectedScope?.campaignPeriodId &&
-			typeof parsed.campaignPeriodId === "string"
-		) {
+		if (expectedScope?.campaignPeriodId !== undefined) {
 			if (
+				typeof parsed.campaignPeriodId !== "string" ||
 				parsed.campaignPeriodId.toLowerCase() !==
-				expectedScope.campaignPeriodId.toLowerCase()
+					expectedScope.campaignPeriodId.toLowerCase()
 			) {
 				throw new Error("Cursor scope mismatch");
 			}

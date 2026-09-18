@@ -33,8 +33,14 @@ export interface PurchaseCursorScope {
 	cardId?: string | undefined;
 }
 
-export function encodeCardCursor(cursor: CardCursor): string {
-	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+export function encodeCardCursor(
+	cursor: CardCursor,
+	scope?: CardCursorScope,
+): string {
+	return Buffer.from(
+		JSON.stringify({ ...cursor, ...(scope ?? {}) }),
+		"utf8",
+	).toString("base64url");
 }
 
 export function decodeCardCursor(
@@ -54,8 +60,11 @@ export function decodeCardCursor(
 		) {
 			throw new Error("Invalid card cursor payload");
 		}
-		if (expectedScope?.userId && typeof parsed.userId === "string") {
-			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+		if (expectedScope?.userId !== undefined) {
+			if (
+				typeof parsed.userId !== "string" ||
+				parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
@@ -71,8 +80,14 @@ export function decodeCardCursor(
 	}
 }
 
-export function encodeStatementCursor(cursor: StatementCursor): string {
-	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+export function encodeStatementCursor(
+	cursor: StatementCursor,
+	scope?: StatementCursorScope,
+): string {
+	return Buffer.from(
+		JSON.stringify({ ...cursor, ...(scope ?? {}) }),
+		"utf8",
+	).toString("base64url");
 }
 
 export function decodeStatementCursor(
@@ -96,13 +111,19 @@ export function decodeStatementCursor(
 		) {
 			throw new Error("Invalid statement cursor payload");
 		}
-		if (expectedScope?.userId && typeof parsed.userId === "string") {
-			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+		if (expectedScope?.userId !== undefined) {
+			if (
+				typeof parsed.userId !== "string" ||
+				parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
-		if (expectedScope?.cardId && typeof parsed.cardId === "string") {
-			if (parsed.cardId.toLowerCase() !== expectedScope.cardId.toLowerCase()) {
+		if (expectedScope?.cardId !== undefined) {
+			if (
+				typeof parsed.cardId !== "string" ||
+				parsed.cardId.toLowerCase() !== expectedScope.cardId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
@@ -119,8 +140,14 @@ export function decodeStatementCursor(
 	}
 }
 
-export function encodePurchaseCursor(cursor: PurchaseCursor): string {
-	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+export function encodePurchaseCursor(
+	cursor: PurchaseCursor,
+	scope?: PurchaseCursorScope,
+): string {
+	return Buffer.from(
+		JSON.stringify({ ...cursor, ...(scope ?? {}) }),
+		"utf8",
+	).toString("base64url");
 }
 
 export function decodePurchaseCursor(
@@ -142,13 +169,19 @@ export function decodePurchaseCursor(
 			throw new Error("Invalid purchase cursor payload");
 		}
 		validateGregorianDateString(parsed.purchaseDate, "purchaseDate");
-		if (expectedScope?.userId && typeof parsed.userId === "string") {
-			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+		if (expectedScope?.userId !== undefined) {
+			if (
+				typeof parsed.userId !== "string" ||
+				parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
-		if (expectedScope?.cardId && typeof parsed.cardId === "string") {
-			if (parsed.cardId.toLowerCase() !== expectedScope.cardId.toLowerCase()) {
+		if (expectedScope?.cardId !== undefined) {
+			if (
+				typeof parsed.cardId !== "string" ||
+				parsed.cardId.toLowerCase() !== expectedScope.cardId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}

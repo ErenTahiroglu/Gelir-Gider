@@ -28,8 +28,10 @@ import {
 	recordRewardOpeningBalance,
 	recordRewardAdjustmentDebit,
 	recordRewardEarn,
+	recordRewardPurchase,
 } from "../src/rewards/events.ts";
 import { RewardError } from "../src/rewards/errors.ts";
+import { CreditCardError } from "../src/credit-cards/errors.ts";
 import { createCreditCard } from "../src/credit-cards/service.ts";
 import { recordCreditCardPurchase } from "../src/credit-cards/purchases.ts";
 import {
@@ -1371,41 +1373,69 @@ async function run() {
 		// TEST 10: Checkpoint M-03 / M-06 -- STG 4-Race Concurrency Verification
 		// 1. CC purchase binding vs CANCEL
 		// 2. CC purchase binding vs COMPLETE
-		// 3. Reward earn purchase binding vs CANCEL
-		// 4. Reward earn purchase binding vs COMPLETE
+		// 3. Reward purchase binding vs CANCEL
+		// 4. Reward purchase binding vs COMPLETE
 		// ========================================================================
 		try {
 			logOut("\n--- Test 10: STG 4-Race Concurrency Verification (Real PostgreSQL) ---");
 
-			// Setup STG goals & card
+			const targetMidasId =
+				midasAccSetupId ||
+				(
+					await controlClient.query(
+						"select id from midas_accounts where user_id = $1 limit 1",
+						[USER_A],
+					)
+				).rows[0]?.id;
+
+			// Setup STG goals, card & reward account with points
 			const stgCardRes = await createCreditCard({
 				db: dbA,
 				userId: USER_A,
-				cardName: "STG Concurrency Test Card",
-				cutoffDay: 15,
-				paymentDueDay: 25,
-				idempotencyKey: "stg-test-card-key",
+				code: "STG_TEST_CARD",
+				displayName: "STG Concurrency Test Card",
+				issuer: "Test Bank",
+				statementDay: 15,
+				dueDay: 25,
+				creditLimit: "10000.00",
+				occurredAt: new Date("2026-08-01T00:00:00Z"),
+				idempotencyKey: `stg-test-card-key-${crypto.randomUUID()}`,
 			});
-			const stgCardId = stgCardRes.card.id;
+			const stgCardId = stgCardRes.card.cardId;
 
 			const stgRewardAccRes = await createRewardAccount({
 				db: dbA,
 				userId: USER_A,
-				programName: "STG Concurrency Rewards",
-				idempotencyKey: "stg-test-reward-key",
+				code: "STG_TEST_REWARD",
+				displayName: "STG Concurrency Rewards",
+				provider: "Test Program",
+				unitName: "Points",
+				occurredAt: new Date("2026-08-01T00:00:00Z"),
+				idempotencyKey: `stg-test-reward-key-${crypto.randomUUID()}`,
 			});
-			const stgRewardAccountId = stgRewardAccRes.rewardAccount.id;
+			const stgRewardAccountId = stgRewardAccRes.account.rewardAccountId;
+
+			await recordRewardOpeningBalance({
+				db: dbA,
+				userId: USER_A,
+				rewardAccountId: stgRewardAccountId,
+				pointAmount: "1000.0000",
+				occurredAt: new Date("2026-08-01T00:00:00Z"),
+				idempotencyKey: `stg-rew-ob-init-${crypto.randomUUID()}`,
+			});
 
 			// --- Race 10.1: CC purchase binding vs CANCEL ---
 			const goal1Res = await createShortTermGoal({
 				db: dbA,
 				userId: USER_A,
+				midasAccountId: targetMidasId,
 				name: "STG Race 1 Goal",
-				targetAmount: "500.00",
+				fundingTarget: "500.00",
 				targetDate: "2026-12-31",
-				idempotencyKey: "stg-race-1-goal-key",
+				occurredAt: new Date("2026-08-01T00:00:00Z"),
+				idempotencyKey: `stg-race-1-goal-key-${crypto.randomUUID()}`,
 			});
-			const goal1Id = goal1Res.shortTermGoal.id;
+			const goal1Id = goal1Res.goalId;
 
 			await controlClient.query("BEGIN; LOCK TABLE short_term_goals IN ACCESS EXCLUSIVE MODE;");
 
@@ -1414,11 +1444,10 @@ async function run() {
 				userId: USER_A,
 				cardId: stgCardId,
 				amount: "50.00",
-				purchaseDate: "2026-08-05",
-				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				purchaseCategory: "SHORT_TERM_PURCHASE",
 				shortTermGoalId: goal1Id,
-				idempotencyKey: "stg-race-1-cc-key",
-				source: { type: "MANUAL", externalId: "stg-r1-cc" },
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				idempotencyKey: `stg-race-1-cc-key-${crypto.randomUUID()}`,
 			});
 
 			const promiseCancel1 = cancelShortTermGoal({
@@ -1426,8 +1455,8 @@ async function run() {
 				userId: USER_A,
 				goalId: goal1Id,
 				expectedRevisionNo: 1,
-				idempotencyKey: "stg-race-1-cancel-key",
-				provenance: { type: "MANUAL", externalId: "stg-r1-cancel" },
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				idempotencyKey: `stg-race-1-cancel-key-${crypto.randomUUID()}`,
 			});
 
 			const blockedSTG1 = await waitUntilBothCompetitorsBlockedOnRelation(
@@ -1445,16 +1474,24 @@ async function run() {
 			const [resCC1, resCancel1] = await Promise.allSettled([promiseCC1, promiseCancel1]);
 			chk(resCC1.status === "fulfilled" || resCancel1.status === "fulfilled", "7B.9 M-06: at least one competitor succeeded in CC vs CANCEL");
 
+			// If CC purchase rejected, must be typed CreditCardError
+			if (resCC1.status === "rejected") {
+				chk(resCC1.reason instanceof CreditCardError, "7B.9 M-06: loser CC purchase threw typed CreditCardError");
+				eq((resCC1.reason as CreditCardError).code, "CREDIT_CARD_INVALID_INPUT", "7B.9 M-06: loser CC purchase rejected with CREDIT_CARD_INVALID_INPUT");
+			}
+
 			// --- Race 10.2: CC purchase binding vs COMPLETE ---
 			const goal2Res = await createShortTermGoal({
 				db: dbA,
 				userId: USER_A,
+				midasAccountId: targetMidasId,
 				name: "STG Race 2 Goal",
-				targetAmount: "500.00",
+				fundingTarget: "500.00",
 				targetDate: "2026-12-31",
-				idempotencyKey: "stg-race-2-goal-key",
+				occurredAt: new Date("2026-08-01T00:00:00Z"),
+				idempotencyKey: `stg-race-2-goal-key-${crypto.randomUUID()}`,
 			});
-			const goal2Id = goal2Res.shortTermGoal.id;
+			const goal2Id = goal2Res.goalId;
 
 			await controlClient.query("BEGIN; LOCK TABLE short_term_goals IN ACCESS EXCLUSIVE MODE;");
 
@@ -1463,11 +1500,10 @@ async function run() {
 				userId: USER_A,
 				cardId: stgCardId,
 				amount: "50.00",
-				purchaseDate: "2026-08-05",
-				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				purchaseCategory: "SHORT_TERM_PURCHASE",
 				shortTermGoalId: goal2Id,
-				idempotencyKey: "stg-race-2-cc-key",
-				source: { type: "MANUAL", externalId: "stg-r2-cc" },
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				idempotencyKey: `stg-race-2-cc-key-${crypto.randomUUID()}`,
 			});
 
 			const promiseComplete2 = completeShortTermGoal({
@@ -1475,8 +1511,8 @@ async function run() {
 				userId: USER_A,
 				goalId: goal2Id,
 				expectedRevisionNo: 1,
-				idempotencyKey: "stg-race-2-complete-key",
-				provenance: { type: "MANUAL", externalId: "stg-r2-complete" },
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				idempotencyKey: `stg-race-2-complete-key-${crypto.randomUUID()}`,
 			});
 
 			const blockedSTG2 = await waitUntilBothCompetitorsBlockedOnRelation(
@@ -1494,28 +1530,35 @@ async function run() {
 			const [resCC2, resComplete2] = await Promise.allSettled([promiseCC2, promiseComplete2]);
 			chk(resCC2.status === "fulfilled" || resComplete2.status === "fulfilled", "7B.9 M-06: at least one competitor succeeded in CC vs COMPLETE");
 
-			// --- Race 10.3: Reward earn purchase binding vs CANCEL ---
+			if (resCC2.status === "rejected") {
+				chk(resCC2.reason instanceof CreditCardError, "7B.9 M-06: loser CC purchase threw typed CreditCardError");
+				eq((resCC2.reason as CreditCardError).code, "CREDIT_CARD_INVALID_INPUT", "7B.9 M-06: loser CC purchase rejected with CREDIT_CARD_INVALID_INPUT");
+			}
+
+			// --- Race 10.3: Reward purchase binding vs CANCEL ---
 			const goal3Res = await createShortTermGoal({
 				db: dbA,
 				userId: USER_A,
+				midasAccountId: targetMidasId,
 				name: "STG Race 3 Goal",
-				targetAmount: "500.00",
+				fundingTarget: "500.00",
 				targetDate: "2026-12-31",
-				idempotencyKey: "stg-race-3-goal-key",
+				occurredAt: new Date("2026-08-01T00:00:00Z"),
+				idempotencyKey: `stg-race-3-goal-key-${crypto.randomUUID()}`,
 			});
-			const goal3Id = goal3Res.shortTermGoal.id;
+			const goal3Id = goal3Res.goalId;
 
 			await controlClient.query("BEGIN; LOCK TABLE short_term_goals IN ACCESS EXCLUSIVE MODE;");
 
-			const promiseReward3 = recordRewardEarn({
+			const promiseReward3 = recordRewardPurchase({
 				db: dbA,
 				userId: USER_A,
 				rewardAccountId: stgRewardAccountId,
-				points: "100.00",
-				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				pointAmount: "100.0000",
+				purchaseCategory: "SHORT_TERM_PURCHASE",
 				shortTermGoalId: goal3Id,
-				idempotencyKey: "stg-race-3-reward-key",
-				provenance: { type: "MANUAL", externalId: "stg-r3-reward" },
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				idempotencyKey: `stg-race-3-reward-key-${crypto.randomUUID()}`,
 			});
 
 			const promiseCancel3 = cancelShortTermGoal({
@@ -1523,8 +1566,8 @@ async function run() {
 				userId: USER_A,
 				goalId: goal3Id,
 				expectedRevisionNo: 1,
-				idempotencyKey: "stg-race-3-cancel-key",
-				provenance: { type: "MANUAL", externalId: "stg-r3-cancel" },
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				idempotencyKey: `stg-race-3-cancel-key-${crypto.randomUUID()}`,
 			});
 
 			const blockedSTG3 = await waitUntilBothCompetitorsBlockedOnRelation(
@@ -1542,28 +1585,35 @@ async function run() {
 			const [resReward3, resCancel3] = await Promise.allSettled([promiseReward3, promiseCancel3]);
 			chk(resReward3.status === "fulfilled" || resCancel3.status === "fulfilled", "7B.9 M-06: at least one competitor succeeded in Reward vs CANCEL");
 
-			// --- Race 10.4: Reward earn purchase binding vs COMPLETE ---
+			if (resReward3.status === "rejected") {
+				chk(resReward3.reason instanceof RewardError, "7B.9 M-06: loser Reward purchase threw typed RewardError");
+				eq((resReward3.reason as RewardError).code, "REWARD_INVALID_INPUT", "7B.9 M-06: loser Reward purchase rejected with REWARD_INVALID_INPUT");
+			}
+
+			// --- Race 10.4: Reward purchase binding vs COMPLETE ---
 			const goal4Res = await createShortTermGoal({
 				db: dbA,
 				userId: USER_A,
+				midasAccountId: targetMidasId,
 				name: "STG Race 4 Goal",
-				targetAmount: "500.00",
+				fundingTarget: "500.00",
 				targetDate: "2026-12-31",
-				idempotencyKey: "stg-race-4-goal-key",
+				occurredAt: new Date("2026-08-01T00:00:00Z"),
+				idempotencyKey: `stg-race-4-goal-key-${crypto.randomUUID()}`,
 			});
-			const goal4Id = goal4Res.shortTermGoal.id;
+			const goal4Id = goal4Res.goalId;
 
 			await controlClient.query("BEGIN; LOCK TABLE short_term_goals IN ACCESS EXCLUSIVE MODE;");
 
-			const promiseReward4 = recordRewardEarn({
+			const promiseReward4 = recordRewardPurchase({
 				db: dbA,
 				userId: USER_A,
 				rewardAccountId: stgRewardAccountId,
-				points: "100.00",
-				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				pointAmount: "100.0000",
+				purchaseCategory: "SHORT_TERM_PURCHASE",
 				shortTermGoalId: goal4Id,
-				idempotencyKey: "stg-race-4-reward-key",
-				provenance: { type: "MANUAL", externalId: "stg-r4-reward" },
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				idempotencyKey: `stg-race-4-reward-key-${crypto.randomUUID()}`,
 			});
 
 			const promiseComplete4 = completeShortTermGoal({
@@ -1571,8 +1621,8 @@ async function run() {
 				userId: USER_A,
 				goalId: goal4Id,
 				expectedRevisionNo: 1,
-				idempotencyKey: "stg-race-4-complete-key",
-				provenance: { type: "MANUAL", externalId: "stg-r4-complete" },
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				idempotencyKey: `stg-race-4-complete-key-${crypto.randomUUID()}`,
 			});
 
 			const blockedSTG4 = await waitUntilBothCompetitorsBlockedOnRelation(
@@ -1589,6 +1639,11 @@ async function run() {
 
 			const [resReward4, resComplete4] = await Promise.allSettled([promiseReward4, promiseComplete4]);
 			chk(resReward4.status === "fulfilled" || resComplete4.status === "fulfilled", "7B.9 M-06: at least one competitor succeeded in Reward vs COMPLETE");
+
+			if (resReward4.status === "rejected") {
+				chk(resReward4.reason instanceof RewardError, "7B.9 M-06: loser Reward purchase threw typed RewardError");
+				eq((resReward4.reason as RewardError).code, "REWARD_INVALID_INPUT", "7B.9 M-06: loser Reward purchase rejected with REWARD_INVALID_INPUT");
+			}
 		} catch (test10Err) {
 			console.error("[Test 10 Fatal Error]:", test10Err);
 			bad("Test 10 threw unexpected error", String(test10Err));
@@ -1603,19 +1658,23 @@ async function run() {
 			// Setup closed month 2026-01 with surplus
 			const mc11Period = "2026-01";
 			const mc11PeriodDate = "2026-01-01";
+			const plan11Id = crypto.randomUUID();
+			const ctx11 = crypto.randomUUID();
+			const crev11 = crypto.randomUUID();
+			const prev11Id = crypto.randomUUID();
 
 			await controlClient.query(
 				`insert into monthly_budget_plans (id, user_id, period_month, canonical_transaction_id, created_at)
-				 values ('plan-11-id', $1, $2, 'ctx-11', now()) on conflict do nothing`,
-				[USER_A, mc11PeriodDate],
+				 values ($1, $2, $3, $4, now()) on conflict do nothing`,
+				[plan11Id, USER_A, mc11PeriodDate, ctx11],
 			);
 			await controlClient.query(
 				`insert into monthly_budget_plan_revisions
 				 (id, user_id, budget_plan_id, canonical_revision_id, revision_no, previous_budget_revision_id, operation, policy_version, currency,
 				  reference_income_amount, mandatory_ceiling_amount, discretionary_ceiling_amount, short_term_purchase_amount, medium_term_reserve_amount, long_term_investment_amount, reference_snapshot)
-				 values ('prev-11-id', $1, 'plan-11-id', 'crev-11', 1, null, 'CREATE', 'PERSONAL_BUDGET_V1', 'TRY',
+				 values ($1, $2, $3, $4, 1, null, 'CREATE', 'PERSONAL_BUDGET_V1', 'TRY',
 				  '5000.00', '2000.00', '1000.00', '1000.00', '1000.00', '0.00', '{}') on conflict do nothing`,
-				[USER_A],
+				[prev11Id, USER_A, plan11Id, crev11],
 			);
 
 			const prevRes11 = await previewMonthClose({
@@ -1631,7 +1690,7 @@ async function run() {
 				expectedProposalFingerprint: prevRes11.proposalFingerprint,
 				decision: "FULL",
 				occurredAt: new Date("2026-02-01T12:00:00.000Z"),
-				idempotencyKey: "mc11-close-key",
+				idempotencyKey: `mc11-close-key-${crypto.randomUUID()}`,
 			});
 
 			// Insert post-close adjustment of -150.00
@@ -1649,18 +1708,23 @@ async function run() {
 			// Setup month 2026-02
 			const mc12Period = "2026-02";
 			const mc12PeriodDate = "2026-02-01";
+			const plan12Id = crypto.randomUUID();
+			const ctx12 = crypto.randomUUID();
+			const crev12 = crypto.randomUUID();
+			const prev12Id = crypto.randomUUID();
+
 			await controlClient.query(
 				`insert into monthly_budget_plans (id, user_id, period_month, canonical_transaction_id, created_at)
-				 values ('plan-12-id', $1, $2, 'ctx-12', now()) on conflict do nothing`,
-				[USER_A, mc12PeriodDate],
+				 values ($1, $2, $3, $4, now()) on conflict do nothing`,
+				[plan12Id, USER_A, mc12PeriodDate, ctx12],
 			);
 			await controlClient.query(
 				`insert into monthly_budget_plan_revisions
 				 (id, user_id, budget_plan_id, canonical_revision_id, revision_no, previous_budget_revision_id, operation, policy_version, currency,
 				  reference_income_amount, mandatory_ceiling_amount, discretionary_ceiling_amount, short_term_purchase_amount, medium_term_reserve_amount, long_term_investment_amount, reference_snapshot)
-				 values ('prev-12-id', $1, 'plan-12-id', 'crev-12', 1, null, 'CREATE', 'PERSONAL_BUDGET_V1', 'TRY',
+				 values ($1, $2, $3, $4, 1, null, 'CREATE', 'PERSONAL_BUDGET_V1', 'TRY',
 				  '5000.00', '2000.00', '1000.00', '1000.00', '1000.00', '0.00', '{}') on conflict do nothing`,
-				[USER_A],
+				[prev12Id, USER_A, plan12Id, crev12],
 			);
 
 			const prevRes12 = await previewMonthClose({

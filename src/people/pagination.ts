@@ -30,8 +30,14 @@ export interface SettlementCursorScope {
 	obligationId?: string | undefined;
 }
 
-export function encodePersonCursor(cursor: PersonCursor): string {
-	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+export function encodePersonCursor(
+	cursor: PersonCursor,
+	scope?: PersonCursorScope,
+): string {
+	return Buffer.from(
+		JSON.stringify({ ...cursor, ...(scope ?? {}) }),
+		"utf8",
+	).toString("base64url");
 }
 
 export function decodePersonCursor(
@@ -51,8 +57,11 @@ export function decodePersonCursor(
 		) {
 			throw new Error("Invalid person cursor payload");
 		}
-		if (expectedScope?.userId && typeof parsed.userId === "string") {
-			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+		if (expectedScope?.userId !== undefined) {
+			if (
+				typeof parsed.userId !== "string" ||
+				parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
@@ -68,8 +77,14 @@ export function decodePersonCursor(
 	}
 }
 
-export function encodeObligationCursor(cursor: ObligationCursor): string {
-	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+export function encodeObligationCursor(
+	cursor: ObligationCursor,
+	scope?: ObligationCursorScope,
+): string {
+	return Buffer.from(
+		JSON.stringify({ ...cursor, ...(scope ?? {}) }),
+		"utf8",
+	).toString("base64url");
 }
 
 export function decodeObligationCursor(
@@ -89,13 +104,17 @@ export function decodeObligationCursor(
 		) {
 			throw new Error("Invalid obligation cursor payload");
 		}
-		if (expectedScope?.userId && typeof parsed.userId === "string") {
-			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+		if (expectedScope?.userId !== undefined) {
+			if (
+				typeof parsed.userId !== "string" ||
+				parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
-		if (expectedScope?.personId && typeof parsed.personId === "string") {
+		if (expectedScope?.personId !== undefined) {
 			if (
+				typeof parsed.personId !== "string" ||
 				parsed.personId.toLowerCase() !== expectedScope.personId.toLowerCase()
 			) {
 				throw new Error("Cursor scope mismatch");
@@ -113,8 +132,14 @@ export function decodeObligationCursor(
 	}
 }
 
-export function encodeSettlementCursor(cursor: SettlementCursor): string {
-	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+export function encodeSettlementCursor(
+	cursor: SettlementCursor,
+	scope?: SettlementCursorScope,
+): string {
+	return Buffer.from(
+		JSON.stringify({ ...cursor, ...(scope ?? {}) }),
+		"utf8",
+	).toString("base64url");
 }
 
 export function decodeSettlementCursor(
@@ -134,18 +159,19 @@ export function decodeSettlementCursor(
 		) {
 			throw new Error("Invalid settlement cursor payload");
 		}
-		if (expectedScope?.userId && typeof parsed.userId === "string") {
-			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+		if (expectedScope?.userId !== undefined) {
+			if (
+				typeof parsed.userId !== "string" ||
+				parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()
+			) {
 				throw new Error("Cursor scope mismatch");
 			}
 		}
-		if (
-			expectedScope?.obligationId &&
-			typeof parsed.obligationId === "string"
-		) {
+		if (expectedScope?.obligationId !== undefined) {
 			if (
+				typeof parsed.obligationId !== "string" ||
 				parsed.obligationId.toLowerCase() !==
-				expectedScope.obligationId.toLowerCase()
+					expectedScope.obligationId.toLowerCase()
 			) {
 				throw new Error("Cursor scope mismatch");
 			}

@@ -433,13 +433,6 @@ export async function runNotificationScheduler(
 	);
 	summary.eventsCreated = result.eventsCreated;
 
-	const events = await runNotificationReadTransaction(db, (tx) =>
-		listEventsForLocalDateInTransaction(tx, localDate, maxEvents),
-	);
-	if (events.length === 0) {
-		return summary;
-	}
-
 	// Phase 15-R2 Section C: created once per run, threaded through every
 	// `processEventSubscription` call so `transport.prepare()` is invoked at
 	// most once -- lazily, only once this point is reached (i.e. there is at
@@ -448,44 +441,65 @@ export async function runNotificationScheduler(
 	const transportPreparedState = { prepared: false };
 	let dispatchesAttempted = 0;
 	let eventsProcessed = 0;
+	let afterEventId: string | undefined;
 
-	for (const rawEvent of events) {
-		if (eventsProcessed >= maxEvents || dispatchesAttempted >= maxDispatches) {
+	while (eventsProcessed < maxEvents && dispatchesAttempted < maxDispatches) {
+		const pageLimit = Math.min(50, maxEvents - eventsProcessed);
+		const events = await runNotificationReadTransaction(db, (tx) =>
+			listEventsForLocalDateInTransaction(
+				tx,
+				localDate,
+				pageLimit,
+				afterEventId,
+			),
+		);
+		if (events.length === 0) {
 			break;
 		}
-		eventsProcessed++;
 
-		const event: NotificationEventReadModel = {
-			id: rawEvent.id,
-			userId: rawEvent.userId,
-			notificationType: rawEvent.notificationType as "CREDIT_CARD_DUE",
-			subjectId: rawEvent.subjectId,
-			scheduledLocalDate: rawEvent.scheduledLocalDate,
-			scheduledFor: rawEvent.scheduledFor,
-			payload: rawEvent.payload,
-			createdAt: rawEvent.createdAt,
-		};
+		for (const rawEvent of events) {
+			afterEventId = rawEvent.id;
+			if (
+				eventsProcessed >= maxEvents ||
+				dispatchesAttempted >= maxDispatches
+			) {
+				break;
+			}
+			eventsProcessed++;
 
-		const activeSubscriptions = await runNotificationReadTransaction(db, (tx) =>
-			listActivePushSubscriptionsInTransaction(tx, event.userId),
-		);
-		if (activeSubscriptions.length === 0) continue;
+			const event: NotificationEventReadModel = {
+				id: rawEvent.id,
+				userId: rawEvent.userId,
+				notificationType: rawEvent.notificationType as "CREDIT_CARD_DUE",
+				subjectId: rawEvent.subjectId,
+				scheduledLocalDate: rawEvent.scheduledLocalDate,
+				scheduledFor: rawEvent.scheduledFor,
+				payload: rawEvent.payload,
+				createdAt: rawEvent.createdAt,
+			};
 
-		for (const subscription of activeSubscriptions) {
-			if (dispatchesAttempted >= maxDispatches) break;
-
-			const dispatched = await processEventSubscription(
+			const activeSubscriptions = await runNotificationReadTransaction(
 				db,
-				transport,
-				event,
-				subscription,
-				scheduledAt,
-				currentHourSlot,
-				summary,
-				transportPreparedState,
+				(tx) => listActivePushSubscriptionsInTransaction(tx, event.userId),
 			);
-			if (dispatched) {
-				dispatchesAttempted++;
+			if (activeSubscriptions.length === 0) continue;
+
+			for (const subscription of activeSubscriptions) {
+				if (dispatchesAttempted >= maxDispatches) break;
+
+				const dispatched = await processEventSubscription(
+					db,
+					transport,
+					event,
+					subscription,
+					scheduledAt,
+					currentHourSlot,
+					summary,
+					transportPreparedState,
+				);
+				if (dispatched) {
+					dispatchesAttempted++;
+				}
 			}
 		}
 	}

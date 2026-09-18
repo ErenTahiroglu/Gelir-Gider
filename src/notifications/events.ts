@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, lte, sql } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	creditCardStatementRevisions,
@@ -200,11 +200,16 @@ export async function listEventsForLocalDateInTransaction(
 	tx: DatabaseTransaction,
 	localDate: string,
 	limit = 500,
+	afterEventId?: string | undefined,
 ): Promise<(typeof notificationEvents.$inferSelect)[]> {
+	const conditions = [eq(notificationEvents.scheduledLocalDate, localDate)];
+	if (afterEventId) {
+		conditions.push(gt(notificationEvents.id, afterEventId));
+	}
 	return tx
 		.select()
 		.from(notificationEvents)
-		.where(eq(notificationEvents.scheduledLocalDate, localDate))
+		.where(and(...conditions))
 		.orderBy(
 			asc(notificationEvents.scheduledLocalDate),
 			asc(notificationEvents.id),

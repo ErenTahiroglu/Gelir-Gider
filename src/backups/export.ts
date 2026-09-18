@@ -1,4 +1,5 @@
-import type { PgTable } from "drizzle-orm/pg-core";
+import { asc, gt } from "drizzle-orm";
+import { getTableConfig, type PgTable } from "drizzle-orm/pg-core";
 import type { DatabaseTransaction } from "../db/client";
 import { BackupError } from "./errors";
 import {
@@ -52,22 +53,24 @@ function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {
  * `src/backups/service.ts`) so the entire multi-table snapshot observes one
  * consistent point-in-time view of the database.
  */
-/**
- * A minimal structural view of `DatabaseTransaction.select().from(table)`
- * used here instead of `any`, since the registry is built by introspecting
- * the schema barrel at runtime -- no static generic table type is available
- * for a dynamically-selected `PgTable`.
- */
 export const BACKUP_CHUNK_SIZE = 500;
 
-interface SelectableTransaction {
+interface DynamicSelectableQuery {
+	where?(clause: unknown): DynamicSelectableQuery;
+	limit?(limit: number): DynamicSelectableQuery;
+	offset?(offset: number): DynamicSelectableQuery;
+	orderBy?(...clauses: unknown[]): DynamicSelectableQuery;
+	then?: unknown;
+}
+
+interface DynamicSelectableTransaction {
 	select(): {
 		from(table: PgTable): {
-			limit?(limit: number): {
-				offset(offset: number): Promise<Record<string, unknown>[]>;
-			};
-			then?: Promise<Record<string, unknown>[]>["then"];
-		};
+			orderBy(
+				...clauses: unknown[]
+			): DynamicSelectableQuery & Promise<Record<string, unknown>[]>;
+		} & DynamicSelectableQuery &
+			Promise<Record<string, unknown>[]>;
 	};
 }
 
@@ -78,41 +81,100 @@ async function exportTable(
 	onChunkBytes?: (chunkBytes: number) => void,
 	chunkSize = BACKUP_CHUNK_SIZE,
 ): Promise<TableSnapshot> {
-	const probeQuery = (tx as unknown as SelectableTransaction)
-		.select()
-		.from(table);
 	const allRows: Record<string, unknown>[] = [];
+	const config = getTableConfig(table);
+	const pkColumns = config.columns.filter((c) => c.primary);
+	const orderColumns = pkColumns.length > 0 ? pkColumns : config.columns;
+	const orderClauses = orderColumns.map((c) => asc(c));
 
-	if (typeof probeQuery?.limit === "function") {
-		let offset = 0;
-		while (true) {
-			const rawChunk = await (tx as unknown as SelectableTransaction)
-				.select()
-				.from(table)
-				.limit?.(chunkSize)
-				?.offset(offset);
-			if (!rawChunk || rawChunk.length === 0) {
-				break;
-			}
-			const normalizedChunk = rawChunk.map(normalizeRow);
-			allRows.push(...normalizedChunk);
+	const dynamicTx = tx as unknown as DynamicSelectableTransaction;
+	const probe = dynamicTx.select().from(table);
 
-			if (onChunkBytes) {
-				const chunkBytes = new TextEncoder().encode(
-					JSON.stringify(normalizedChunk),
-				).length;
-				onChunkBytes(chunkBytes);
+	if (typeof probe?.orderBy === "function") {
+		if (pkColumns.length === 1) {
+			const pkCol = pkColumns[0];
+			if (!pkCol) {
+				return {
+					tableName,
+					rowCount: 0,
+					rows: [],
+					tableContentHash: "",
+				};
 			}
+			let lastPk: unknown;
+			while (true) {
+				let query = dynamicTx
+					.select()
+					.from(table)
+					.orderBy(asc(pkCol)) as DynamicSelectableQuery &
+					Promise<Record<string, unknown>[]>;
+				if (typeof query.limit === "function") {
+					query = query.limit(chunkSize) as DynamicSelectableQuery &
+						Promise<Record<string, unknown>[]>;
+				}
+				if (lastPk !== undefined && typeof query.where === "function") {
+					query = query.where(gt(pkCol, lastPk)) as DynamicSelectableQuery &
+						Promise<Record<string, unknown>[]>;
+				}
+				const rawChunk = await query;
+				if (!rawChunk || rawChunk.length === 0) {
+					break;
+				}
+				const normalizedChunk = rawChunk.map(normalizeRow);
+				allRows.push(...normalizedChunk);
 
-			if (rawChunk.length < chunkSize) {
-				break;
+				if (onChunkBytes) {
+					const chunkBytes = new TextEncoder().encode(
+						JSON.stringify(normalizedChunk),
+					).length;
+					onChunkBytes(chunkBytes);
+				}
+
+				if (rawChunk.length < chunkSize) {
+					break;
+				}
+				const lastRow = rawChunk[rawChunk.length - 1];
+				lastPk = lastRow ? lastRow[pkCol.name] : undefined;
 			}
-			offset += rawChunk.length;
+		} else {
+			let offset = 0;
+			while (true) {
+				let query = dynamicTx
+					.select()
+					.from(table)
+					.orderBy(...orderClauses) as DynamicSelectableQuery &
+					Promise<Record<string, unknown>[]>;
+				if (typeof query.limit === "function") {
+					query = query.limit(chunkSize) as DynamicSelectableQuery &
+						Promise<Record<string, unknown>[]>;
+				}
+				if (typeof query.offset === "function") {
+					query = query.offset(offset) as DynamicSelectableQuery &
+						Promise<Record<string, unknown>[]>;
+				}
+				const rawChunk = await query;
+				if (!rawChunk || rawChunk.length === 0) {
+					break;
+				}
+				const normalizedChunk = rawChunk.map(normalizeRow);
+				allRows.push(...normalizedChunk);
+
+				if (onChunkBytes) {
+					const chunkBytes = new TextEncoder().encode(
+						JSON.stringify(normalizedChunk),
+					).length;
+					onChunkBytes(chunkBytes);
+				}
+
+				if (rawChunk.length < chunkSize) {
+					break;
+				}
+				offset += rawChunk.length;
+			}
 		}
 	} else {
-		const rawRows = await (probeQuery as unknown as Promise<
-			Record<string, unknown>[]
-		>);
+		// Simple direct Promise support (e.g. static mock query in tests)
+		const rawRows = await probe;
 		const normalizedRows = (rawRows ?? []).map(normalizeRow);
 		allRows.push(...normalizedRows);
 		if (onChunkBytes) {

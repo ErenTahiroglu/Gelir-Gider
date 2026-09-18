@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	pushSubscriptionRevisions,
@@ -821,22 +821,80 @@ export async function listPushSubscriptions(
 /**
  * Resolves a user's currently-ACTIVE push subscriptions inside an already-open
  * transaction (used by the delivery/scheduler layer -- Section 18).
+ * Uses a single DISTINCT ON query to avoid N+1 queries.
  */
 export async function listActivePushSubscriptionsInTransaction(
 	tx: DatabaseTransaction,
 	userId: string,
+	limit = 50,
 ): Promise<PushSubscriptionReadModel[]> {
-	const anchors = await tx
-		.select()
-		.from(pushSubscriptions)
-		.where(eq(pushSubscriptions.userId, userId));
-	const results: PushSubscriptionReadModel[] = [];
-	for (const anchor of anchors) {
-		const latest = await findLatestRevisionInTransaction(tx, anchor.id);
-		if (latest?.status !== "ACTIVE") continue;
-		results.push(
-			toReadModel(anchor.id, anchor.userId, latest, anchor.createdAt),
-		);
-	}
-	return results;
+	const rawResult = await tx.execute(sql`
+		WITH latest_revisions AS (
+			SELECT DISTINCT ON (${pushSubscriptions.id})
+				${pushSubscriptions.id} AS subscription_id,
+				${pushSubscriptions.userId} AS user_id,
+				${pushSubscriptions.createdAt} AS created_at,
+				${pushSubscriptionRevisions.id} AS revision_id,
+				${pushSubscriptionRevisions.revisionNo} AS revision_no,
+				${pushSubscriptionRevisions.operation} AS operation,
+				${pushSubscriptionRevisions.status} AS status,
+				${pushSubscriptionRevisions.endpoint} AS endpoint,
+				${pushSubscriptionRevisions.p256dh} AS p256dh,
+				${pushSubscriptionRevisions.auth} AS auth,
+				${pushSubscriptionRevisions.expirationTime} AS expiration_time,
+				${pushSubscriptionRevisions.userAgent} AS user_agent,
+				${pushSubscriptionRevisions.disableReason} AS disable_reason,
+				${pushSubscriptionRevisions.occurredAt} AS occurred_at,
+				${pushSubscriptionRevisions.idempotencyKey} AS idempotency_key,
+				${pushSubscriptionRevisions.revisionFingerprint} AS revision_fingerprint
+			FROM ${pushSubscriptions}
+			INNER JOIN ${pushSubscriptionRevisions} ON ${pushSubscriptions.id} = ${pushSubscriptionRevisions.subscriptionId}
+			WHERE ${pushSubscriptions.userId} = ${userId}
+			ORDER BY ${pushSubscriptions.id}, ${pushSubscriptionRevisions.revisionNo} DESC
+		)
+		SELECT *
+		FROM latest_revisions
+		WHERE status = 'ACTIVE'
+		ORDER BY subscription_id ASC
+		LIMIT ${limit}
+	`);
+
+	const rows = (Array.isArray(rawResult)
+		? rawResult
+		: ((rawResult as { rows?: unknown[] }).rows ?? [])) as unknown as Array<{
+		subscription_id: string;
+		user_id: string;
+		created_at: string | Date;
+		revision_id: string;
+		revision_no: number;
+		operation: "REGISTER" | "REFRESH" | "REACTIVATE" | "DISABLE";
+		status: "ACTIVE";
+		endpoint: string;
+		p256dh: string;
+		auth: string;
+		expiration_time: string | Date | null;
+		user_agent: string | null;
+		disable_reason: string | null;
+		occurred_at: string | Date;
+		idempotency_key: string;
+		revision_fingerprint: string;
+	}>;
+
+	return rows.map((r) => ({
+		subscriptionId: r.subscription_id,
+		userId: r.user_id,
+		status: "ACTIVE",
+		revisionNo: Number(r.revision_no),
+		endpoint: r.endpoint,
+		p256dh: r.p256dh,
+		auth: r.auth,
+		expirationTime: r.expiration_time
+			? r.expiration_time instanceof Date
+				? r.expiration_time
+				: new Date(r.expiration_time)
+			: null,
+		userAgent: r.user_agent,
+		createdAt:
+			r.created_at instanceof Date ? r.created_at : new Date(r.created_at),
+	}));
 }

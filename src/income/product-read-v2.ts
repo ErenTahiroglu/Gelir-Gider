@@ -294,21 +294,21 @@ export async function listBoundedIncomeEntitlements({
 				WHERE ${incomeSettlementBatchRevisions.userId} = ${userId}
 				ORDER BY ${incomeSettlementBatchRevisions.settlementBatchId}, ${incomeSettlementBatchRevisions.revisionNo} DESC
 			),
-			unrolled_allocs AS (
+			page_allocs AS (
 				SELECT
 					(elem->>'entitlementId')::text AS entitlement_id,
 					(elem->>'amount')::numeric AS amount
 				FROM latest_batches,
 				jsonb_array_elements(allocations) AS elem
+				WHERE (elem->>'entitlementId')::text IN (${sql.join(
+					entitlementIds.map((id) => sql`${id}`),
+					sql`, `,
+				)})
 			)
 			SELECT
 				entitlement_id,
 				COALESCE(SUM(ROUND(amount * 100)), 0)::text AS total_allocated_cents
-			FROM unrolled_allocs
-			WHERE entitlement_id IN (${sql.join(
-				entitlementIds.map((id) => sql`${id}`),
-				sql`, `,
-			)})
+			FROM page_allocs
 			GROUP BY entitlement_id
 		`;
 		const rawAllocResult = await db.execute(allocQuery);
