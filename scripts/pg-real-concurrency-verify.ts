@@ -1700,7 +1700,6 @@ async function run() {
 				userId: USER_A,
 				periodMonth: mc11Period,
 				expectedProposalFingerprint: prevRes11.proposalFingerprint,
-				decision: "FULL",
 				occurredAt: new Date("2026-02-01T12:00:00.000Z"),
 				idempotencyKey: `mc11-close-key-${crypto.randomUUID()}`,
 			});
@@ -1765,7 +1764,6 @@ async function run() {
 				userId: USER_A,
 				periodMonth: mc12Period,
 				expectedProposalFingerprint: prevRes12.proposalFingerprint,
-				decision: "FULL",
 				occurredAt: new Date("2026-03-01T12:00:00.000Z"),
 				idempotencyKey: "mc12-race-a",
 			});
@@ -1775,7 +1773,6 @@ async function run() {
 				userId: USER_A,
 				periodMonth: mc12Period,
 				expectedProposalFingerprint: prevRes12.proposalFingerprint,
-				decision: "FULL",
 				occurredAt: new Date("2026-03-01T12:00:00.000Z"),
 				idempotencyKey: "mc12-race-b",
 			});
