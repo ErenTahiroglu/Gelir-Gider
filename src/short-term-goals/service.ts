@@ -1102,13 +1102,14 @@ export async function updateShortTermGoal(
 			);
 		}
 
-		// 2. Fetch goal identity
+		// 2. Fetch goal identity with FOR UPDATE lock
 		const [goal] = await tx
 			.select()
 			.from(shortTermGoals)
 			.where(
 				and(eq(shortTermGoals.id, goalId), eq(shortTermGoals.userId, userId)),
 			)
+			.for("update")
 			.limit(1);
 
 		if (!goal) {
@@ -1438,13 +1439,14 @@ async function transitionTerminalStatus(params: {
 			);
 		}
 
-		// 2. Fetch goal identity
+		// 2. Fetch goal identity with FOR UPDATE lock
 		const [goal] = await tx
 			.select()
 			.from(shortTermGoals)
 			.where(
 				and(eq(shortTermGoals.id, goalId), eq(shortTermGoals.userId, userId)),
 			)
+			.for("update")
 			.limit(1);
 
 		if (!goal) {

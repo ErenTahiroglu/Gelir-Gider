@@ -36,6 +36,12 @@ export const monthCloseAdjustments = pgTable(
 			precision: 18,
 			scale: 2,
 		}).notNull(),
+		remainingAmount: numeric("remaining_amount", {
+			precision: 18,
+			scale: 2,
+		})
+			.default("0.00")
+			.notNull(),
 		reasonCode: varchar("reason_code", { length: 64 }).notNull(),
 		sourceRef: varchar("source_ref", { length: 128 }).notNull(),
 		appliedInMonthCloseId: uuid("applied_in_month_close_id").references(
@@ -47,6 +53,10 @@ export const monthCloseAdjustments = pgTable(
 			.notNull(),
 	},
 	(table) => [
+		uniqueIndex("month_close_adjustments_user_source_ref_idx").on(
+			table.userId,
+			table.sourceRef,
+		),
 		index("month_close_adjustments_user_unapplied_idx").on(
 			table.userId,
 			table.closedPeriodMonth,

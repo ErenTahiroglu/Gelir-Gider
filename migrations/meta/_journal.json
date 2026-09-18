@@ -512,6 +512,13 @@
       "when": 1789120000000,
       "tag": "0072_add_month_close_adjustments",
       "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1789712992060,
+      "tag": "0073_condemned_ironclad",
+      "breakpoints": true
     }
   ]
 }

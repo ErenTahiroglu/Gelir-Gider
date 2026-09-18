@@ -434,7 +434,7 @@ export async function runNotificationScheduler(
 	summary.eventsCreated = result.eventsCreated;
 
 	const events = await runNotificationReadTransaction(db, (tx) =>
-		listEventsForLocalDateInTransaction(tx, localDate),
+		listEventsForLocalDateInTransaction(tx, localDate, maxEvents),
 	);
 	if (events.length === 0) {
 		return summary;

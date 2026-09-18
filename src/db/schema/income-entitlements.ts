@@ -188,6 +188,8 @@ export const incomeSettlementBatchRevisions = pgTable(
 		allocations: jsonb("allocations")
 			.$type<SettlementAllocationItem[]>()
 			.notNull(),
+		receiptAmount: numeric("receipt_amount", { precision: 18, scale: 2 }),
+		snapshotAllocations: jsonb("snapshot_allocations"),
 		note: varchar("note", { length: 500 }),
 		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
 			.defaultNow()

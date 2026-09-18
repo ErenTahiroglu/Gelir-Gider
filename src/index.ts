@@ -126,6 +126,7 @@ app.notFound((c) => {
 });
 
 app.onError((_err, c) => {
+	console.error("app.onError caught error:", _err);
 	logOperationalEvent({
 		level: "error",
 		eventCode: "HTTP_REQUEST_FAILED",

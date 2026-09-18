@@ -6,13 +6,24 @@ import {
 	journalLines,
 	ledgerAccounts,
 } from "../db/schema/ledger";
+import { monthCloses } from "../db/schema/month-close";
+import { monthCloseAdjustments } from "../db/schema/month-close-adjustments";
+import {
+	dateToIstanbulPeriodMonth,
+	periodMonthToDateString,
+} from "../month-close/calendar";
+import { formatMonthCloseCents } from "../month-close/formula";
 import type {
 	AccountType,
 	LedgerAccountRecord,
 	NormalBalance,
 } from "./accounts";
 import { LedgerError } from "./errors";
-import { formatCentsToMoney, parsePositiveMoneyString } from "./money";
+import {
+	formatCentsToMoney,
+	parseMoneyString,
+	parsePositiveMoneyString,
+} from "./money";
 
 export type JournalLineSide = "DEBIT" | "CREDIT";
 
@@ -376,6 +387,7 @@ export async function postJournalEntryInTransaction({
 		.select({
 			id: ledgerAccounts.id,
 			userId: ledgerAccounts.userId,
+			accountType: ledgerAccounts.accountType,
 			currency: ledgerAccounts.currency,
 			archivedAt: ledgerAccounts.archivedAt,
 		})
@@ -524,6 +536,51 @@ export async function postJournalEntryInTransaction({
 			"LEDGER_INVALID_ENTRY",
 			"Failed to transition journal entry to POSTED state",
 		);
+	}
+
+	// Phase 14 / MC-01: If occurredAt belongs to an already-closed month, record an automatic adjustment
+	const periodMonth = dateToIstanbulPeriodMonth(occurredAt);
+	const periodMonthDate = periodMonthToDateString(periodMonth);
+	const [closedMonth] = await tx
+		.select({ id: monthCloses.id })
+		.from(monthCloses)
+		.where(
+			and(
+				eq(monthCloses.userId, userId),
+				eq(monthCloses.periodMonth, periodMonthDate),
+			),
+		)
+		.limit(1);
+
+	if (closedMonth) {
+		let expenseSurplusDeltaCents = 0n;
+		for (const line of normalizedLines) {
+			const acc = accountMap.get(line.accountId);
+			if (acc?.accountType === "EXPENSE") {
+				const parsedLine = parseMoneyString(line.amountNormalized);
+				if (line.side === "DEBIT") {
+					expenseSurplusDeltaCents -= parsedLine.cents;
+				} else if (line.side === "CREDIT") {
+					expenseSurplusDeltaCents += parsedLine.cents;
+				}
+			}
+		}
+
+		if (expenseSurplusDeltaCents !== 0n) {
+			const adjustmentAmount = formatMonthCloseCents(expenseSurplusDeltaCents);
+			await tx
+				.insert(monthCloseAdjustments)
+				.values({
+					userId,
+					closedPeriodMonth: periodMonthDate,
+					adjustmentAmount,
+					remainingAmount: adjustmentAmount,
+					reasonCode: "POST_CLOSE_EXPENSE_MUTATION",
+					sourceRef: postedEntry.id,
+					appliedInMonthCloseId: null,
+				})
+				.onConflictDoNothing();
+		}
 	}
 
 	return {

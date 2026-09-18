@@ -175,7 +175,11 @@ describe("Ledger Reversal Service (Phase 4B)", () => {
 							retObj.limit = vi.fn().mockImplementation(execute);
 							return retObj;
 						}
-						return {};
+						const defaultQuery: Record<string, unknown> = {};
+						defaultQuery.where = vi.fn().mockReturnValue(defaultQuery);
+						defaultQuery.for = vi.fn().mockReturnValue(defaultQuery);
+						defaultQuery.limit = vi.fn().mockResolvedValue([]);
+						return defaultQuery;
 					}),
 				})),
 

@@ -61,7 +61,15 @@ import {
 	getMonthClose,
 } from "../src/month-close/service.ts";
 import { MonthCloseError } from "../src/month-close/errors.ts";
-import { createShortTermGoal } from "../src/short-term-goals/service.ts";
+import {
+	createShortTermGoal,
+	updateShortTermGoal,
+	cancelShortTermGoal,
+	completeShortTermGoal,
+	getShortTermGoal,
+} from "../src/short-term-goals/service.ts";
+import { ShortTermGoalError } from "../src/short-term-goals/errors.ts";
+import { recordPostCloseAdjustmentIfClosedInTransaction } from "../src/month-close/service.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const migDir = path.join(root, "migrations");
@@ -1357,6 +1365,365 @@ async function run() {
 		} catch (test9Err) {
 			console.error("[Test 9 Fatal Error]:", test9Err);
 			bad("Test 9 threw unexpected error", String(test9Err));
+		}
+
+		// ========================================================================
+		// TEST 10: Checkpoint M-03 / M-06 -- STG 4-Race Concurrency Verification
+		// 1. CC purchase binding vs CANCEL
+		// 2. CC purchase binding vs COMPLETE
+		// 3. Reward earn purchase binding vs CANCEL
+		// 4. Reward earn purchase binding vs COMPLETE
+		// ========================================================================
+		try {
+			logOut("\n--- Test 10: STG 4-Race Concurrency Verification (Real PostgreSQL) ---");
+
+			// Setup STG goals & card
+			const stgCardRes = await createCreditCard({
+				db: dbA,
+				userId: USER_A,
+				cardName: "STG Concurrency Test Card",
+				cutoffDay: 15,
+				paymentDueDay: 25,
+				idempotencyKey: "stg-test-card-key",
+			});
+			const stgCardId = stgCardRes.card.id;
+
+			const stgRewardAccRes = await createRewardAccount({
+				db: dbA,
+				userId: USER_A,
+				programName: "STG Concurrency Rewards",
+				idempotencyKey: "stg-test-reward-key",
+			});
+			const stgRewardAccountId = stgRewardAccRes.rewardAccount.id;
+
+			// --- Race 10.1: CC purchase binding vs CANCEL ---
+			const goal1Res = await createShortTermGoal({
+				db: dbA,
+				userId: USER_A,
+				name: "STG Race 1 Goal",
+				targetAmount: "500.00",
+				targetDate: "2026-12-31",
+				idempotencyKey: "stg-race-1-goal-key",
+			});
+			const goal1Id = goal1Res.shortTermGoal.id;
+
+			await controlClient.query("BEGIN; LOCK TABLE short_term_goals IN ACCESS EXCLUSIVE MODE;");
+
+			const promiseCC1 = recordCreditCardPurchase({
+				db: dbA,
+				userId: USER_A,
+				cardId: stgCardId,
+				amount: "50.00",
+				purchaseDate: "2026-08-05",
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				shortTermGoalId: goal1Id,
+				idempotencyKey: "stg-race-1-cc-key",
+				source: { type: "MANUAL", externalId: "stg-r1-cc" },
+			});
+
+			const promiseCancel1 = cancelShortTermGoal({
+				db: dbB,
+				userId: USER_A,
+				goalId: goal1Id,
+				expectedRevisionNo: 1,
+				idempotencyKey: "stg-race-1-cancel-key",
+				provenance: { type: "MANUAL", externalId: "stg-r1-cancel" },
+			});
+
+			const blockedSTG1 = await waitUntilBothCompetitorsBlockedOnRelation(
+				controlClient,
+				"short_term_goals",
+				[pidA, pidB],
+			);
+			ok(
+				"7B.9 M-06: CC vs CANCEL competitors observed waiting on short_term_goals in pg_locks",
+				`(pidA=${blockedSTG1.pidA}, pidB=${blockedSTG1.pidB})`,
+			);
+
+			await controlClient.query("COMMIT;");
+
+			const [resCC1, resCancel1] = await Promise.allSettled([promiseCC1, promiseCancel1]);
+			chk(resCC1.status === "fulfilled" || resCancel1.status === "fulfilled", "7B.9 M-06: at least one competitor succeeded in CC vs CANCEL");
+
+			// --- Race 10.2: CC purchase binding vs COMPLETE ---
+			const goal2Res = await createShortTermGoal({
+				db: dbA,
+				userId: USER_A,
+				name: "STG Race 2 Goal",
+				targetAmount: "500.00",
+				targetDate: "2026-12-31",
+				idempotencyKey: "stg-race-2-goal-key",
+			});
+			const goal2Id = goal2Res.shortTermGoal.id;
+
+			await controlClient.query("BEGIN; LOCK TABLE short_term_goals IN ACCESS EXCLUSIVE MODE;");
+
+			const promiseCC2 = recordCreditCardPurchase({
+				db: dbA,
+				userId: USER_A,
+				cardId: stgCardId,
+				amount: "50.00",
+				purchaseDate: "2026-08-05",
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				shortTermGoalId: goal2Id,
+				idempotencyKey: "stg-race-2-cc-key",
+				source: { type: "MANUAL", externalId: "stg-r2-cc" },
+			});
+
+			const promiseComplete2 = completeShortTermGoal({
+				db: dbB,
+				userId: USER_A,
+				goalId: goal2Id,
+				expectedRevisionNo: 1,
+				idempotencyKey: "stg-race-2-complete-key",
+				provenance: { type: "MANUAL", externalId: "stg-r2-complete" },
+			});
+
+			const blockedSTG2 = await waitUntilBothCompetitorsBlockedOnRelation(
+				controlClient,
+				"short_term_goals",
+				[pidA, pidB],
+			);
+			ok(
+				"7B.9 M-06: CC vs COMPLETE competitors observed waiting on short_term_goals in pg_locks",
+				`(pidA=${blockedSTG2.pidA}, pidB=${blockedSTG2.pidB})`,
+			);
+
+			await controlClient.query("COMMIT;");
+
+			const [resCC2, resComplete2] = await Promise.allSettled([promiseCC2, promiseComplete2]);
+			chk(resCC2.status === "fulfilled" || resComplete2.status === "fulfilled", "7B.9 M-06: at least one competitor succeeded in CC vs COMPLETE");
+
+			// --- Race 10.3: Reward earn purchase binding vs CANCEL ---
+			const goal3Res = await createShortTermGoal({
+				db: dbA,
+				userId: USER_A,
+				name: "STG Race 3 Goal",
+				targetAmount: "500.00",
+				targetDate: "2026-12-31",
+				idempotencyKey: "stg-race-3-goal-key",
+			});
+			const goal3Id = goal3Res.shortTermGoal.id;
+
+			await controlClient.query("BEGIN; LOCK TABLE short_term_goals IN ACCESS EXCLUSIVE MODE;");
+
+			const promiseReward3 = recordRewardEarn({
+				db: dbA,
+				userId: USER_A,
+				rewardAccountId: stgRewardAccountId,
+				points: "100.00",
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				shortTermGoalId: goal3Id,
+				idempotencyKey: "stg-race-3-reward-key",
+				provenance: { type: "MANUAL", externalId: "stg-r3-reward" },
+			});
+
+			const promiseCancel3 = cancelShortTermGoal({
+				db: dbB,
+				userId: USER_A,
+				goalId: goal3Id,
+				expectedRevisionNo: 1,
+				idempotencyKey: "stg-race-3-cancel-key",
+				provenance: { type: "MANUAL", externalId: "stg-r3-cancel" },
+			});
+
+			const blockedSTG3 = await waitUntilBothCompetitorsBlockedOnRelation(
+				controlClient,
+				"short_term_goals",
+				[pidA, pidB],
+			);
+			ok(
+				"7B.9 M-06: Reward vs CANCEL competitors observed waiting on short_term_goals in pg_locks",
+				`(pidA=${blockedSTG3.pidA}, pidB=${blockedSTG3.pidB})`,
+			);
+
+			await controlClient.query("COMMIT;");
+
+			const [resReward3, resCancel3] = await Promise.allSettled([promiseReward3, promiseCancel3]);
+			chk(resReward3.status === "fulfilled" || resCancel3.status === "fulfilled", "7B.9 M-06: at least one competitor succeeded in Reward vs CANCEL");
+
+			// --- Race 10.4: Reward earn purchase binding vs COMPLETE ---
+			const goal4Res = await createShortTermGoal({
+				db: dbA,
+				userId: USER_A,
+				name: "STG Race 4 Goal",
+				targetAmount: "500.00",
+				targetDate: "2026-12-31",
+				idempotencyKey: "stg-race-4-goal-key",
+			});
+			const goal4Id = goal4Res.shortTermGoal.id;
+
+			await controlClient.query("BEGIN; LOCK TABLE short_term_goals IN ACCESS EXCLUSIVE MODE;");
+
+			const promiseReward4 = recordRewardEarn({
+				db: dbA,
+				userId: USER_A,
+				rewardAccountId: stgRewardAccountId,
+				points: "100.00",
+				occurredAt: new Date("2026-08-05T12:00:00.000Z"),
+				shortTermGoalId: goal4Id,
+				idempotencyKey: "stg-race-4-reward-key",
+				provenance: { type: "MANUAL", externalId: "stg-r4-reward" },
+			});
+
+			const promiseComplete4 = completeShortTermGoal({
+				db: dbB,
+				userId: USER_A,
+				goalId: goal4Id,
+				expectedRevisionNo: 1,
+				idempotencyKey: "stg-race-4-complete-key",
+				provenance: { type: "MANUAL", externalId: "stg-r4-complete" },
+			});
+
+			const blockedSTG4 = await waitUntilBothCompetitorsBlockedOnRelation(
+				controlClient,
+				"short_term_goals",
+				[pidA, pidB],
+			);
+			ok(
+				"7B.9 M-06: Reward vs COMPLETE competitors observed waiting on short_term_goals in pg_locks",
+				`(pidA=${blockedSTG4.pidA}, pidB=${blockedSTG4.pidB})`,
+			);
+
+			await controlClient.query("COMMIT;");
+
+			const [resReward4, resComplete4] = await Promise.allSettled([promiseReward4, promiseComplete4]);
+			chk(resReward4.status === "fulfilled" || resComplete4.status === "fulfilled", "7B.9 M-06: at least one competitor succeeded in Reward vs COMPLETE");
+		} catch (test10Err) {
+			console.error("[Test 10 Fatal Error]:", test10Err);
+			bad("Test 10 threw unexpected error", String(test10Err));
+		}
+
+		// ========================================================================
+		// TEST 11: Checkpoint MC-01 / M-06 -- Concurrent Adjustment Application
+		// ========================================================================
+		try {
+			logOut("\n--- Test 11: MC-01 Concurrent Post-Close Adjustment Application ---");
+
+			// Setup closed month 2026-01 with surplus
+			const mc11Period = "2026-01";
+			const mc11PeriodDate = "2026-01-01";
+
+			await controlClient.query(
+				`insert into monthly_budget_plans (id, user_id, period_month, canonical_transaction_id, created_at)
+				 values ('plan-11-id', $1, $2, 'ctx-11', now()) on conflict do nothing`,
+				[USER_A, mc11PeriodDate],
+			);
+			await controlClient.query(
+				`insert into monthly_budget_plan_revisions
+				 (id, user_id, budget_plan_id, canonical_revision_id, revision_no, previous_budget_revision_id, operation, policy_version, currency,
+				  reference_income_amount, mandatory_ceiling_amount, discretionary_ceiling_amount, short_term_purchase_amount, medium_term_reserve_amount, long_term_investment_amount, reference_snapshot)
+				 values ('prev-11-id', $1, 'plan-11-id', 'crev-11', 1, null, 'CREATE', 'PERSONAL_BUDGET_V1', 'TRY',
+				  '5000.00', '2000.00', '1000.00', '1000.00', '1000.00', '0.00', '{}') on conflict do nothing`,
+				[USER_A],
+			);
+
+			const prevRes11 = await previewMonthClose({
+				db: dbA,
+				userId: USER_A,
+				periodMonth: mc11Period,
+			});
+
+			await closeMonth({
+				db: dbA,
+				userId: USER_A,
+				periodMonth: mc11Period,
+				expectedProposalFingerprint: prevRes11.proposalFingerprint,
+				decision: "FULL",
+				occurredAt: new Date("2026-02-01T12:00:00.000Z"),
+				idempotencyKey: "mc11-close-key",
+			});
+
+			// Insert post-close adjustment of -150.00
+			const adj11 = await dbA.transaction((tx: any) =>
+				recordPostCloseAdjustmentIfClosedInTransaction(tx, {
+					userId: USER_A,
+					periodMonth: mc11Period,
+					adjustmentAmount: "-150.00",
+					reasonCode: "RETROACTIVE_TEST_ADJUSTMENT",
+					sourceRef: "txn-mc11-test",
+				}),
+			);
+			chk(Boolean(adj11), "7B.9 MC-01: Post-close adjustment created");
+
+			// Setup month 2026-02
+			const mc12Period = "2026-02";
+			const mc12PeriodDate = "2026-02-01";
+			await controlClient.query(
+				`insert into monthly_budget_plans (id, user_id, period_month, canonical_transaction_id, created_at)
+				 values ('plan-12-id', $1, $2, 'ctx-12', now()) on conflict do nothing`,
+				[USER_A, mc12PeriodDate],
+			);
+			await controlClient.query(
+				`insert into monthly_budget_plan_revisions
+				 (id, user_id, budget_plan_id, canonical_revision_id, revision_no, previous_budget_revision_id, operation, policy_version, currency,
+				  reference_income_amount, mandatory_ceiling_amount, discretionary_ceiling_amount, short_term_purchase_amount, medium_term_reserve_amount, long_term_investment_amount, reference_snapshot)
+				 values ('prev-12-id', $1, 'plan-12-id', 'crev-12', 1, null, 'CREATE', 'PERSONAL_BUDGET_V1', 'TRY',
+				  '5000.00', '2000.00', '1000.00', '1000.00', '1000.00', '0.00', '{}') on conflict do nothing`,
+				[USER_A],
+			);
+
+			const prevRes12 = await previewMonthClose({
+				db: dbA,
+				userId: USER_A,
+				periodMonth: mc12Period,
+			});
+			eq(prevRes12.unappliedPriorAdjustments, "-150.00", "7B.9 MC-01: unapplied prior adjustments carried to preview");
+
+			await controlClient.query("BEGIN; LOCK TABLE month_close_adjustments IN ACCESS EXCLUSIVE MODE;");
+
+			const promiseMC11A = closeMonth({
+				db: dbA,
+				userId: USER_A,
+				periodMonth: mc12Period,
+				expectedProposalFingerprint: prevRes12.proposalFingerprint,
+				decision: "FULL",
+				occurredAt: new Date("2026-03-01T12:00:00.000Z"),
+				idempotencyKey: "mc12-race-a",
+			});
+
+			const promiseMC11B = closeMonth({
+				db: dbB,
+				userId: USER_A,
+				periodMonth: mc12Period,
+				expectedProposalFingerprint: prevRes12.proposalFingerprint,
+				decision: "FULL",
+				occurredAt: new Date("2026-03-01T12:00:00.000Z"),
+				idempotencyKey: "mc12-race-b",
+			});
+
+			const blockedMC11 = await waitUntilBothCompetitorsBlockedOnRelation(
+				controlClient,
+				"month_close_adjustments",
+				[pidA, pidB],
+			);
+			ok(
+				"7B.9 MC-01: both independent competitors observed waiting on month_close_adjustments in pg_locks",
+				`(pidA=${blockedMC11.pidA}, pidB=${blockedMC11.pidB})`,
+			);
+
+			await controlClient.query("COMMIT;");
+
+			const [resMC11A, resMC11B] = await Promise.allSettled([promiseMC11A, promiseMC11B]);
+			const winnerMC11 = [resMC11A, resMC11B].find((s) => s.status === "fulfilled") as any;
+			const loserMC11 = [resMC11A, resMC11B].find((s) => s.status === "rejected") as any;
+
+			chk(winnerMC11 !== undefined, "7B.9 MC-01: exactly one winner closed the month");
+			chk(loserMC11 !== undefined, "7B.9 MC-01: exactly one loser was rejected");
+			if (loserMC11) {
+				chk(loserMC11.reason instanceof MonthCloseError, "7B.9 MC-01: loser threw MonthCloseError");
+				eq((loserMC11.reason as MonthCloseError).code, "MONTH_CLOSE_ALREADY_CLOSED", "7B.9 MC-01: loser code = MONTH_CLOSE_ALREADY_CLOSED");
+			}
+
+			const [adj11After] = await controlClient.query(
+				"select remaining_amount, applied_in_month_close_id from month_close_adjustments where id = $1",
+				[adj11?.id],
+			).then((r: any) => r.rows);
+			eq(adj11After.remaining_amount, "0.00", "7B.9 MC-01: remaining_amount is exactly 0.00 after full application");
+			eq(adj11After.applied_in_month_close_id, winnerMC11.value.monthClose.monthCloseId, "7B.9 MC-01: adjustment applied_in_month_close_id matches winning close ID");
+		} catch (test11Err) {
+			console.error("[Test 11 Fatal Error]:", test11Err);
+			bad("Test 11 threw unexpected error", String(test11Err));
 		}
 	} catch (fatalErr) {
 		console.error("FATAL RUN ERROR:", fatalErr);

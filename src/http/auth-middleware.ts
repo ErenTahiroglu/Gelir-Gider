@@ -126,7 +126,8 @@ export const requireAuthenticatedSession: MiddlewareHandler<{
 			db,
 			token: cookieToken,
 		});
-	} catch {
+	} catch (err) {
+		console.error("requireAuthenticatedSession error:", err);
 		// Operational / DB error: Fail-closed with 500 without clearing browser cookie
 		return c.json(
 			{

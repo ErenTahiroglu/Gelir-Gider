@@ -251,7 +251,7 @@ export async function getCampaignProgressInTransaction(
 	const MAX_SAMPLE_PURCHASES = 50;
 	const qualifying: CampaignQualifyingPurchase[] = [];
 	const needsReview: CampaignQualifyingPurchase[] = [];
-	const countedAmountsCents: bigint[] = [];
+	let totalEligibleSpendCents = 0n;
 	let needsReviewCents = 0n;
 	let totalQualifyingCount = 0;
 	let totalNeedsReviewCount = 0;
@@ -335,7 +335,7 @@ export async function getCampaignProgressInTransaction(
 
 				if (purchaseCountsTowardProgress(finalStatus)) {
 					totalQualifyingCount++;
-					countedAmountsCents.push(amountCents);
+					totalEligibleSpendCents += amountCents;
 					if (qualifying.length < MAX_SAMPLE_PURCHASES) {
 						qualifying.push(entry);
 					}
@@ -367,7 +367,8 @@ export async function getCampaignProgressInTransaction(
 			| "TOTAL_SPEND"
 			| "TRANSACTION_COUNT"
 			| "REPEATABLE_SPEND",
-		countedAmountsCents,
+		eligibleSpendCents: totalEligibleSpendCents,
+		eligibleTransactionCount: totalQualifyingCount,
 		targetSpendAmountCents,
 		requiredTransactionCount: rev.requiredTransactionCount,
 		stepSpendAmountCents,

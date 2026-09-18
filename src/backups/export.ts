@@ -58,20 +58,72 @@ function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {
  * the schema barrel at runtime -- no static generic table type is available
  * for a dynamically-selected `PgTable`.
  */
+export const BACKUP_CHUNK_SIZE = 500;
+
 interface SelectableTransaction {
-	select(): { from(table: PgTable): Promise<Record<string, unknown>[]> };
+	select(): {
+		from(table: PgTable): {
+			limit?(limit: number): {
+				offset(offset: number): Promise<Record<string, unknown>[]>;
+			};
+			then?: Promise<Record<string, unknown>[]>["then"];
+		};
+	};
 }
 
 async function exportTable(
 	tx: DatabaseTransaction,
 	tableName: string,
 	table: PgTable,
+	onChunkBytes?: (chunkBytes: number) => void,
+	chunkSize = BACKUP_CHUNK_SIZE,
 ): Promise<TableSnapshot> {
-	const rawRows = await (tx as unknown as SelectableTransaction)
+	const probeQuery = (tx as unknown as SelectableTransaction)
 		.select()
 		.from(table);
-	const rows = rawRows.map(normalizeRow);
-	const { sortedRows, hash } = await computeTableContentHash(rows);
+	const allRows: Record<string, unknown>[] = [];
+
+	if (typeof probeQuery?.limit === "function") {
+		let offset = 0;
+		while (true) {
+			const rawChunk = await (tx as unknown as SelectableTransaction)
+				.select()
+				.from(table)
+				.limit?.(chunkSize)
+				?.offset(offset);
+			if (!rawChunk || rawChunk.length === 0) {
+				break;
+			}
+			const normalizedChunk = rawChunk.map(normalizeRow);
+			allRows.push(...normalizedChunk);
+
+			if (onChunkBytes) {
+				const chunkBytes = new TextEncoder().encode(
+					JSON.stringify(normalizedChunk),
+				).length;
+				onChunkBytes(chunkBytes);
+			}
+
+			if (rawChunk.length < chunkSize) {
+				break;
+			}
+			offset += rawChunk.length;
+		}
+	} else {
+		const rawRows = await (probeQuery as unknown as Promise<
+			Record<string, unknown>[]
+		>);
+		const normalizedRows = (rawRows ?? []).map(normalizeRow);
+		allRows.push(...normalizedRows);
+		if (onChunkBytes) {
+			const chunkBytes = new TextEncoder().encode(
+				JSON.stringify(normalizedRows),
+			).length;
+			onChunkBytes(chunkBytes);
+		}
+	}
+
+	const { sortedRows, hash } = await computeTableContentHash(allRows);
 	return {
 		tableName,
 		rowCount: sortedRows.length,
@@ -106,20 +158,17 @@ export async function exportDatabaseSnapshot(
 			tx,
 			descriptor.tableName,
 			descriptor.table,
+			(chunkBytes) => {
+				cumulativePlaintextSizeBytes += chunkBytes;
+				if (cumulativePlaintextSizeBytes > maxBytes) {
+					throw new BackupError(
+						"BACKUP_TOO_LARGE",
+						"Backup snapshot plaintext exceeds the maximum allowed size",
+					);
+				}
+			},
 		);
 		tables.push(tableSnapshot);
-
-		const tableBytes = new TextEncoder().encode(
-			JSON.stringify(tableSnapshot.rows),
-		).length;
-		cumulativePlaintextSizeBytes += tableBytes;
-
-		if (cumulativePlaintextSizeBytes > maxBytes) {
-			throw new BackupError(
-				"BACKUP_TOO_LARGE",
-				"Backup snapshot plaintext exceeds the maximum allowed size",
-			);
-		}
 	}
 
 	return { tables, plaintextSizeBytes: cumulativePlaintextSizeBytes };

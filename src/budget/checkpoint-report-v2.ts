@@ -1,4 +1,4 @@
-import { and, asc, eq, lte } from "drizzle-orm";
+import { and, asc, eq, inArray, lte } from "drizzle-orm";
 import { resolveAuthoritativePurchaseSplitAsOf } from "../credit-cards/purchase-split-read";
 import {
 	getStatementReconciliationAsOf,
@@ -2316,7 +2316,12 @@ async function loadSurplusUseCandidateUniverse(
 			reversalOfTransferId: midasAllocationTransfers.reversalOfTransferId,
 		})
 		.from(midasAllocationTransfers)
-		.where(eq(midasAllocationTransfers.userId, userId));
+		.where(
+			and(
+				eq(midasAllocationTransfers.userId, userId),
+				lte(midasAllocationTransfers.occurredAt, checkpointAt),
+			),
+		);
 	const reversedTargets = new Set(
 		transfers
 			.filter(
@@ -2326,72 +2331,135 @@ async function loadSurplusUseCandidateUniverse(
 			)
 			.map((t) => t.reversalOfTransferId as string),
 	);
-	for (const t of transfers) {
-		if (t.reversalOfTransferId !== null) continue;
-		if (t.fromBucketId !== null || t.toBucketId === null) continue;
-		if (!win.inMtd(asDate(t.occurredAt))) continue;
-		if (reversedTargets.has(t.id)) continue; // SOURCE_INACTIVE -- not a candidate
-		const [goal] = await db
-			.select({ id: shortTermGoals.id })
-			.from(shortTermGoals)
-			.where(eq(shortTermGoals.midasBucketId, t.toBucketId))
-			.limit(1);
-		if (!goal) continue;
-		const purposeRevs = await db
+	const candidateTransfers = transfers.filter(
+		(t) =>
+			t.reversalOfTransferId === null &&
+			t.fromBucketId === null &&
+			t.toBucketId !== null &&
+			win.inMtd(asDate(t.occurredAt)) &&
+			!reversedTargets.has(t.id),
+	);
+	if (candidateTransfers.length > 0) {
+		const targetBucketIds = Array.from(
+			new Set(candidateTransfers.map((t) => t.toBucketId as string)),
+		);
+		const goals = await db
 			.select({
-				revisionNo: shortTermGoalBudgetV2PurposeRevisions.revisionNo,
-				purpose: shortTermGoalBudgetV2PurposeRevisions.purpose,
-				occurredAt: shortTermGoalBudgetV2PurposeRevisions.occurredAt,
+				id: shortTermGoals.id,
+				midasBucketId: shortTermGoals.midasBucketId,
 			})
-			.from(shortTermGoalBudgetV2PurposeRevisions)
-			.where(eq(shortTermGoalBudgetV2PurposeRevisions.goalId, goal.id));
-		const purpose = effectiveRevisionAsOf(purposeRevs, checkpointAt);
-		if (purpose?.purpose !== "INTERNATIONAL_MOBILITY") continue;
-		out.push({
-			subject: {
-				type: "MOBILITY_MIDAS_TRANSFER",
-				midasAllocationTransferId: t.id,
-			},
-			subjectType: "MOBILITY_MIDAS_TRANSFER",
-			subjectId: t.id,
-			lane: "INTERNATIONAL_MOBILITY",
-			sourceEconomicCents: centsOf(t.amount),
-			coveredCents: 0n,
-			overlapExact: true,
-			overlapUnresolvedReason: null,
-		});
+			.from(shortTermGoals)
+			.where(inArray(shortTermGoals.midasBucketId, targetBucketIds));
+
+		const goalByBucketId = new Map(goals.map((g) => [g.midasBucketId, g]));
+		const goalIds = goals.map((g) => g.id);
+
+		const purposeRevs =
+			goalIds.length > 0
+				? await db
+						.select({
+							goalId: shortTermGoalBudgetV2PurposeRevisions.goalId,
+							revisionNo: shortTermGoalBudgetV2PurposeRevisions.revisionNo,
+							purpose: shortTermGoalBudgetV2PurposeRevisions.purpose,
+							occurredAt: shortTermGoalBudgetV2PurposeRevisions.occurredAt,
+						})
+						.from(shortTermGoalBudgetV2PurposeRevisions)
+						.where(
+							and(
+								inArray(shortTermGoalBudgetV2PurposeRevisions.goalId, goalIds),
+								lte(
+									shortTermGoalBudgetV2PurposeRevisions.occurredAt,
+									checkpointAt,
+								),
+							),
+						)
+				: [];
+
+		const revsByGoalId = new Map<string, typeof purposeRevs>();
+		for (const r of purposeRevs) {
+			const list = revsByGoalId.get(r.goalId) ?? [];
+			list.push(r);
+			revsByGoalId.set(r.goalId, list);
+		}
+
+		for (const t of candidateTransfers) {
+			const goal = goalByBucketId.get(t.toBucketId as string);
+			if (!goal) continue;
+			const revs = revsByGoalId.get(goal.id) ?? [];
+			const purpose = effectiveRevisionAsOf(revs, checkpointAt);
+			if (purpose?.purpose !== "INTERNATIONAL_MOBILITY") continue;
+			out.push({
+				subject: {
+					type: "MOBILITY_MIDAS_TRANSFER",
+					midasAllocationTransferId: t.id,
+				},
+				subjectType: "MOBILITY_MIDAS_TRANSFER",
+				subjectId: t.id,
+				lane: "INTERNATIONAL_MOBILITY",
+				sourceEconomicCents: centsOf(t.amount),
+				coveredCents: 0n,
+				overlapExact: true,
+				overlapUnresolvedReason: null,
+			});
+		}
 	}
 
 	// ---- 11C. Long Term -- one active source per task (CREATE; SENT is not a 2nd) ----
 	const tasks = await db
-		.select({ id: longTermSendTasks.id })
+		.select({
+			id: longTermSendTasks.id,
+			createdAt: longTermSendTasks.createdAt,
+		})
 		.from(longTermSendTasks)
-		.where(eq(longTermSendTasks.userId, userId));
-	for (const task of tasks) {
-		const tRevs = await db
+		.where(
+			and(
+				eq(longTermSendTasks.userId, userId),
+				lte(longTermSendTasks.createdAt, checkpointAt),
+			),
+		);
+	if (tasks.length > 0) {
+		const taskIds = tasks.map((t) => t.id);
+		const allTRevs = await db
 			.select({
 				id: longTermSendTaskRevisions.id,
+				taskId: longTermSendTaskRevisions.taskId,
 				revisionNo: longTermSendTaskRevisions.revisionNo,
 				status: longTermSendTaskRevisions.status,
 				amount: longTermSendTaskRevisions.amount,
 				occurredAt: longTermSendTaskRevisions.occurredAt,
 			})
 			.from(longTermSendTaskRevisions)
-			.where(eq(longTermSendTaskRevisions.taskId, task.id));
-		const eff = effectiveRevisionAsOf(tRevs, checkpointAt);
-		if (!eff || eff.status === "CANCELLED") continue; // SOURCE_INACTIVE
-		const create = tRevs.find((r) => r.revisionNo === 1);
-		if (!create || !win.inMtd(asDate(create.occurredAt))) continue;
-		out.push({
-			subject: { type: "LONG_TERM_SEND_TASK", longTermSendTaskId: task.id },
-			subjectType: "LONG_TERM_SEND_TASK",
-			subjectId: task.id,
-			lane: "LONG_TERM_INVESTMENT",
-			sourceEconomicCents: centsOf(eff.amount),
-			coveredCents: 0n,
-			overlapExact: true,
-			overlapUnresolvedReason: null,
-		});
+			.where(
+				and(
+					inArray(longTermSendTaskRevisions.taskId, taskIds),
+					lte(longTermSendTaskRevisions.occurredAt, checkpointAt),
+				),
+			);
+
+		const revsByTaskId = new Map<string, typeof allTRevs>();
+		for (const r of allTRevs) {
+			const list = revsByTaskId.get(r.taskId) ?? [];
+			list.push(r);
+			revsByTaskId.set(r.taskId, list);
+		}
+
+		for (const task of tasks) {
+			const tRevs = revsByTaskId.get(task.id) ?? [];
+			const eff = effectiveRevisionAsOf(tRevs, checkpointAt);
+			if (!eff || eff.status === "CANCELLED") continue; // SOURCE_INACTIVE
+			const create = tRevs.find((r) => r.revisionNo === 1);
+			if (!create || !win.inMtd(asDate(create.occurredAt))) continue;
+			out.push({
+				subject: { type: "LONG_TERM_SEND_TASK", longTermSendTaskId: task.id },
+				subjectType: "LONG_TERM_SEND_TASK",
+				subjectId: task.id,
+				lane: "LONG_TERM_INVESTMENT",
+				sourceEconomicCents: centsOf(eff.amount),
+				coveredCents: 0n,
+				overlapExact: true,
+				overlapUnresolvedReason: null,
+			});
+		}
 	}
 
 	out.sort((a, b) =>

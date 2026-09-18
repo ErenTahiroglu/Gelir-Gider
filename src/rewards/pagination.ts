@@ -11,11 +11,23 @@ export interface RewardEventCursor {
 	id: string; // UUID
 }
 
+export interface RewardAccountCursorScope {
+	userId?: string | undefined;
+}
+
+export interface RewardEventCursorScope {
+	userId?: string | undefined;
+	rewardAccountId?: string | undefined;
+}
+
 export function encodeRewardAccountCursor(cursor: RewardAccountCursor): string {
 	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
 }
 
-export function decodeRewardAccountCursor(raw: string): RewardAccountCursor {
+export function decodeRewardAccountCursor(
+	raw: string,
+	expectedScope?: RewardAccountCursorScope,
+): RewardAccountCursor {
 	try {
 		const json = Buffer.from(raw, "base64url").toString("utf8");
 		const parsed = JSON.parse(json);
@@ -28,6 +40,11 @@ export function decodeRewardAccountCursor(raw: string): RewardAccountCursor {
 			!isUuid(parsed.id)
 		) {
 			throw new Error("Invalid reward account cursor payload");
+		}
+		if (expectedScope?.userId && typeof parsed.userId === "string") {
+			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+				throw new Error("Cursor scope mismatch");
+			}
 		}
 		return {
 			createdAt: parsed.createdAt,
@@ -45,7 +62,10 @@ export function encodeRewardEventCursor(cursor: RewardEventCursor): string {
 	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
 }
 
-export function decodeRewardEventCursor(raw: string): RewardEventCursor {
+export function decodeRewardEventCursor(
+	raw: string,
+	expectedScope?: RewardEventCursorScope,
+): RewardEventCursor {
 	try {
 		const json = Buffer.from(raw, "base64url").toString("utf8");
 		const parsed = JSON.parse(json);
@@ -58,6 +78,22 @@ export function decodeRewardEventCursor(raw: string): RewardEventCursor {
 			!isUuid(parsed.id)
 		) {
 			throw new Error("Invalid reward event cursor payload");
+		}
+		if (expectedScope?.userId && typeof parsed.userId === "string") {
+			if (parsed.userId.toLowerCase() !== expectedScope.userId.toLowerCase()) {
+				throw new Error("Cursor scope mismatch");
+			}
+		}
+		if (
+			expectedScope?.rewardAccountId &&
+			typeof parsed.rewardAccountId === "string"
+		) {
+			if (
+				parsed.rewardAccountId.toLowerCase() !==
+				expectedScope.rewardAccountId.toLowerCase()
+			) {
+				throw new Error("Cursor scope mismatch");
+			}
 		}
 		return {
 			createdAt: parsed.createdAt,

@@ -267,17 +267,20 @@ export interface CampaignRuleProgress {
  */
 export function computeRuleProgress(params: {
 	ruleMode: CampaignRuleMode;
-	countedAmountsCents: bigint[];
+	countedAmountsCents?: bigint[] | undefined;
+	eligibleSpendCents?: bigint | undefined;
+	eligibleTransactionCount?: number | undefined;
 	targetSpendAmountCents: bigint | null;
 	requiredTransactionCount: number | null;
 	stepSpendAmountCents: bigint | null;
 	maxSteps: number | null;
 }): CampaignRuleProgress {
-	const eligibleSpendCents = params.countedAmountsCents.reduce(
-		(sum, c) => sum + c,
-		0n,
-	);
-	const eligibleTransactionCount = params.countedAmountsCents.length;
+	const eligibleSpendCents =
+		params.eligibleSpendCents ??
+		(params.countedAmountsCents ?? []).reduce((sum, c) => sum + c, 0n);
+	const eligibleTransactionCount =
+		params.eligibleTransactionCount ??
+		(params.countedAmountsCents ? params.countedAmountsCents.length : 0);
 
 	if (params.ruleMode === "TOTAL_SPEND") {
 		const target = params.targetSpendAmountCents ?? 0n;

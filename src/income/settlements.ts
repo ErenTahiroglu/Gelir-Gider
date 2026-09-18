@@ -294,64 +294,23 @@ export async function createIncomeSettlement(
 					);
 				}
 
-				const storedAllocations = (latestBatchRev.allocations ??
-					[]) as SettlementAllocationItem[];
+				const rawSnapshot = latestBatchRev.snapshotAllocations as
+					| IncomeReceiptSettlementAllocationItem[]
+					| null;
+				const receiptAmount = latestBatchRev.receiptAmount ?? "0.00";
+				const entBreakdown: IncomeReceiptSettlementAllocationItem[] =
+					rawSnapshot ?? [];
+
 				let totalAllocatedCents = 0n;
-				for (const a of storedAllocations) {
-					totalAllocatedCents += parseMoneyString(a.amount).cents;
+				for (const a of entBreakdown) {
+					totalAllocatedCents += parseMoneyString(a.allocatedAmount).cents;
 				}
 
-				const [receiptRev] = await tx
-					.select()
-					.from(incomeReceiptRevisions)
-					.where(
-						and(
-							eq(incomeReceiptRevisions.incomeReceiptId, canonicalReceiptId),
-							eq(incomeReceiptRevisions.userId, userId),
-						),
-					)
-					.orderBy(desc(incomeReceiptRevisions.revisionNo))
-					.limit(1);
-
-				const receiptAmount = receiptRev?.amount ?? "0.00";
 				const receiptCents = parseMoneyString(receiptAmount).cents;
 				const unallocatedCents =
 					receiptCents > totalAllocatedCents
 						? receiptCents - totalAllocatedCents
 						: 0n;
-
-				const entBreakdown: IncomeReceiptSettlementAllocationItem[] = [];
-				for (const a of storedAllocations) {
-					const [ent] = await tx
-						.select()
-						.from(incomeEntitlements)
-						.where(
-							and(
-								eq(incomeEntitlements.id, a.entitlementId),
-								eq(incomeEntitlements.userId, userId),
-							),
-						)
-						.limit(1);
-					const [entRev] = await tx
-						.select()
-						.from(incomeEntitlementRevisions)
-						.where(
-							and(
-								eq(incomeEntitlementRevisions.entitlementId, a.entitlementId),
-								eq(incomeEntitlementRevisions.userId, userId),
-							),
-						)
-						.orderBy(desc(incomeEntitlementRevisions.revisionNo))
-						.limit(1);
-
-					entBreakdown.push({
-						entitlementId: a.entitlementId,
-						periodMonth: ent?.periodMonth ?? "",
-						entitlementAmount: entRev?.amount ?? a.amount,
-						allocatedAmount: a.amount,
-						entitlementOutstandingAfterAllReceipts: "0.00",
-					});
-				}
 
 				return {
 					idempotentReplay: true,
@@ -557,21 +516,34 @@ export async function createIncomeSettlement(
 				);
 			}
 
-			const unallocatedCents =
-				receiptCents > totalAllocatedCents
-					? receiptCents - totalAllocatedCents
+			const rawSnapshot = latestBatchRev.snapshotAllocations as
+				| IncomeReceiptSettlementAllocationItem[]
+				| null;
+			const replayReceiptAmount =
+				latestBatchRev.receiptAmount ?? latestReceiptRev.amount;
+			const replayAllocations = rawSnapshot ?? entBreakdown;
+
+			let totalReplayAllocatedCents = 0n;
+			for (const a of replayAllocations) {
+				totalReplayAllocatedCents += parseMoneyString(a.allocatedAmount).cents;
+			}
+
+			const replayReceiptCents = parseMoneyString(replayReceiptAmount).cents;
+			const replayUnallocatedCents =
+				replayReceiptCents > totalReplayAllocatedCents
+					? replayReceiptCents - totalReplayAllocatedCents
 					: 0n;
 
 			return {
 				idempotentReplay: true,
 				settlement: {
 					incomeReceiptId: receipt.id,
-					receiptAmount: latestReceiptRev.amount,
-					allocatedAmount: formatCentsToMoney(totalAllocatedCents),
-					unallocatedAmount: formatCentsToMoney(unallocatedCents),
+					receiptAmount: replayReceiptAmount,
+					allocatedAmount: formatCentsToMoney(totalReplayAllocatedCents),
+					unallocatedAmount: formatCentsToMoney(replayUnallocatedCents),
 					settlementBatchId: existingBatch.id,
 					revisionNo: latestBatchRev.revisionNo,
-					allocations: entBreakdown,
+					allocations: replayAllocations,
 				},
 			};
 		}
@@ -611,6 +583,8 @@ export async function createIncomeSettlement(
 				previousSettlementRevisionId: null,
 				operation: "CREATE",
 				allocations: normalizedAllocations,
+				receiptAmount: latestReceiptRev.amount,
+				snapshotAllocations: entBreakdown,
 				note: normalizedNote,
 			})
 			.returning();
@@ -693,6 +667,105 @@ export async function reviseIncomeSettlement(
 	}
 
 	return await db.transaction(async (tx) => {
+		const canonicalPayload: Record<string, unknown> = {
+			incomeReceiptId: canonicalReceiptId,
+			allocations: normalizedAllocations,
+			note: normalizedNote,
+		};
+
+		// 0. Early Idempotency Replay Check (before locks)
+		const [existingRev] = await tx
+			.select()
+			.from(transactionRevisions)
+			.where(
+				and(
+					eq(transactionRevisions.userId, userId),
+					eq(transactionRevisions.idempotencyKey, trimmedIdempotencyKey),
+				),
+			)
+			.limit(1);
+
+		if (existingRev) {
+			let canonRes: CanonicalTransactionOperationResult;
+			try {
+				canonRes = await reviseCanonicalTransactionInTransaction({
+					tx,
+					userId,
+					transactionId: existingRev.transactionId,
+					expectedRevisionNo: existingRev.revisionNo - 1,
+					idempotencyKey: trimmedIdempotencyKey,
+					occurredAt: existingRev.occurredAt,
+					payload: canonicalPayload,
+					reasonCode,
+					reasonNote: reasonNote?.trim() ? reasonNote.trim() : null,
+					source: provenance,
+				});
+			} catch (err) {
+				if (
+					err instanceof CanonicalTransactionError &&
+					err.code === "TRANSACTION_IDEMPOTENCY_CONFLICT"
+				) {
+					throw new IncomeError(
+						"INCOME_IDEMPOTENCY_CONFLICT",
+						"Settlement revision replayed with changed parameters",
+					);
+				}
+				throw err;
+			}
+
+			if (canonRes.idempotentReplay) {
+				const [existingBatchRev] = await tx
+					.select()
+					.from(incomeSettlementBatchRevisions)
+					.where(
+						eq(
+							incomeSettlementBatchRevisions.canonicalRevisionId,
+							canonRes.revisionId,
+						),
+					)
+					.limit(1);
+
+				if (!existingBatchRev) {
+					throw new IncomeError(
+						"INCOME_SETTLEMENT_NOT_FOUND",
+						"Settlement revision missing on replay",
+					);
+				}
+
+				const rawSnapshot = existingBatchRev.snapshotAllocations as
+					| IncomeReceiptSettlementAllocationItem[]
+					| null;
+				const replayReceiptAmount = existingBatchRev.receiptAmount ?? "0.00";
+				const replayAllocations = rawSnapshot ?? [];
+
+				let totalReplayAllocatedCents = 0n;
+				for (const a of replayAllocations) {
+					totalReplayAllocatedCents += parseMoneyString(
+						a.allocatedAmount,
+					).cents;
+				}
+
+				const replayReceiptCents = parseMoneyString(replayReceiptAmount).cents;
+				const replayUnallocatedCents =
+					replayReceiptCents > totalReplayAllocatedCents
+						? replayReceiptCents - totalReplayAllocatedCents
+						: 0n;
+
+				return {
+					idempotentReplay: true,
+					settlement: {
+						incomeReceiptId: canonicalReceiptId,
+						receiptAmount: replayReceiptAmount,
+						allocatedAmount: formatCentsToMoney(totalReplayAllocatedCents),
+						unallocatedAmount: formatCentsToMoney(replayUnallocatedCents),
+						settlementBatchId: existingBatchRev.settlementBatchId,
+						revisionNo: existingBatchRev.revisionNo,
+						allocations: replayAllocations,
+					},
+				};
+			}
+		}
+
 		// 1. Fetch settlement batch identity
 		const [batch] = await tx
 			.select()
@@ -867,11 +940,9 @@ export async function reviseIncomeSettlement(
 			});
 		}
 
-		const canonicalPayload: Record<string, unknown> = {
-			incomeReceiptId: receipt.id,
-			allocations: normalizedAllocations,
-			note: normalizedNote,
-		};
+		canonicalPayload.incomeReceiptId = receipt.id;
+		canonicalPayload.allocations = normalizedAllocations;
+		canonicalPayload.note = normalizedNote;
 
 		let canonRes: CanonicalTransactionOperationResult;
 		try {
@@ -928,21 +999,34 @@ export async function reviseIncomeSettlement(
 				);
 			}
 
-			const unallocatedCents =
-				receiptCents > totalAllocatedCents
-					? receiptCents - totalAllocatedCents
+			const rawSnapshot = existingBatchRev.snapshotAllocations as
+				| IncomeReceiptSettlementAllocationItem[]
+				| null;
+			const replayReceiptAmount =
+				existingBatchRev.receiptAmount ?? latestReceiptRev.amount;
+			const replayAllocations = rawSnapshot ?? entBreakdown;
+
+			let totalReplayAllocatedCents = 0n;
+			for (const a of replayAllocations) {
+				totalReplayAllocatedCents += parseMoneyString(a.allocatedAmount).cents;
+			}
+
+			const replayReceiptCents = parseMoneyString(replayReceiptAmount).cents;
+			const replayUnallocatedCents =
+				replayReceiptCents > totalReplayAllocatedCents
+					? replayReceiptCents - totalReplayAllocatedCents
 					: 0n;
 
 			return {
 				idempotentReplay: true,
 				settlement: {
 					incomeReceiptId: receipt.id,
-					receiptAmount: latestReceiptRev.amount,
-					allocatedAmount: formatCentsToMoney(totalAllocatedCents),
-					unallocatedAmount: formatCentsToMoney(unallocatedCents),
+					receiptAmount: replayReceiptAmount,
+					allocatedAmount: formatCentsToMoney(totalReplayAllocatedCents),
+					unallocatedAmount: formatCentsToMoney(replayUnallocatedCents),
 					settlementBatchId: batch.id,
 					revisionNo: existingBatchRev.revisionNo,
-					allocations: entBreakdown,
+					allocations: replayAllocations,
 				},
 			};
 		}
@@ -958,6 +1042,8 @@ export async function reviseIncomeSettlement(
 				previousSettlementRevisionId: prevBatchRev.id,
 				operation: "UPDATE",
 				allocations: normalizedAllocations,
+				receiptAmount: latestReceiptRev.amount,
+				snapshotAllocations: entBreakdown,
 				note: normalizedNote,
 			})
 			.returning();

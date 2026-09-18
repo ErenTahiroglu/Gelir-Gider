@@ -94,6 +94,16 @@ export function dateStringToPeriodMonth(dateString: string): string {
 }
 
 /**
+ * Converts a Date instant into Europe/Istanbul local "YYYY-MM" periodMonth string.
+ */
+export function dateToIstanbulPeriodMonth(date: Date): string {
+	const istanbulTime = new Date(date.getTime() + 3 * 60 * 60 * 1000);
+	const year = istanbulTime.getUTCFullYear();
+	const month = String(istanbulTime.getUTCMonth() + 1).padStart(2, "0");
+	return `${year}-${month}`;
+}
+
+/**
  * Returns the "YYYY-MM-01" date string for the calendar month immediately
  * following the given "YYYY-MM-01" periodMonth date string.
  */

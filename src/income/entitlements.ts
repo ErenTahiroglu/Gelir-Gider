@@ -1106,19 +1106,49 @@ export async function getIncomeEntitlement(
 		);
 	}
 
-	// Fetch current allocation across all active settlement batches
-	const allBatchRevs = await db
-		.select({
+	// Fetch current allocation across active settlement batches referencing this entitlement
+	const matchingBatchRows = await db
+		.selectDistinct({
 			settlementBatchId: incomeSettlementBatchRevisions.settlementBatchId,
-			revisionNo: incomeSettlementBatchRevisions.revisionNo,
-			allocations: incomeSettlementBatchRevisions.allocations,
 		})
 		.from(incomeSettlementBatchRevisions)
-		.where(eq(incomeSettlementBatchRevisions.userId, userId))
-		.orderBy(
-			incomeSettlementBatchRevisions.settlementBatchId,
-			desc(incomeSettlementBatchRevisions.revisionNo),
+		.where(
+			and(
+				eq(incomeSettlementBatchRevisions.userId, userId),
+				sql`${incomeSettlementBatchRevisions.allocations} @> ${JSON.stringify([{ entitlementId: entitlement.id }])}::jsonb`,
+			),
 		);
+
+	const matchingBatchIds = matchingBatchRows.map((r) => r.settlementBatchId);
+
+	let allBatchRevs: {
+		settlementBatchId: string;
+		revisionNo: number;
+		allocations: unknown;
+	}[] = [];
+
+	if (matchingBatchIds.length > 0) {
+		allBatchRevs = await db
+			.select({
+				settlementBatchId: incomeSettlementBatchRevisions.settlementBatchId,
+				revisionNo: incomeSettlementBatchRevisions.revisionNo,
+				allocations: incomeSettlementBatchRevisions.allocations,
+			})
+			.from(incomeSettlementBatchRevisions)
+			.where(
+				and(
+					eq(incomeSettlementBatchRevisions.userId, userId),
+					inArray(
+						incomeSettlementBatchRevisions.settlementBatchId,
+						matchingBatchIds,
+					),
+				),
+			)
+			.orderBy(
+				incomeSettlementBatchRevisions.settlementBatchId,
+				desc(incomeSettlementBatchRevisions.revisionNo),
+			);
+	}
 
 	const latestBatches = new Map<string, SettlementAllocationItem[]>();
 	for (const r of allBatchRevs) {

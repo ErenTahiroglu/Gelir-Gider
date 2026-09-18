@@ -59,9 +59,14 @@ function mapMonthCloseDomainError(c: Context<MonthCloseEnv>, err: unknown) {
 			case "MONTH_CLOSE_IDEMPOTENCY_CONFLICT":
 				return fail(c, unwrapped.code, 409);
 			default:
+				console.error(
+					"mapMonthCloseDomainError unhandled MonthCloseError:",
+					unwrapped,
+				);
 				return fail(c, "INTERNAL_ERROR", 500);
 		}
 	}
+	console.error("mapMonthCloseDomainError unhandled error:", err);
 	return fail(c, "INTERNAL_ERROR", 500);
 }
 

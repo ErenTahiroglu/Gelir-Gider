@@ -68,6 +68,7 @@ export interface EligibleDueStatementRow {
 export async function findEligibleDueStatementsInTransaction(
 	tx: DatabaseTransaction,
 	localDate: string,
+	limit = 500,
 ): Promise<EligibleDueStatementRow[]> {
 	const latestRevisionNumbers = tx
 		.select({
@@ -115,7 +116,8 @@ export async function findEligibleDueStatementsInTransaction(
 		.orderBy(
 			asc(creditCardStatementRevisions.dueDate),
 			asc(creditCardStatementRevisions.statementId),
-		);
+		)
+		.limit(limit);
 
 	return rows.map((row) => ({
 		statementId: row.statementId,
@@ -156,8 +158,13 @@ export interface MaterializeDueEventsResult {
 export async function materializeCreditCardDueEventsInTransaction(
 	tx: DatabaseTransaction,
 	localDate: string,
+	limit = 500,
 ): Promise<MaterializeDueEventsResult> {
-	const eligible = await findEligibleDueStatementsInTransaction(tx, localDate);
+	const eligible = await findEligibleDueStatementsInTransaction(
+		tx,
+		localDate,
+		limit,
+	);
 	const scheduledFor = istanbulNoonToUtcInstant(localDate);
 	let eventsCreated = 0;
 
@@ -192,6 +199,7 @@ export async function materializeCreditCardDueEventsInTransaction(
 export async function listEventsForLocalDateInTransaction(
 	tx: DatabaseTransaction,
 	localDate: string,
+	limit = 500,
 ): Promise<(typeof notificationEvents.$inferSelect)[]> {
 	return tx
 		.select()
@@ -200,7 +208,8 @@ export async function listEventsForLocalDateInTransaction(
 		.orderBy(
 			asc(notificationEvents.scheduledLocalDate),
 			asc(notificationEvents.id),
-		);
+		)
+		.limit(limit);
 }
 
 // ============================================================================

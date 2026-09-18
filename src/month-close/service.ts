@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, isNull, lt, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, lt, lte, sql } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
 	monthlyBudgetPlanRevisions,
@@ -290,27 +290,31 @@ export async function fetchUnappliedPriorAdjustmentsInTransaction(
 	tx: DatabaseTransaction,
 	userId: string,
 	periodMonth: string,
+	forUpdate: boolean = false,
 ): Promise<PriorAdjustmentSummary> {
 	const periodMonthDate = periodMonthToDateString(periodMonth);
-	const rows = await tx
+	const query = tx
 		.select()
 		.from(monthCloseAdjustments)
 		.where(
 			and(
 				eq(monthCloseAdjustments.userId, userId),
-				isNull(monthCloseAdjustments.appliedInMonthCloseId),
+				sql`${monthCloseAdjustments.remainingAmount} != '0.00'`,
 				lt(monthCloseAdjustments.closedPeriodMonth, periodMonthDate),
 			),
 		)
 		.orderBy(
 			asc(monthCloseAdjustments.closedPeriodMonth),
 			asc(monthCloseAdjustments.createdAt),
+			asc(monthCloseAdjustments.id),
 		);
+
+	const rows = forUpdate ? await query.for("update") : await query;
 
 	let totalAdjustmentCents = 0n;
 	for (const r of rows) {
 		totalAdjustmentCents += parseSignedAggregateMoneyString(
-			r.adjustmentAmount,
+			r.remainingAmount,
 		).cents;
 	}
 
@@ -326,6 +330,7 @@ export async function recordPostCloseAdjustmentIfClosedInTransaction(
 		userId: string;
 		periodMonth: string;
 		adjustmentAmount: string;
+		remainingAmount?: string | undefined;
 		reasonCode: string;
 		sourceRef: string;
 	},
@@ -350,10 +355,12 @@ export async function recordPostCloseAdjustmentIfClosedInTransaction(
 			userId: params.userId,
 			closedPeriodMonth: periodMonthDate,
 			adjustmentAmount: params.adjustmentAmount,
+			remainingAmount: params.remainingAmount ?? params.adjustmentAmount,
 			reasonCode: params.reasonCode,
 			sourceRef: params.sourceRef,
 			appliedInMonthCloseId: null,
 		})
+		.onConflictDoNothing()
 		.returning();
 
 	return adj ?? null;
@@ -1281,6 +1288,7 @@ export async function closeMonth(
 			tx,
 			userId,
 			periodMonth,
+			true,
 		);
 
 		const resolved: { status: "OK" } & MonthCloseFigures = {
@@ -1534,18 +1542,48 @@ export async function closeMonth(
 			);
 		}
 
+		let availableCapacityCents = resolved.closeSurplusCents;
 		for (const adj of priorAdjs.unappliedAdjustments) {
-			await tx
-				.update(monthCloseAdjustments)
-				.set({ appliedInMonthCloseId: monthCloseId })
-				.where(eq(monthCloseAdjustments.id, adj.id));
+			const rem = parseSignedAggregateMoneyString(adj.remainingAmount).cents;
+			if (rem > 0n) {
+				availableCapacityCents += rem;
+			}
+		}
 
-			await tx.insert(monthCloseAdjustmentApplications).values({
-				userId,
-				monthCloseId,
-				adjustmentId: adj.id,
-				appliedAmount: adj.adjustmentAmount,
-			});
+		for (const adj of priorAdjs.unappliedAdjustments) {
+			const rem = parseSignedAggregateMoneyString(adj.remainingAmount).cents;
+			let appliedCents = 0n;
+			let newRemCents = rem;
+
+			if (rem > 0n) {
+				appliedCents = rem;
+				newRemCents = 0n;
+			} else if (rem < 0n) {
+				if (availableCapacityCents > 0n) {
+					const absorb =
+						availableCapacityCents < -rem ? availableCapacityCents : -rem;
+					appliedCents = -absorb;
+					newRemCents = rem - appliedCents; // rem + absorb
+					availableCapacityCents -= absorb;
+				}
+			}
+
+			if (appliedCents !== 0n) {
+				await tx
+					.update(monthCloseAdjustments)
+					.set({
+						remainingAmount: centsToMoney(newRemCents),
+						appliedInMonthCloseId: newRemCents === 0n ? monthCloseId : null,
+					})
+					.where(eq(monthCloseAdjustments.id, adj.id));
+
+				await tx.insert(monthCloseAdjustmentApplications).values({
+					userId,
+					monthCloseId,
+					adjustmentId: adj.id,
+					appliedAmount: centsToMoney(appliedCents),
+				});
+			}
 		}
 
 		return {
