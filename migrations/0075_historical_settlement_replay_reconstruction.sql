@@ -3,7 +3,7 @@
 UPDATE income_settlement_batch_revisions isbr
 SET receipt_amount = COALESCE(
   (
-    SELECT ir.amount::text
+    SELECT ir.amount
     FROM income_receipt_revisions ir
     JOIN income_settlement_batches isb ON isb.income_receipt_id = ir.income_receipt_id
     WHERE isb.id = isbr.settlement_batch_id
@@ -12,14 +12,14 @@ SET receipt_amount = COALESCE(
     LIMIT 1
   ),
   (
-    SELECT ir.amount::text
+    SELECT ir.amount
     FROM income_receipt_revisions ir
     JOIN income_settlement_batches isb ON isb.income_receipt_id = ir.income_receipt_id
     WHERE isb.id = isbr.settlement_batch_id
     ORDER BY ir.revision_no ASC
     LIMIT 1
   ),
-  '0.00'
+  0.00
 );
 
 -- 2. Reconstruct snapshot_allocations with historical as-of entitlementAmount and exact historical outstanding calculation
