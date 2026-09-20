@@ -1572,22 +1572,76 @@ async function buildPeopleFamily(
 		return v;
 	};
 
+	const obligationIds = obligations.map((o) => o.id);
+	const allORevs =
+		obligationIds.length > 0
+			? await db
+					.select({
+						obligationId: personObligationRevisions.obligationId,
+						revisionNo: personObligationRevisions.revisionNo,
+						operation: personObligationRevisions.operation,
+						principal: personObligationRevisions.principalAmount,
+						budgetCategory: personObligationRevisions.budgetCategory,
+						dueDate: personObligationRevisions.dueDate,
+						occurredAt: personObligationRevisions.occurredAt,
+					})
+					.from(personObligationRevisions)
+					.where(inArray(personObligationRevisions.obligationId, obligationIds))
+					.orderBy(asc(personObligationRevisions.revisionNo))
+			: [];
+
+	const oRevsByObligationId = new Map<string, typeof allORevs>();
+	for (const rev of allORevs) {
+		const list = oRevsByObligationId.get(rev.obligationId) ?? [];
+		list.push(rev);
+		oRevsByObligationId.set(rev.obligationId, list);
+	}
+
+	const allSettlements =
+		obligationIds.length > 0
+			? await db
+					.select({
+						id: personSettlements.id,
+						obligationId: personSettlements.obligationId,
+					})
+					.from(personSettlements)
+					.where(inArray(personSettlements.obligationId, obligationIds))
+			: [];
+
+	const settlementsByObligationId = new Map<string, typeof allSettlements>();
+	for (const s of allSettlements) {
+		const list = settlementsByObligationId.get(s.obligationId) ?? [];
+		list.push(s);
+		settlementsByObligationId.set(s.obligationId, list);
+	}
+
+	const settlementIds = allSettlements.map((s) => s.id);
+	const allSRevs =
+		settlementIds.length > 0
+			? await db
+					.select({
+						settlementId: personSettlementRevisions.settlementId,
+						revisionNo: personSettlementRevisions.revisionNo,
+						operation: personSettlementRevisions.operation,
+						applied: personSettlementRevisions.appliedAmount,
+						occurredAt: personSettlementRevisions.occurredAt,
+					})
+					.from(personSettlementRevisions)
+					.where(inArray(personSettlementRevisions.settlementId, settlementIds))
+			: [];
+
+	const sRevsBySettlementId = new Map<string, typeof allSRevs>();
+	for (const rev of allSRevs) {
+		const list = sRevsBySettlementId.get(rev.settlementId) ?? [];
+		list.push(rev);
+		sRevsBySettlementId.set(rev.settlementId, list);
+	}
+
 	for (const o of obligations) {
 		const direction = o.direction as "RECEIVABLE" | "PAYABLE";
 		const info = await who(o.personId);
 
-		const oRevs = await db
-			.select({
-				revisionNo: personObligationRevisions.revisionNo,
-				operation: personObligationRevisions.operation,
-				principal: personObligationRevisions.principalAmount,
-				budgetCategory: personObligationRevisions.budgetCategory,
-				dueDate: personObligationRevisions.dueDate,
-				occurredAt: personObligationRevisions.occurredAt,
-			})
-			.from(personObligationRevisions)
-			.where(eq(personObligationRevisions.obligationId, o.id))
-			.orderBy(asc(personObligationRevisions.revisionNo));
+		const oRevs = oRevsByObligationId.get(o.id) ?? [];
 		for (const rev of oRevs) {
 			const at = asDate(rev.occurredAt);
 			if (!win.inInterval(at)) continue;
@@ -1617,20 +1671,9 @@ async function buildPeopleFamily(
 			});
 		}
 
-		const settlements = await db
-			.select({ id: personSettlements.id })
-			.from(personSettlements)
-			.where(eq(personSettlements.obligationId, o.id));
+		const settlements = settlementsByObligationId.get(o.id) ?? [];
 		for (const s of settlements) {
-			const sRevs = await db
-				.select({
-					revisionNo: personSettlementRevisions.revisionNo,
-					operation: personSettlementRevisions.operation,
-					applied: personSettlementRevisions.appliedAmount,
-					occurredAt: personSettlementRevisions.occurredAt,
-				})
-				.from(personSettlementRevisions)
-				.where(eq(personSettlementRevisions.settlementId, s.id));
+			const sRevs = sRevsBySettlementId.get(s.id) ?? [];
 			for (const rev of [...sRevs].sort(
 				(a, b) => a.revisionNo - b.revisionNo,
 			)) {

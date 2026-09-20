@@ -171,17 +171,20 @@ campaignsRouter.get("/review-candidates", async (c) => {
 		statusFilter = statusQuery as "PENDING" | "APPLIED" | "DISMISSED";
 	}
 
+	const auth = c.get("auth");
 	const afterQuery = c.req.query("after");
 	let afterCursor: CampaignReviewCandidateCursor | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodeCampaignReviewCandidateCursor(afterQuery);
+			afterCursor = decodeCampaignReviewCandidateCursor(afterQuery, {
+				userId: auth.userId,
+				campaignPeriodId: campaignPeriodIdQuery,
+			});
 		} catch (err) {
 			return mapCampaignsDomainError(c, err);
 		}
 	}
 
-	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
 
 	try {
@@ -196,7 +199,10 @@ campaignsRouter.get("/review-candidates", async (c) => {
 
 		const nextCursor =
 			result.hasMore && result.nextCursor
-				? encodeCampaignReviewCandidateCursor(result.nextCursor)
+				? encodeCampaignReviewCandidateCursor(result.nextCursor, {
+						userId: auth.userId,
+						campaignPeriodId: campaignPeriodIdQuery,
+					})
 				: null;
 
 		return c.json(
@@ -490,17 +496,19 @@ campaignsRouter.get("/", async (c) => {
 		return fail(c, "CAMPAIGN_INVALID_INPUT", 400);
 	}
 
+	const auth = c.get("auth");
 	const afterQuery = c.req.query("after");
 	let afterCursor: CampaignPeriodCursor | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodeCampaignPeriodCursor(afterQuery);
+			afterCursor = decodeCampaignPeriodCursor(afterQuery, {
+				userId: auth.userId,
+			});
 		} catch (err) {
 			return mapCampaignsDomainError(c, err);
 		}
 	}
 
-	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
 
 	try {
@@ -517,7 +525,9 @@ campaignsRouter.get("/", async (c) => {
 
 		const nextCursor =
 			result.hasMore && result.nextCursor
-				? encodeCampaignPeriodCursor(result.nextCursor)
+				? encodeCampaignPeriodCursor(result.nextCursor, {
+						userId: auth.userId,
+					})
 				: null;
 
 		return c.json(
@@ -1080,17 +1090,19 @@ campaignsRouter.get("/:id/progress/purchases", async (c) => {
 	});
 	if (!limitRes.ok) return fail(c, "CAMPAIGN_INVALID_INPUT", 400);
 
+	const auth = c.get("auth");
 	const afterQuery = c.req.query("after");
 	let afterCursor: CampaignProgressPurchaseCursor | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodeCampaignProgressPurchaseCursor(afterQuery);
+			afterCursor = decodeCampaignProgressPurchaseCursor(afterQuery, {
+				userId: auth.userId,
+			});
 		} catch (err) {
 			return mapCampaignsDomainError(c, err);
 		}
 	}
 
-	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
 
 	try {
@@ -1105,7 +1117,9 @@ campaignsRouter.get("/:id/progress/purchases", async (c) => {
 
 		const nextCursor =
 			result.hasMore && result.nextCursor
-				? encodeCampaignProgressPurchaseCursor(result.nextCursor)
+				? encodeCampaignProgressPurchaseCursor(result.nextCursor, {
+						userId: auth.userId,
+					})
 				: null;
 
 		return c.json(
@@ -1141,17 +1155,20 @@ campaignsRouter.get("/:id/overrides", async (c) => {
 	});
 	if (!limitRes.ok) return fail(c, "CAMPAIGN_INVALID_INPUT", 400);
 
+	const auth = c.get("auth");
 	const afterQuery = c.req.query("after");
 	let afterCursor: { id: string } | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodeCampaignOverrideCursor(afterQuery);
+			afterCursor = decodeCampaignOverrideCursor(afterQuery, {
+				userId: auth.userId,
+				campaignPeriodId,
+			});
 		} catch (err) {
 			return mapCampaignsDomainError(c, err);
 		}
 	}
 
-	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
 
 	try {
@@ -1165,7 +1182,10 @@ campaignsRouter.get("/:id/overrides", async (c) => {
 
 		const nextCursor =
 			result.hasMore && result.nextCursor
-				? encodeCampaignOverrideCursor(result.nextCursor)
+				? encodeCampaignOverrideCursor(result.nextCursor, {
+						userId: auth.userId,
+						campaignPeriodId,
+					})
 				: null;
 
 		return c.json(

@@ -288,7 +288,6 @@ export async function listBoundedIncomeEntitlements({
 			WITH latest_batches AS (
 				SELECT DISTINCT ON (${incomeSettlementBatchRevisions.settlementBatchId})
 					${incomeSettlementBatchRevisions.settlementBatchId},
-					${incomeSettlementBatchRevisions.revisionNo},
 					${incomeSettlementBatchRevisions.allocations}
 				FROM ${incomeSettlementBatchRevisions}
 				WHERE ${incomeSettlementBatchRevisions.userId} = ${userId}

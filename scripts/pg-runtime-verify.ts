@@ -939,7 +939,7 @@ async function runtime() {
 		db,
 		`insert into credit_card_statement_reconciliation_revisions
 		 (id,user_id,reconciliation_id,revision_no,previous_revision_id,operation,statement_revision_id,reconciled_statement_amount,component_count,idempotency_key,reconciliation_fingerprint,occurred_at)
-		 values ('82000000-0000-4000-8000-000000000001',$1,'81000000-0000-4000-8000-000000000001',1,null,'CREATE','80000000-0000-4000-8000-000000000621','1000.00',2,'recon-1',$2,now())`,
+		 values ('82000000-0000-4000-8000-000000000001',$1,'81000000-0000-4000-8000-000000000001',1,null,'CREATE','80000000-0000-4000-8000-000000000621','1000.00',2,'recon-1',$2,'2026-09-01 00:00:00+00')`,
 		[U1, "a".repeat(64)],
 		"CREATE reconciliation revision (amount matches statement) accepted",
 	);
@@ -947,7 +947,7 @@ async function runtime() {
 		db,
 		`insert into credit_card_statement_reconciliation_revisions
 		 (user_id,reconciliation_id,revision_no,previous_revision_id,operation,statement_revision_id,reconciled_statement_amount,component_count,idempotency_key,reconciliation_fingerprint,occurred_at)
-		 values ($1,'81000000-0000-4000-8000-000000000001',2,'82000000-0000-4000-8000-000000000001','SUPERSEDE','80000000-0000-4000-8000-000000000621','999.00',1,'recon-bad',$2,now())`,
+		 values ($1,'81000000-0000-4000-8000-000000000001',2,'82000000-0000-4000-8000-000000000001','SUPERSEDE','80000000-0000-4000-8000-000000000621','999.00',1,'recon-bad',$2,'2026-09-01 00:00:00+00')`,
 		[U1, "a".repeat(64)],
 		"reconciled_statement_amount != statement_amount rejected",
 	);
@@ -1006,7 +1006,7 @@ async function runtime() {
 		db,
 		`insert into credit_card_statement_reconciliation_revisions
 		 (id,user_id,reconciliation_id,revision_no,previous_revision_id,operation,statement_revision_id,reconciled_statement_amount,component_count,idempotency_key,reconciliation_fingerprint,occurred_at)
-		 values ('82000000-0000-4000-8000-000000000002',$1,'81000000-0000-4000-8000-000000000001',2,'82000000-0000-4000-8000-000000000001','SUPERSEDE','80000000-0000-4000-8000-000000000621','1000.00',1,'recon-2',$2,now())`,
+		 values ('82000000-0000-4000-8000-000000000002',$1,'81000000-0000-4000-8000-000000000001',2,'82000000-0000-4000-8000-000000000001','SUPERSEDE','80000000-0000-4000-8000-000000000621','1000.00',1,'recon-2',$2,'2026-09-01 00:00:00+00')`,
 		[U1, "a".repeat(64)],
 		"SUPERSEDE reconciliation revision accepted",
 	);
@@ -1157,7 +1157,7 @@ async function resolverRuntime() {
 		[U1] as never[],
 	);
 	await pg.query(
-		`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-0000000000a1',$1,'80000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','A','Bank','1','10','50000.00',now(),'ccr-1',$2)`,
+		`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-0000000000a1',$1,'80000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','A','Bank','1','10','50000.00','2026-09-01 00:00:00 Europe/Istanbul','ccr-1',$2)`,
 		[U1, F] as never[],
 	);
 	await pg.query(
@@ -1165,7 +1165,7 @@ async function resolverRuntime() {
 		[U1] as never[],
 	);
 	await pg.query(
-		`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-000000000621',$1,'80000000-0000-4000-8000-000000000521',1,'CREATE','OPEN','1000.00','2026-09-01','2026-09-10','MIDAS_FUND',now(),'st-r1',$2)`,
+		`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-000000000621',$1,'80000000-0000-4000-8000-000000000521',1,'CREATE','OPEN','1000.00','2026-09-01','2026-09-10','MIDAS_FUND','2026-09-01 00:00:00 Europe/Istanbul','st-r1',$2)`,
 		[U1, F] as never[],
 	);
 	await pg.query(
@@ -1195,6 +1195,7 @@ async function resolverRuntime() {
 		currency: "TRY",
 		sourceKind: "USER_APPROVED",
 		idempotencyKey: "bl-create-1",
+		occurredAt: new Date("2026-09-01T00:00:00Z"),
 	});
 	await classifySupportReceipt({
 		db,
@@ -1202,6 +1203,7 @@ async function resolverRuntime() {
 		incomeReceiptId: "b1000000-0000-4000-8000-000000000003",
 		supportRole: "PLANNED_FAMILY_GIFT",
 		idempotencyKey: "sup-gift-1",
+		occurredAt: new Date("2026-09-05T00:00:00Z"),
 	});
 	await classifySupportReceipt({
 		db,
@@ -1209,6 +1211,7 @@ async function resolverRuntime() {
 		incomeReceiptId: "b1000000-0000-4000-8000-000000000004",
 		supportRole: "DEFICIT_FAMILY_SUPPORT",
 		idempotencyKey: "sup-def-1",
+		occurredAt: new Date("2026-09-05T00:00:00Z"),
 	});
 	await classifyGoalPurpose({
 		db,
@@ -1216,6 +1219,7 @@ async function resolverRuntime() {
 		goalId: "99999999-0000-4000-8000-000000000001",
 		purpose: "INTERNATIONAL_MOBILITY",
 		idempotencyKey: "gp-mob-1",
+		occurredAt: new Date("2026-09-01T00:00:00Z"),
 	});
 	await classifyGoalPurpose({
 		db,
@@ -1223,6 +1227,7 @@ async function resolverRuntime() {
 		goalId: "99999999-0000-4000-8000-000000000002",
 		purpose: "DATE_BOUND_NECESSARY_PURCHASE",
 		idempotencyKey: "gp-dbn-1",
+		occurredAt: new Date("2026-09-01T00:00:00Z"),
 	});
 	await reconcileStatement({
 		db,
@@ -1230,6 +1235,7 @@ async function resolverRuntime() {
 		statementId: "80000000-0000-4000-8000-000000000521",
 		statementRevisionId: "80000000-0000-4000-8000-000000000621",
 		idempotencyKey: "recon-svc-1",
+		occurredAt: new Date("2026-09-10T00:00:00Z"),
 		components: [
 			{
 				componentType: "PURCHASE",
@@ -1297,7 +1303,7 @@ async function resolverRuntime() {
 		[U1] as never[],
 	);
 	await pg.query(
-		`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-000000000921',$1,'80000000-0000-4000-8000-000000000821',1,'CREATE','OPEN','300.00','2026-08-01','2026-09-05','OUTSIDE_MIDAS',now(),'st-r2',$2)`,
+		`insert into credit_card_statement_revisions (id,user_id,statement_id,revision_no,operation,status,statement_amount,statement_date,due_date,reserve_placement,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-000000000921',$1,'80000000-0000-4000-8000-000000000821',1,'CREATE','OPEN','300.00','2026-08-01','2026-09-05','OUTSIDE_MIDAS','2026-08-01 00:00:00+00','st-r2',$2)`,
 		[U1, F] as never[],
 	);
 	await pg.exec("SET session_replication_role = origin");
@@ -1316,6 +1322,7 @@ async function resolverRuntime() {
 		statementId: "80000000-0000-4000-8000-000000000821",
 		statementRevisionId: "80000000-0000-4000-8000-000000000921",
 		idempotencyKey: "recon-svc-2",
+		occurredAt: asOf,
 		components: [
 			{ componentType: "ADJUSTMENT", amount: "300.00", ownership: "PERSONAL", adjustmentKind: "OTHER" },
 		],
@@ -1354,6 +1361,7 @@ async function resolverRuntime() {
 		incomeReceiptId: "b1000000-0000-4000-8000-0000000000ff",
 		supportRole: "DEFICIT_FAMILY_SUPPORT",
 		idempotencyKey: "sup-x",
+		occurredAt: asOf,
 	});
 
 	// G. historical replay: seed a stored V2 creation revision, then prove
@@ -1515,7 +1523,7 @@ async function resolverRuntime4A() {
 		[U1] as never[],
 	);
 	await pg.query(
-		`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-0000000000a1',$1,'80000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','A','B','1','10','90000.00',now(),'ccr-1',$2)`,
+		`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-0000000000a1',$1,'80000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','A','B','1','10','90000.00','2026-09-01 00:00:00+00','ccr-1',$2)`,
 		[U1, F] as never[],
 	);
 	// people P1 (family) for the mixed-ownership / split cases
@@ -1524,7 +1532,7 @@ async function resolverRuntime4A() {
 		[U1] as never[],
 	);
 	await pg.query(
-		`insert into person_revisions (id,user_id,person_id,revision_no,operation,status,display_name,relationship,occurred_at,idempotency_key,revision_fingerprint) values ('9a000000-0000-4000-8000-0000000000a1',$1,'9a000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','Fam','FAMILY',now(),'pr-1',$2)`,
+		`insert into person_revisions (id,user_id,person_id,revision_no,operation,status,display_name,relationship,occurred_at,idempotency_key,revision_fingerprint) values ('9a000000-0000-4000-8000-0000000000a1',$1,'9a000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','Fam','FAMILY','2026-09-01 00:00:00+00','pr-1',$2)`,
 		[U1, F] as never[],
 	);
 
@@ -1620,7 +1628,10 @@ async function resolverRuntime4A() {
 		currency: "TRY",
 		sourceKind: "USER_APPROVED",
 		idempotencyKey: "bl-4a",
+		occurredAt: new Date("2026-09-01T00:00:00Z"),
 	});
+
+	const RECON_AT = new Date("2026-09-05T00:00:00Z");
 
 	// ---- D: full pre-period reserve => zero burden ----
 	{
@@ -1629,6 +1640,7 @@ async function resolverRuntime4A() {
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1,
 			idempotencyKey: `rc-d-${sid.slice(-6)}`,
+			occurredAt: RECON_AT,
 			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
 		});
 		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
@@ -1642,6 +1654,7 @@ async function resolverRuntime4A() {
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1,
 			idempotencyKey: `rc-e-${sid.slice(-6)}`,
+			occurredAt: RECON_AT,
 			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
 		});
 		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
@@ -1655,6 +1668,7 @@ async function resolverRuntime4A() {
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1,
 			idempotencyKey: `rc-f-${sid.slice(-6)}`,
+			occurredAt: RECON_AT,
 			components: [
 				{ componentType: "PURCHASE", amount: "700.00", ownership: "PERSONAL", purchaseEventId: pur.eid },
 				{ componentType: "ADJUSTMENT", amount: "300.00", ownership: "EXTERNAL_PERSON", personId: "9a000000-0000-4000-8000-000000000001", adjustmentKind: "OTHER" },
@@ -1677,6 +1691,7 @@ async function resolverRuntime4A() {
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1,
 			idempotencyKey: `rc-g-${sid.slice(-6)}`,
+			occurredAt: RECON_AT,
 			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
 		});
 		// reserve bucket G has a 300 transfer at exactly periodStart -> strict < excludes it.
@@ -1691,6 +1706,7 @@ async function resolverRuntime4A() {
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: latestRevId,
 			idempotencyKey: `rc-b-${sid.slice(-6)}`,
+			occurredAt: RECON_AT,
 			components: [{ componentType: "PURCHASE", amount: "500.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
 		});
 		const sep = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
@@ -1708,6 +1724,7 @@ async function resolverRuntime4A() {
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1,
 			idempotencyKey: `rc-h-${sid.slice(-6)}`,
+			occurredAt: RECON_AT,
 			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
 		});
 		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: "2026-09-01", asOf: asOfSep });
@@ -1733,6 +1750,7 @@ async function resolverRuntime4A() {
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1,
 			idempotencyKey: `rc-n-${sid.slice(-6)}`,
+			occurredAt: RECON_AT,
 			components: [{ componentType: "PURCHASE", amount: "400.00", ownership: "PERSONAL", purchaseEventId: pur.eid }],
 		});
 		// now VOID the purchase liability event
@@ -2014,7 +2032,7 @@ async function resolverRuntime4A1() {
 		[U1] as never[],
 	);
 	await pg.query(
-		`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-0000000000a1',$1,'80000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','A','B','1','10','90000.00',now(),'ccr-1',$2)`,
+		`insert into credit_card_revisions (id,user_id,credit_card_id,revision_no,operation,status,display_name,issuer,statement_day,due_day,credit_limit,occurred_at,idempotency_key,revision_fingerprint) values ('80000000-0000-4000-8000-0000000000a1',$1,'80000000-0000-4000-8000-000000000001',1,'CREATE','ACTIVE','A','B','1','10','90000.00','2026-09-01 00:00:00+00','ccr-1',$2)`,
 		[U1, F] as never[],
 	);
 	await pg.exec("SET session_replication_role = origin");
@@ -2022,7 +2040,10 @@ async function resolverRuntime4A1() {
 		db, userId: U1, effectivePeriodMonth: "2026-09-01",
 		monthlyTargetAmount: "6000.00", currency: "TRY",
 		sourceKind: "USER_APPROVED", idempotencyKey: "bl-4a1",
+		occurredAt: new Date("2026-09-01T00:00:00Z"),
 	});
+
+	const RECON_AT = new Date("2026-09-05T00:00:00Z");
 
 	let seq = 0;
 	const seedStmt = async (reserveBucket: string, amount: string) => {
@@ -2069,7 +2090,7 @@ async function resolverRuntime4A1() {
 			[er, U1, eid, tr, amount, category, occurredAt, `cper-${seq}`, F] as never[],
 		);
 		await pg.exec("SET session_replication_role = origin");
-		return { eid };
+		return { eid, tr };
 	};
 	let voidN = 0;
 	const voidStmt = async (sid: string, r1: string) => {
@@ -2089,6 +2110,7 @@ async function resolverRuntime4A1() {
 		const p = await seedPur("1000.00", "MANDATORY_EXPENSE");
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: `rc-a1-${seq}`,
+			occurredAt: RECON_AT,
 			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: p.eid }],
 		});
 		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: P, asOf: asOfSep });
@@ -2106,6 +2128,7 @@ async function resolverRuntime4A1() {
 		const pd = await seedPur("600.00", "DISCRETIONARY_SPEND");
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: `rc-b1-${seq}`,
+			occurredAt: RECON_AT,
 			components: [
 				{ componentType: "PURCHASE", amount: "400.00", ownership: "PERSONAL", purchaseEventId: pm.eid },
 				{ componentType: "PURCHASE", amount: "600.00", ownership: "PERSONAL", purchaseEventId: pd.eid },
@@ -2128,6 +2151,7 @@ async function resolverRuntime4A1() {
 		const pout = await seedPur("500.00", "MANDATORY_EXPENSE", "2026-08-20 00:00:00+00"); // before periodStart -> not MTD
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: `rc-c1-${seq}`,
+			occurredAt: RECON_AT,
 			components: [
 				{ componentType: "PURCHASE", amount: "500.00", ownership: "PERSONAL", purchaseEventId: pin.eid },
 				{ componentType: "PURCHASE", amount: "500.00", ownership: "PERSONAL", purchaseEventId: pout.eid },
@@ -2150,6 +2174,7 @@ async function resolverRuntime4A1() {
 		const pd = await seedPur("600.00", "DISCRETIONARY_SPEND");
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: `rc-d1-${seq}`,
+			occurredAt: RECON_AT,
 			components: [
 				{ componentType: "PURCHASE", amount: "400.00", ownership: "PERSONAL", purchaseEventId: pm.eid },
 				{ componentType: "PURCHASE", amount: "600.00", ownership: "PERSONAL", purchaseEventId: pd.eid },
@@ -2169,6 +2194,7 @@ async function resolverRuntime4A1() {
 		const pm = await seedPur("1000.00", "MANDATORY_EXPENSE");
 		await reconcileStatement({
 			db, userId: U1, statementId: sid, statementRevisionId: r1, idempotencyKey: `rc-e1-${seq}`,
+			occurredAt: RECON_AT,
 			components: [{ componentType: "PURCHASE", amount: "1000.00", ownership: "PERSONAL", purchaseEventId: pm.eid }],
 		});
 		const res = await resolveBudgetV2LiveSnapshot({ db, userId: U1, periodMonth: P, asOf: asOfSep });
@@ -16356,10 +16382,9 @@ async function resolverRuntime7B4() {
 		});
 		eqD(crossUserSplitMutRes.status, 404, "7B.4-E: User B cannot mutate User A split (404 NOT_FOUND)");
 
-		// User B cannot reuse User A cursor to access User A rows
+		// User B cannot reuse User A cursor to access User A rows (rejected with 400 per N-02)
 		const crossCursorRes = await httpCall(`/people?after=${encodeURIComponent(peopleCursor!)}`, { method: "GET", token: tokenB });
-		eqD(crossCursorRes.status, 200, "7B.4-E: User B with User A cursor returns 200 for User B scope");
-		eqD((crossCursorRes.json?.people ?? crossCursorRes.json?.items ?? []).length, 0, "7B.4-E: User B sees 0 items from User A cursor (zero leakage)");
+		eqD(crossCursorRes.status, 400, "7B.4-E: User B with User A cursor is rejected with 400 (cross-user scope mismatch)");
 
 		// =========================================================================
 		// SCENARIO F: Read-Only GET Proof (Zero Database Writes on All GET Endpoints)
@@ -17005,10 +17030,9 @@ async function resolverRuntime7B5(): Promise<void> {
 		});
 		eqD(crossVoidRes.status, 404, "7B.5-E: User B cannot void User A event (404 NOT_FOUND)");
 
-		// User B with User A cursor sees 0 items
+		// User B cannot reuse User A cursor to access User A rows (rejected with 400 per N-02)
 		const crossCursorRes = await httpCall(`/rewards/accounts?after=${encodeURIComponent(accCursor!)}`, { method: "GET", token: tokenB });
-		eqD(crossCursorRes.status, 200, "7B.5-E: User B with User A cursor returns 200 for User B scope");
-		eqD((crossCursorRes.json?.accounts ?? []).length, 0, "7B.5-E: User B sees 0 items from User A cursor (zero leakage)");
+		eqD(crossCursorRes.status, 400, "7B.5-E: User B with User A cursor is rejected with 400 (cross-user scope mismatch)");
 
 		// =========================================================================
 		// SCENARIO F: Read-Only GET Proof (Zero Database Writes on All GET Endpoints)
@@ -17975,10 +17999,9 @@ async function resolverRuntime7B6(): Promise<void> {
 		const crossSnapRes = await httpCall(`/campaigns/source-snapshots/${snap1Id}`, { method: "GET", token: tokenB });
 		eqD(crossSnapRes.status, 404, "7B.6-I: User B cannot GET User A source snapshot (404 NOT_FOUND)");
 
-		// User B with User A cursor sees 0 items
+		// User B cannot reuse User A cursor to access User A rows (rejected with 400 per N-02)
 		const crossCursorRes = await httpCall(`/campaigns?after=${encodeURIComponent(firstValidCampCursor!)}`, { method: "GET", token: tokenB });
-		eqD(crossCursorRes.status, 200, "7B.6-I: User B with User A cursor returns 200 for User B scope");
-		eqD((crossCursorRes.json?.campaigns ?? []).length, 0, "7B.6-I: User B sees 0 items from User A cursor (zero leakage)");
+		eqD(crossCursorRes.status, 400, "7B.6-I: User B with User A cursor is rejected with 400 (cross-user scope mismatch)");
 
 		// User B attempts mutation on User A campaign -> 404
 		const crossMutRes = await httpCall(`/campaigns/${camp1Id}/confirm`, {

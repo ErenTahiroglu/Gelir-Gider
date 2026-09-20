@@ -205,17 +205,17 @@ peopleRouter.get("/", async (c) => {
 		relationshipFilter = relationshipQuery as PersonRelationship;
 	}
 
+	const auth = c.get("auth");
 	const afterQuery = c.req.query("after");
 	let afterCursor: PersonCursor | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodePersonCursor(afterQuery);
+			afterCursor = decodePersonCursor(afterQuery, { userId: auth.userId });
 		} catch (err) {
 			return mapPeopleDomainError(c, err);
 		}
 	}
 
-	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
 
 	try {
@@ -230,7 +230,7 @@ peopleRouter.get("/", async (c) => {
 
 		const nextCursor =
 			result.hasMore && result.nextCursor
-				? encodePersonCursor(result.nextCursor)
+				? encodePersonCursor(result.nextCursor, { userId: auth.userId })
 				: null;
 
 		return c.json(
@@ -590,17 +590,20 @@ peopleRouter.get("/:personId/obligations", async (c) => {
 		}
 	}
 
+	const auth = c.get("auth");
 	const afterQuery = c.req.query("after");
 	let afterCursor: ObligationCursor | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodeObligationCursor(afterQuery);
+			afterCursor = decodeObligationCursor(afterQuery, {
+				userId: auth.userId,
+				personId,
+			});
 		} catch (err) {
 			return mapPeopleDomainError(c, err);
 		}
 	}
 
-	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
 
 	try {
@@ -627,7 +630,10 @@ peopleRouter.get("/:personId/obligations", async (c) => {
 
 		const nextCursor =
 			result.hasMore && result.nextCursor
-				? encodeObligationCursor(result.nextCursor)
+				? encodeObligationCursor(result.nextCursor, {
+						userId: auth.userId,
+						personId,
+					})
 				: null;
 
 		return c.json(
@@ -1195,17 +1201,20 @@ peopleRouter.get(
 			statusFilter = statusQuery;
 		}
 
+		const auth = c.get("auth");
 		const afterQuery = c.req.query("after");
 		let afterCursor: SettlementCursor | undefined;
 		if (afterQuery !== undefined) {
 			try {
-				afterCursor = decodeSettlementCursor(afterQuery);
+				afterCursor = decodeSettlementCursor(afterQuery, {
+					userId: auth.userId,
+					obligationId,
+				});
 			} catch (err) {
 				return mapPeopleDomainError(c, err);
 			}
 		}
 
-		const auth = c.get("auth");
 		const db = createDatabase(getDatabaseUrl(c.env));
 
 		try {
@@ -1221,7 +1230,10 @@ peopleRouter.get(
 
 			const nextCursor =
 				result.hasMore && result.nextCursor
-					? encodeSettlementCursor(result.nextCursor)
+					? encodeSettlementCursor(result.nextCursor, {
+							userId: auth.userId,
+							obligationId,
+						})
 					: null;
 
 			return c.json(

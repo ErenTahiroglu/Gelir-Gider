@@ -451,6 +451,7 @@ export async function runNotificationScheduler(
 				localDate,
 				pageLimit,
 				afterEventId,
+				true,
 			),
 		);
 		if (events.length === 0) {
@@ -478,28 +479,40 @@ export async function runNotificationScheduler(
 				createdAt: rawEvent.createdAt,
 			};
 
-			const activeSubscriptions = await runNotificationReadTransaction(
-				db,
-				(tx) => listActivePushSubscriptionsInTransaction(tx, event.userId),
-			);
-			if (activeSubscriptions.length === 0) continue;
-
-			for (const subscription of activeSubscriptions) {
-				if (dispatchesAttempted >= maxDispatches) break;
-
-				const dispatched = await processEventSubscription(
+			let afterSubscriptionId: string | undefined;
+			while (dispatchesAttempted < maxDispatches) {
+				const activeSubscriptions = await runNotificationReadTransaction(
 					db,
-					transport,
-					event,
-					subscription,
-					scheduledAt,
-					currentHourSlot,
-					summary,
-					transportPreparedState,
+					(tx) =>
+						listActivePushSubscriptionsInTransaction(
+							tx,
+							event.userId,
+							50,
+							afterSubscriptionId,
+						),
 				);
-				if (dispatched) {
-					dispatchesAttempted++;
+				if (activeSubscriptions.length === 0) break;
+
+				for (const subscription of activeSubscriptions) {
+					afterSubscriptionId = subscription.subscriptionId;
+					if (dispatchesAttempted >= maxDispatches) break;
+
+					const dispatched = await processEventSubscription(
+						db,
+						transport,
+						event,
+						subscription,
+						scheduledAt,
+						currentHourSlot,
+						summary,
+						transportPreparedState,
+					);
+					if (dispatched) {
+						dispatchesAttempted++;
+					}
 				}
+
+				if (activeSubscriptions.length < 50) break;
 			}
 		}
 	}

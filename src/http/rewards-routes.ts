@@ -147,17 +147,19 @@ rewardsRouter.get("/accounts", async (c) => {
 		statusFilter = statusQuery as RewardAccountStatus;
 	}
 
+	const auth = c.get("auth");
 	const afterQuery = c.req.query("after");
 	let afterCursor: RewardAccountCursor | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodeRewardAccountCursor(afterQuery);
+			afterCursor = decodeRewardAccountCursor(afterQuery, {
+				userId: auth.userId,
+			});
 		} catch (err) {
 			return mapRewardsDomainError(c, err);
 		}
 	}
 
-	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
 
 	try {
@@ -171,7 +173,9 @@ rewardsRouter.get("/accounts", async (c) => {
 
 		const nextCursor =
 			result.hasMore && result.nextCursor
-				? encodeRewardAccountCursor(result.nextCursor)
+				? encodeRewardAccountCursor(result.nextCursor, {
+						userId: auth.userId,
+					})
 				: null;
 
 		return c.json(
@@ -510,17 +514,20 @@ rewardsRouter.get("/accounts/:accountId/events", async (c) => {
 		statusFilter = statusQuery;
 	}
 
+	const auth = c.get("auth");
 	const afterQuery = c.req.query("after");
 	let afterCursor: RewardEventCursor | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodeRewardEventCursor(afterQuery);
+			afterCursor = decodeRewardEventCursor(afterQuery, {
+				userId: auth.userId,
+				rewardAccountId,
+			});
 		} catch (err) {
 			return mapRewardsDomainError(c, err);
 		}
 	}
 
-	const auth = c.get("auth");
 	const db = createDatabase(getDatabaseUrl(c.env));
 
 	try {
@@ -544,7 +551,10 @@ rewardsRouter.get("/accounts/:accountId/events", async (c) => {
 
 		const nextCursor =
 			result.hasMore && result.nextCursor
-				? encodeRewardEventCursor(result.nextCursor)
+				? encodeRewardEventCursor(result.nextCursor, {
+						userId: auth.userId,
+						rewardAccountId,
+					})
 				: null;
 
 		return c.json(

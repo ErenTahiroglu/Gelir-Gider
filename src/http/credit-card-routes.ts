@@ -203,7 +203,7 @@ creditCardRouter.get("/", async (c) => {
 	let afterCursor: CardCursor | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodeCardCursor(afterQuery);
+			afterCursor = decodeCardCursor(afterQuery, { userId: auth.userId });
 		} catch (err) {
 			return mapCreditCardDomainError(c, err);
 		}
@@ -224,10 +224,13 @@ creditCardRouter.get("/", async (c) => {
 		const lastCard = cards.length > 0 ? cards[cards.length - 1] : null;
 		const nextCursor =
 			hasMore && lastCard
-				? encodeCardCursor({
-						createdAt: lastCard.createdAt.toISOString(),
-						id: lastCard.cardId,
-					})
+				? encodeCardCursor(
+						{
+							createdAt: lastCard.createdAt.toISOString(),
+							id: lastCard.cardId,
+						},
+						{ userId: auth.userId },
+					)
 				: null;
 
 		return c.json({
@@ -630,7 +633,10 @@ creditCardRouter.get("/:cardId/statements", async (c) => {
 	let afterCursor: StatementCursor | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodeStatementCursor(afterQuery);
+			afterCursor = decodeStatementCursor(afterQuery, {
+				userId: auth.userId,
+				cardId,
+			});
 		} catch (err) {
 			return mapCreditCardDomainError(c, err);
 		}
@@ -659,11 +665,14 @@ creditCardRouter.get("/:cardId/statements", async (c) => {
 			statements.length > 0 ? statements[statements.length - 1] : null;
 		const nextCursor =
 			hasMore && lastStmt
-				? encodeStatementCursor({
-						cycleYear: lastStmt.cycleYear,
-						cycleMonth: lastStmt.cycleMonth,
-						id: lastStmt.statementId,
-					})
+				? encodeStatementCursor(
+						{
+							cycleYear: lastStmt.cycleYear,
+							cycleMonth: lastStmt.cycleMonth,
+							id: lastStmt.statementId,
+						},
+						{ userId: auth.userId, cardId },
+					)
 				: null;
 
 		return c.json({
@@ -1546,7 +1555,10 @@ creditCardRouter.get("/:cardId/purchases", async (c) => {
 	let afterCursor: PurchaseCursor | undefined;
 	if (afterQuery !== undefined) {
 		try {
-			afterCursor = decodePurchaseCursor(afterQuery);
+			afterCursor = decodePurchaseCursor(afterQuery, {
+				userId: auth.userId,
+				cardId,
+			});
 		} catch (err) {
 			return mapCreditCardDomainError(c, err);
 		}
@@ -1576,11 +1588,14 @@ creditCardRouter.get("/:cardId/purchases", async (c) => {
 			purchases.length > 0 ? purchases[purchases.length - 1] : null;
 		const nextCursor =
 			hasMore && lastPurchase?.purchaseDate
-				? encodePurchaseCursor({
-						purchaseDate: lastPurchase.purchaseDate,
-						occurredAt: lastPurchase.occurredAt.toISOString(),
-						eventId: lastPurchase.eventId,
-					})
+				? encodePurchaseCursor(
+						{
+							purchaseDate: lastPurchase.purchaseDate,
+							occurredAt: lastPurchase.occurredAt.toISOString(),
+							eventId: lastPurchase.eventId,
+						},
+						{ userId: auth.userId, cardId },
+					)
 				: null;
 
 		return c.json({

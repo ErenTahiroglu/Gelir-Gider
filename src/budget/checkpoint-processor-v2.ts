@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNull, lt } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lt } from "drizzle-orm";
 import type { Database } from "../db/client";
 import {
 	budgetV2CheckpointRequests,
@@ -135,14 +135,9 @@ export async function processPendingBudgetV2CheckpointRequests(
 	params: ProcessPendingCheckpointRequestsParams,
 ): Promise<ProcessPendingCheckpointRequestsResult> {
 	const { db } = params;
-	const pendingRequests = await db
+	const pendingRows = await db
 		.select({
-			id: budgetV2CheckpointRequests.id,
-			userId: budgetV2CheckpointRequests.userId,
-			periodMonth: budgetV2CheckpointRequests.periodMonth,
-			paymentEventId: budgetV2CheckpointRequests.paymentEventId,
-			checkpointAt: budgetV2CheckpointRequests.checkpointAt,
-			createdAt: budgetV2CheckpointRequests.createdAt,
+			request: budgetV2CheckpointRequests,
 		})
 		.from(budgetV2CheckpointRequests)
 		.leftJoin(
@@ -158,6 +153,7 @@ export async function processPendingBudgetV2CheckpointRequests(
 		)
 		.limit(100);
 
+	const pendingRequests = pendingRows.map((r) => r.request);
 	const pendingIds = new Set(pendingRequests.map((r) => r.id));
 
 	const result: ProcessPendingCheckpointRequestsResult = {
@@ -185,56 +181,85 @@ export async function processPendingBudgetV2CheckpointRequests(
 	for (const { userId, periodMonth } of distinctGroups) {
 		result.periodsProcessed += 1;
 
-		const groupRequests = await db
-			.select()
+		const groupPending = pendingRequests.filter(
+			(r) => r.userId === userId && r.periodMonth === periodMonth,
+		);
+		const firstPending = groupPending[0];
+		if (!firstPending) continue;
+
+		// Strict oldest-first: verify there is no unpersisted request earlier than groupPending[0]
+		const earliestCheckpointAt = firstPending.checkpointAt;
+		const [earlierUnprocessed] = await db
+			.select({ id: budgetV2CheckpointRequests.id })
+			.from(budgetV2CheckpointRequests)
+			.leftJoin(
+				budgetV2CheckpointSnapshots,
+				eq(
+					budgetV2CheckpointRequests.id,
+					budgetV2CheckpointSnapshots.requestId,
+				),
+			)
+			.where(
+				and(
+					eq(budgetV2CheckpointRequests.userId, userId),
+					eq(budgetV2CheckpointRequests.periodMonth, periodMonth),
+					isNull(budgetV2CheckpointSnapshots.requestId),
+					lt(budgetV2CheckpointRequests.checkpointAt, earliestCheckpointAt),
+				),
+			)
+			.limit(1);
+
+		if (earlierUnprocessed) {
+			result.blocked += groupPending.length;
+			continue;
+		}
+
+		// Candidate collision check for timestamps in groupPending
+		const candidateTimestamps = groupPending.map((r) => r.checkpointAt);
+		const collisionCandidateRequests = await db
+			.select({
+				checkpointAt: budgetV2CheckpointRequests.checkpointAt,
+				paymentEventId: budgetV2CheckpointRequests.paymentEventId,
+			})
 			.from(budgetV2CheckpointRequests)
 			.where(
 				and(
 					eq(budgetV2CheckpointRequests.userId, userId),
 					eq(budgetV2CheckpointRequests.periodMonth, periodMonth),
+					inArray(budgetV2CheckpointRequests.checkpointAt, candidateTimestamps),
 				),
-			)
-			.orderBy(
-				asc(budgetV2CheckpointRequests.checkpointAt),
-				asc(budgetV2CheckpointRequests.id),
 			);
 
-		// Persisted snapshots already in this (user, period) chain.
-		let chain: SnapshotRow[] = await db
-			.select()
+		const collisionCandidateSnapshots = await db
+			.select({
+				checkpointAt: budgetV2CheckpointSnapshots.checkpointAt,
+				paymentEventId: budgetV2CheckpointSnapshots.paymentEventId,
+			})
 			.from(budgetV2CheckpointSnapshots)
 			.where(
 				and(
 					eq(budgetV2CheckpointSnapshots.userId, userId),
 					eq(budgetV2CheckpointSnapshots.periodMonth, periodMonth),
+					inArray(
+						budgetV2CheckpointSnapshots.checkpointAt,
+						candidateTimestamps,
+					),
 				),
-			)
-			.orderBy(asc(budgetV2CheckpointSnapshots.checkpointAt));
+			);
 
-		// Identity-aware same-`checkpointAt` collision over {persisted chain}
-		// UNION {this period's requests}. Only two DISTINCT payment events at
-		// the same instant fail closed.
 		if (
 			hasDistinctEventTimestampCollision([
-				...chain.map((s) => ({
-					checkpointAt: s.checkpointAt,
-					paymentEventId: s.paymentEventId,
-				})),
-				...groupRequests.map((r) => ({
-					checkpointAt: r.checkpointAt,
-					paymentEventId: r.paymentEventId,
-				})),
+				...collisionCandidateSnapshots,
+				...collisionCandidateRequests,
 			])
 		) {
 			result.collisionPeriods += 1;
-			result.blocked += groupRequests.filter((r) =>
-				pendingIds.has(r.id),
-			).length;
+			result.blocked += groupPending.length;
 			continue;
 		}
 
 		let halted = false;
-		for (const request of groupRequests) {
+		for (const request of groupPending) {
 			const isPending = pendingIds.has(request.id);
 			if (halted) {
 				if (isPending) result.blocked += 1;
@@ -247,13 +272,24 @@ export async function processPendingBudgetV2CheckpointRequests(
 			const existing = await loadSnapshotByRequestId(db, request.id);
 			if (existing) {
 				await verifySnapshotRow(existing);
-				chain = mergeChain(chain, existing);
 				if (isPending) result.alreadyPersisted += 1;
 				continue;
 			}
 
 			// Immediately-preceding persisted checkpoint in this period.
-			const predecessor = lastBefore(chain, request.checkpointAt);
+			const [predecessor] = await db
+				.select()
+				.from(budgetV2CheckpointSnapshots)
+				.where(
+					and(
+						eq(budgetV2CheckpointSnapshots.userId, userId),
+						eq(budgetV2CheckpointSnapshots.periodMonth, periodMonth),
+						lt(budgetV2CheckpointSnapshots.checkpointAt, request.checkpointAt),
+					),
+				)
+				.orderBy(desc(budgetV2CheckpointSnapshots.checkpointAt))
+				.limit(1);
+
 			const previousCheckpointAt = predecessor?.checkpointAt;
 
 			let report: Awaited<ReturnType<typeof buildBudgetV2CheckpointReport>>;
@@ -297,32 +333,12 @@ export async function processPendingBudgetV2CheckpointRequests(
 				throw err;
 			}
 
-			chain = mergeChain(chain, persisted.snapshot);
 			if (persisted.created) result.persisted += 1;
 			else if (isPending) result.alreadyPersisted += 1;
 		}
 	}
 
 	return result;
-}
-
-function mergeChain(chain: SnapshotRow[], row: SnapshotRow): SnapshotRow[] {
-	if (chain.some((s) => s.id === row.id)) return chain;
-	return [...chain, row].sort(
-		(a, b) => a.checkpointAt.getTime() - b.checkpointAt.getTime(),
-	);
-}
-
-function lastBefore(chain: SnapshotRow[], at: Date): SnapshotRow | undefined {
-	let chosen: SnapshotRow | undefined;
-	for (const s of chain) {
-		if (s.checkpointAt.getTime() < at.getTime()) {
-			if (!chosen || s.checkpointAt.getTime() > chosen.checkpointAt.getTime()) {
-				chosen = s;
-			}
-		}
-	}
-	return chosen;
 }
 
 export interface PersistResult {

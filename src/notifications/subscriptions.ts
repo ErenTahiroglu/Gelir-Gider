@@ -827,6 +827,7 @@ export async function listActivePushSubscriptionsInTransaction(
 	tx: DatabaseTransaction,
 	userId: string,
 	limit = 50,
+	afterSubscriptionId?: string | undefined,
 ): Promise<PushSubscriptionReadModel[]> {
 	const rawResult = await tx.execute(sql`
 		WITH latest_revisions AS (
@@ -855,6 +856,7 @@ export async function listActivePushSubscriptionsInTransaction(
 		SELECT *
 		FROM latest_revisions
 		WHERE status = 'ACTIVE'
+		${afterSubscriptionId ? sql`AND subscription_id > ${afterSubscriptionId}` : sql``}
 		ORDER BY subscription_id ASC
 		LIMIT ${limit}
 	`);

@@ -526,6 +526,13 @@
       "when": 1789713500000,
       "tag": "0074_fix_legacy_adjustments_and_settlement_replays",
       "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "7",
+      "when": 1789714000000,
+      "tag": "0075_historical_settlement_replay_reconstruction",
+      "breakpoints": true
     }
   ]
 }

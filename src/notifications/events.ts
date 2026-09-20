@@ -111,6 +111,12 @@ export async function findEligibleDueStatementsInTransaction(
 			and(
 				eq(creditCardStatementRevisions.status, "OPEN"),
 				eq(creditCardStatementRevisions.dueDate, localDate),
+				sql`NOT EXISTS (
+					SELECT 1 FROM ${notificationEvents}
+					WHERE ${notificationEvents.subjectId} = ${creditCardStatementRevisions.statementId}
+						AND ${notificationEvents.notificationType} = 'CREDIT_CARD_DUE'
+						AND ${notificationEvents.scheduledLocalDate} = ${localDate}
+				)`,
 			),
 		)
 		.orderBy(
@@ -201,10 +207,30 @@ export async function listEventsForLocalDateInTransaction(
 	localDate: string,
 	limit = 500,
 	afterEventId?: string | undefined,
+	onlyPendingDeliveries = false,
 ): Promise<(typeof notificationEvents.$inferSelect)[]> {
 	const conditions = [eq(notificationEvents.scheduledLocalDate, localDate)];
 	if (afterEventId) {
 		conditions.push(gt(notificationEvents.id, afterEventId));
+	}
+	if (onlyPendingDeliveries) {
+		conditions.push(sql`EXISTS (
+			SELECT 1 FROM push_subscriptions ps
+			JOIN (
+				SELECT DISTINCT ON (subscription_id) subscription_id, status
+				FROM push_subscription_revisions
+				ORDER BY subscription_id, revision_no DESC
+			) psr ON psr.subscription_id = ps.id
+			WHERE ps.user_id = ${notificationEvents.userId}
+			  AND psr.status = 'ACTIVE'
+			  AND NOT EXISTS (
+				SELECT 1 FROM notification_deliveries nd
+				JOIN notification_delivery_attempts nda ON nda.delivery_id = nd.id
+				WHERE nd.notification_event_id = ${notificationEvents.id}
+				  AND nd.push_subscription_id = ps.id
+				  AND nda.status IN ('SUCCESS', 'TERMINAL_FAILURE', 'SUPPRESSED_OBSOLETE')
+			  )
+		)`);
 	}
 	return tx
 		.select()
