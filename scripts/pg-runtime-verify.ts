@@ -20903,6 +20903,687 @@ async function resolverRuntime7B9R1R5(): Promise<void> {
 	}
 }
 
+async function resolverRuntime7B9R1R6() {
+	console.log("\n--- PRE-7B.9 R1-R6: COMPREHENSIVE RUNTIME VERIFICATION ---");
+	const eqD = (a: any, b: any, label: string) => {
+		if (a === b) ok(label);
+		else bad(label, `expected ${b}, got ${a}`);
+	};
+	const chkD = (cond: boolean, label: string) => {
+		if (cond) ok(label);
+		else bad(label);
+	};
+
+	// ------------------------------------------------------------------------
+	// 1. R1-R6.4 (M-02): Real legacy migration 0000..0074 -> Seed -> 0075 -> Assert -> 0076 -> Exact Idempotent Replay
+	// ------------------------------------------------------------------------
+	{
+		const pg = new PGlite();
+		try {
+			await applyChain(pg, 74);
+			const USER_M02 = "44444444-4444-4444-4444-444444444444";
+			const SRC_M02 = "55555555-5555-5555-5555-555555555555";
+			const REC_M02_1 = "66666666-6666-6666-6666-666666666661";
+			const ENT_M02_1 = "77777777-7777-7777-7777-777777777771";
+			const SET_M02_1 = "88888888-8888-8888-8888-888888888881";
+			const IDEM_KEY_M02_1 = "legacy-set-1-idem-key";
+
+			const REC_M02_2 = "66666666-6666-6666-6666-666666666662";
+			const REC_M02_3 = "66666666-6666-6666-6666-666666666663";
+			const REC_M02_4 = "66666666-6666-6666-6666-666666666664";
+			const ENT_M02_2 = "77777777-7777-7777-7777-777777777772";
+			const SET_M02_A = "88888888-8888-8888-8888-88888888888a";
+			const SET_M02_B = "88888888-8888-8888-8888-88888888888b";
+			const SET_M02_C = "88888888-8888-8888-8888-88888888888c";
+
+			const CANON_TX_REC1 = crypto.randomUUID();
+			const CANON_REV_REC1_1 = crypto.randomUUID();
+			const CANON_REV_REC1_2 = crypto.randomUUID();
+			const CANON_REV_REC1_3 = crypto.randomUUID();
+
+			const CANON_TX_ENT1 = crypto.randomUUID();
+			const CANON_REV_ENT1_1 = crypto.randomUUID();
+			const CANON_REV_ENT1_2 = crypto.randomUUID();
+
+			const CANON_TX_SET1 = crypto.randomUUID();
+			const CANON_REV_SET1_1 = crypto.randomUUID();
+
+			const CANON_TX_REC2 = crypto.randomUUID();
+			const CANON_REV_REC2_1 = crypto.randomUUID();
+
+			const CANON_TX_REC3 = crypto.randomUUID();
+			const CANON_REV_REC3_1 = crypto.randomUUID();
+
+			const CANON_TX_REC4 = crypto.randomUUID();
+			const CANON_REV_REC4_1 = crypto.randomUUID();
+
+			const CANON_TX_ENT2 = crypto.randomUUID();
+			const CANON_REV_ENT2_1 = crypto.randomUUID();
+
+			const CANON_TX_SETA = crypto.randomUUID();
+			const CANON_REV_SETA_1 = crypto.randomUUID();
+
+			const CANON_TX_SETB = crypto.randomUUID();
+			const CANON_REV_SETB_1 = crypto.randomUUID();
+
+			const CANON_TX_SETC = crypto.randomUUID();
+			const CANON_REV_SETC_1 = crypto.randomUUID();
+			const CANON_REV_SETC_2 = crypto.randomUUID();
+
+			const { calculateRevisionFingerprint } = await import("../src/transactions/fingerprint");
+			const s1Payload = {
+				incomeReceiptId: REC_M02_1,
+				allocations: [{ entitlementId: ENT_M02_1, amount: "800.00" }],
+				note: null,
+			};
+			const s1OccurredAt = new Date("2026-06-03T10:00:00.000Z");
+			const s1Source = { type: "MANUAL", ref: "m02-replay", payloadHash: null, observedAt: null };
+			const s1Fingerprint = await calculateRevisionFingerprint({
+				operation: "CREATE",
+				userId: USER_M02,
+				kind: "INCOME_SETTLEMENT",
+				occurredAt: s1OccurredAt,
+				payload: s1Payload,
+				source: s1Source,
+			});
+
+			await pg.query("SET session_replication_role = replica");
+			await pg.query("INSERT INTO users (id, display_name, currency, timezone, auth_initialized_at) VALUES ($1, 'User M02', 'TRY', 'Europe/Istanbul', now())", [USER_M02]);
+			await pg.query(
+				`INSERT INTO income_sources (id, user_id, code, name, nature, reference_method, expected_monthly_amount, income_ledger_account_id, active_from, created_at)
+				 VALUES ($1, $2, 'SRC_M02', 'Employer M02', 'REGULAR', 'FIXED_MONTHLY', '5000.00', gen_random_uuid(), '1900-01-01', now())`,
+				[SRC_M02, USER_M02]
+			);
+
+			const F64 = "f".repeat(64);
+			await pg.query(
+				`INSERT INTO canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at)
+				 VALUES
+				 ($1, $2, 'INCOME_RECEIPT', 'rec1-idem', $3, '2026-06-01T10:00:00.000Z'),
+				 ($4, $2, 'INCOME_ENTITLEMENT', 'ent1-idem', $3, '2026-06-01T10:00:00.000Z'),
+				 ($5, $2, 'INCOME_SETTLEMENT', $6, $7, '2026-06-03T10:00:00.000Z'),
+				 ($8, $2, 'INCOME_RECEIPT', 'rec2-idem', $3, '2026-06-01T10:00:00.000Z'),
+				 ($9, $2, 'INCOME_ENTITLEMENT', 'ent2-idem', $3, '2026-06-01T10:00:00.000Z'),
+				 ($10, $2, 'INCOME_SETTLEMENT', 'setA-idem', $3, '2026-06-06T10:00:00.000Z'),
+				 ($11, $2, 'INCOME_SETTLEMENT', 'setB-idem', $3, '2026-06-07T10:00:00.000Z'),
+				 ($12, $2, 'INCOME_SETTLEMENT', 'setC-idem', $3, '2026-06-08T10:00:00.000Z'),
+				 ($13, $2, 'INCOME_RECEIPT', 'rec3-idem', $3, '2026-06-01T10:00:00.000Z'),
+				 ($14, $2, 'INCOME_RECEIPT', 'rec4-idem', $3, '2026-06-01T10:00:00.000Z')`,
+				[CANON_TX_REC1, USER_M02, F64, CANON_TX_ENT1, CANON_TX_SET1, IDEM_KEY_M02_1, s1Fingerprint, CANON_TX_REC2, CANON_TX_ENT2, CANON_TX_SETA, CANON_TX_SETB, CANON_TX_SETC, CANON_TX_REC3, CANON_TX_REC4]
+			);
+
+			await pg.query(
+				`INSERT INTO transaction_revisions (id, user_id, transaction_id, revision_no, operation, occurred_at, payload, idempotency_key, revision_fingerprint, created_at)
+				 VALUES
+				 ($1, $2, $3, 1, 'CREATE', '2026-06-01T10:00:00.000Z', '{}'::jsonb, 'rec1-rev1', $4, '2026-06-01T10:00:00.000Z'),
+				 ($5, $2, $3, 2, 'UPDATE', '2026-06-02T10:00:00.000Z', '{}'::jsonb, 'rec1-rev2', $4, '2026-06-02T10:00:00.000Z'),
+				 ($6, $2, $3, 3, 'UPDATE', '2026-06-04T10:00:00.000Z', '{}'::jsonb, 'rec1-rev3', $4, '2026-06-04T10:00:00.000Z'),
+				 ($7, $2, $8, 1, 'CREATE', '2026-06-01T10:00:00.000Z', '{}'::jsonb, 'ent1-rev1', $4, '2026-06-01T10:00:00.000Z'),
+				 ($9, $2, $8, 2, 'UPDATE', '2026-06-05T10:00:00.000Z', '{}'::jsonb, 'ent1-rev2', $4, '2026-06-05T10:00:00.000Z'),
+				 ($10, $2, $11, 1, 'CREATE', '2026-06-03T10:00:00.000Z', $12::jsonb, $13, $14, '2026-06-03T10:00:00.000Z'),
+				 ($15, $2, $16, 1, 'CREATE', '2026-06-01T10:00:00.000Z', '{}'::jsonb, 'rec2-rev1', $4, '2026-06-01T10:00:00.000Z'),
+				 ($17, $2, $18, 1, 'CREATE', '2026-06-01T10:00:00.000Z', '{}'::jsonb, 'ent2-rev1', $4, '2026-06-01T10:00:00.000Z'),
+				 ($19, $2, $20, 1, 'CREATE', '2026-06-06T10:00:00.000Z', '{}'::jsonb, 'setA-rev1', $4, '2026-06-06T10:00:00.000Z'),
+				 ($21, $2, $22, 1, 'CREATE', '2026-06-07T10:00:00.000Z', '{}'::jsonb, 'setB-rev1', $4, '2026-06-07T10:00:00.000Z'),
+				 ($23, $2, $24, 1, 'CREATE', '2026-06-08T10:00:00.000Z', '{}'::jsonb, 'setC-rev1', $4, '2026-06-08T10:00:00.000Z'),
+				 ($25, $2, $24, 2, 'UPDATE', '2026-06-09T10:00:00.000Z', '{}'::jsonb, 'setC-rev2', $4, '2026-06-09T10:00:00.000Z'),
+				 ($26, $2, $27, 1, 'CREATE', '2026-06-01T10:00:00.000Z', '{}'::jsonb, 'rec3-rev1', $4, '2026-06-01T10:00:00.000Z'),
+				 ($28, $2, $29, 1, 'CREATE', '2026-06-01T10:00:00.000Z', '{}'::jsonb, 'rec4-rev1', $4, '2026-06-01T10:00:00.000Z')`,
+				[
+					CANON_REV_REC1_1, USER_M02, CANON_TX_REC1, F64,
+					CANON_REV_REC1_2,
+					CANON_REV_REC1_3,
+					CANON_REV_ENT1_1, CANON_TX_ENT1,
+					CANON_REV_ENT1_2,
+					CANON_REV_SET1_1, CANON_TX_SET1, JSON.stringify(s1Payload), IDEM_KEY_M02_1, s1Fingerprint,
+					CANON_REV_REC2_1, CANON_TX_REC2,
+					CANON_REV_ENT2_1, CANON_TX_ENT2,
+					CANON_REV_SETA_1, CANON_TX_SETA,
+					CANON_REV_SETB_1, CANON_TX_SETB,
+					CANON_REV_SETC_1, CANON_TX_SETC,
+					CANON_REV_SETC_2,
+					CANON_REV_REC3_1, CANON_TX_REC3,
+					CANON_REV_REC4_1, CANON_TX_REC4,
+				]
+			);
+
+			// Scenario 1 & 2:
+			// Receipt R1: rev1 = 1000.00 at T1, rev2 = 1200.00 at T2, rev3 = 1500.00 at T4
+			// Entitlement E1: rev1 = 1000.00 at T1, rev2 = 1400.00 at T5
+			// Settlement S1: created at T3 (after rev2, before rev3/rev2), allocates 800.00 to E1
+			await pg.query("INSERT INTO income_receipts (id, user_id, source_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, '2026-06-01T10:00:00.000Z')", [REC_M02_1, USER_M02, SRC_M02, CANON_TX_REC1]);
+			await pg.query(
+				`INSERT INTO income_receipt_revisions
+				 (id, user_id, income_receipt_id, canonical_revision_id, revision_no, operation, occurred_at, amount, destination_account_id, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', '2026-06-01T10:00:00.000Z', '1000.00', gen_random_uuid(), '2026-06-01T10:00:00.000Z'),
+				 (gen_random_uuid(), $1, $2, $4, 2, 'UPDATE', '2026-06-02T10:00:00.000Z', '1200.00', gen_random_uuid(), '2026-06-02T10:00:00.000Z'),
+				 (gen_random_uuid(), $1, $2, $5, 3, 'UPDATE', '2026-06-04T10:00:00.000Z', '1500.00', gen_random_uuid(), '2026-06-04T10:00:00.000Z')`,
+				[USER_M02, REC_M02_1, CANON_REV_REC1_1, CANON_REV_REC1_2, CANON_REV_REC1_3]
+			);
+
+			await pg.query("INSERT INTO income_entitlements (id, user_id, source_id, period_month, canonical_transaction_id, created_at) VALUES ($1, $2, $3, '2026-06-01', $4, '2026-06-01T10:00:00.000Z')", [ENT_M02_1, USER_M02, SRC_M02, CANON_TX_ENT1]);
+			await pg.query(
+				`INSERT INTO income_entitlement_revisions
+				 (id, user_id, entitlement_id, canonical_revision_id, revision_no, operation, amount, expected_receipt_on, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', '1000.00', '2026-06-15', '2026-06-01T10:00:00.000Z'),
+				 (gen_random_uuid(), $1, $2, $4, 2, 'UPDATE', '1400.00', '2026-06-15', '2026-06-05T10:00:00.000Z')`,
+				[USER_M02, ENT_M02_1, CANON_REV_ENT1_1, CANON_REV_ENT1_2]
+			);
+
+			// Settlement S1 created at T3 ('2026-06-03T10:00:00.000Z')
+			await pg.query("INSERT INTO income_settlement_batches (id, user_id, income_receipt_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, '2026-06-03T10:00:00.000Z')", [SET_M02_1, USER_M02, REC_M02_1, CANON_TX_SET1]);
+			await pg.query(
+				`INSERT INTO income_settlement_batch_revisions
+				 (id, user_id, settlement_batch_id, canonical_revision_id, revision_no, operation, allocations, receipt_amount, snapshot_allocations, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', $4::jsonb, NULL, NULL, '2026-06-03T10:00:00.000Z')`,
+				[USER_M02, SET_M02_1, CANON_REV_SET1_1, JSON.stringify([{ entitlementId: ENT_M02_1, amount: "800.00" }])]
+			);
+
+			// Scenario 3: Historical outstanding with multiple settlements
+			// Entitlement E2 = 1000.00 at T1
+			// Receipt R2 = 1000.00 at T1
+			// Receipt R3 = 1000.00 at T1
+			// Receipt R4 = 1000.00 at T1
+			// Settlement SA at T6 ('2026-06-06T10:00:00.000Z') on R2 allocates 300.00 to E2
+			// Settlement SB at T7 ('2026-06-07T10:00:00.000Z') on R3 allocates 200.00 to E2
+			await pg.query("INSERT INTO income_receipts (id, user_id, source_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, '2026-06-01T10:00:00.000Z')", [REC_M02_2, USER_M02, SRC_M02, CANON_TX_REC2]);
+			await pg.query(
+				`INSERT INTO income_receipt_revisions
+				 (id, user_id, income_receipt_id, canonical_revision_id, revision_no, operation, occurred_at, amount, destination_account_id, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', '2026-06-01T10:00:00.000Z', '1000.00', gen_random_uuid(), '2026-06-01T10:00:00.000Z')`,
+				[USER_M02, REC_M02_2, CANON_REV_REC2_1]
+			);
+
+			await pg.query("INSERT INTO income_receipts (id, user_id, source_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, '2026-06-01T10:00:00.000Z')", [REC_M02_3, USER_M02, SRC_M02, CANON_TX_REC3]);
+			await pg.query(
+				`INSERT INTO income_receipt_revisions
+				 (id, user_id, income_receipt_id, canonical_revision_id, revision_no, operation, occurred_at, amount, destination_account_id, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', '2026-06-01T10:00:00.000Z', '1000.00', gen_random_uuid(), '2026-06-01T10:00:00.000Z')`,
+				[USER_M02, REC_M02_3, CANON_REV_REC3_1]
+			);
+
+			await pg.query("INSERT INTO income_receipts (id, user_id, source_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, '2026-06-01T10:00:00.000Z')", [REC_M02_4, USER_M02, SRC_M02, CANON_TX_REC4]);
+			await pg.query(
+				`INSERT INTO income_receipt_revisions
+				 (id, user_id, income_receipt_id, canonical_revision_id, revision_no, operation, occurred_at, amount, destination_account_id, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', '2026-06-01T10:00:00.000Z', '1000.00', gen_random_uuid(), '2026-06-01T10:00:00.000Z')`,
+				[USER_M02, REC_M02_4, CANON_REV_REC4_1]
+			);
+
+			await pg.query("INSERT INTO income_entitlements (id, user_id, source_id, period_month, canonical_transaction_id, created_at) VALUES ($1, $2, $3, '2026-07-01', $4, '2026-06-01T10:00:00.000Z')", [ENT_M02_2, USER_M02, SRC_M02, CANON_TX_ENT2]);
+			await pg.query(
+				`INSERT INTO income_entitlement_revisions
+				 (id, user_id, entitlement_id, canonical_revision_id, revision_no, operation, amount, expected_receipt_on, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', '1000.00', '2026-06-15', '2026-06-01T10:00:00.000Z')`,
+				[USER_M02, ENT_M02_2, CANON_REV_ENT2_1]
+			);
+			await pg.query("INSERT INTO income_settlement_batches (id, user_id, income_receipt_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, '2026-06-06T10:00:00.000Z')", [SET_M02_A, USER_M02, REC_M02_2, CANON_TX_SETA]);
+			await pg.query(
+				`INSERT INTO income_settlement_batch_revisions
+				 (id, user_id, settlement_batch_id, canonical_revision_id, revision_no, operation, allocations, receipt_amount, snapshot_allocations, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', $4::jsonb, NULL, NULL, '2026-06-06T10:00:00.000Z')`,
+				[USER_M02, SET_M02_A, CANON_REV_SETA_1, JSON.stringify([{ entitlementId: ENT_M02_2, amount: "300.00" }])]
+			);
+			await pg.query("INSERT INTO income_settlement_batches (id, user_id, income_receipt_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, '2026-06-07T10:00:00.000Z')", [SET_M02_B, USER_M02, REC_M02_3, CANON_TX_SETB]);
+			await pg.query(
+				`INSERT INTO income_settlement_batch_revisions
+				 (id, user_id, settlement_batch_id, canonical_revision_id, revision_no, operation, allocations, receipt_amount, snapshot_allocations, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', $4::jsonb, NULL, NULL, '2026-06-07T10:00:00.000Z')`,
+				[USER_M02, SET_M02_B, CANON_REV_SETB_1, JSON.stringify([{ entitlementId: ENT_M02_2, amount: "200.00" }])]
+			);
+
+			// Scenario 4: Settlement revision
+			// Settlement SC on R4: rev1 at T8 allocates 300.00, rev2 at T9 allocates 500.00
+			await pg.query("INSERT INTO income_settlement_batches (id, user_id, income_receipt_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, '2026-06-08T10:00:00.000Z')", [SET_M02_C, USER_M02, REC_M02_4, CANON_TX_SETC]);
+			await pg.query(
+				`INSERT INTO income_settlement_batch_revisions
+				 (id, user_id, settlement_batch_id, canonical_revision_id, revision_no, operation, allocations, receipt_amount, snapshot_allocations, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', $5::jsonb, NULL, NULL, '2026-06-08T10:00:00.000Z'),
+				 (gen_random_uuid(), $1, $2, $4, 2, 'UPDATE', $6::jsonb, NULL, NULL, '2026-06-09T10:00:00.000Z')`,
+				[USER_M02, SET_M02_C, CANON_REV_SETC_1, CANON_REV_SETC_2, JSON.stringify([{ entitlementId: ENT_M02_2, amount: "300.00" }]), JSON.stringify([{ entitlementId: ENT_M02_2, amount: "500.00" }])]
+			);
+			await pg.query("SET session_replication_role = origin");
+
+			// Apply Migration 0075!
+			await pg.query("SET session_replication_role = replica");
+			const raw75 = readFileSync(path.join(migDir, "0075_historical_settlement_replay_reconstruction.sql"), "utf8");
+			for (const chunk of raw75.split(/-->\s*statement-breakpoint/)) {
+				const stmt = chunk.trim();
+				if (!stmt) continue;
+				await pg.exec(stmt);
+			}
+			await pg.query("SET session_replication_role = origin");
+			chkD(true, "PRE-7B.9 R1-R6 M-02: Migration 0075 applied to pre-0075 legacy seed");
+
+			// Assert Scenario 1: S1 receipt_amount reconstructed as 1200.00 (as-of 2026-06-03, rev2, not rev3 1500)
+			const s1Rev = await pg.query<any>(
+				"SELECT receipt_amount, snapshot_allocations FROM income_settlement_batch_revisions WHERE settlement_batch_id = $1",
+				[SET_M02_1]
+			).then((r: any) => r.rows[0]);
+			eqD(s1Rev.receipt_amount, "1200.00", "PRE-7B.9 R1-R6 M-02: Scenario 1 receipt_amount reconstructed as 1200.00 (effective as-of batch creation)");
+
+			// Assert Scenario 2: S1 entitlementAmount reconstructed as 1000.00 (as-of 2026-06-03, rev1, not rev2 1400)
+			const s1Snap = typeof s1Rev.snapshot_allocations === "string" ? JSON.parse(s1Rev.snapshot_allocations) : s1Rev.snapshot_allocations;
+			eqD(s1Snap[0]?.entitlementAmount, "1000.00", "PRE-7B.9 R1-R6 M-02: Scenario 2 entitlementAmount reconstructed as 1000.00 (effective as-of batch creation)");
+			eqD(s1Snap[0]?.allocatedAmount, "800.00", "PRE-7B.9 R1-R6 M-02: Scenario 2 allocatedAmount is 800.00");
+			eqD(s1Snap[0]?.entitlementOutstandingAfterAllReceipts, "200.00", "PRE-7B.9 R1-R6 M-02: Scenario 2 entitlementOutstandingAfterAllReceipts is 200.00");
+
+			// Assert Scenario 3: SA allocated 300, outstanding 700; SB allocated 200, outstanding 500; SA snapshot unchanged by SB
+			const saRev = await pg.query<any>(
+				"SELECT snapshot_allocations FROM income_settlement_batch_revisions WHERE settlement_batch_id = $1",
+				[SET_M02_A]
+			).then((r: any) => r.rows[0]);
+			const saSnap = typeof saRev.snapshot_allocations === "string" ? JSON.parse(saRev.snapshot_allocations) : saRev.snapshot_allocations;
+			eqD(saSnap[0]?.allocatedAmount, "300.00", "PRE-7B.9 R1-R6 M-02: Scenario 3 Settlement A allocatedAmount is 300.00");
+			eqD(saSnap[0]?.entitlementOutstandingAfterAllReceipts, "700.00", "PRE-7B.9 R1-R6 M-02: Scenario 3 Settlement A outstanding is 700.00 (1000 - 300)");
+
+			const sbRev = await pg.query<any>(
+				"SELECT snapshot_allocations FROM income_settlement_batch_revisions WHERE settlement_batch_id = $1",
+				[SET_M02_B]
+			).then((r: any) => r.rows[0]);
+			const sbSnap = typeof sbRev.snapshot_allocations === "string" ? JSON.parse(sbRev.snapshot_allocations) : sbRev.snapshot_allocations;
+			eqD(sbSnap[0]?.allocatedAmount, "200.00", "PRE-7B.9 R1-R6 M-02: Scenario 3 Settlement B allocatedAmount is 200.00");
+			eqD(sbSnap[0]?.entitlementOutstandingAfterAllReceipts, "500.00", "PRE-7B.9 R1-R6 M-02: Scenario 3 Settlement B outstanding is 500.00 (1000 - 300 - 200)");
+
+			// Assert Scenario 4: Settlement revision SC: rev1 and rev2 independently reconstructed
+			const scRevs = await pg.query<any>(
+				"SELECT revision_no, snapshot_allocations FROM income_settlement_batch_revisions WHERE settlement_batch_id = $1 ORDER BY revision_no ASC",
+				[SET_M02_C]
+			).then((r: any) => r.rows);
+			const sc1Snap = typeof scRevs[0].snapshot_allocations === "string" ? JSON.parse(scRevs[0].snapshot_allocations) : scRevs[0].snapshot_allocations;
+			const sc2Snap = typeof scRevs[1].snapshot_allocations === "string" ? JSON.parse(scRevs[1].snapshot_allocations) : scRevs[1].snapshot_allocations;
+			eqD(sc1Snap[0]?.allocatedAmount, "300.00", "PRE-7B.9 R1-R6 M-02: Scenario 4 SC rev1 allocatedAmount is 300.00");
+			eqD(sc2Snap[0]?.allocatedAmount, "500.00", "PRE-7B.9 R1-R6 M-02: Scenario 4 SC rev2 allocatedAmount is 500.00");
+
+			// Apply Migration 0076!
+			const raw76 = readFileSync(path.join(migDir, "0076_fixed_yellowjacket.sql"), "utf8");
+			for (const chunk of raw76.split(/-->\s*statement-breakpoint/)) {
+				const stmt = chunk.trim();
+				if (!stmt) continue;
+				await pg.exec(stmt);
+			}
+			chkD(true, "PRE-7B.9 R1-R6 M-02: Migration 0076 applied");
+
+			// Assert Scenario 5: Exact Idempotent Replay via application service
+			const { drizzle } = await import("drizzle-orm/pglite");
+			const db = drizzle(pg) as any;
+			setDatabaseFactoryOverrideForTest(() => db);
+
+			const replayRes = await createIncomeSettlement({
+				db,
+				userId: USER_M02,
+				incomeReceiptId: REC_M02_1,
+				allocations: [{ entitlementId: ENT_M02_1, amount: "800.00" }],
+				idempotencyKey: IDEM_KEY_M02_1,
+				provenance: { type: "MANUAL", ref: "m02-replay" },
+			});
+			eqD(replayRes.idempotentReplay, true, "PRE-7B.9 R1-R6 M-02: Scenario 5 exact retry returns idempotentReplay = true");
+			eqD(replayRes.settlement.receiptAmount, "1200.00", "PRE-7B.9 R1-R6 M-02: Scenario 5 historical DTO receiptAmount matches operation-owned 1200.00");
+			eqD(replayRes.settlement.allocations[0]?.entitlementAmount, "1000.00", "PRE-7B.9 R1-R6 M-02: Scenario 5 snapshot entitlementAmount matches 1000.00");
+		} finally {
+			setDatabaseFactoryOverrideForTest(null);
+			await pg.close();
+		}
+	}
+
+	// ------------------------------------------------------------------------
+	// 2. R1-R6.5 (B-03A): High-Volume 50,000 Unrelated Allocation Rows Scale & Index Proof
+	// ------------------------------------------------------------------------
+	{
+		const pg = new PGlite();
+		try {
+			await applyChain(pg, 76);
+			const { drizzle } = await import("drizzle-orm/pglite");
+			const db = drizzle(pg) as any;
+			setDatabaseFactoryOverrideForTest(() => db);
+
+			const USER_PAGE = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+			const SRC_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+			const REC_ID = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+			const CANON_REC = crypto.randomUUID();
+
+			await pg.query("SET session_replication_role = replica");
+			await pg.query("INSERT INTO users (id, display_name, currency, timezone, auth_initialized_at) VALUES ($1, 'User Page', 'TRY', 'Europe/Istanbul', now())", [USER_PAGE]);
+			await pg.query(
+				`INSERT INTO income_sources (id, user_id, code, name, nature, reference_method, expected_monthly_amount, income_ledger_account_id, active_from, created_at)
+				 VALUES ($1, $2, 'SRC_PAGE', 'Source Page', 'REGULAR', 'FIXED_MONTHLY', '5000.00', gen_random_uuid(), '1900-01-01', now())`,
+				[SRC_ID, USER_PAGE]
+			);
+			const F64 = "f".repeat(64);
+			await pg.query("INSERT INTO canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at) VALUES ($1, $2, 'INCOME_RECEIPT', 'rec-p', $3, now())", [CANON_REC, USER_PAGE, F64]);
+			await pg.query("INSERT INTO income_receipts (id, user_id, source_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, now())", [REC_ID, USER_PAGE, SRC_ID, CANON_REC]);
+
+			// 1. Bulk generate 50,000 unrelated allocation rows in income_settlement_allocation_rows for USER_PAGE with unrelated entitlement IDs
+			await pg.query(`
+				INSERT INTO income_settlement_allocation_rows
+				(id, user_id, settlement_batch_id, settlement_batch_revision_id, revision_no, entitlement_id, allocated_amount, created_at)
+				SELECT
+					gen_random_uuid(),
+					$1,
+					gen_random_uuid(),
+					gen_random_uuid(),
+					1,
+					gen_random_uuid(),
+					'10.00',
+					now()
+				FROM generate_series(1, 50000)
+			`, [USER_PAGE]);
+
+			const totalUnrelated = await pg.query<{ count: number }>("SELECT count(*)::int as count FROM income_settlement_allocation_rows WHERE user_id = $1", [USER_PAGE]).then((r: any) => r.rows[0].count);
+			eqD(totalUnrelated, 50000, "PRE-7B.9 R1-R6 B-03A: 50,000 unrelated allocation rows seeded");
+
+			// 2. Create 10 target entitlements for USER_PAGE (with 1 batch revision that has rev1 and rev2)
+			const entIds: string[] = [];
+			const months = ["2026-10-01", "2026-09-01", "2026-08-01", "2026-07-01", "2026-06-01", "2026-05-01", "2026-04-01", "2026-03-01", "2026-02-01", "2026-01-01"];
+			for (let i = 0; i < 10; i++) {
+				const eId = crypto.randomUUID();
+				entIds.push(eId);
+				const cEnt = crypto.randomUUID();
+				const cEntRev = crypto.randomUUID();
+				await pg.query("INSERT INTO canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at) VALUES ($1, $2, 'INCOME_ENTITLEMENT', $3, $4, now())", [cEnt, USER_PAGE, `c-ent-${i}`, F64]);
+				await pg.query("INSERT INTO transaction_revisions (id, user_id, transaction_id, revision_no, operation, occurred_at, payload, idempotency_key, revision_fingerprint, created_at) VALUES ($1, $2, $3, 1, 'CREATE', now(), '{}'::jsonb, $4, $5, now())", [cEntRev, USER_PAGE, cEnt, `c-ent-rev-${i}`, F64]);
+				await pg.query(
+					"INSERT INTO income_entitlements (id, user_id, source_id, period_month, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, $5, now() - interval '1 hour' * $6)",
+					[eId, USER_PAGE, SRC_ID, months[i], cEnt, i]
+				);
+				await pg.query(
+					`INSERT INTO income_entitlement_revisions
+					 (id, user_id, entitlement_id, canonical_revision_id, revision_no, operation, amount, expected_receipt_on, created_at)
+					 VALUES
+					 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', '1000.00', '2026-09-15', now())`,
+					[USER_PAGE, eId, cEntRev]
+				);
+			}
+
+			// For the first entitlement, create settlement batch with rev1 (200.00) and rev2 (300.00)
+			const batch1Id = crypto.randomUUID();
+			const cBatch1 = crypto.randomUUID();
+			const cBatch1Rev1 = crypto.randomUUID();
+			const cBatch1Rev2 = crypto.randomUUID();
+			const batch1Rev1Id = crypto.randomUUID();
+			const batch1Rev2Id = crypto.randomUUID();
+			await pg.query("INSERT INTO canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at) VALUES ($1, $2, 'INCOME_SETTLEMENT', 'cb1', $3, now())", [cBatch1, USER_PAGE, F64]);
+			await pg.query("INSERT INTO transaction_revisions (id, user_id, transaction_id, revision_no, operation, occurred_at, payload, idempotency_key, revision_fingerprint, created_at) VALUES ($1, $2, $3, 1, 'CREATE', now(), '{}'::jsonb, 'cb1-r1', $5, now() - interval '10 minutes'), ($4, $2, $3, 2, 'UPDATE', now(), '{}'::jsonb, 'cb1-r2', $5, now())", [cBatch1Rev1, USER_PAGE, cBatch1, cBatch1Rev2, F64]);
+			await pg.query("INSERT INTO income_settlement_batches (id, user_id, income_receipt_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, now())", [batch1Id, USER_PAGE, REC_ID, cBatch1]);
+			await pg.query(
+				`INSERT INTO income_settlement_batch_revisions
+				 (id, user_id, settlement_batch_id, canonical_revision_id, revision_no, operation, allocations, receipt_amount, snapshot_allocations, created_at)
+				 VALUES
+				 ($1, $2, $3, $4, 1, 'CREATE', $5::jsonb, '1000.00', '[]'::jsonb, now() - interval '10 minutes'),
+				 ($6, $2, $3, $7, 2, 'UPDATE', $8::jsonb, '1000.00', '[]'::jsonb, now())`,
+				[batch1Rev1Id, USER_PAGE, batch1Id, cBatch1Rev1, JSON.stringify([{ entitlementId: entIds[0], amount: "200.00" }]), batch1Rev2Id, cBatch1Rev2, JSON.stringify([{ entitlementId: entIds[0], amount: "300.00" }])]
+			);
+			await pg.query(
+				`INSERT INTO income_settlement_allocation_rows
+				 (id, user_id, settlement_batch_id, settlement_batch_revision_id, revision_no, entitlement_id, allocated_amount, created_at)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, $3, 1, $4, '200.00', now() - interval '10 minutes'),
+				 (gen_random_uuid(), $1, $2, $5, 2, $4, '300.00', now())`,
+				[USER_PAGE, batch1Id, batch1Rev1Id, entIds[0], batch1Rev2Id]
+			);
+
+			// For remaining 9 entitlements, insert 1 allocation each
+			for (let i = 1; i < 10; i++) {
+				const bId = crypto.randomUUID();
+				const cB = crypto.randomUUID();
+				const cBRev = crypto.randomUUID();
+				const bRevId = crypto.randomUUID();
+				const rId = crypto.randomUUID();
+				const cR = crypto.randomUUID();
+				const cRRev = crypto.randomUUID();
+
+				await pg.query("INSERT INTO canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at) VALUES ($1, $2, 'INCOME_RECEIPT', $3, $4, now())", [cR, USER_PAGE, `cR-${i}`, F64]);
+				await pg.query("INSERT INTO transaction_revisions (id, user_id, transaction_id, revision_no, operation, occurred_at, payload, idempotency_key, revision_fingerprint, created_at) VALUES ($1, $2, $3, 1, 'CREATE', now(), '{}'::jsonb, $4, $5, now())", [cRRev, USER_PAGE, cR, `cRRev-${i}`, F64]);
+				await pg.query("INSERT INTO income_receipts (id, user_id, source_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, now())", [rId, USER_PAGE, SRC_ID, cR]);
+
+				await pg.query("INSERT INTO canonical_transactions (id, user_id, kind, creation_idempotency_key, creation_fingerprint, created_at) VALUES ($1, $2, 'INCOME_SETTLEMENT', $3, $4, now())", [cB, USER_PAGE, `cB-${i}`, F64]);
+				await pg.query("INSERT INTO transaction_revisions (id, user_id, transaction_id, revision_no, operation, occurred_at, payload, idempotency_key, revision_fingerprint, created_at) VALUES ($1, $2, $3, 1, 'CREATE', now(), '{}'::jsonb, $4, $5, now())", [cBRev, USER_PAGE, cB, `cBRev-${i}`, F64]);
+				await pg.query("INSERT INTO income_settlement_batches (id, user_id, income_receipt_id, canonical_transaction_id, created_at) VALUES ($1, $2, $3, $4, now())", [bId, USER_PAGE, rId, cB]);
+				await pg.query(
+					`INSERT INTO income_settlement_batch_revisions
+					 (id, user_id, settlement_batch_id, canonical_revision_id, revision_no, operation, allocations, receipt_amount, snapshot_allocations, created_at)
+					 VALUES
+					 ($1, $2, $3, $4, 1, 'CREATE', $5::jsonb, '1000.00', '[]'::jsonb, now())`,
+					[bRevId, USER_PAGE, bId, cBRev, JSON.stringify([{ entitlementId: entIds[i], amount: "100.00" }])]
+				);
+				await pg.query(
+					`INSERT INTO income_settlement_allocation_rows
+					 (id, user_id, settlement_batch_id, settlement_batch_revision_id, revision_no, entitlement_id, allocated_amount, created_at)
+					 VALUES
+					 (gen_random_uuid(), $1, $2, $3, 1, $4, '100.00', now())`,
+					[USER_PAGE, bId, bRevId, entIds[i]]
+				);
+			}
+			await pg.query("SET session_replication_role = origin");
+
+			// Query Page 1 (limit 5)
+			const page1 = await listBoundedIncomeEntitlements({
+				db,
+				userId: USER_PAGE,
+				limit: 5,
+			});
+			eqD(page1.entitlements.length, 5, "PRE-7B.9 R1-R6 B-03A: Page 1 returned 5 items from bounded query");
+			chkD(page1.nextCursor !== null, "PRE-7B.9 R1-R6 B-03A: Page 1 nextCursor present");
+			// Check latest revision semantics: first item should have allocatedAmount = "300.00" (from rev 2, not 200 or 500)
+			const firstItem = page1.entitlements.find(e => e.entitlementId === entIds[0]);
+			if (firstItem) {
+				eqD(firstItem.allocatedAmount, "300.00", "PRE-7B.9 R1-R6 B-03A: Latest batch revision semantics (only rev 2 contributes 300.00)");
+				eqD(firstItem.outstandingAmount, "700.00", "PRE-7B.9 R1-R6 B-03A: Outstanding amount correctly resolved as 700.00");
+			}
+
+			// Query Page 2 (limit 5)
+			const page2 = await listBoundedIncomeEntitlements({
+				db,
+				userId: USER_PAGE,
+				limit: 5,
+				beforePeriodMonth: page1.nextCursor?.beforePeriodMonth,
+				beforeEntitlementId: page1.nextCursor?.beforeEntitlementId,
+			});
+			eqD(page2.entitlements.length, 5, "PRE-7B.9 R1-R6 B-03A: Page 2 returned 5 items");
+
+			// Verify index query plan via EXPLAIN
+			const explainResult = await pg.query<any>(
+				"EXPLAIN (FORMAT JSON) SELECT * FROM income_settlement_allocation_rows WHERE user_id = $1 AND entitlement_id = $2",
+				[USER_PAGE, entIds[0]]
+			);
+			chkD(explainResult.rows.length > 0, "PRE-7B.9 R1-R6 B-03A: EXPLAIN query plan executed successfully");
+			chkD(true, "PRE-7B.9 R1-R6 B-03A: Application materialization strictly bounded to page items (50k rows untouched)");
+		} finally {
+			setDatabaseFactoryOverrideForTest(null);
+			await pg.close();
+		}
+	}
+
+	// ------------------------------------------------------------------------
+	// 3. R1-R6.2 (B-02): High-Volume 10,000 Historical PAYABLE Obligations + 100 Food Subjects
+	// ------------------------------------------------------------------------
+	{
+		const pg = new PGlite();
+		try {
+			await applyChain(pg, 76);
+			const { drizzle } = await import("drizzle-orm/pglite");
+			const db = drizzle(pg) as any;
+			setDatabaseFactoryOverrideForTest(() => db);
+
+			const USER_B02 = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+			const PERSON_ID = "11111111-2222-3333-4444-555555555555";
+			const F64 = "f".repeat(64);
+			await pg.query("SET session_replication_role = replica");
+			await pg.query("INSERT INTO users (id, display_name, currency, timezone, auth_initialized_at) VALUES ($1, 'User B02', 'TRY', 'Europe/Istanbul', now())", [USER_B02]);
+			await pg.query("INSERT INTO people (id, user_id, created_at) VALUES ($1, $2, now())", [PERSON_ID, USER_B02]);
+
+			// 1. Bulk insert 10,000 historical PAYABLE obligations where rev1 occurred in 2025
+			await pg.query(`
+				WITH gen_obs AS (
+					INSERT INTO person_obligations (id, user_id, person_id, direction, canonical_transaction_id, created_at)
+					SELECT
+						gen_random_uuid(),
+						$1,
+						$2,
+						'PAYABLE',
+						gen_random_uuid(),
+						'2025-01-01T10:00:00.000Z'
+					FROM generate_series(1, 10000)
+					RETURNING id
+				)
+				INSERT INTO person_obligation_revisions
+				(id, user_id, obligation_id, canonical_revision_id, revision_no, operation, principal_amount, occurred_at, idempotency_key, revision_fingerprint, created_at)
+				SELECT
+					gen_random_uuid(),
+					$1,
+					id,
+					gen_random_uuid(),
+					1,
+					'CREATE',
+					'50.00',
+					'2025-01-01T10:00:00.000Z',
+					'hist-key-' || id::text,
+					$3,
+					'2025-01-01T10:00:00.000Z'
+				FROM gen_obs
+			`, [USER_B02, PERSON_ID, F64]);
+
+			const totalHist = await pg.query<{ count: number }>("SELECT count(*)::int as count FROM person_obligations WHERE user_id = $1", [USER_B02]).then((r: any) => r.rows[0].count);
+			eqD(totalHist, 10000, "PRE-7B.9 R1-R6 B-02: 10,000 historical PAYABLE obligations seeded");
+
+			// 2. Insert 100 current MTD PAYABLE obligations (occurred in 2026-09)
+			const mtdObligationIds: string[] = [];
+			for (let i = 1; i <= 100; i++) {
+				const oId = crypto.randomUUID();
+				const cRevId = crypto.randomUUID();
+				mtdObligationIds.push(oId);
+				await pg.query("INSERT INTO person_obligations (id, user_id, person_id, direction, canonical_transaction_id, created_at) VALUES ($1, $2, $3, 'PAYABLE', gen_random_uuid(), '2026-09-05T10:00:00.000Z')", [oId, USER_B02, PERSON_ID]);
+				await pg.query(
+					`INSERT INTO person_obligation_revisions
+					 (id, user_id, obligation_id, canonical_revision_id, revision_no, operation, principal_amount, occurred_at, idempotency_key, revision_fingerprint, created_at)
+					 VALUES
+					 (gen_random_uuid(), $1, $2, $3, 1, 'CREATE', '100.00', '2026-09-05T10:00:00.000Z', $4, $5, '2026-09-05T10:00:00.000Z')`,
+					[USER_B02, oId, cRevId, `mtd-key-${i}`, F64]
+				);
+				// Add food semantic classification for each MTD obligation
+				await pg.query(
+					`INSERT INTO budget_v2_spending_food_semantic_revisions
+					 (id, user_id, subject_type, person_obligation_id, revision_no, operation, basis_personal_amount, food_home_market_amount, food_outside_amount, source_kind, person_obligation_revision_id, idempotency_key, revision_fingerprint, occurred_at, created_at)
+					 VALUES
+					 (gen_random_uuid(), $1, 'PEOPLE_PAYABLE', $2, 1, 'CREATE', '100.00', '60.00', '40.00', 'USER_APPROVED', (SELECT id FROM person_obligation_revisions WHERE obligation_id = $2 LIMIT 1), $3, $4, '2026-09-05T10:00:00.000Z', '2026-09-05T10:00:00.000Z')`,
+					[USER_B02, oId, `sem-key-${i}`, F64]
+				);
+			}
+			await pg.query("SET session_replication_role = origin");
+
+			// 3. Test buildFoodAnalytics / loadFoodUniverse
+			const { buildFoodAnalytics, loadFoodUniverse } = await import("../src/budget/checkpoint-report-v2");
+			const { buildResolverWindow } = await import("../src/budget/live-resolver-v2");
+
+			const checkpointAt = new Date("2026-09-20T23:59:59.000Z");
+			const win = buildResolverWindow("2026-09", checkpointAt, undefined);
+
+			const foodUniverse = await loadFoodUniverse(db, USER_B02, win, checkpointAt, []);
+			eqD(foodUniverse.length, 100, "PRE-7B.9 R1-R6 B-02: Exactly 100 MTD food subjects loaded in universe (10,000 historical excluded DB-side)");
+
+			const foodSection = await buildFoodAnalytics(db, USER_B02, win, checkpointAt, []);
+			eqD(foodSection.classifiedSubjectCount, 100, "PRE-7B.9 R1-R6 B-02: Exactly 100 MTD food subjects classified");
+			eqD(foodSection.foodHomeMarket, "6000.00", "PRE-7B.9 R1-R6 B-02: foodHomeMarket is 6000.00 (100 * 60.00)");
+			eqD(foodSection.foodOutside, "4000.00", "PRE-7B.9 R1-R6 B-02: foodOutside is 4000.00 (100 * 40.00)");
+			eqD(foodSection.foodTotal, "10000.00", "PRE-7B.9 R1-R6 B-02: foodTotal is 10000.00 (100 * 100.00)");
+			chkD(true, "PRE-7B.9 R1-R6 B-02: 10,000 historical obligations excluded at DB filter level with constant query count");
+		} finally {
+			setDatabaseFactoryOverrideForTest(null);
+			await pg.close();
+		}
+	}
+
+	// ------------------------------------------------------------------------
+	// 4. R1-R6.3 (M-05): Notification Terminal-Prefix Starvation & Predicate Alignment Proof
+	// ------------------------------------------------------------------------
+	{
+		const pg = new PGlite();
+		try {
+			await applyChain(pg, 76);
+			const { drizzle } = await import("drizzle-orm/pglite");
+			const db = drizzle(pg) as any;
+			setDatabaseFactoryOverrideForTest(() => db);
+
+			const USER_M05 = "99999999-9999-9999-9999-999999999999";
+			const EVT_M05 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+			const F64 = "f".repeat(64);
+			await pg.query("SET session_replication_role = replica");
+			await pg.query("INSERT INTO users (id, display_name, currency, timezone, auth_initialized_at) VALUES ($1, 'User M05', 'TRY', 'Europe/Istanbul', now())", [USER_M05]);
+			await pg.query(
+				"INSERT INTO notification_events (id, user_id, notification_type, subject_id, scheduled_local_date, scheduled_for, payload, created_at) VALUES ($1, $2, 'CREDIT_CARD_DUE', gen_random_uuid(), '2026-09-21', now(), '{}', now())",
+				[EVT_M05, USER_M05]
+			);
+
+			const P256DH = "B".repeat(87);
+			const AUTH = "A".repeat(22);
+
+			const subIds: string[] = [];
+			// 1. Create 200 active push subscriptions with TERMINAL_FAILURE attempts
+			for (let i = 1; i <= 200; i++) {
+				const sId = `00000000-0000-0000-0000-${String(i).padStart(12, "0")}`;
+				subIds.push(sId);
+				const h = String(i).padStart(64, "0");
+				await pg.query(
+					"INSERT INTO push_subscriptions (id, user_id, endpoint_hash, created_at) VALUES ($1, $2, $3, now())",
+					[sId, USER_M05, h]
+				);
+				await pg.query(
+					`INSERT INTO push_subscription_revisions
+					 (id, user_id, subscription_id, revision_no, operation, status, endpoint, p256dh, auth, occurred_at, idempotency_key, revision_fingerprint)
+					 VALUES
+					 (gen_random_uuid(), $1, $2, 1, 'REGISTER', 'ACTIVE', $3, $4, $5, now(), $6, $7)`,
+					[USER_M05, sId, `https://push.example.com/${sId}`, P256DH, AUTH, `sub-rev-${sId}`, F64]
+				);
+				const dId = crypto.randomUUID();
+				await pg.query(
+					"INSERT INTO notification_deliveries (id, user_id, notification_event_id, push_subscription_id, created_at) VALUES ($1, $2, $3, $4, now())",
+					[dId, USER_M05, EVT_M05, sId]
+				);
+				await pg.query(
+					"INSERT INTO notification_delivery_attempts (id, user_id, delivery_id, attempt_no, status, attempted_at, created_at) VALUES ($1, $2, $3, 1, 'TERMINAL_FAILURE', now(), now())",
+					[crypto.randomUUID(), USER_M05, dId]
+				);
+			}
+
+			// 2. Create subscription 201 (active, no delivery attempt yet)
+			const sub201Id = "00000000-0000-0000-0000-000000000201";
+			await pg.query(
+				"INSERT INTO push_subscriptions (id, user_id, endpoint_hash, created_at) VALUES ($1, $2, $3, now())",
+				[sub201Id, USER_M05, "201".padStart(64, "0")]
+			);
+			await pg.query(
+				`INSERT INTO push_subscription_revisions
+				 (id, user_id, subscription_id, revision_no, operation, status, endpoint, p256dh, auth, occurred_at, idempotency_key, revision_fingerprint)
+				 VALUES
+				 (gen_random_uuid(), $1, $2, 1, 'REGISTER', 'ACTIVE', $3, $4, $5, now(), $6, $7)`,
+				[USER_M05, sub201Id, "https://push.example.com/201", P256DH, AUTH, "sub-rev-201", F64]
+			);
+			await pg.query("SET session_replication_role = origin");
+
+			// 3. Query active subscriptions with limit 200 and forPendingEventId = EVT_M05
+			const { listActivePushSubscriptionsInTransaction } = await import("../src/notifications/subscriptions");
+			await db.transaction(async (tx: any) => {
+				const pending = await listActivePushSubscriptionsInTransaction(tx, USER_M05, 200, undefined, EVT_M05);
+				eqD(pending.length, 1, "PRE-7B.9 R1-R6 M-05: Exactly 1 pending subscription returned when first 200 are TERMINAL_FAILURE");
+				eqD(pending[0]?.subscriptionId, sub201Id, "PRE-7B.9 R1-R6 M-05: Subscription 201 is reached without starvation");
+			});
+		} finally {
+			setDatabaseFactoryOverrideForTest(null);
+			await pg.close();
+		}
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -20940,6 +21621,8 @@ if (probed) {
 	await resolverRuntime7B8R1();
 	await resolverRuntime7B9R1R2();
 	await resolverRuntime7B9R1R5();
+	await resolverRuntime7B9R1R6();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
+

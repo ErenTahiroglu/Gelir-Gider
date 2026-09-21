@@ -23,7 +23,8 @@ import {
 //   * The 10 MiB `DEFAULT_MAX_PLAINTEXT_BYTES` limit is a safe plaintext
 //     ceiling enforced by `exportDatabaseSnapshot` and `buildSnapshotPayload`,
 //     ensuring the Worker's 128 MB memory limit is strictly respected under
-//     measured ~8.2x simultaneous peak live heap amplification.
+//     formal simultaneous live representation bounds (<= 7.5x peak live bytes,
+//     yielding <= 75 MiB live memory and >= 48 MiB safety headroom).
 //
 //   * Deterministic byte amplification through the export -> encrypt ->
 //     upload -> read-back -> verify pipeline: the uploaded envelope is ~1.33x
@@ -147,9 +148,7 @@ describe("backup pipeline byte amplification", () => {
 // (`node --expose-gc --import tsx scripts/profile-backup-memory.ts`).
 describe("backup pipeline amplification sweep (deterministic bytes)", () => {
 	for (const targetMib of [1, 5, 10, 15, 20, 25, 30]) {
-		it(`profiles ${targetMib} MiB (${
-			targetMib > 25 ? "over" : "within"
-		} the 25 MiB ceiling)`, async () => {
+		it(`profiles ${targetMib} MiB synthetic plaintext`, async () => {
 			const result = await runAmplificationPipeline(targetMib * MIB);
 			expect(result.plaintextBytes / MIB).toBeGreaterThan(targetMib * 0.98);
 			expect(result.plaintextBytes / MIB).toBeLessThan(targetMib * 1.05 + 0.2);

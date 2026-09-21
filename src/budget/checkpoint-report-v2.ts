@@ -7,6 +7,7 @@ import {
 	isNotNull,
 	isNull,
 	lte,
+	or,
 } from "drizzle-orm";
 import { resolveAuthoritativePurchaseSplitAsOf } from "../credit-cards/purchase-split-read";
 import {
@@ -19,6 +20,7 @@ import {
 	incomeReceiptBudgetV2SemanticRevisions,
 	shortTermGoalBudgetV2PurposeRevisions,
 } from "../db/schema/budget-v2-semantics";
+import { budgetV2SpendingFoodSemanticRevisions } from "../db/schema/budget-v2-spending-food";
 import {
 	creditCardLiabilityEventRevisions,
 	creditCardLiabilityEvents,
@@ -64,6 +66,7 @@ import {
 	resolveBudgetV2LiveSnapshot,
 } from "./live-resolver-v2";
 import {
+	deriveFoodClassificationKind,
 	type FoodClassificationKind,
 	getSpendingFoodClassificationAsOf,
 } from "./spending-food-classification-v2";
@@ -1962,7 +1965,7 @@ interface FoodUniverseSubject {
  * Family/friend external shares, People RECEIVABLE, reimbursements, family
  * gift / support income, statement payments and Midas movement are excluded.
  */
-async function loadFoodUniverse(
+export async function loadFoodUniverse(
 	db: Database,
 	userId: string,
 	win: ResolverWindow,
@@ -1971,78 +1974,130 @@ async function loadFoodUniverse(
 ): Promise<FoodUniverseSubject[]> {
 	const subjects: FoodUniverseSubject[] = [];
 
-	for (const ev of events) {
+	if (events.length > 0) {
+		const eventIds = events.map((e) => e.eventId);
 		const revs = await db
 			.select({
 				id: creditCardLiabilityEventRevisions.id,
+				eventId: creditCardLiabilityEventRevisions.eventId,
 				revisionNo: creditCardLiabilityEventRevisions.revisionNo,
 				operation: creditCardLiabilityEventRevisions.operation,
 				amount: creditCardLiabilityEventRevisions.amount,
 				occurredAt: creditCardLiabilityEventRevisions.occurredAt,
 			})
 			.from(creditCardLiabilityEventRevisions)
-			.where(eq(creditCardLiabilityEventRevisions.eventId, ev.eventId));
-		const eff = effectiveRevisionAsOf(revs, checkpointAt);
-		if (!eff || eff.operation === "VOID") continue;
-		const at = asDate(eff.occurredAt);
-		if (!win.inMtd(at)) continue;
-		const grossCents = centsOf(eff.amount);
-		const shares = await purchaseSharesAsOf(
-			db,
-			userId,
-			ev.eventId,
-			grossCents,
-			checkpointAt,
-		);
-		if (!shares.available) {
-			reportFailClosed(
-				`MTD food: purchase ${ev.eventId} ownership cannot be authoritatively resolved as of the checkpoint (${shares.reason})`,
-			);
+			.where(
+				and(
+					inArray(creditCardLiabilityEventRevisions.eventId, eventIds),
+					lte(creditCardLiabilityEventRevisions.occurredAt, checkpointAt),
+				),
+			)
+			.orderBy(asc(creditCardLiabilityEventRevisions.revisionNo));
+
+		const revsByEventId = new Map<string, typeof revs>();
+		for (const r of revs) {
+			const list = revsByEventId.get(r.eventId) ?? [];
+			list.push(r);
+			revsByEventId.set(r.eventId, list);
 		}
-		if (shares.personalCents <= 0n) continue; // no personal spend to classify
-		subjects.push({
-			subjectType: "CREDIT_CARD_PURCHASE",
-			subjectId: ev.eventId,
-			effectiveFinancialRevisionId: eff.id,
-			personalCents: shares.personalCents,
-		});
+
+		for (const ev of events) {
+			const evRevs = revsByEventId.get(ev.eventId) ?? [];
+			const eff = effectiveRevisionAsOf(evRevs, checkpointAt);
+			if (!eff || eff.operation === "VOID") continue;
+			const at = asDate(eff.occurredAt);
+			if (!win.inMtd(at)) continue;
+			const grossCents = centsOf(eff.amount);
+			const shares = await purchaseSharesAsOf(
+				db,
+				userId,
+				ev.eventId,
+				grossCents,
+				checkpointAt,
+			);
+			if (!shares.available) {
+				reportFailClosed(
+					`MTD food: purchase ${ev.eventId} ownership cannot be authoritatively resolved as of the checkpoint (${shares.reason})`,
+				);
+			}
+			if (shares.personalCents <= 0n) continue; // no personal spend to classify
+			subjects.push({
+				subjectType: "CREDIT_CARD_PURCHASE",
+				subjectId: ev.eventId,
+				effectiveFinancialRevisionId: eff.id,
+				personalCents: shares.personalCents,
+			});
+		}
 	}
 
-	const payables = await db
-		.select({ id: personObligations.id })
-		.from(personObligations)
+	// Bounded DB query: only query obligations whose initial revision (revisionNo = 1)
+	// occurred within the MTD window, eliminating lifetime scans of historical obligations.
+	const payableCandidates = await db
+		.select({
+			obligationId: personObligationRevisions.obligationId,
+		})
+		.from(personObligationRevisions)
+		.innerJoin(
+			personObligations,
+			eq(personObligations.id, personObligationRevisions.obligationId),
+		)
 		.where(
 			and(
 				eq(personObligations.userId, userId),
 				eq(personObligations.direction, "PAYABLE"),
+				eq(personObligationRevisions.revisionNo, 1),
+				gte(personObligationRevisions.occurredAt, win.periodStart),
+				lte(personObligationRevisions.occurredAt, checkpointAt),
 			),
 		);
-	for (const o of payables) {
+
+	if (payableCandidates.length > 0) {
+		const payableCandidateIds = Array.from(
+			new Set(payableCandidates.map((c) => c.obligationId)),
+		);
 		const oRevs = await db
 			.select({
 				id: personObligationRevisions.id,
+				obligationId: personObligationRevisions.obligationId,
 				revisionNo: personObligationRevisions.revisionNo,
 				operation: personObligationRevisions.operation,
 				principal: personObligationRevisions.principalAmount,
 				occurredAt: personObligationRevisions.occurredAt,
 			})
 			.from(personObligationRevisions)
-			.where(eq(personObligationRevisions.obligationId, o.id));
-		const eff = effectiveRevisionAsOf(oRevs, checkpointAt);
-		if (!eff || eff.operation === "VOID") continue;
-		const create = oRevs.find((r) => r.revisionNo === 1);
-		if (!create) continue;
-		// Economic expense occurrence = the CREATE revision instant. A later
-		// UPDATE corrects the principal but not when the expense happened.
-		if (!win.inMtd(asDate(create.occurredAt))) continue;
-		const principalCents = centsOf(eff.principal);
-		if (principalCents <= 0n) continue;
-		subjects.push({
-			subjectType: "PEOPLE_PAYABLE",
-			subjectId: o.id,
-			effectiveFinancialRevisionId: eff.id,
-			personalCents: principalCents,
-		});
+			.where(
+				and(
+					inArray(personObligationRevisions.obligationId, payableCandidateIds),
+					lte(personObligationRevisions.occurredAt, checkpointAt),
+				),
+			)
+			.orderBy(asc(personObligationRevisions.revisionNo));
+
+		const revsByObligationId = new Map<string, typeof oRevs>();
+		for (const r of oRevs) {
+			const list = revsByObligationId.get(r.obligationId) ?? [];
+			list.push(r);
+			revsByObligationId.set(r.obligationId, list);
+		}
+
+		for (const obligationId of payableCandidateIds) {
+			const revs = revsByObligationId.get(obligationId) ?? [];
+			const eff = effectiveRevisionAsOf(revs, checkpointAt);
+			if (!eff || eff.operation === "VOID") continue;
+			const create = revs.find((r) => r.revisionNo === 1);
+			if (!create) continue;
+			// Economic expense occurrence = the CREATE revision instant. A later
+			// UPDATE corrects the principal but not when the expense happened.
+			if (!win.inMtd(asDate(create.occurredAt))) continue;
+			const principalCents = centsOf(eff.principal);
+			if (principalCents <= 0n) continue;
+			subjects.push({
+				subjectType: "PEOPLE_PAYABLE",
+				subjectId: obligationId,
+				effectiveFinancialRevisionId: eff.id,
+				personalCents: principalCents,
+			});
+		}
 	}
 
 	subjects.sort((a, b) =>
@@ -2053,7 +2108,7 @@ async function loadFoodUniverse(
 	return subjects;
 }
 
-async function buildFoodAnalytics(
+export async function buildFoodAnalytics(
 	db: Database,
 	userId: string,
 	win: ResolverWindow,
@@ -2076,95 +2131,80 @@ async function buildFoodAnalytics(
 	const unclassifiedSubjectIds: string[] = [];
 	const staleSubjectIds: string[] = [];
 
+	if (universe.length === 0) {
+		return {
+			available: true,
+			merchantInferenceUsed: false,
+			subjects: [],
+			classifiedSubjectCount: 0,
+			foodHomeMarket: "0.00",
+			foodOutside: "0.00",
+			foodTotal: "0.00",
+			classifiedPersonalSpend: "0.00",
+		};
+	}
+
+	// Batch resolve all semantic food classification revisions for all universe subjects in 1 query
+	const ccIds = universe
+		.filter((s) => s.subjectType === "CREDIT_CARD_PURCHASE")
+		.map((s) => s.subjectId);
+	const poIds = universe
+		.filter((s) => s.subjectType === "PEOPLE_PAYABLE")
+		.map((s) => s.subjectId);
+
+	const orFilters = [];
+	if (ccIds.length > 0) {
+		orFilters.push(
+			inArray(budgetV2SpendingFoodSemanticRevisions.purchaseEventId, ccIds),
+		);
+	}
+	if (poIds.length > 0) {
+		orFilters.push(
+			inArray(budgetV2SpendingFoodSemanticRevisions.personObligationId, poIds),
+		);
+	}
+
+	const semRevs = await db
+		.select()
+		.from(budgetV2SpendingFoodSemanticRevisions)
+		.where(
+			and(
+				eq(budgetV2SpendingFoodSemanticRevisions.userId, userId),
+				or(...orFilters),
+				lte(budgetV2SpendingFoodSemanticRevisions.occurredAt, checkpointAt),
+			),
+		)
+		.orderBy(asc(budgetV2SpendingFoodSemanticRevisions.revisionNo));
+
+	const semBySubject = new Map<string, typeof semRevs>();
+	for (const r of semRevs) {
+		const key = `${r.subjectType}:${r.purchaseEventId ?? r.personObligationId}`;
+		const list = semBySubject.get(key) ?? [];
+		list.push(r);
+		semBySubject.set(key, list);
+	}
+
 	for (const subj of universe) {
-		const view = await getSpendingFoodClassificationAsOf({
-			db,
-			userId,
-			subject:
-				subj.subjectType === "CREDIT_CARD_PURCHASE"
-					? { type: "CREDIT_CARD_PURCHASE", purchaseEventId: subj.subjectId }
-					: { type: "PEOPLE_PAYABLE", personObligationId: subj.subjectId },
-			asOf: checkpointAt,
-		});
+		const key = `${subj.subjectType}:${subj.subjectId}`;
+		const revs = semBySubject.get(key) ?? [];
+		const eff = effectiveRevisionAsOf(
+			revs.map((r) => ({ ...r, occurredAt: r.occurredAt })),
+			checkpointAt,
+		);
 
-		// The subject was pre-filtered to an economically-active source, so the
-		// only statuses possible here are CLASSIFIED / UNCLASSIFIED / STALE.
-		const status: FoodSubjectEntry["classificationStatus"] =
-			view.status === "CLASSIFIED"
-				? "CLASSIFIED"
-				: view.status === "STALE" || view.status === "SOURCE_VOID"
-					? "STALE"
-					: "UNCLASSIFIED";
-
+		let status: FoodSubjectEntry["classificationStatus"];
 		let entry: FoodSubjectEntry;
-		if (status === "CLASSIFIED") {
-			// Every field below is REQUIRED for a CLASSIFIED subject. Corruption
-			// fails the report closed -- never a plausible zero food spend.
-			const path = `foodAnalytics.subject[${subj.subjectId}]`;
-			const home = reqMoney(
-				view.foodHomeMarketAmount,
-				`${path}.foodHomeMarketAmount`,
-			);
-			const outside = reqMoney(
-				view.foodOutsideAmount,
-				`${path}.foodOutsideAmount`,
-			);
-			const total = reqMoney(view.foodTotalAmount, `${path}.foodTotalAmount`);
-			const nonFood = reqMoney(view.nonFoodAmount, `${path}.nonFoodAmount`);
-			const basis = reqMoney(
-				view.basisPersonalAmount,
-				`${path}.basisPersonalAmount`,
-			);
-			if (!view.semanticRevisionId || view.semanticRevisionNo == null) {
-				reportFailClosed(
-					`${path} is CLASSIFIED but carries no semantic revision identity`,
-				);
-			}
-			if (!view.classificationKind || !view.sourceKind) {
-				reportFailClosed(
-					`${path} is CLASSIFIED but carries no classificationKind / sourceKind`,
-				);
-			}
-			const hc = centsOf(home);
-			const oc = centsOf(outside);
-			// FOOD_TOTAL = FOOD_HOME_MARKET + FOOD_OUTSIDE (per subject).
-			if (centsOf(total) !== hc + oc) {
-				reportFailClosed(
-					`${path}: FOOD_TOTAL ${total} != FOOD_HOME_MARKET ${home} + FOOD_OUTSIDE ${outside}`,
-				);
-			}
-			if (centsOf(basis) !== hc + oc + centsOf(nonFood)) {
-				reportFailClosed(
-					`${path}: basis ${basis} != food ${total} + nonFood ${nonFood}`,
-				);
-			}
-			entry = {
-				subjectType: subj.subjectType,
-				subjectId: subj.subjectId,
-				effectiveFinancialRevisionId: subj.effectiveFinancialRevisionId,
-				personalEconomicAmount: formatCentsToMoney(subj.personalCents),
-				classificationStatus: "CLASSIFIED",
-				semanticRevisionId: view.semanticRevisionId,
-				semanticRevisionNo: view.semanticRevisionNo,
-				foodHomeMarketAmount: home,
-				foodOutsideAmount: outside,
-				foodTotalAmount: total,
-				nonFoodAmount: nonFood,
-				classificationKind: view.classificationKind,
-				sourceKind: view.sourceKind,
-			};
-			homeTotal += hc;
-			outsideTotal += oc;
-			classifiedPersonal += subj.personalCents;
-		} else {
+
+		if (!eff || eff.operation === "VOID") {
+			status = "UNCLASSIFIED";
 			entry = {
 				subjectType: subj.subjectType,
 				subjectId: subj.subjectId,
 				effectiveFinancialRevisionId: subj.effectiveFinancialRevisionId,
 				personalEconomicAmount: formatCentsToMoney(subj.personalCents),
 				classificationStatus: status,
-				semanticRevisionId: view.semanticRevisionId,
-				semanticRevisionNo: view.semanticRevisionNo,
+				semanticRevisionId: eff ? eff.id : null,
+				semanticRevisionNo: eff ? eff.revisionNo : null,
 				foodHomeMarketAmount: null,
 				foodOutsideAmount: null,
 				foodTotalAmount: null,
@@ -2173,8 +2213,98 @@ async function buildFoodAnalytics(
 				sourceKind: null,
 			};
 			unclassifiedOrStalePersonal += subj.personalCents;
-			if (status === "STALE") staleSubjectIds.push(subj.subjectId);
-			else unclassifiedSubjectIds.push(subj.subjectId);
+			unclassifiedSubjectIds.push(subj.subjectId);
+		} else {
+			const basisCents = centsOf(eff.basisPersonalAmount);
+			if (subj.personalCents === basisCents) {
+				status = "CLASSIFIED";
+			} else {
+				status = "STALE";
+			}
+
+			if (status === "CLASSIFIED") {
+				const path = `foodAnalytics.subject[${subj.subjectId}]`;
+				const home = reqMoney(
+					eff.foodHomeMarketAmount,
+					`${path}.foodHomeMarketAmount`,
+				);
+				const outside = reqMoney(
+					eff.foodOutsideAmount,
+					`${path}.foodOutsideAmount`,
+				);
+				const hc = centsOf(home);
+				const oc = centsOf(outside);
+				const total = formatCentsToMoney(hc + oc);
+				const nonFood = formatCentsToMoney(basisCents - (hc + oc));
+				const basis = reqMoney(
+					eff.basisPersonalAmount,
+					`${path}.basisPersonalAmount`,
+				);
+				if (!eff.id || eff.revisionNo == null) {
+					reportFailClosed(
+						`${path} is CLASSIFIED but carries no semantic revision identity`,
+					);
+				}
+				if (!eff.sourceKind) {
+					reportFailClosed(
+						`${path} is CLASSIFIED but carries no classificationKind / sourceKind`,
+					);
+				}
+				const classificationKind = deriveFoodClassificationKind(
+					basisCents,
+					hc,
+					oc,
+				);
+				// FOOD_TOTAL = FOOD_HOME_MARKET + FOOD_OUTSIDE (per subject).
+				if (centsOf(total) !== hc + oc) {
+					reportFailClosed(
+						`${path}: FOOD_TOTAL ${total} != FOOD_HOME_MARKET ${home} + FOOD_OUTSIDE ${outside}`,
+					);
+				}
+				if (centsOf(basis) !== hc + oc + centsOf(nonFood)) {
+					reportFailClosed(
+						`${path}: basis ${basis} != food ${total} + nonFood ${nonFood}`,
+					);
+				}
+				entry = {
+					subjectType: subj.subjectType,
+					subjectId: subj.subjectId,
+					effectiveFinancialRevisionId: subj.effectiveFinancialRevisionId,
+					personalEconomicAmount: formatCentsToMoney(subj.personalCents),
+					classificationStatus: "CLASSIFIED",
+					semanticRevisionId: eff.id,
+					semanticRevisionNo: eff.revisionNo,
+					foodHomeMarketAmount: home,
+					foodOutsideAmount: outside,
+					foodTotalAmount: total,
+					nonFoodAmount: nonFood,
+					classificationKind,
+					sourceKind: eff.sourceKind as
+						| "USER_APPROVED"
+						| "USER_APPROVED_FROM_SUGGESTION",
+				};
+				homeTotal += hc;
+				outsideTotal += oc;
+				classifiedPersonal += subj.personalCents;
+			} else {
+				entry = {
+					subjectType: subj.subjectType,
+					subjectId: subj.subjectId,
+					effectiveFinancialRevisionId: subj.effectiveFinancialRevisionId,
+					personalEconomicAmount: formatCentsToMoney(subj.personalCents),
+					classificationStatus: "STALE",
+					semanticRevisionId: eff.id,
+					semanticRevisionNo: eff.revisionNo,
+					foodHomeMarketAmount: null,
+					foodOutsideAmount: null,
+					foodTotalAmount: null,
+					nonFoodAmount: null,
+					classificationKind: null,
+					sourceKind: null,
+				};
+				unclassifiedOrStalePersonal += subj.personalCents;
+				staleSubjectIds.push(subj.subjectId);
+			}
 		}
 		subjects.push(entry);
 	}
@@ -2259,10 +2389,12 @@ async function loadSurplusUseCandidateUniverse(
 	const ambiguous = new Set(overlap.ambiguousPurchaseEventIds);
 
 	// ---- 11A. personal spending -- credit-card purchase PERSONAL share ----
-	for (const ev of events) {
+	if (events.length > 0) {
+		const eventIds = events.map((e) => e.eventId);
 		const revs = await db
 			.select({
 				id: creditCardLiabilityEventRevisions.id,
+				eventId: creditCardLiabilityEventRevisions.eventId,
 				revisionNo: creditCardLiabilityEventRevisions.revisionNo,
 				operation: creditCardLiabilityEventRevisions.operation,
 				amount: creditCardLiabilityEventRevisions.amount,
@@ -2270,50 +2402,68 @@ async function loadSurplusUseCandidateUniverse(
 				occurredAt: creditCardLiabilityEventRevisions.occurredAt,
 			})
 			.from(creditCardLiabilityEventRevisions)
-			.where(eq(creditCardLiabilityEventRevisions.eventId, ev.eventId));
-		const eff = effectiveRevisionAsOf(revs, checkpointAt);
-		if (!eff || eff.operation === "VOID") continue;
-		if (!win.inMtd(asDate(eff.occurredAt))) continue;
-		const shares = await purchaseSharesAsOf(
-			db,
-			userId,
-			ev.eventId,
-			centsOf(eff.amount),
-			checkpointAt,
-		);
-		if (!shares.available) {
-			reportFailClosed(
-				`surplus-use: purchase ${ev.eventId} ownership cannot be authoritatively resolved as of the checkpoint (${shares.reason})`,
+			.where(
+				and(
+					inArray(creditCardLiabilityEventRevisions.eventId, eventIds),
+					lte(creditCardLiabilityEventRevisions.occurredAt, checkpointAt),
+				),
+			)
+			.orderBy(asc(creditCardLiabilityEventRevisions.revisionNo));
+
+		const revsByEventId = new Map<string, typeof revs>();
+		for (const r of revs) {
+			const list = revsByEventId.get(r.eventId) ?? [];
+			list.push(r);
+			revsByEventId.set(r.eventId, list);
+		}
+
+		for (const ev of events) {
+			const evRevs = revsByEventId.get(ev.eventId) ?? [];
+			const eff = effectiveRevisionAsOf(evRevs, checkpointAt);
+			if (!eff || eff.operation === "VOID") continue;
+			if (!win.inMtd(asDate(eff.occurredAt))) continue;
+			const shares = await purchaseSharesAsOf(
+				db,
+				userId,
+				ev.eventId,
+				centsOf(eff.amount),
+				checkpointAt,
 			);
+			if (!shares.available) {
+				reportFailClosed(
+					`surplus-use: purchase ${ev.eventId} ownership cannot be authoritatively resolved as of the checkpoint (${shares.reason})`,
+				);
+			}
+			const personalCents = shares.personalCents;
+			if (personalCents <= 0n) continue;
+			const coveredCents =
+				overlap.purchasePersonalCoveredCents.get(ev.eventId) ?? 0n;
+			let overlapExact = true;
+			let overlapUnresolvedReason: string | null = null;
+			if (ambiguous.has(ev.eventId)) {
+				overlapExact = false;
+				overlapUnresolvedReason =
+					"a partial pre-period reserve carry-in makes the per-purchase currentObligations overlap ambiguous";
+			} else if (
+				eff.budgetCategory === "MANDATORY_EXPENSE" &&
+				coveredCents < personalCents
+			) {
+				overlapExact = false;
+				overlapUnresolvedReason =
+					"a MANDATORY_EXPENSE personal share not fully inside currentObligations is basic-living funded in aggregate; per-source overlap is not exact";
+			}
+			out.push({
+				subject: { type: "CREDIT_CARD_PURCHASE", purchaseEventId: ev.eventId },
+				subjectType: "CREDIT_CARD_PURCHASE",
+				subjectId: ev.eventId,
+				lane: "DISCRETIONARY",
+				sourceEconomicCents: personalCents,
+				coveredCents:
+					coveredCents > personalCents ? personalCents : coveredCents,
+				overlapExact,
+				overlapUnresolvedReason,
+			});
 		}
-		const personalCents = shares.personalCents;
-		if (personalCents <= 0n) continue;
-		const coveredCents =
-			overlap.purchasePersonalCoveredCents.get(ev.eventId) ?? 0n;
-		let overlapExact = true;
-		let overlapUnresolvedReason: string | null = null;
-		if (ambiguous.has(ev.eventId)) {
-			overlapExact = false;
-			overlapUnresolvedReason =
-				"a partial pre-period reserve carry-in makes the per-purchase currentObligations overlap ambiguous";
-		} else if (
-			eff.budgetCategory === "MANDATORY_EXPENSE" &&
-			coveredCents < personalCents
-		) {
-			overlapExact = false;
-			overlapUnresolvedReason =
-				"a MANDATORY_EXPENSE personal share not fully inside currentObligations is basic-living funded in aggregate; per-source overlap is not exact";
-		}
-		out.push({
-			subject: { type: "CREDIT_CARD_PURCHASE", purchaseEventId: ev.eventId },
-			subjectType: "CREDIT_CARD_PURCHASE",
-			subjectId: ev.eventId,
-			lane: "DISCRETIONARY",
-			sourceEconomicCents: personalCents,
-			coveredCents: coveredCents > personalCents ? personalCents : coveredCents,
-			overlapExact,
-			overlapUnresolvedReason,
-		});
 	}
 
 	// ---- 11A. personal spending -- People PAYABLE principal ----

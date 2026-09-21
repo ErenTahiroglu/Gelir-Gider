@@ -865,7 +865,7 @@ export async function listActivePushSubscriptionsInTransaction(
 					JOIN notification_delivery_attempts nda ON nd.id = nda.delivery_id
 					WHERE nd.notification_event_id = ${forPendingEventId}
 					  AND nd.push_subscription_id = lr.subscription_id
-					  AND nda.status IN ('SUCCESS', 'SUPPRESSED_OBSOLETE')
+					  AND nda.status IN ('SUCCESS', 'TERMINAL_FAILURE', 'SUPPRESSED_OBSOLETE')
 				)`
 				: sql``
 		}
