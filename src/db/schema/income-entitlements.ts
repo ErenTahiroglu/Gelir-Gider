@@ -224,3 +224,47 @@ export const incomeSettlementBatchRevisions = pgTable(
 		),
 	],
 );
+
+/**
+ * Normalized Income Settlement Allocation Rows Table (Append-Only Projection)
+ * Indexable normalized projection of batch revision allocations for O(relevant allocations) page queries.
+ */
+export const incomeSettlementAllocationRows = pgTable(
+	"income_settlement_allocation_rows",
+	{
+		id: uuid("id").defaultRandom().primaryKey().notNull(),
+		userId: uuid("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "restrict" }),
+		settlementBatchId: uuid("settlement_batch_id")
+			.notNull()
+			.references(() => incomeSettlementBatches.id, { onDelete: "restrict" }),
+		settlementBatchRevisionId: uuid("settlement_batch_revision_id")
+			.notNull()
+			.references(() => incomeSettlementBatchRevisions.id, {
+				onDelete: "restrict",
+			}),
+		revisionNo: integer("revision_no").notNull(),
+		entitlementId: uuid("entitlement_id")
+			.notNull()
+			.references(() => incomeEntitlements.id, { onDelete: "restrict" }),
+		allocatedAmount: numeric("allocated_amount", {
+			precision: 18,
+			scale: 2,
+		}).notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+			.defaultNow()
+			.notNull(),
+	},
+	(table) => [
+		index("idx_income_settlement_alloc_rows_user_entitlement").on(
+			table.userId,
+			table.entitlementId,
+			table.settlementBatchId,
+			table.revisionNo,
+		),
+		index("idx_income_settlement_alloc_rows_revision").on(
+			table.settlementBatchRevisionId,
+		),
+	],
+);

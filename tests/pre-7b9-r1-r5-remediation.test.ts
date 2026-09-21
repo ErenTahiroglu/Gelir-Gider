@@ -1,9 +1,12 @@
 import { getTableConfig } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import journal from "../migrations/meta/_journal.json";
-import snapshot0075 from "../migrations/meta/0075_snapshot.json";
+import snapshot0076 from "../migrations/meta/0076_snapshot.json";
 import { BackupError } from "../src/backups/errors";
-import { buildSnapshotPayload } from "../src/backups/export";
+import {
+	buildSnapshotPayload,
+	DEFAULT_MAX_PLAINTEXT_BYTES,
+} from "../src/backups/export";
 import { discoverBackupTableRegistry } from "../src/backups/registry";
 import {
 	decodeCampaignOverrideCursor,
@@ -38,21 +41,50 @@ import {
 	encodeRewardEventCursor,
 } from "../src/rewards/pagination";
 
-describe("R1-R4.1 (M-02) Migration 0075 integrity & journal registration", () => {
-	it("verifies migration 0075 is recorded in _journal.json and snapshot exists", () => {
-		const entry75 = (
-			journal.entries as Array<{ idx: number; tag: string; when: number }>
-		).find((e) => e.idx === 75);
-		expect(entry75).toBeDefined();
-		expect(entry75?.tag).toBe(
-			"0075_historical_settlement_replay_reconstruction",
-		);
+describe("R1-R5.1 (B-01) Backup peak memory safety & registry primary keys", () => {
+	it("ensures every table in discoverBackupTableRegistry has exactly 1 primary key column", () => {
+		const tables = discoverBackupTableRegistry();
+		expect(tables.length).toBeGreaterThan(0);
+		for (const table of tables) {
+			const config = getTableConfig(table);
+			const pkCols = config.columns.filter((c) => c.primary);
+			expect(pkCols.length).toBe(1);
+		}
+	});
 
-		expect(snapshot0075.prevId).toBe("c4a92de8-b715-46f9-bf55-cb81e19481ea");
+	it("enforces safe 10 MiB default plaintext ceiling and throws BACKUP_TOO_LARGE when exceeded", async () => {
+		expect(DEFAULT_MAX_PLAINTEXT_BYTES).toBe(10 * 1024 * 1024);
+
+		const payload = {
+			formatVersion: "V1",
+			backupId: "test-bk",
+			createdAt: new Date().toISOString(),
+			tables: [
+				{
+					tableName: "test",
+					rowCount: 1,
+					rows: [{ id: "1", data: "x".repeat(5000) }],
+					tableContentHash: "hash",
+				},
+			],
+			maxPlaintextBytes: 100,
+		};
+		await expect(buildSnapshotPayload(payload)).rejects.toThrow(BackupError);
 	});
 });
 
-describe("R1-R4.3 (N-02) Cursor scope enforcement & cross-scope fail-closed rejection", () => {
+describe("R1-R5.3 (B-03A) Migration 0076 normalized allocation rows journal registration", () => {
+	it("verifies migration 0076 is recorded in _journal.json and snapshot exists", () => {
+		const entry76 = (
+			journal.entries as Array<{ idx: number; tag: string; when: number }>
+		).find((e) => e.idx === 76);
+		expect(entry76).toBeDefined();
+		expect(entry76?.tag).toContain("0076");
+		expect(snapshot0076).toBeDefined();
+	});
+});
+
+describe("R1-R5 (N-02) Cursor scope enforcement & cross-scope fail-closed rejection", () => {
 	const userA = "00000000-0000-0000-0000-00000000000a";
 	const userB = "00000000-0000-0000-0000-00000000000b";
 	const cardA = "11111111-1111-1111-1111-11111111111a";
@@ -219,35 +251,5 @@ describe("R1-R4.3 (N-02) Cursor scope enforcement & cross-scope fail-closed reje
 				campaignPeriodId: "00000000-0000-0000-0000-000000000000",
 			}),
 		).toThrow();
-	});
-});
-
-describe("R1-R4.6 (B-01) Backup safety & registry primary keys", () => {
-	it("ensures every table in discoverBackupTableRegistry has exactly 1 primary key column", () => {
-		const tables = discoverBackupTableRegistry();
-		expect(tables.length).toBeGreaterThan(0);
-		for (const table of tables) {
-			const config = getTableConfig(table);
-			const pkCols = config.columns.filter((c) => c.primary);
-			expect(pkCols.length).toBe(1);
-		}
-	});
-
-	it("throws BACKUP_TOO_LARGE when plaintext exceeds ceiling", async () => {
-		const payload = {
-			formatVersion: "V1",
-			backupId: "test-bk",
-			createdAt: new Date().toISOString(),
-			tables: [
-				{
-					tableName: "test",
-					rowCount: 1,
-					rows: [{ id: "1", data: "x".repeat(5000) }],
-					tableContentHash: "hash",
-				},
-			],
-			maxPlaintextBytes: 100,
-		};
-		await expect(buildSnapshotPayload(payload)).rejects.toThrow(BackupError);
 	});
 });

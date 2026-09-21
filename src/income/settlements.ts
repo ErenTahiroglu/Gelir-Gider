@@ -4,6 +4,7 @@ import { incomeReceiptRevisions, incomeReceipts } from "../db/schema/income";
 import {
 	incomeEntitlementRevisions,
 	incomeEntitlements,
+	incomeSettlementAllocationRows,
 	incomeSettlementBatches,
 	incomeSettlementBatchRevisions,
 	type SettlementAllocationItem,
@@ -596,6 +597,19 @@ export async function createIncomeSettlement(
 			);
 		}
 
+		if (normalizedAllocations.length > 0) {
+			await tx.insert(incomeSettlementAllocationRows).values(
+				normalizedAllocations.map((a) => ({
+					userId,
+					settlementBatchId: batch.id,
+					settlementBatchRevisionId: batchRev.id,
+					revisionNo: batchRev.revisionNo,
+					entitlementId: a.entitlementId,
+					allocatedAmount: a.amount,
+				})),
+			);
+		}
+
 		const unallocatedCents =
 			receiptCents > totalAllocatedCents
 				? receiptCents - totalAllocatedCents
@@ -1052,6 +1066,19 @@ export async function reviseIncomeSettlement(
 			throw new IncomeError(
 				"INCOME_SETTLEMENT_NOT_FOUND",
 				"Failed to insert revised settlement batch revision",
+			);
+		}
+
+		if (normalizedAllocations.length > 0) {
+			await tx.insert(incomeSettlementAllocationRows).values(
+				normalizedAllocations.map((a) => ({
+					userId,
+					settlementBatchId: batch.id,
+					settlementBatchRevisionId: newBatchRev.id,
+					revisionNo: newBatchRev.revisionNo,
+					entitlementId: a.entitlementId,
+					allocatedAmount: a.amount,
+				})),
 			);
 		}
 

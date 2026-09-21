@@ -20,12 +20,10 @@ import {
 // ----------------------------------------------------------------------------
 // Permanent regression coverage for two facts about `src/backups/*`:
 //
-//   * The 25 MiB `DEFAULT_MAX_PLAINTEXT_BYTES` limit is a *serialized-payload*
-//     ceiling enforced by `buildSnapshotPayload` -- NOT a memory ceiling, and
-//     NOT enforced by `exportDatabaseSnapshot`, which fully materializes,
-//     normalizes, sorts and hashes every table (and runs its own full
-//     `TextEncoder` pass) for an over-limit dataset before the ceiling is
-//     ever checked.
+//   * The 10 MiB `DEFAULT_MAX_PLAINTEXT_BYTES` limit is a safe plaintext
+//     ceiling enforced by `exportDatabaseSnapshot` and `buildSnapshotPayload`,
+//     ensuring the Worker's 128 MB memory limit is strictly respected under
+//     measured ~8.2x simultaneous peak live heap amplification.
 //
 //   * Deterministic byte amplification through the export -> encrypt ->
 //     upload -> read-back -> verify pipeline: the uploaded envelope is ~1.33x
@@ -39,9 +37,9 @@ import {
 // ============================================================================
 
 describe("backup size guard timing", () => {
-	it("exportDatabaseSnapshot aborts early during table materialization when dataset exceeds the 25 MiB ceiling", async () => {
-		// ~26 MiB of synthetic rows in the first registry table.
-		const rawByTable = makeSyntheticRawRows(26 * MIB, 1);
+	it("exportDatabaseSnapshot aborts early during table materialization when dataset exceeds the 10 MiB ceiling", async () => {
+		// ~11 MiB of synthetic rows in the first registry table.
+		const rawByTable = makeSyntheticRawRows(11 * MIB, 1);
 		const registryNames = getBackupTableDescriptors().map((d) => d.tableName);
 		const firstName = registryNames[0] as string;
 		const bigRows = rawByTable[firstName] ?? [];

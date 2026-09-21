@@ -828,6 +828,7 @@ export async function listActivePushSubscriptionsInTransaction(
 	userId: string,
 	limit = 50,
 	afterSubscriptionId?: string | undefined,
+	forPendingEventId?: string | undefined,
 ): Promise<PushSubscriptionReadModel[]> {
 	const rawResult = await tx.execute(sql`
 		WITH latest_revisions AS (
@@ -854,10 +855,21 @@ export async function listActivePushSubscriptionsInTransaction(
 			ORDER BY ${pushSubscriptions.id}, ${pushSubscriptionRevisions.revisionNo} DESC
 		)
 		SELECT *
-		FROM latest_revisions
-		WHERE status = 'ACTIVE'
-		${afterSubscriptionId ? sql`AND subscription_id > ${afterSubscriptionId}` : sql``}
-		ORDER BY subscription_id ASC
+		FROM latest_revisions lr
+		WHERE lr.status = 'ACTIVE'
+		${afterSubscriptionId ? sql`AND lr.subscription_id > ${afterSubscriptionId}` : sql``}
+		${
+			forPendingEventId
+				? sql`AND NOT EXISTS (
+					SELECT 1 FROM notification_deliveries nd
+					JOIN notification_delivery_attempts nda ON nd.id = nda.delivery_id
+					WHERE nd.notification_event_id = ${forPendingEventId}
+					  AND nd.push_subscription_id = lr.subscription_id
+					  AND nda.status IN ('SUCCESS', 'SUPPRESSED_OBSOLETE')
+				)`
+				: sql``
+		}
+		ORDER BY lr.subscription_id ASC
 		LIMIT ${limit}
 	`);
 

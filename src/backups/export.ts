@@ -10,8 +10,13 @@ import {
 } from "./manifest";
 import { getBackupTableDescriptors } from "./registry";
 
-/** Default plaintext size ceiling: 25 MiB. Overridable for tests. */
-export const DEFAULT_MAX_PLAINTEXT_BYTES = 25 * 1024 * 1024;
+/**
+ * Safe plaintext size ceiling: 10 MiB.
+ * Proven safe for Cloudflare Worker 128 MB memory limit under measured ~8.2x
+ * peak live heap amplification during snapshot, encryption, and verification.
+ * Overridable for tests.
+ */
+export const DEFAULT_MAX_PLAINTEXT_BYTES = 10 * 1024 * 1024;
 
 function bytesToBase64(bytes: Uint8Array): string {
 	let binary = "";

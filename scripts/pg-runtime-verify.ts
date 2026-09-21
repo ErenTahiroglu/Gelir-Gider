@@ -375,7 +375,7 @@ async function runtime() {
 	const db = new PGlite();
 	await db.query("SET timezone='UTC'");
 	try {
-		await applyChain(db, 73);
+		await applyChain(db, 76);
 		ok("migration chain 0000..0071 applied to an empty PostgreSQL database");
 	} catch (e) {
 		bad("migration chain apply", "\n" + (e as Error).message);
@@ -1057,7 +1057,7 @@ async function resolverRuntime() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -1467,7 +1467,7 @@ async function resolverRuntime4A() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	const F = "f".repeat(64);
@@ -1965,7 +1965,7 @@ async function resolverRuntime4A1() {
 	{
 		const pg0 = new PGlite();
 		await pg0.query("SET timezone='UTC'");
-		await applyChain(pg0, 70);
+		await applyChain(pg0, 76);
 		// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 		const db0 = drizzle(pg0 as any) as any;
 		try {
@@ -1988,7 +1988,7 @@ async function resolverRuntime4A1() {
 	// --- partial carry-in overlap (A..E) ----------------------------------
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 70);
+	await applyChain(pg, 76);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 	const F = "f".repeat(64);
@@ -2258,7 +2258,7 @@ async function make4bScenario() {
 	} = B4_IDS;
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -13312,7 +13312,7 @@ async function resolverRuntime7B2R1() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
 	const db = drizzle(pg as any) as any;
 
@@ -13539,7 +13539,7 @@ async function resolverRuntime7B2R2() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	// Drop test-only singleton constraint in disposable DB so User A and User B can coexist in the same database
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
@@ -14029,7 +14029,7 @@ async function resolverRuntime7B3() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 
@@ -14632,7 +14632,7 @@ async function resolverRuntime7B3R1() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 
@@ -15177,7 +15177,7 @@ async function resolverRuntime7B3R2() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 	// biome-ignore lint/suspicious/noExplicitAny: cross-driver drizzle client
@@ -15502,7 +15502,7 @@ async function resolverRuntime7B4() {
 	console.log("\n--- RESOLVER RUNTIME 7B.4 (People + Family Product HTTP Surface) ---");
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 	const { drizzle } = await import("drizzle-orm/pglite");
@@ -16429,7 +16429,7 @@ async function resolverRuntime7B5(): Promise<void> {
 	console.log("\n--- Checkpoint 7B.5: Rewards Product HTTP Surface Runtime Verification ---");
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 	const { drizzle } = await import("drizzle-orm/pglite");
@@ -17069,7 +17069,7 @@ async function resolverRuntime7B6(): Promise<void> {
 	console.log("\n--- Checkpoint 7B.6: Campaigns Product HTTP Surface Runtime Verification ---");
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 	const { drizzle } = await import("drizzle-orm/pglite");
@@ -18065,7 +18065,7 @@ async function resolverRuntime7B7() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 
@@ -19283,7 +19283,7 @@ async function resolverRuntime7B8() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 
@@ -19982,7 +19982,7 @@ async function resolverRuntime7B8R1() {
 
 	const pg = new PGlite();
 	await pg.query("SET timezone='UTC'");
-	await applyChain(pg, 73);
+	await applyChain(pg, 76);
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 	await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 
@@ -20238,7 +20238,7 @@ async function resolverRuntime7B9R1R2(): Promise<void> {
 	console.log("\n--- Phase 7B.9-R1-R2: MC-01 / M-02 / M-03 / B-01 Hardening Verification ---");
 	const pg = new PGlite();
 	try {
-		await applyChain(pg, 73);
+		await applyChain(pg, 76);
 		await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
 		await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
 		const { drizzle } = await import("drizzle-orm/pglite");
@@ -20627,6 +20627,282 @@ async function resolverRuntime7B9R1R2(): Promise<void> {
 	}
 }
 
+async function resolverRuntime7B9R1R5(): Promise<void> {
+	console.log("\n--- Phase PRE-7B.9 R1-R5: Comprehensive M-02 / B-03A / M-05 / B-02 Verification ---");
+	const pg = new PGlite();
+	try {
+		await applyChain(pg, 76);
+		await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_check");
+		await pg.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_singleton_key_unique");
+		const { drizzle } = await import("drizzle-orm/pglite");
+		const schema = await import("../src/db/schema/index.ts");
+		const db = drizzle(pg as any, { schema }) as any;
+		setDatabaseFactoryOverrideForTest(() => db);
+
+		const { listActivePushSubscriptionsInTransaction } = await import(
+			"../src/notifications/subscriptions.ts"
+		);
+
+		const eqD = (a: unknown, b: unknown, msg: string) => {
+			if (a === b) ok(msg);
+			else bad(msg, `expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
+		};
+		const chkD = (cond: boolean, msg: string) => {
+			if (cond) ok(msg);
+			else bad(msg, "condition failed");
+		};
+
+		const USER_R1R5 = "99999999-9999-4999-a999-999999999999";
+		await pg.query("SET session_replication_role = replica");
+		await pg.query(
+			"insert into users (id, display_name, currency, timezone, auth_initialized_at) values ($1, $2, 'TRY', 'Europe/Istanbul', now())",
+			[USER_R1R5, "User R1R5"],
+		);
+		await pg.query("SET session_replication_role = origin");
+
+		// --------------------------------------------------------------------
+		// 1. M-02: Legacy Income settlement historical replay / revision immutability
+		// --------------------------------------------------------------------
+		const bankAcc = await createProductLedgerAccount({
+			db,
+			userId: USER_R1R5,
+			code: "BANK_R1R5",
+			name: "Primary Checking R1R5",
+			accountType: "ASSET",
+		});
+		const incomeAcc = await createLedgerAccount({
+			db,
+			userId: USER_R1R5,
+			code: "INC_SALARY_R1R5",
+			name: "Salary Account R1R5",
+			accountType: "INCOME",
+		});
+		const srcRes = await createIncomeSource({
+			db,
+			userId: USER_R1R5,
+			code: "SRC_SALARY_R1R5",
+			name: "Primary Salary R1R5",
+			nature: "REGULAR",
+			referenceMethod: "FIXED_MONTHLY",
+			expectedMonthlyAmount: "2000.00",
+			incomeLedgerAccountId: incomeAcc.id,
+			activeFrom: "2026-01-01",
+			idempotencyKey: "src-salary-r1r5-key",
+		});
+		const entRes1 = await createIncomeEntitlement({
+			db,
+			userId: USER_R1R5,
+			sourceId: srcRes.id,
+			periodMonth: "2026-05-01",
+			amount: "1000.00",
+			idempotencyKey: "ent-1-r1r5-key",
+			provenance: { type: "MANUAL", ref: "ent-1" },
+		});
+		const recRes1 = await createIncomeReceipt({
+			db,
+			userId: USER_R1R5,
+			sourceId: srcRes.id,
+			amount: "1200.00",
+			destinationAccountId: bankAcc.account.id,
+			receivedAt: new Date("2026-05-10T10:00:00.000Z"),
+			idempotencyKey: "rec-1-r1r5-key",
+			provenance: { type: "MANUAL", ref: "rec-1" },
+		});
+
+		// Settle 1000.00 against entRes1
+		const setRes1 = await createIncomeSettlement({
+			db,
+			userId: USER_R1R5,
+			incomeReceiptId: recRes1.incomeReceipt.incomeReceiptId,
+			allocations: [{ entitlementId: entRes1.incomeEntitlement.entitlementId, amount: "1000.00" }],
+			idempotencyKey: "set-1-r1r5-key",
+			provenance: { type: "MANUAL", ref: "set-1" },
+		});
+		chkD(Boolean(setRes1.settlement.settlementBatchId), "PRE-7B.9 R1-R5 M-02: Initial settlement created");
+
+		// Check initial replay: receiptAmount 1200.00, remaining unallocated 200.00, allocated 1000.00
+		const replay1 = await getIncomeReceiptSettlement({
+			db,
+			userId: USER_R1R5,
+			incomeReceiptId: recRes1.incomeReceipt.incomeReceiptId,
+		});
+		eqD(replay1?.receiptAmount, "1200.00", "PRE-7B.9 R1-R5 M-02: Replay 1 receiptAmount = 1200.00");
+		eqD(replay1?.unallocatedAmount, "200.00", "PRE-7B.9 R1-R5 M-02: Replay 1 unallocatedAmount = 200.00");
+		eqD(replay1?.allocations.length, 1, "PRE-7B.9 R1-R5 M-02: Replay 1 has 1 allocation");
+		eqD(replay1?.allocations[0]?.allocatedAmount, "1000.00", "PRE-7B.9 R1-R5 M-02: Replay 1 allocatedAmount = 1000.00");
+
+		// Revise Receipt R1 from 1200.00 -> 1500.00
+		await reviseIncomeReceipt({
+			db,
+			userId: USER_R1R5,
+			incomeReceiptId: recRes1.incomeReceipt.incomeReceiptId,
+			expectedRevisionNo: 1,
+			amount: "1500.00",
+			destinationAccountId: bankAcc.account.id,
+			receivedAt: new Date("2026-05-10T10:00:00.000Z"),
+			reasonCode: INCOME_USER_EDIT_REASON_CODE,
+			idempotencyKey: "rec-1-r1r5-rev-key",
+			provenance: { type: "MANUAL", ref: "rec-1-rev" },
+		});
+
+		// Check replay: shows current receipt amount 1500.00, unallocated 500.00, allocation still 1000.00
+		const replay2 = await getIncomeReceiptSettlement({
+			db,
+			userId: USER_R1R5,
+			incomeReceiptId: recRes1.incomeReceipt.incomeReceiptId,
+		});
+		eqD(replay2?.receiptAmount, "1500.00", "PRE-7B.9 R1-R5 M-02: Replay 2 reflects revised receipt amount 1500.00");
+		eqD(replay2?.unallocatedAmount, "500.00", "PRE-7B.9 R1-R5 M-02: Replay 2 unallocatedAmount = 500.00");
+		eqD(replay2?.allocations[0]?.allocatedAmount, "1000.00", "PRE-7B.9 R1-R5 M-02: Replay 2 allocation intact at 1000.00");
+
+		// Revise Entitlement E1 from 1000.00 -> 1400.00
+		await reviseIncomeEntitlement({
+			db,
+			userId: USER_R1R5,
+			entitlementId: entRes1.incomeEntitlement.entitlementId,
+			expectedRevisionNo: 1,
+			amount: "1400.00",
+			reasonCode: INCOME_USER_EDIT_REASON_CODE,
+			idempotencyKey: "ent-1-r1r5-rev-key",
+			provenance: { type: "MANUAL", ref: "ent-1-rev" },
+		});
+
+		// Revise settlement to allocate 1400.00 against entRes1
+		const setRevRes = await reviseIncomeSettlement({
+			db,
+			userId: USER_R1R5,
+			incomeReceiptId: recRes1.incomeReceipt.incomeReceiptId,
+			expectedRevisionNo: 1,
+			allocations: [{ entitlementId: entRes1.incomeEntitlement.entitlementId, amount: "1400.00" }],
+			reasonCode: INCOME_USER_EDIT_REASON_CODE,
+			idempotencyKey: "set-1-r1r5-rev-key",
+			provenance: { type: "MANUAL", ref: "set-1-rev" },
+		});
+		chkD(Boolean(setRevRes.settlement.settlementBatchId), "PRE-7B.9 R1-R5 M-02: Settlement revised successfully");
+
+		const replay3 = await getIncomeReceiptSettlement({
+			db,
+			userId: USER_R1R5,
+			incomeReceiptId: recRes1.incomeReceipt.incomeReceiptId,
+		});
+		eqD(replay3?.receiptAmount, "1500.00", "PRE-7B.9 R1-R5 M-02: Replay 3 receiptAmount = 1500.00");
+		eqD(replay3?.unallocatedAmount, "100.00", "PRE-7B.9 R1-R5 M-02: Replay 3 unallocatedAmount = 100.00");
+		eqD(replay3?.allocations[0]?.allocatedAmount, "1400.00", "PRE-7B.9 R1-R5 M-02: Replay 3 allocatedAmount = 1400.00");
+
+		// --------------------------------------------------------------------
+		// 2. B-03A: Income entitlement DB-side page scoping (0076 normalized rows)
+		// --------------------------------------------------------------------
+		const entRes2 = await createIncomeEntitlement({
+			db,
+			userId: USER_R1R5,
+			sourceId: srcRes.id,
+			periodMonth: "2026-06-01",
+			amount: "800.00",
+			idempotencyKey: "ent-2-r1r5-key",
+			provenance: { type: "MANUAL", ref: "ent-2" },
+		});
+		const recRes2 = await createIncomeReceipt({
+			db,
+			userId: USER_R1R5,
+			sourceId: srcRes.id,
+			amount: "800.00",
+			destinationAccountId: bankAcc.account.id,
+			receivedAt: new Date("2026-06-10T10:00:00.000Z"),
+			idempotencyKey: "rec-2-r1r5-key",
+			provenance: { type: "MANUAL", ref: "rec-2" },
+		});
+		await createIncomeSettlement({
+			db,
+			userId: USER_R1R5,
+			incomeReceiptId: recRes2.incomeReceipt.incomeReceiptId,
+			allocations: [{ entitlementId: entRes2.incomeEntitlement.entitlementId, amount: "800.00" }],
+			idempotencyKey: "set-2-r1r5-key",
+			provenance: { type: "MANUAL", ref: "set-2" },
+		});
+
+		// Verify 0076 projection rows populated
+		const normRows = await pg.query<{ count: number }>(
+			"select count(*)::int as count from income_settlement_allocation_rows where user_id = $1",
+			[USER_R1R5],
+		).then((r: any) => r.rows[0].count);
+		chkD(normRows >= 2, `PRE-7B.9 R1-R5 B-03A: Normalized allocation rows exist (count=${normRows})`);
+
+		// Test bounded page read for page 1 (limit 1)
+		const page1 = await listBoundedIncomeEntitlements({
+			db,
+			userId: USER_R1R5,
+			limit: 1,
+		});
+		eqD(page1.entitlements.length, 1, "PRE-7B.9 R1-R5 B-03A: Page 1 returns 1 item");
+		chkD(page1.nextCursor !== null, "PRE-7B.9 R1-R5 B-03A: Page 1 nextCursor is present");
+		chkD(page1.entitlements[0]?.allocatedAmount !== undefined, "PRE-7B.9 R1-R5 B-03A: Page 1 allocatedAmount populated");
+
+		// Test page 2
+		const page2 = await listBoundedIncomeEntitlements({
+			db,
+			userId: USER_R1R5,
+			limit: 1,
+			beforePeriodMonth: page1.nextCursor?.beforePeriodMonth,
+			beforeEntitlementId: page1.nextCursor?.beforeEntitlementId,
+		});
+		eqD(page2.entitlements.length, 1, "PRE-7B.9 R1-R5 B-03A: Page 2 returns 1 item");
+		chkD(page2.entitlements[0]?.entitlementId !== page1.entitlements[0]?.entitlementId, "PRE-7B.9 R1-R5 B-03A: Page 2 item distinct from Page 1");
+
+		// --------------------------------------------------------------------
+		// 3. M-05: Notification bounded subscription query with pendingEventId filter
+		// --------------------------------------------------------------------
+		const sub1Id = crypto.randomUUID();
+		const sub2Id = crypto.randomUUID();
+		const evtId = crypto.randomUUID();
+		const delivId = crypto.randomUUID();
+		const attId = crypto.randomUUID();
+		const hash1 = "1".repeat(64);
+		const hash2 = "2".repeat(64);
+
+		await pg.query("SET session_replication_role = replica");
+		await pg.query(
+			"insert into push_subscriptions (id, user_id, endpoint_hash, created_at) values ($1, $2, $3, now()), ($4, $2, $5, now())",
+			[sub1Id, USER_R1R5, hash1, sub2Id, hash2],
+		);
+		const p256dhStr = "B".repeat(87);
+		const authStr = "A".repeat(22);
+		const fp1 = "f".repeat(64);
+		const fp2 = "e".repeat(64);
+		await pg.query(
+			`insert into push_subscription_revisions
+			 (id, user_id, subscription_id, revision_no, operation, status, endpoint, p256dh, auth, occurred_at, idempotency_key, revision_fingerprint)
+			 values
+			 (gen_random_uuid(), $1, $2, 1, 'REGISTER', 'ACTIVE', 'https://push1.example.com', $4, $5, now(), 'sub1-rev1', $6),
+			 (gen_random_uuid(), $1, $3, 1, 'REGISTER', 'ACTIVE', 'https://push2.example.com', $4, $5, now(), 'sub2-rev1', $7)`,
+			[USER_R1R5, sub1Id, sub2Id, p256dhStr, authStr, fp1, fp2],
+		);
+		// Mark sub1 as already delivered (SUCCESS) for evtId
+		await pg.query(
+			"insert into notification_events (id, user_id, notification_type, subject_id, scheduled_local_date, scheduled_for, payload, created_at) values ($1, $2, 'CREDIT_CARD_DUE', gen_random_uuid(), '2026-09-21', now(), '{}', now())",
+			[evtId, USER_R1R5],
+		);
+		await pg.query(
+			"insert into notification_deliveries (id, user_id, notification_event_id, push_subscription_id, created_at) values ($1, $2, $3, $4, now())",
+			[delivId, USER_R1R5, evtId, sub1Id],
+		);
+		await pg.query(
+			"insert into notification_delivery_attempts (id, user_id, delivery_id, attempt_no, status, attempted_at, created_at) values ($1, $2, $3, 1, 'SUCCESS', now(), now())",
+			[attId, USER_R1R5, delivId],
+		);
+		await pg.query("SET session_replication_role = origin");
+
+		await db.transaction(async (tx: any) => {
+			const activeSubs = await listActivePushSubscriptionsInTransaction(tx, USER_R1R5, 50, undefined, evtId);
+			eqD(activeSubs.length, 1, "PRE-7B.9 R1-R5 M-05: Only undelivered subscription returned");
+			eqD(activeSubs[0]?.subscriptionId, sub2Id, "PRE-7B.9 R1-R5 M-05: Returned subscription is sub2 (sub1 excluded via NOT EXISTS)");
+		});
+
+	} finally {
+		setDatabaseFactoryOverrideForTest(null);
+		await pg.close();
+	}
+}
+
 const probed = await probe();
 console.log(probed ? "\nPROBE: PASS\n" : "\nPROBE: FAIL (aborting runtime phase)\n");
 if (probed) {
@@ -20663,6 +20939,7 @@ if (probed) {
 	await resolverRuntime7B8();
 	await resolverRuntime7B8R1();
 	await resolverRuntime7B9R1R2();
+	await resolverRuntime7B9R1R5();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

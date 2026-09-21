@@ -8,6 +8,7 @@ import {
 import {
 	incomeEntitlementRevisions,
 	incomeEntitlements,
+	incomeSettlementAllocationRows,
 	incomeSettlementBatchRevisions,
 } from "../db/schema/income-entitlements";
 import { formatCentsToMoney, parseMoneyString } from "../ledger/money";
@@ -282,33 +283,39 @@ export async function listBoundedIncomeEntitlements({
 	}
 
 	// 3. Fetch latest settlement allocations scoped strictly to the page's entitlement IDs
+	// Uses normalized indexed table income_settlement_allocation_rows to ensure work is strictly O(page allocations)
 	const allocMap = new Map<string, bigint>();
 	if (entitlementIds.length > 0) {
 		const allocQuery = sql`
-			WITH latest_batches AS (
-				SELECT DISTINCT ON (${incomeSettlementBatchRevisions.settlementBatchId})
-					${incomeSettlementBatchRevisions.settlementBatchId},
-					${incomeSettlementBatchRevisions.allocations}
-				FROM ${incomeSettlementBatchRevisions}
-				WHERE ${incomeSettlementBatchRevisions.userId} = ${userId}
-				ORDER BY ${incomeSettlementBatchRevisions.settlementBatchId}, ${incomeSettlementBatchRevisions.revisionNo} DESC
-			),
-			page_allocs AS (
+			WITH relevant_allocations AS (
 				SELECT
-					(elem->>'entitlementId')::text AS entitlement_id,
-					(elem->>'amount')::numeric AS amount
-				FROM latest_batches,
-				jsonb_array_elements(allocations) AS elem
-				WHERE (elem->>'entitlementId')::text IN (${sql.join(
-					entitlementIds.map((id) => sql`${id}`),
-					sql`, `,
-				)})
+					isar.settlement_batch_id,
+					isar.revision_no,
+					isar.entitlement_id,
+					isar.allocated_amount
+				FROM ${incomeSettlementAllocationRows} isar
+				WHERE isar.user_id = ${userId}
+				  AND isar.entitlement_id IN (${sql.join(
+						entitlementIds.map((id) => sql`${id}`),
+						sql`, `,
+					)})
+			),
+			active_batch_latest AS (
+				SELECT
+					isbr.settlement_batch_id,
+					MAX(isbr.revision_no) AS latest_revision_no
+				FROM ${incomeSettlementBatchRevisions} isbr
+				WHERE isbr.settlement_batch_id IN (SELECT DISTINCT settlement_batch_id FROM relevant_allocations)
+				GROUP BY isbr.settlement_batch_id
 			)
 			SELECT
-				entitlement_id,
-				COALESCE(SUM(ROUND(amount * 100)), 0)::text AS total_allocated_cents
-			FROM page_allocs
-			GROUP BY entitlement_id
+				ra.entitlement_id::text AS entitlement_id,
+				COALESCE(SUM(ROUND(ra.allocated_amount * 100)), 0)::text AS total_allocated_cents
+			FROM relevant_allocations ra
+			JOIN active_batch_latest abl
+			  ON ra.settlement_batch_id = abl.settlement_batch_id
+			 AND ra.revision_no = abl.latest_revision_no
+			GROUP BY ra.entitlement_id
 		`;
 		const rawAllocResult = await db.execute(allocQuery);
 		const allocRows = (Array.isArray(rawAllocResult)

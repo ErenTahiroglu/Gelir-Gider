@@ -1,4 +1,13 @@
-import { and, asc, eq, inArray, lte } from "drizzle-orm";
+import {
+	and,
+	asc,
+	eq,
+	gte,
+	inArray,
+	isNotNull,
+	isNull,
+	lte,
+} from "drizzle-orm";
 import { resolveAuthoritativePurchaseSplitAsOf } from "../credit-cards/purchase-split-read";
 import {
 	getStatementReconciliationAsOf,
@@ -2308,160 +2317,221 @@ async function loadSurplusUseCandidateUniverse(
 	}
 
 	// ---- 11A. personal spending -- People PAYABLE principal ----
-	const payables = await db
-		.select({ id: personObligations.id })
-		.from(personObligations)
+	// Bounded DB query: only query obligations whose initial revision (revisionNo = 1)
+	// occurred within the MTD window, eliminating lifetime scans of historical obligations.
+	const payableCandidates = await db
+		.select({
+			obligationId: personObligationRevisions.obligationId,
+		})
+		.from(personObligationRevisions)
+		.innerJoin(
+			personObligations,
+			eq(personObligations.id, personObligationRevisions.obligationId),
+		)
 		.where(
 			and(
 				eq(personObligations.userId, userId),
 				eq(personObligations.direction, "PAYABLE"),
+				eq(personObligationRevisions.revisionNo, 1),
+				gte(personObligationRevisions.occurredAt, win.periodStart),
+				lte(personObligationRevisions.occurredAt, checkpointAt),
 			),
 		);
-	for (const o of payables) {
+
+	if (payableCandidates.length > 0) {
+		const payableCandidateIds = Array.from(
+			new Set(payableCandidates.map((c) => c.obligationId)),
+		);
 		const oRevs = await db
 			.select({
 				id: personObligationRevisions.id,
+				obligationId: personObligationRevisions.obligationId,
 				revisionNo: personObligationRevisions.revisionNo,
 				operation: personObligationRevisions.operation,
 				principal: personObligationRevisions.principalAmount,
 				occurredAt: personObligationRevisions.occurredAt,
 			})
 			.from(personObligationRevisions)
-			.where(eq(personObligationRevisions.obligationId, o.id));
-		const eff = effectiveRevisionAsOf(oRevs, checkpointAt);
-		if (!eff || eff.operation === "VOID") continue;
-		const create = oRevs.find((r) => r.revisionNo === 1);
-		if (!create || !win.inMtd(asDate(create.occurredAt))) continue;
-		const principalCents = centsOf(eff.principal);
-		if (principalCents <= 0n) continue;
-		const coveredCents = overlap.peoplePayableCoveredCents.get(o.id) ?? 0n;
-		out.push({
-			subject: { type: "PEOPLE_PAYABLE", personObligationId: o.id },
-			subjectType: "PEOPLE_PAYABLE",
-			subjectId: o.id,
-			lane: "DISCRETIONARY",
-			sourceEconomicCents: principalCents,
-			coveredCents:
-				coveredCents > principalCents ? principalCents : coveredCents,
-			overlapExact: true,
-			overlapUnresolvedReason: null,
-		});
-	}
-
-	// ---- 11B. Mobility -- UNALLOCATED -> INTERNATIONAL_MOBILITY goal transfer ----
-	const transfers = await db
-		.select({
-			id: midasAllocationTransfers.id,
-			fromBucketId: midasAllocationTransfers.fromBucketId,
-			toBucketId: midasAllocationTransfers.toBucketId,
-			amount: midasAllocationTransfers.amount,
-			occurredAt: midasAllocationTransfers.occurredAt,
-			reversalOfTransferId: midasAllocationTransfers.reversalOfTransferId,
-		})
-		.from(midasAllocationTransfers)
-		.where(
-			and(
-				eq(midasAllocationTransfers.userId, userId),
-				lte(midasAllocationTransfers.occurredAt, checkpointAt),
-			),
-		);
-	const reversedTargets = new Set(
-		transfers
-			.filter(
-				(t) =>
-					t.reversalOfTransferId !== null &&
-					asDate(t.occurredAt).getTime() <= checkpointAt.getTime(),
+			.where(
+				and(
+					inArray(personObligationRevisions.obligationId, payableCandidateIds),
+					lte(personObligationRevisions.occurredAt, checkpointAt),
+				),
 			)
-			.map((t) => t.reversalOfTransferId as string),
-	);
-	const candidateTransfers = transfers.filter(
-		(t) =>
-			t.reversalOfTransferId === null &&
-			t.fromBucketId === null &&
-			t.toBucketId !== null &&
-			win.inMtd(asDate(t.occurredAt)) &&
-			!reversedTargets.has(t.id),
-	);
-	if (candidateTransfers.length > 0) {
-		const targetBucketIds = Array.from(
-			new Set(candidateTransfers.map((t) => t.toBucketId as string)),
-		);
-		const goals = await db
-			.select({
-				id: shortTermGoals.id,
-				midasBucketId: shortTermGoals.midasBucketId,
-			})
-			.from(shortTermGoals)
-			.where(inArray(shortTermGoals.midasBucketId, targetBucketIds));
+			.orderBy(asc(personObligationRevisions.revisionNo));
 
-		const goalByBucketId = new Map(goals.map((g) => [g.midasBucketId, g]));
-		const goalIds = goals.map((g) => g.id);
-
-		const purposeRevs =
-			goalIds.length > 0
-				? await db
-						.select({
-							goalId: shortTermGoalBudgetV2PurposeRevisions.goalId,
-							revisionNo: shortTermGoalBudgetV2PurposeRevisions.revisionNo,
-							purpose: shortTermGoalBudgetV2PurposeRevisions.purpose,
-							occurredAt: shortTermGoalBudgetV2PurposeRevisions.occurredAt,
-						})
-						.from(shortTermGoalBudgetV2PurposeRevisions)
-						.where(
-							and(
-								inArray(shortTermGoalBudgetV2PurposeRevisions.goalId, goalIds),
-								lte(
-									shortTermGoalBudgetV2PurposeRevisions.occurredAt,
-									checkpointAt,
-								),
-							),
-						)
-				: [];
-
-		const revsByGoalId = new Map<string, typeof purposeRevs>();
-		for (const r of purposeRevs) {
-			const list = revsByGoalId.get(r.goalId) ?? [];
+		const revsByObligationId = new Map<string, typeof oRevs>();
+		for (const r of oRevs) {
+			const list = revsByObligationId.get(r.obligationId) ?? [];
 			list.push(r);
-			revsByGoalId.set(r.goalId, list);
+			revsByObligationId.set(r.obligationId, list);
 		}
 
-		for (const t of candidateTransfers) {
-			const goal = goalByBucketId.get(t.toBucketId as string);
-			if (!goal) continue;
-			const revs = revsByGoalId.get(goal.id) ?? [];
-			const purpose = effectiveRevisionAsOf(revs, checkpointAt);
-			if (purpose?.purpose !== "INTERNATIONAL_MOBILITY") continue;
+		for (const obligationId of payableCandidateIds) {
+			const list = revsByObligationId.get(obligationId) ?? [];
+			const eff = effectiveRevisionAsOf(list, checkpointAt);
+			if (!eff || eff.operation === "VOID") continue;
+			const create = list.find((r) => r.revisionNo === 1);
+			if (!create || !win.inMtd(asDate(create.occurredAt))) continue;
+			const principalCents = centsOf(eff.principal);
+			if (principalCents <= 0n) continue;
+			const coveredCents =
+				overlap.peoplePayableCoveredCents.get(obligationId) ?? 0n;
 			out.push({
-				subject: {
-					type: "MOBILITY_MIDAS_TRANSFER",
-					midasAllocationTransferId: t.id,
-				},
-				subjectType: "MOBILITY_MIDAS_TRANSFER",
-				subjectId: t.id,
-				lane: "INTERNATIONAL_MOBILITY",
-				sourceEconomicCents: centsOf(t.amount),
-				coveredCents: 0n,
+				subject: { type: "PEOPLE_PAYABLE", personObligationId: obligationId },
+				subjectType: "PEOPLE_PAYABLE",
+				subjectId: obligationId,
+				lane: "DISCRETIONARY",
+				sourceEconomicCents: principalCents,
+				coveredCents:
+					coveredCents > principalCents ? principalCents : coveredCents,
 				overlapExact: true,
 				overlapUnresolvedReason: null,
 			});
 		}
 	}
 
-	// ---- 11C. Long Term -- one active source per task (CREATE; SENT is not a 2nd) ----
-	const tasks = await db
+	// ---- 11B. Mobility -- UNALLOCATED -> INTERNATIONAL_MOBILITY goal transfer ----
+	// Bounded DB query: only query MTD candidate transfers with fromBucketId IS NULL and toBucketId IS NOT NULL,
+	// preventing lifetime transfer history materialization into Worker memory.
+	const candidateTransfers = await db
 		.select({
-			id: longTermSendTasks.id,
-			createdAt: longTermSendTasks.createdAt,
+			id: midasAllocationTransfers.id,
+			fromBucketId: midasAllocationTransfers.fromBucketId,
+			toBucketId: midasAllocationTransfers.toBucketId,
+			amount: midasAllocationTransfers.amount,
+			occurredAt: midasAllocationTransfers.occurredAt,
 		})
-		.from(longTermSendTasks)
+		.from(midasAllocationTransfers)
+		.where(
+			and(
+				eq(midasAllocationTransfers.userId, userId),
+				gte(midasAllocationTransfers.occurredAt, win.periodStart),
+				lte(midasAllocationTransfers.occurredAt, checkpointAt),
+				isNull(midasAllocationTransfers.reversalOfTransferId),
+				isNull(midasAllocationTransfers.fromBucketId),
+				isNotNull(midasAllocationTransfers.toBucketId),
+			),
+		);
+
+	if (candidateTransfers.length > 0) {
+		const candidateIds = candidateTransfers.map((t) => t.id);
+		const reversals = await db
+			.select({
+				reversalOfTransferId: midasAllocationTransfers.reversalOfTransferId,
+			})
+			.from(midasAllocationTransfers)
+			.where(
+				and(
+					eq(midasAllocationTransfers.userId, userId),
+					inArray(midasAllocationTransfers.reversalOfTransferId, candidateIds),
+					lte(midasAllocationTransfers.occurredAt, checkpointAt),
+				),
+			);
+		const reversedTargets = new Set(
+			reversals
+				.filter((r) => r.reversalOfTransferId !== null)
+				.map((r) => r.reversalOfTransferId as string),
+		);
+
+		const activeCandidateTransfers = candidateTransfers.filter(
+			(t) => win.inMtd(asDate(t.occurredAt)) && !reversedTargets.has(t.id),
+		);
+
+		if (activeCandidateTransfers.length > 0) {
+			const targetBucketIds = Array.from(
+				new Set(activeCandidateTransfers.map((t) => t.toBucketId as string)),
+			);
+			const goals = await db
+				.select({
+					id: shortTermGoals.id,
+					midasBucketId: shortTermGoals.midasBucketId,
+				})
+				.from(shortTermGoals)
+				.where(inArray(shortTermGoals.midasBucketId, targetBucketIds));
+
+			const goalByBucketId = new Map(goals.map((g) => [g.midasBucketId, g]));
+			const goalIds = goals.map((g) => g.id);
+
+			const purposeRevs =
+				goalIds.length > 0
+					? await db
+							.select({
+								goalId: shortTermGoalBudgetV2PurposeRevisions.goalId,
+								revisionNo: shortTermGoalBudgetV2PurposeRevisions.revisionNo,
+								purpose: shortTermGoalBudgetV2PurposeRevisions.purpose,
+								occurredAt: shortTermGoalBudgetV2PurposeRevisions.occurredAt,
+							})
+							.from(shortTermGoalBudgetV2PurposeRevisions)
+							.where(
+								and(
+									inArray(
+										shortTermGoalBudgetV2PurposeRevisions.goalId,
+										goalIds,
+									),
+									lte(
+										shortTermGoalBudgetV2PurposeRevisions.occurredAt,
+										checkpointAt,
+									),
+								),
+							)
+					: [];
+
+			const revsByGoalId = new Map<string, typeof purposeRevs>();
+			for (const r of purposeRevs) {
+				const list = revsByGoalId.get(r.goalId) ?? [];
+				list.push(r);
+				revsByGoalId.set(r.goalId, list);
+			}
+
+			for (const t of activeCandidateTransfers) {
+				const goal = goalByBucketId.get(t.toBucketId as string);
+				if (!goal) continue;
+				const revs = revsByGoalId.get(goal.id) ?? [];
+				const purpose = effectiveRevisionAsOf(revs, checkpointAt);
+				if (purpose?.purpose !== "INTERNATIONAL_MOBILITY") continue;
+				out.push({
+					subject: {
+						type: "MOBILITY_MIDAS_TRANSFER",
+						midasAllocationTransferId: t.id,
+					},
+					subjectType: "MOBILITY_MIDAS_TRANSFER",
+					subjectId: t.id,
+					lane: "INTERNATIONAL_MOBILITY",
+					sourceEconomicCents: centsOf(t.amount),
+					coveredCents: 0n,
+					overlapExact: true,
+					overlapUnresolvedReason: null,
+				});
+			}
+		}
+	}
+
+	// ---- 11C. Long Term -- one active source per task (CREATE; SENT is not a 2nd) ----
+	// Bounded DB query: only query tasks whose initial revision (revisionNo = 1)
+	// occurred within the MTD window, eliminating lifetime task scans.
+	const ltCandidates = await db
+		.select({
+			taskId: longTermSendTaskRevisions.taskId,
+		})
+		.from(longTermSendTaskRevisions)
+		.innerJoin(
+			longTermSendTasks,
+			eq(longTermSendTasks.id, longTermSendTaskRevisions.taskId),
+		)
 		.where(
 			and(
 				eq(longTermSendTasks.userId, userId),
-				lte(longTermSendTasks.createdAt, checkpointAt),
+				eq(longTermSendTaskRevisions.revisionNo, 1),
+				gte(longTermSendTaskRevisions.occurredAt, win.periodStart),
+				lte(longTermSendTaskRevisions.occurredAt, checkpointAt),
 			),
 		);
-	if (tasks.length > 0) {
-		const taskIds = tasks.map((t) => t.id);
+
+	if (ltCandidates.length > 0) {
+		const ltCandidateIds = Array.from(
+			new Set(ltCandidates.map((c) => c.taskId)),
+		);
 		const allTRevs = await db
 			.select({
 				id: longTermSendTaskRevisions.id,
@@ -2474,7 +2544,7 @@ async function loadSurplusUseCandidateUniverse(
 			.from(longTermSendTaskRevisions)
 			.where(
 				and(
-					inArray(longTermSendTaskRevisions.taskId, taskIds),
+					inArray(longTermSendTaskRevisions.taskId, ltCandidateIds),
 					lte(longTermSendTaskRevisions.occurredAt, checkpointAt),
 				),
 			);
@@ -2486,16 +2556,16 @@ async function loadSurplusUseCandidateUniverse(
 			revsByTaskId.set(r.taskId, list);
 		}
 
-		for (const task of tasks) {
-			const tRevs = revsByTaskId.get(task.id) ?? [];
+		for (const taskId of ltCandidateIds) {
+			const tRevs = revsByTaskId.get(taskId) ?? [];
 			const eff = effectiveRevisionAsOf(tRevs, checkpointAt);
 			if (!eff || eff.status === "CANCELLED") continue; // SOURCE_INACTIVE
 			const create = tRevs.find((r) => r.revisionNo === 1);
 			if (!create || !win.inMtd(asDate(create.occurredAt))) continue;
 			out.push({
-				subject: { type: "LONG_TERM_SEND_TASK", longTermSendTaskId: task.id },
+				subject: { type: "LONG_TERM_SEND_TASK", longTermSendTaskId: taskId },
 				subjectType: "LONG_TERM_SEND_TASK",
-				subjectId: task.id,
+				subjectId: taskId,
 				lane: "LONG_TERM_INVESTMENT",
 				sourceEconomicCents: centsOf(eff.amount),
 				coveredCents: 0n,

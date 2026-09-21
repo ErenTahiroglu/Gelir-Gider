@@ -93,7 +93,7 @@ describe("Backup snapshot size-limit enforcement", () => {
 		expect(result.plaintextBytes.length).toBeGreaterThan(0);
 	});
 
-	it("rejects using the real default 25 MiB ceiling only when genuinely exceeded (no large allocation on the happy path)", async () => {
+	it("rejects using the real default 10 MiB ceiling only when genuinely exceeded (no large allocation on the happy path)", async () => {
 		const tables = [makeTable("tiny_table", [{ id: "1" }])];
 		const result = await buildSnapshotPayload({
 			formatVersion: "V1",
@@ -101,6 +101,6 @@ describe("Backup snapshot size-limit enforcement", () => {
 			createdAt: "2026-09-07T00:00:00.000Z",
 			tables,
 		});
-		expect(result.plaintextBytes.length).toBeLessThan(25 * 1024 * 1024);
+		expect(result.plaintextBytes.length).toBeLessThan(10 * 1024 * 1024);
 	});
 });

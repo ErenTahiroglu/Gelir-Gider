@@ -41,6 +41,7 @@ export interface RunNotificationSchedulerParams {
 	transport: PushTransport;
 	maxEvents?: number | undefined;
 	maxDispatches?: number | undefined;
+	maxSubscriptionsExamined?: number | undefined;
 }
 
 export interface NotificationSchedulerSummary {
@@ -418,6 +419,7 @@ export async function runNotificationScheduler(
 		transport,
 		maxEvents = 100,
 		maxDispatches = 100,
+		maxSubscriptionsExamined = 200,
 	} = params;
 	const { localDate, localHour } = getIstanbulLocalDateAndHour(scheduledAt);
 
@@ -440,10 +442,15 @@ export async function runNotificationScheduler(
 	// early return above.
 	const transportPreparedState = { prepared: false };
 	let dispatchesAttempted = 0;
+	let subscriptionsExamined = 0;
 	let eventsProcessed = 0;
 	let afterEventId: string | undefined;
 
-	while (eventsProcessed < maxEvents && dispatchesAttempted < maxDispatches) {
+	while (
+		eventsProcessed < maxEvents &&
+		dispatchesAttempted < maxDispatches &&
+		subscriptionsExamined < maxSubscriptionsExamined
+	) {
 		const pageLimit = Math.min(50, maxEvents - eventsProcessed);
 		const events = await runNotificationReadTransaction(db, (tx) =>
 			listEventsForLocalDateInTransaction(
@@ -462,7 +469,8 @@ export async function runNotificationScheduler(
 			afterEventId = rawEvent.id;
 			if (
 				eventsProcessed >= maxEvents ||
-				dispatchesAttempted >= maxDispatches
+				dispatchesAttempted >= maxDispatches ||
+				subscriptionsExamined >= maxSubscriptionsExamined
 			) {
 				break;
 			}
@@ -480,7 +488,10 @@ export async function runNotificationScheduler(
 			};
 
 			let afterSubscriptionId: string | undefined;
-			while (dispatchesAttempted < maxDispatches) {
+			while (
+				dispatchesAttempted < maxDispatches &&
+				subscriptionsExamined < maxSubscriptionsExamined
+			) {
 				const activeSubscriptions = await runNotificationReadTransaction(
 					db,
 					(tx) =>
@@ -489,13 +500,20 @@ export async function runNotificationScheduler(
 							event.userId,
 							50,
 							afterSubscriptionId,
+							event.id,
 						),
 				);
 				if (activeSubscriptions.length === 0) break;
 
 				for (const subscription of activeSubscriptions) {
 					afterSubscriptionId = subscription.subscriptionId;
-					if (dispatchesAttempted >= maxDispatches) break;
+					if (
+						dispatchesAttempted >= maxDispatches ||
+						subscriptionsExamined >= maxSubscriptionsExamined
+					) {
+						break;
+					}
+					subscriptionsExamined++;
 
 					const dispatched = await processEventSubscription(
 						db,
