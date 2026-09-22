@@ -13,7 +13,7 @@ Private, single-user personal finance backend built for high-integrity ledger ac
 - **Scheduled Workers (Cron):**
   - `0 * * * *` (Hourly): Notification scheduler and push delivery via Web Push (VAPID)
   - `17 2 * * *` (Daily): Automated encrypted database snapshot to Cloudflare R2 with retention management
-- **Testing & Quality:** Vitest + `@cloudflare/vitest-plugin` (137 test suites, 1740+ unit and contract tests), Biome linter/formatter, TypeScript strict mode
+- **Testing & Quality:** Vitest + `@cloudflare/vitest-plugin` (185 test suites, 2648 unit, contract, and HTTP surface tests), Biome linter/formatter, TypeScript strict mode
 
 ## Implemented Domains & Modules
 
@@ -35,9 +35,9 @@ Private, single-user personal finance backend built for high-integrity ledger ac
 
 ## Current Backend Status
 
-- **Backend Core (Phases 0–20):** **100% COMPLETE & RELEASE-READY**.
-- **Database Migrations:** Migrations `0000` through `0060` are complete, audited, and immutable.
-- **Financial HTTP Adapters:** Intentionally deferred to frontend integration. All financial domain services are fully implemented and tested as internal TypeScript domain services, ready to be mounted behind authentication middleware when frontend UI requirements are finalized.
+- **Backend Core & HTTP Surface (Phases 0–20 & 7B.1–7B.9):** **100% COMPLETE & PRE-FRONTEND CODE-FROZEN**.
+- **Database Migrations:** Migrations `0000` through `0071` are complete, audited, and immutable.
+- **Financial HTTP Adapters:** All financial HTTP adapters (transactions, ledger, income, credit cards, people, rewards, campaigns, goals, midas, long-term, month-close, notifications, imports) are mounted, tested, and guarded by same-origin mutation checks.
 - **Production Deployment:** Full end-to-end production cutover is deferred until the production frontend domain and WebAuthn RP ID are configured.
 
 ## Prerequisites

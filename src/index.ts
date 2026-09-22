@@ -20,11 +20,13 @@ import { authRouter } from "./http/auth-routes";
 import { budgetV2Router } from "./http/budget-v2-routes";
 import { campaignsRouter } from "./http/campaign-routes";
 import { creditCardRouter } from "./http/credit-card-routes";
+import { importsRouter } from "./http/imports-routes";
 import { incomeRouter } from "./http/income-routes";
 import { ledgerRouter } from "./http/ledger-routes";
 import { longTermRouter } from "./http/long-term-routes";
 import { midasRouter } from "./http/midas-routes";
 import { monthCloseRouter } from "./http/month-close-routes";
+import { notificationsRouter } from "./http/notifications-routes";
 import { peopleRouter } from "./http/people-routes";
 import { rewardsRouter } from "./http/rewards-routes";
 import type { RequestIdVariables } from "./http/security-middleware";
@@ -112,6 +114,8 @@ app.route("/short-term-goals", shortTermGoalsRouter);
 app.route("/midas", midasRouter);
 app.route("/long-term", longTermRouter);
 app.route("/month-close", monthCloseRouter);
+app.route("/notifications", notificationsRouter);
+app.route("/imports", importsRouter);
 
 app.notFound((c) => {
 	return c.json(

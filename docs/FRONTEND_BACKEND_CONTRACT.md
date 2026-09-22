@@ -1719,24 +1719,106 @@ The following table documents the domain error codes and their HTTP status mappi
 ### 7B.9 — Notifications + Imports
 
 ```
-PLANNED  GET   /notifications/subscriptions/:id
-PLANNED  GET   /notifications/subscriptions  ?status=&limit=&after=
-PLANNED  POST  /notifications/subscriptions  (register push subscription)
-PLANNED  POST  /notifications/subscriptions/:id/disable  (disable)
+MOUNTED  GET   /notifications/subscriptions/:id
+MOUNTED  GET   /notifications/subscriptions  ?status=&limit=&after=
+MOUNTED  POST  /notifications/subscriptions  (register push subscription)
+MOUNTED  POST  /notifications/subscriptions/:id/disable  (disable)
 
-PLANNED  GET   /notifications/events/:id
-PLANNED  GET   /notifications/events    ?date=YYYY-MM-DD&limit=&after=
+MOUNTED  GET   /notifications/events/:id
+MOUNTED  GET   /notifications/events    ?date=YYYY-MM-DD&limit=&after=
 
-PLANNED  GET   /imports/batches/:id
-PLANNED  GET   /imports/batches         ?limit=&after=
-PLANNED  POST  /imports/batches         (stage batch)
-PLANNED  GET   /imports/batches/:id/preview
-PLANNED  POST  /imports/batches/:batchId/rows/:rowId/resolve  (resolve row)
-PLANNED  POST  /imports/batches/:id/apply  (apply ready rows)
+MOUNTED  GET   /imports/batches/:id
+MOUNTED  GET   /imports/batches         ?limit=&after=
+MOUNTED  POST  /imports/batches         (stage batch)
+MOUNTED  GET   /imports/batches/:id/preview
+MOUNTED  POST  /imports/batches/:batchId/rows/:rowId/resolve  (resolve row)
+MOUNTED  POST  /imports/batches/:id/apply  (apply ready rows)
 
-PLANNED  GET   /imports/rows/:id
-PLANNED  GET   /imports/rows            ?batchId=&status=&limit=&after=
+MOUNTED  GET   /imports/rows/:id
+MOUNTED  GET   /imports/rows            ?batchId=&status=&limit=&after=
 ```
+
+#### 1. Endpoint Contracts & DTOs
+
+##### Notifications
+- `GET /notifications/subscriptions/:id`
+  - **Auth:** Session cookie required.
+  - **Response:** `200 OK` with subscription DTO (`id`, `userId`, `endpoint`, `userAgent`, `status`, `failureCount`, `lastFailureAt`, `createdAt`, `revokedAt`). `keys` (p256dh/auth) are omitted for transport privacy.
+  - **Errors:** `404` (`NOTIFICATION_SUBSCRIPTION_NOT_FOUND`), `400` (`NOTIFICATION_INVALID_INPUT` on malformed UUID/query).
+- `GET /notifications/subscriptions?status=&limit=&after=`
+  - **Auth:** Session cookie required.
+  - **Query:** `status` (`ACTIVE | INACTIVE`), `limit` (1..100, default 20), `after` (opaque cursor).
+  - **Response:** `200 OK` with `{ items: SubscriptionDto[], nextCursor: string | null }`.
+- `POST /notifications/subscriptions`
+  - **Auth:** Session cookie required + Same-Origin guard.
+  - **Body:** `{ endpoint: string, keys: { p256dh: string, auth: string }, userAgent?: string }`.
+  - **Behavior:** Upserts subscription using domain `upsertWebPushSubscription`.
+  - **Response:** `201 Created` with subscription DTO.
+- `POST /notifications/subscriptions/:id/disable`
+  - **Auth:** Session cookie required + Same-Origin guard.
+  - **Body:** Optional empty JSON object (`{}`).
+  - **Response:** `200 OK` with `{ success: true }`.
+- `GET /notifications/events/:id`
+  - **Auth:** Session cookie required.
+  - **Response:** `200 OK` with event DTO (`id`, `userId`, `eventType`, `eventDate`, `aggregateKey`, `payload`, `createdAt`). `payload` contains privacy-safe notification metadata (no raw tokens/secrets).
+  - **Errors:** `404` (`NOTIFICATION_EVENT_NOT_FOUND`).
+- `GET /notifications/events?date=YYYY-MM-DD&limit=&after=`
+  - **Auth:** Session cookie required.
+  - **Query:** `date` (required ISO date `YYYY-MM-DD`), `limit` (1..100, default 20), `after` (opaque cursor).
+  - **Response:** `200 OK` with `{ items: EventDto[], nextCursor: string | null }`.
+
+##### Imports
+- `GET /imports/batches/:id`
+  - **Auth:** Session cookie required.
+  - **Response:** `200 OK` with `ImportBatchSummary` DTO (`batchId`, `source`, `filename`, `status`, `totalRows`, `stagedRows`, `appliedRows`, `skippedRows`, `errorRows`, `createdAt`, `completedAt`).
+  - **Errors:** `404` (`IMPORT_BATCH_NOT_FOUND`).
+- `GET /imports/batches?limit=&after=`
+  - **Auth:** Session cookie required.
+  - **Query:** `limit` (1..100, default 20), `after` (opaque cursor).
+  - **Response:** `200 OK` with `{ items: ImportBatchSummary[], nextCursor: string | null }`.
+- `POST /imports/batches`
+  - **Auth:** Session cookie required + Same-Origin guard.
+  - **Body:** `{ source: "QNB_FINANSBANK" | "GARANTI_BBVA" | "IS_BANKASI" | "YAPI_KREDI" | "MANUAL_CSV", filename: string, rawCsv: string, defaultAccountId?: string }`.
+  - **Response:** `201 Created` with `ImportBatchSummary` DTO.
+- `GET /imports/batches/:id/preview`
+  - **Auth:** Session cookie required.
+  - **Response:** `200 OK` with `{ batch: ImportBatchSummary, rows: ImportRowDetail[] }`.
+- `POST /imports/batches/:batchId/rows/:rowId/resolve`
+  - **Auth:** Session cookie required + Same-Origin guard.
+  - **Body:** `{ expectedRevisionNo: number, action: "CONFIRM_IMPORT" | "LINK_EXISTING" | "SKIP", resolutionReason?: string, resolvedMappings?: { accountId?: string, categoryId?: string, description?: string, personId?: string }, targetTransactionId?: string }`.
+  - **Response:** `200 OK` with updated `ImportRowDetail` DTO.
+- `POST /imports/batches/:id/apply`
+  - **Auth:** Session cookie required + Same-Origin guard.
+  - **Body:** Optional empty JSON object (`{}`).
+  - **Response:** `200 OK` with `{ appliedCount: number, batchStatus: string }`.
+- `GET /imports/rows/:id`
+  - **Auth:** Session cookie required.
+  - **Response:** `200 OK` with `ImportRowDetail` DTO.
+- `GET /imports/rows?batchId=&status=&limit=&after=`
+  - **Auth:** Session cookie required.
+  - **Query:** `batchId` (required UUID), `status` (`PENDING | READY | APPLIED | SKIPPED | ERROR`), `limit` (1..100, default 50), `after` (opaque cursor).
+  - **Response:** `200 OK` with `{ items: ImportRowDetail[], nextCursor: string | null }`.
+
+#### 2. Keyset Pagination & Isolation
+Opaque base64url-encoded cursors bind user ownership and query filters:
+- Subscription cursors: `{ v: 1, userId, status, createdAt, id }`
+- Notification event cursors: `{ v: 1, userId, date, createdAt, id }`
+- Import batch cursors: `{ v: 1, userId, createdAt, id }`
+- Import row cursors: `{ v: 1, userId, batchId, status, rowNumber, id }`
+Any cursor tampering, schema mismatch, or foreign user ID instantly fails with `400` (`NOTIFICATION_INVALID_INPUT` / `IMPORT_INVALID_INPUT`).
+
+#### 3. Error Codes & HTTP Mapping
+
+| Code | HTTP Status | Context / Description |
+|---|---|---|
+| `NOTIFICATION_INVALID_INPUT` | 400 | Malformed query parameters, invalid UUID, cursor tampering, or invalid body schema |
+| `NOTIFICATION_SUBSCRIPTION_NOT_FOUND` | 404 | Subscription ID not found or belongs to another user |
+| `NOTIFICATION_EVENT_NOT_FOUND` | 404 | Notification event ID not found or belongs to another user |
+| `IMPORT_INVALID_INPUT` | 400 | Invalid payload, unknown CSV dialect, missing required parameters, or invalid action |
+| `IMPORT_BATCH_NOT_FOUND` | 404 | Batch ID not found or belongs to another user |
+| `IMPORT_ROW_NOT_FOUND` | 404 | Row ID not found or belongs to another user |
+| `IMPORT_CONCURRENCY_CONFLICT` | 409 | `expectedRevisionNo` mismatch when resolving an import row |
+| `IMPORT_INVALID_STATE` | 409 | Attempting to apply or resolve a batch/row in an incompatible terminal state |
 
 ---
 
@@ -1762,20 +1844,19 @@ product HTTP routes**. They must never be callable by the frontend or treated as
 
 ## 9. Proposed 7B.1–7B.9 Implementation Sequence
 
-This sequence is derived from the completed domain source inventory. Later checkpoints
-depend on earlier ones where noted.
+This sequence is derived from the completed domain source inventory.
 
-| Checkpoint | Domain Family | Dependencies | Notes |
-|-----------|--------------|-------------|-------|
-| **7B.1** | Transactions + Ledger (read model first) | None | Core financial primitive. Read-only HTTP surface is lowest risk. Write surface (create/revise/void canonical transaction) follows read. |
-| **7B.2** | Income (sources, entitlements, receipts, settlements) | 7B.1 ledger read | Settlement state references ledger balances. |
-| **7B.3** | Credit Cards (cards, statements, payments, reconciliation) | 7B.1 | High-value; purchase split reads reference people (7B.4) but core card/statement lifecycle is independent. |
-| **7B.4** | People + Family (persons, obligations, settlements) | 7B.3 for split obligations | Independent person CRUD; obligation ledger provisioning needs ledger (7B.1). |
-| **7B.5** | Rewards (accounts, events) | 7B.3 | Reward events source from credit card purchases. |
-| **7B.6** | Campaigns (periods, review candidates, progress) | 7B.5 | Campaign reward crediting depends on rewards domain. |
-| **7B.7** | Short-Term Goals + Midas + Long-Term Investment | 7B.1 ledger | Liquidity group; Midas and long-term transfers post ledger entries. |
-| **7B.8** | Month-Close | 7B.1–7B.7 | Month-close formula reads across all financial domains; should be last in the financial group. |
-| **7B.9** | Notifications + Imports | 7B.3 for notification events | Web-push subscription management; batch CSV import staging and resolution. |
+| Checkpoint | Domain Family | Status | Notes |
+|-----------|--------------|--------|-------|
+| **7B.1** | Transactions + Ledger (read model first) | COMPLETED | Core financial primitive. Read-only HTTP surface and product ledger provisioning. |
+| **7B.2** | Income (sources, entitlements, receipts, settlements) | COMPLETED | Settlement state references ledger balances. |
+| **7B.3** | Credit Cards (cards, statements, payments, reconciliation) | COMPLETED | Multi-card management, billing cycle statements, payments, splits. |
+| **7B.4** | People + Family (persons, obligations, settlements) | COMPLETED | Independent person CRUD; obligation ledger reconciliation. |
+| **7B.5** | Rewards (accounts, events) | COMPLETED | Reward accounts, point accruals, and redemptions. |
+| **7B.6** | Campaigns (periods, review candidates, progress) | COMPLETED | Card/bank merchant campaigns and spending tracking. |
+| **7B.7** | Short-Term Goals + Midas + Long-Term Investment | COMPLETED | Liquidity group; Midas and long-term transfers. |
+| **7B.8** | Month-Close | COMPLETED | Accounting period close, proposal preview, and settlement apply. |
+| **7B.9** | Notifications + Imports | COMPLETED | Web-push subscriptions, notification events, and batch CSV imports. |
 
 ---
 
@@ -1796,11 +1877,9 @@ The following headers are set globally on every response:
 
 ## 11. Backend Code Freeze Status
 
-> **PRE-FRONTEND BACKEND CODE FREEZE: NOT YET COMPLETE**
+> **PRE-FRONTEND BACKEND CODE FREEZE: COMPLETE**
 
-The backend is fully implemented at the domain service layer. The HTTP product surface for
-financial domains (7B.1–7B.9) is IN PROGRESS and must be completed and verified before
-the pre-frontend backend code freeze can be declared.
+With the delivery and verification of Checkpoint 7B.9 (Notifications + Imports), all planned product HTTP surfaces (7B.1–7B.9) have been mounted, guarded with Same-Origin protection, keyset-paginated, and covered by comprehensive contract tests.
 
-The freeze declaration will be made explicitly in a future checkpoint delivery. Do not
-infer it from this document.
+The backend core and HTTP product surfaces are fully frozen. No further backend feature changes are planned prior to frontend integration.
+
