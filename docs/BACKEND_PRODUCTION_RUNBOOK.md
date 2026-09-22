@@ -26,13 +26,13 @@ Every release candidate must pass all validation gates locally and in CI before 
    ```bash
    npm run check
    ```
-   Runs `cf-typegen`, `typecheck`, `lint`, `format:check`, and `test` (171 test suites, 2205+ tests).
+   Runs `cf-typegen`, `typecheck`, `lint`, `format:check`, and `test` (185 test suites, 2651 passed tests).
 
 2. **PostgreSQL Runtime Verification (PGlite):**
    ```bash
    npm run test:pg
    ```
-   Runs the complete disposable PGlite migration chain (0000–0071) and all domain runtime
+   Runs the complete disposable PGlite migration chain (0000–0076) and all domain runtime
    regression suites including the 7B.0 correctness and 7B.1-R1 transaction/ledger read models. This is a
    **required CI gate** — not local-report-only.
 
@@ -120,8 +120,8 @@ The Worker defines two automated cron triggers in `wrangler.jsonc` and `src/inde
 ## 7. Database Migration Procedure
 
 1. **Immutability:**
-   - Migrations `0000` through `0071` are strictly immutable.
-   - Any new database changes must be added forward-only as new sequential migration files (e.g., `0072_...sql`).
+   - Migrations `0000` through `0076` are strictly immutable.
+   - Any new database changes must be added forward-only as new sequential migration files (e.g., `0077_...sql`).
 
 2. **Application Flow:**
    - Execute migration runner or apply migrations against target PostgreSQL instance.
@@ -221,13 +221,13 @@ The application origin is read from `WEBAUTHN_ORIGIN` config — never hard-code
 
 | Component | Status | Notes |
 | :--- | :--- | :--- |
-| **BACKEND CORE** | **READY** | All domain calculations, invariants, and tests passing (2205 tests). |
+| **BACKEND CORE** | **READY** | All domain calculations, invariants, and tests passing (185 suites, 2651 tests). |
 | **FINANCIAL DOMAIN SERVICES** | **READY** | Implemented as internal TypeScript domain services (see 7B.0 inventory). |
-| **DATABASE MIGRATIONS** | **READY through 0071** | 72 migration files verified and immutable. |
+| **DATABASE MIGRATIONS** | **READY through 0076** | 77 migration files verified and immutable. Future migrations start at 0077+. |
 | **AUTH CORE** | **READY** | WebAuthn / Passkey, session cookies, rate limiter, recovery. |
 | **SCHEDULED NOTIFICATIONS** | **READY** | Push notification queue and VAPID transport (`0 * * * *`). |
 | **SCHEDULED BUDGET CHECKPOINTS** | **READY** | Pending Budget V2 checkpoint processor (`0 * * * *`). |
-| **BACKUP / RESTORE CODE** | **READY** | AES-256-GCM streaming encryption and retention logic (`17 2 * * *`). |
+| **BACKUP / RESTORE CODE** | **READY** | AES-256-GCM bounded envelope encryption (10 MiB plaintext ceiling, chunked DB export) and retention logic (`17 2 * * *`). |
 | **HTTP TRANSPORT HELPERS** | **READY** | Shared transport layer (7B.0): UUID, instant, idempotency, origin guard. |
 | **AUTH HTTP ADAPTER** | **READY** | `/auth/*` routes complete and tested. |
 | **BUDGET V2 HTTP ADAPTER** | **READY** | `/budget-v2/*` routes complete, CSRF-guarded, and tested. |
@@ -235,7 +235,7 @@ The application origin is read from `WEBAUTHN_ORIGIN` config — never hard-code
 | **LEDGER ACCOUNT PRODUCT PROVISIONING** | **READY** | Safe namespaced `USR_*` product account metadata creation (`POST /ledger/accounts`) tested with natural-key replay and zero financial side effects. |
 | **INCOME HTTP ADAPTER** | **READY (Checkpoint 7B.2)** | `/income/*` product endpoints (sources, entitlements, receipts, settlements, reference) complete, tested, same-origin guarded, and domain-authoritative. |
 | **FINANCIAL HTTP PRODUCT SURFACE** | **READY (Checkpoint 7B.9)** | All financial HTTP adapters (7B.1–7B.9: transactions, ledger, income, credit-cards, people, rewards, campaigns, short-term-goals, midas, long-term, month-close, notifications, imports) complete, tested, and same-origin guarded. |
-| **PRE-FRONTEND BACKEND CODE FREEZE** | **COMPLETE** | Checkpoints 7B.1–7B.9 verified with 2648 tests. Backend code frozen prior to frontend integration. |
+| **PRE-FRONTEND BACKEND CODE FREEZE** | **COMPLETE** | Checkpoints 7B.1–7B.9 verified with 185 suites and 2651 tests. Backend code frozen prior to frontend integration. |
 | **LIVE R2 DRILL** | **BLOCKED — TEST BUCKET UNAVAILABLE** | Unit & mock tests green; live drill deferred. |
 | **LIVE RESTORE DRILL** | **BLOCKED — DISPOSABLE DATABASE UNAVAILABLE** | Restore logic verified with empty-target checks. |
 | **FINAL FRONTEND DOMAIN / WEBAUTHN ORIGIN** | **DEFERRED** | Awaiting production web frontend provisioning. |

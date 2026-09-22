@@ -204,6 +204,9 @@ describe("Notifications HTTP — GET /subscriptions/:id", () => {
 		const body = (await res.json()) as Record<string, unknown>;
 		expect(body.subscriptionId).toBe(SUB_ID);
 		expect(body.status).toBe("ACTIVE");
+		expect(body.p256dh).toBeUndefined();
+		expect(body.auth).toBeUndefined();
+		expect(body.endpoint).toBeUndefined();
 	});
 
 	it("C: other user's subscription → 404", async () => {
@@ -236,9 +239,22 @@ describe("Notifications HTTP — GET /subscriptions/:id", () => {
 // -----------------------------------------------------------------------
 
 describe("Notifications HTTP — GET /subscriptions (list)", () => {
-	it("D: returns bounded list with nextCursor", async () => {
+	it("D: returns bounded list with nextCursor and strips credentials", async () => {
 		vi.spyOn(dbClientModule, "createDatabase").mockReturnValue({
-			execute: vi.fn().mockResolvedValue([]),
+			execute: vi.fn().mockResolvedValue([
+				{
+					subscription_id: SUB_ID,
+					user_id: U1,
+					created_at: new Date(),
+					revision_no: 1,
+					status: "ACTIVE",
+					endpoint: ENDPOINT,
+					p256dh: P256DH,
+					auth: AUTH_KEY,
+					expiration_time: null,
+					user_agent: null,
+				},
+			]),
 		} as never);
 		const res = await app.request(
 			"/notifications/subscriptions?limit=10",
@@ -247,10 +263,14 @@ describe("Notifications HTTP — GET /subscriptions (list)", () => {
 		);
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as {
-			items: unknown[];
+			items: Array<Record<string, unknown>>;
 			nextCursor: unknown;
 		};
 		expect(Array.isArray(body.items)).toBe(true);
+		expect(body.items[0]?.subscriptionId).toBe(SUB_ID);
+		expect(body.items[0]?.p256dh).toBeUndefined();
+		expect(body.items[0]?.auth).toBeUndefined();
+		expect(body.items[0]?.endpoint).toBeUndefined();
 		expect("nextCursor" in body).toBe(true);
 	});
 

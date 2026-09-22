@@ -760,22 +760,26 @@ describe("Imports HTTP — GET /rows (list)", () => {
 			makeMockBatch() as never,
 		);
 		vi.spyOn(dbClientModule, "createDatabase").mockReturnValue({
-			select: vi.fn().mockReturnValue({
-				from: vi.fn().mockReturnValue({
-					where: vi.fn().mockReturnValue({
-						orderBy: vi.fn().mockReturnValue({
-							limit: vi.fn().mockResolvedValue([]),
-						}),
-					}),
-				}),
-			}),
+			execute: vi.fn().mockResolvedValue([]),
+			// biome-ignore lint/complexity/noBannedTypes: vitest mock callback
+			transaction: vi.fn().mockImplementation(async (fn: Function) => fn({})),
 		} as never);
+		vi.spyOn(
+			serviceModule,
+			"buildImportRowReadModelsInTransaction",
+		).mockResolvedValue([]);
 		const res = await app.request(
 			`/imports/rows?batchId=${BATCH_ID}`,
 			{ method: "GET", headers: { Cookie: COOKIE } },
 			mockEnv,
 		);
-		expect([200, 404]).toContain(res.status);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as {
+			items: unknown[];
+			nextCursor: unknown;
+		};
+		expect(Array.isArray(body.items)).toBe(true);
+		expect(body.nextCursor).toBeNull();
 	});
 });
 
@@ -791,6 +795,8 @@ describe("Imports HTTP — POST /batches/:id/apply", () => {
 		vi.spyOn(serviceModule, "applyReadyImportRows").mockResolvedValue({
 			appliedCount: 1,
 			failedCount: 0,
+			remainingReadyCount: 0,
+			hasMore: false,
 			results: [{ importRowId: ROW_ID, status: "APPLIED" }],
 		});
 		const res = await app.request(
@@ -804,6 +810,8 @@ describe("Imports HTTP — POST /batches/:id/apply", () => {
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as Record<string, unknown>;
 		expect(body.appliedCount).toBe(1);
+		expect(body.remainingReadyCount).toBe(0);
+		expect(body.hasMore).toBe(false);
 	});
 
 	it("I: cross-user batch → 404", async () => {
@@ -868,7 +876,7 @@ describe("Imports HTTP — POST /batches/:id/apply", () => {
 // -----------------------------------------------------------------------
 
 describe("Imports HTTP — GET /batches/:id/preview", () => {
-	it("J: preview returns batch + rows DTO", async () => {
+	it("J: preview returns batch + rowSample DTO", async () => {
 		vi.spyOn(dbClientModule, "createDatabase").mockReturnValue({
 			// biome-ignore lint/complexity/noBannedTypes: vitest mock callback
 			transaction: vi.fn().mockImplementation(async (fn: Function) =>
@@ -876,7 +884,9 @@ describe("Imports HTTP — GET /batches/:id/preview", () => {
 					select: vi.fn().mockReturnValue({
 						from: vi.fn().mockReturnValue({
 							where: vi.fn().mockReturnValue({
-								orderBy: vi.fn().mockResolvedValue([]),
+								orderBy: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([]),
+								}),
 							}),
 						}),
 					}),
@@ -887,12 +897,20 @@ describe("Imports HTTP — GET /batches/:id/preview", () => {
 			serviceModule,
 			"buildImportBatchSummaryInTransaction",
 		).mockResolvedValue(makeMockBatch() as never);
+		vi.spyOn(
+			serviceModule,
+			"buildImportRowReadModelsInTransaction",
+		).mockResolvedValue([]);
 		const res = await app.request(
 			`/imports/batches/${BATCH_ID}/preview`,
 			{ method: "GET", headers: { Cookie: COOKIE } },
 			mockEnv,
 		);
-		expect([200, 404]).toContain(res.status);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as Record<string, unknown>;
+		expect(body.batch).toBeDefined();
+		expect(Array.isArray(body.rowSample)).toBe(true);
+		expect(body.rowSampleLimit).toBe(25);
 	});
 
 	it("J: non-UUID batchId → 404", async () => {
@@ -911,5 +929,225 @@ describe("Imports HTTP — GET /batches/:id/preview", () => {
 			mockEnv,
 		);
 		expect(res.status).toBe(400);
+	});
+
+	it("J: 5000-row batch preview does not invoke per-row builder 5000 times and bounds sample", async () => {
+		vi.spyOn(
+			serviceModule,
+			"buildImportBatchSummaryInTransaction",
+		).mockResolvedValue(makeMockBatch({ totalRows: 5000 }) as never);
+		const buildRowsSpy = vi
+			.spyOn(serviceModule, "buildImportRowReadModelsInTransaction")
+			.mockResolvedValue([makeMockRow() as never]);
+
+		vi.spyOn(dbClientModule, "createDatabase").mockReturnValue({
+			// biome-ignore lint/complexity/noBannedTypes: vitest mock callback
+			transaction: vi.fn().mockImplementation(async (fn: Function) =>
+				fn({
+					select: vi.fn().mockReturnValue({
+						from: vi.fn().mockReturnValue({
+							where: vi.fn().mockReturnValue({
+								orderBy: vi.fn().mockReturnValue({
+									limit: vi.fn().mockResolvedValue([{ id: ROW_ID }]),
+								}),
+							}),
+						}),
+					}),
+				}),
+			),
+		} as never);
+
+		const res = await app.request(
+			`/imports/batches/${BATCH_ID}/preview`,
+			{ method: "GET", headers: { Cookie: COOKIE } },
+			mockEnv,
+		);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as {
+			batch: Record<string, unknown>;
+			rowSample: unknown[];
+			rowSampleLimit: number;
+		};
+		expect(body.batch).toBeDefined();
+		expect(body.rowSampleLimit).toBe(25);
+		expect(body.rowSample.length).toBeLessThanOrEqual(25);
+		// Crucial boundedness assertion: batch read helper received at most 25 IDs, NOT 5000
+		expect(buildRowsSpy).toHaveBeenCalledTimes(1);
+		const requestedIds = buildRowsSpy.mock.calls[0]?.[1] as string[];
+		expect(requestedIds.length).toBeLessThanOrEqual(25);
+	});
+});
+
+// -----------------------------------------------------------------------
+// 7B.9 Boundedness & Scale Verification (Sections 16, 17, 18, 19)
+// -----------------------------------------------------------------------
+
+describe("Imports HTTP — 7B.9 Bounded Scale & Chunking Verification", () => {
+	it("K: Section 18 — 120-row status-filter pagination (70 READY, 50 APPLIED) applies DB-side before page cut", async () => {
+		vi.spyOn(serviceModule, "getImportBatch").mockResolvedValue(
+			makeMockBatch() as never,
+		);
+
+		// Page 1: returns first 51 anchors (50 page + 1 peek) for READY status
+		const page1Anchors = Array.from({ length: 51 }, (_, i) => ({
+			id: `11111111-1111-4111-8111-${String(i).padStart(12, "0")}`,
+		}));
+		const page1Details = page1Anchors
+			.slice(0, 50)
+			.map((a) => makeMockRow({ id: a.id, status: "READY" }));
+
+		const executeMock = vi.fn().mockResolvedValueOnce(page1Anchors);
+		vi.spyOn(dbClientModule, "createDatabase").mockReturnValue({
+			execute: executeMock,
+			// biome-ignore lint/complexity/noBannedTypes: vitest mock callback
+			transaction: vi.fn().mockImplementation(async (fn: Function) => fn({})),
+		} as never);
+		const readModelsSpy = vi
+			.spyOn(serviceModule, "buildImportRowReadModelsInTransaction")
+			.mockResolvedValueOnce(page1Details as never);
+
+		const res1 = await app.request(
+			`/imports/rows?batchId=${BATCH_ID}&status=READY&limit=50`,
+			{ method: "GET", headers: { Cookie: COOKIE } },
+			mockEnv,
+		);
+		expect(res1.status).toBe(200);
+		const body1 = (await res1.json()) as {
+			items: Array<{ id: string; status: string }>;
+			nextCursor: string | null;
+		};
+		expect(body1.items.length).toBe(50);
+		for (const it of body1.items) {
+			expect(it.status).toBe("READY");
+		}
+		expect(body1.nextCursor).toBe(page1Anchors[49]?.id);
+		expect(readModelsSpy).toHaveBeenCalledTimes(1);
+
+		// Page 2: returns remaining 20 READY anchors with no peek beyond
+		const page2Anchors = Array.from({ length: 20 }, (_, i) => ({
+			id: `11111111-1111-4111-8111-${String(50 + i).padStart(12, "0")}`,
+		}));
+		const page2Details = page2Anchors.map((a) =>
+			makeMockRow({ id: a.id, status: "READY" }),
+		);
+
+		executeMock.mockResolvedValueOnce(page2Anchors);
+		readModelsSpy.mockResolvedValueOnce(page2Details as never);
+
+		const res2 = await app.request(
+			`/imports/rows?batchId=${BATCH_ID}&status=READY&limit=50&after=${body1.nextCursor}`,
+			{ method: "GET", headers: { Cookie: COOKIE } },
+			mockEnv,
+		);
+		expect(res2.status).toBe(200);
+		const body2 = (await res2.json()) as {
+			items: Array<{ id: string; status: string }>;
+			nextCursor: string | null;
+		};
+		expect(body2.items.length).toBe(20);
+		for (const it of body2.items) {
+			expect(it.status).toBe("READY");
+		}
+		expect(body2.nextCursor).toBeNull();
+	});
+
+	it("L: Section 19 — 120 READY rows apply chunking (chunk=50) transitions cleanly until hasMore=false", async () => {
+		vi.spyOn(serviceModule, "getImportBatch").mockResolvedValue(
+			makeMockBatch() as never,
+		);
+		const applySpy = vi.spyOn(serviceModule, "applyReadyImportRows");
+
+		// Invocation 1: applies 50 rows, 70 remaining, hasMore = true
+		applySpy.mockResolvedValueOnce({
+			appliedCount: 50,
+			failedCount: 0,
+			remainingReadyCount: 70,
+			hasMore: true,
+			results: Array.from({ length: 50 }, (_, i) => ({
+				importRowId: `row-${i}`,
+				status: "APPLIED",
+			})),
+		});
+
+		const res1 = await app.request(
+			`/imports/batches/${BATCH_ID}/apply`,
+			{
+				method: "POST",
+				headers: { Cookie: COOKIE, Origin: ORIGIN },
+			},
+			mockEnv,
+		);
+		expect(res1.status).toBe(200);
+		const body1 = (await res1.json()) as {
+			appliedCount: number;
+			failedCount: number;
+			remainingReadyCount: number;
+			hasMore: boolean;
+		};
+		expect(body1.appliedCount).toBe(50);
+		expect(body1.remainingReadyCount).toBe(70);
+		expect(body1.hasMore).toBe(true);
+
+		// Invocation 2: applies next 50 rows, 20 remaining, hasMore = true
+		applySpy.mockResolvedValueOnce({
+			appliedCount: 50,
+			failedCount: 0,
+			remainingReadyCount: 20,
+			hasMore: true,
+			results: Array.from({ length: 50 }, (_, i) => ({
+				importRowId: `row-${50 + i}`,
+				status: "APPLIED",
+			})),
+		});
+
+		const res2 = await app.request(
+			`/imports/batches/${BATCH_ID}/apply`,
+			{
+				method: "POST",
+				headers: { Cookie: COOKIE, Origin: ORIGIN },
+			},
+			mockEnv,
+		);
+		expect(res2.status).toBe(200);
+		const body2 = (await res2.json()) as {
+			appliedCount: number;
+			failedCount: number;
+			remainingReadyCount: number;
+			hasMore: boolean;
+		};
+		expect(body2.appliedCount).toBe(50);
+		expect(body2.remainingReadyCount).toBe(20);
+		expect(body2.hasMore).toBe(true);
+
+		// Invocation 3: applies remaining 20 rows, 0 remaining, hasMore = false
+		applySpy.mockResolvedValueOnce({
+			appliedCount: 20,
+			failedCount: 0,
+			remainingReadyCount: 0,
+			hasMore: false,
+			results: Array.from({ length: 20 }, (_, i) => ({
+				importRowId: `row-${100 + i}`,
+				status: "APPLIED",
+			})),
+		});
+
+		const res3 = await app.request(
+			`/imports/batches/${BATCH_ID}/apply`,
+			{
+				method: "POST",
+				headers: { Cookie: COOKIE, Origin: ORIGIN },
+			},
+			mockEnv,
+		);
+		expect(res3.status).toBe(200);
+		const body3 = (await res3.json()) as {
+			appliedCount: number;
+			failedCount: number;
+			remainingReadyCount: number;
+			hasMore: boolean;
+		};
+		expect(body3.appliedCount).toBe(20);
+		expect(body3.remainingReadyCount).toBe(0);
+		expect(body3.hasMore).toBe(false);
 	});
 });

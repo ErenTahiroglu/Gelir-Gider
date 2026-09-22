@@ -30,13 +30,13 @@ Private, single-user personal finance backend built for high-integrity ledger ac
 11. **Notifications & Alerts:** Notification event queue, delivery planning, push subscription management, and VAPID payload delivery.
 12. **Campaigns & Merchant Tracking:** Card/bank merchant campaigns, spending thresholds, review candidates, reward credits, and family tracking.
 13. **Bank/Statement CSV Imports:** Raw file parsing, duplicate candidate detection, external identity claims, mutation receipts, and batch ingestion.
-14. **Encrypted Backups & Disaster Recovery:** AES-256-GCM envelope encryption, streaming R2 backup upload, retention cleanup, and safe restore tooling with empty-target protection.
+14. **Encrypted Backups & Disaster Recovery:** AES-256-GCM envelope encryption, bounded encrypted Backup V1 10 MiB plaintext ceiling chunked DB export full snapshot/envelope materialization R2 upload, retention cleanup, and safe restore tooling with empty-target protection.
 15. **WebAuthn Passkey Authentication:** Single-user authentication, challenge generation, credential management, rate limiting, and session cookie lifecycle.
 
 ## Current Backend Status
 
 - **Backend Core & HTTP Surface (Phases 0–20 & 7B.1–7B.9):** **100% COMPLETE & PRE-FRONTEND CODE-FROZEN**.
-- **Database Migrations:** Migrations `0000` through `0071` are complete, audited, and immutable.
+- **Database Migrations:** Migrations `0000` through `0076` are complete, audited, and immutable.
 - **Financial HTTP Adapters:** All financial HTTP adapters (transactions, ledger, income, credit cards, people, rewards, campaigns, goals, midas, long-term, month-close, notifications, imports) are mounted, tested, and guarded by same-origin mutation checks.
 - **Production Deployment:** Full end-to-end production cutover is deferred until the production frontend domain and WebAuthn RP ID are configured.
 

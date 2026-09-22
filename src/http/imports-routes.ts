@@ -1,11 +1,15 @@
-import { and, asc, eq, gt } from "drizzle-orm";
+import { and, asc, eq, gt, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { type AppEnv, getDatabaseUrl } from "../config/env";
 import type { DatabaseTransaction } from "../db/client";
 import { createDatabase } from "../db/client";
-import { importBatches, importRows } from "../db/schema/imports";
+import {
+	importBatches,
+	importRowRevisions,
+	importRows,
+} from "../db/schema/imports";
 import { ImportError, parseGenericCsvV1 } from "../imports";
 import { withImportTransaction } from "../imports/boundary";
 import type { RawImportRowInput } from "../imports/normalize";
@@ -13,7 +17,7 @@ import { MAX_SOURCE_CONTENT_BYTES } from "../imports/normalize";
 import {
 	applyReadyImportRows,
 	buildImportBatchSummaryInTransaction,
-	buildImportRowReadModelInTransaction,
+	buildImportRowReadModelsInTransaction,
 	getImportBatch,
 	getImportRow,
 	type ImportBatchSummary,
@@ -422,17 +426,20 @@ importsRouter.get("/batches/:id/preview", async (c) => {
 				if (summary.userId !== userId) {
 					return null;
 				}
-				// Load all rows for the batch (bounded by MAX_IMPORT_BATCH_ROWS=5000)
-				const rowAnchors = await tx
+				// Bounded sample: at most 25 rows, never scaling with 5000 rows
+				const PREVIEW_SAMPLE_LIMIT = 25;
+				const sampleRowAnchors = await tx
 					.select({ id: importRows.id })
 					.from(importRows)
 					.where(eq(importRows.batchId, id))
-					.orderBy(importRows.rowOrdinal);
+					.orderBy(importRows.rowOrdinal)
+					.limit(PREVIEW_SAMPLE_LIMIT);
 
-				const rowDetails: ImportRowDetail[] = [];
-				for (const r of rowAnchors) {
-					rowDetails.push(await buildImportRowReadModelInTransaction(tx, r.id));
-				}
+				const rowDetails = await buildImportRowReadModelsInTransaction(
+					tx,
+					sampleRowAnchors.map((r) => r.id),
+				);
+
 				return { summary, rows: rowDetails };
 			},
 		);
@@ -444,7 +451,8 @@ importsRouter.get("/batches/:id/preview", async (c) => {
 		return c.json(
 			{
 				batch: batchResponseBody(result.summary),
-				rows: result.rows.map(rowResponseBody),
+				rowSample: result.rows.map(rowResponseBody),
+				rowSampleLimit: 25,
 			},
 			200,
 		);
@@ -595,13 +603,22 @@ importsRouter.post(
 		onError: (c) => c.json(errorEnvelope("IMPORT_INVALID_INPUT"), 400),
 	}),
 	async (c) => {
-		if (!validateStrictQueryParams(c, [])) {
+		if (!validateStrictQueryParams(c, ["limit"])) {
 			return fail(c, "IMPORT_INVALID_INPUT", 400);
 		}
 
 		const id = c.req.param("id");
 		if (!UUID_RE.test(id)) {
 			return fail(c, "IMPORT_BATCH_NOT_FOUND", 404);
+		}
+
+		const rawLimit = c.req.query("limit");
+		const limitResult = parseBoundedLimit(rawLimit, {
+			defaultLimit: 50,
+			maxLimit: 100,
+		});
+		if (!limitResult.ok) {
+			return fail(c, "IMPORT_INVALID_INPUT", 400);
 		}
 
 		const userId = c.get("auth").userId;
@@ -628,7 +645,11 @@ importsRouter.post(
 				return fail(c, "IMPORT_BATCH_NOT_FOUND", 404);
 			}
 
-			const result = await applyReadyImportRows(db, { userId, batchId: id });
+			const result = await applyReadyImportRows(db, {
+				userId,
+				batchId: id,
+				limit: limitResult.limit,
+			});
 			return c.json(result, 200);
 		} catch (err) {
 			return mapImportError(c, err);
@@ -711,37 +732,46 @@ importsRouter.get("/rows", async (c) => {
 		}
 
 		const fetchLimit = limit + 1;
-		const conditions = [
-			eq(importRows.batchId, batchId),
-			eq(importRows.userId, userId),
-		];
-		if (after !== undefined) {
-			conditions.push(gt(importRows.id, after));
-		}
 
-		const rowAnchors = await db
-			.select({ id: importRows.id })
-			.from(importRows)
-			.where(and(...conditions))
-			.orderBy(asc(importRows.id))
-			.limit(fetchLimit);
+		// Select row IDs applying latest-revision status filter DB-side before page cut
+		const rawRowAnchors = await db.execute(sql`
+			WITH latest_revisions AS (
+				SELECT DISTINCT ON (${importRowRevisions.importRowId})
+					${importRowRevisions.importRowId} AS import_row_id,
+					${importRowRevisions.revisionNo} AS revision_no,
+					${importRowRevisions.status} AS status
+				FROM ${importRowRevisions}
+				WHERE ${importRowRevisions.userId} = ${userId}
+				ORDER BY ${importRowRevisions.importRowId}, ${importRowRevisions.revisionNo} DESC
+			)
+			SELECT ${importRows.id} AS id
+			FROM ${importRows}
+			INNER JOIN latest_revisions lr ON ${importRows.id} = lr.import_row_id
+			WHERE ${importRows.batchId} = ${batchId}
+			  AND ${importRows.userId} = ${userId}
+			  ${rawStatus !== undefined ? sql`AND lr.status = ${rawStatus}` : sql``}
+			  ${after !== undefined ? sql`AND ${importRows.id} > ${after}` : sql``}
+			ORDER BY ${importRows.id} ASC
+			LIMIT ${fetchLimit}
+		`);
+
+		const rowAnchors = (
+			Array.isArray(rawRowAnchors)
+				? rawRowAnchors
+				: ((rawRowAnchors as { rows?: unknown[] }).rows ?? [])
+		) as Array<{ id: string }>;
 
 		const hasMore = rowAnchors.length > limit;
 		const page = hasMore ? rowAnchors.slice(0, limit) : rowAnchors;
 
-		// Build row details and apply optional status filter
+		// Batch read details in a single set of constant queries (no N+1)
 		const details = await withImportTransaction(
 			db,
 			async (tx: DatabaseTransaction) => {
-				const result: ImportRowDetail[] = [];
-				for (const r of page) {
-					const detail = await buildImportRowReadModelInTransaction(tx, r.id);
-					if (rawStatus !== undefined && detail.status !== rawStatus) {
-						continue;
-					}
-					result.push(detail);
-				}
-				return result;
+				return await buildImportRowReadModelsInTransaction(
+					tx,
+					page.map((r) => r.id),
+				);
 			},
 		);
 

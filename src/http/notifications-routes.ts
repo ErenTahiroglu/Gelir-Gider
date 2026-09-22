@@ -98,9 +98,6 @@ function subscriptionResponseBody(sub: PushSubscriptionReadModel) {
 		userId: sub.userId,
 		status: sub.status,
 		revisionNo: sub.revisionNo,
-		endpoint: sub.endpoint,
-		p256dh: sub.p256dh,
-		auth: sub.auth,
 		expirationTime: sub.expirationTime?.toISOString() ?? null,
 		userAgent: sub.userAgent,
 		createdAt: sub.createdAt.toISOString(),
@@ -259,9 +256,6 @@ notificationsRouter.get("/subscriptions", async (c) => {
 			userId: r.user_id,
 			status: r.status,
 			revisionNo: Number(r.revision_no),
-			endpoint: r.endpoint,
-			p256dh: r.p256dh,
-			auth: r.auth,
 			expirationTime: r.expiration_time
 				? r.expiration_time instanceof Date
 					? r.expiration_time.toISOString()

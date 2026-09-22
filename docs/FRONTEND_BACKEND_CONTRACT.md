@@ -1732,7 +1732,7 @@ MOUNTED  GET   /imports/batches         ?limit=&after=
 MOUNTED  POST  /imports/batches         (stage batch)
 MOUNTED  GET   /imports/batches/:id/preview
 MOUNTED  POST  /imports/batches/:batchId/rows/:rowId/resolve  (resolve row)
-MOUNTED  POST  /imports/batches/:id/apply  (apply ready rows)
+MOUNTED  POST  /imports/batches/:id/apply  (apply ready rows chunk, limit=1..100)
 
 MOUNTED  GET   /imports/rows/:id
 MOUNTED  GET   /imports/rows            ?batchId=&status=&limit=&after=
@@ -1743,7 +1743,7 @@ MOUNTED  GET   /imports/rows            ?batchId=&status=&limit=&after=
 ##### Notifications
 - `GET /notifications/subscriptions/:id`
   - **Auth:** Session cookie required.
-  - **Response:** `200 OK` with subscription DTO (`id`, `userId`, `endpoint`, `userAgent`, `status`, `failureCount`, `lastFailureAt`, `createdAt`, `revokedAt`). `keys` (p256dh/auth) are omitted for transport privacy.
+  - **Response:** `200 OK` with subscription DTO (`id`, `userId`, `userAgent`, `status`, `failureCount`, `lastFailureAt`, `createdAt`, `revokedAt`). Push credentials (`endpoint`, `p256dh`, `auth`) are omitted from GET responses for transport privacy.
   - **Errors:** `404` (`NOTIFICATION_SUBSCRIPTION_NOT_FOUND`), `400` (`NOTIFICATION_INVALID_INPUT` on malformed UUID/query).
 - `GET /notifications/subscriptions?status=&limit=&after=`
   - **Auth:** Session cookie required.
@@ -1782,21 +1782,24 @@ MOUNTED  GET   /imports/rows            ?batchId=&status=&limit=&after=
   - **Response:** `201 Created` with `ImportBatchSummary` DTO.
 - `GET /imports/batches/:id/preview`
   - **Auth:** Session cookie required.
-  - **Response:** `200 OK` with `{ batch: ImportBatchSummary, rows: ImportRowDetail[] }`.
+  - **Response:** `200 OK` with `{ batch: ImportBatchSummary, rowSample: ImportRowDetail[], rowSampleLimit: 25 }`. Persisted preview returns batch summary and a bounded sample of up to 25 rows (no N-per-row materialization of the full batch). Full row inspection uses `GET /imports/rows`.
 - `POST /imports/batches/:batchId/rows/:rowId/resolve`
   - **Auth:** Session cookie required + Same-Origin guard.
   - **Body:** `{ expectedRevisionNo: number, action: "CONFIRM_IMPORT" | "LINK_EXISTING" | "SKIP", resolutionReason?: string, resolvedMappings?: { accountId?: string, categoryId?: string, description?: string, personId?: string }, targetTransactionId?: string }`.
   - **Response:** `200 OK` with updated `ImportRowDetail` DTO.
 - `POST /imports/batches/:id/apply`
   - **Auth:** Session cookie required + Same-Origin guard.
+  - **Query:** `limit` (optional integer 1..100, default 50).
   - **Body:** Optional empty JSON object (`{}`).
-  - **Response:** `200 OK` with `{ appliedCount: number, batchStatus: string }`.
+  - **Behavior:** Bounded chunk execution. Queries up to `limit` READY rows directly from the DB, applies them sequentially in individual transactions, and computes `remainingReadyCount`.
+  - **Response:** `200 OK` with `{ appliedCount: number, failedCount: number, remainingReadyCount: number, hasMore: boolean, results: { importRowId: string, status: "APPLIED" | "ERROR", transactionId?: string, errorMessage?: string }[] }`. Frontend should invoke repeatedly while `hasMore: true`.
 - `GET /imports/rows/:id`
   - **Auth:** Session cookie required.
   - **Response:** `200 OK` with `ImportRowDetail` DTO.
 - `GET /imports/rows?batchId=&status=&limit=&after=`
   - **Auth:** Session cookie required.
   - **Query:** `batchId` (required UUID), `status` (`PENDING | READY | APPLIED | SKIPPED | ERROR`), `limit` (1..100, default 50), `after` (opaque cursor).
+  - **Behavior:** Status filtering is evaluated DB-side on the latest revision of each row before keyset pagination cutoff (`LIMIT limit + 1`), guaranteeing exact limit semantics. Selected rows are batch-materialized in a constant query count without N+1 queries.
   - **Response:** `200 OK` with `{ items: ImportRowDetail[], nextCursor: string | null }`.
 
 #### 2. Keyset Pagination & Isolation

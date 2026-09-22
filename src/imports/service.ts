@@ -1,4 +1,4 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { recordCreditCardPurchaseInTransaction } from "../credit-cards/purchases";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
@@ -269,6 +269,137 @@ export async function buildImportRowReadModelInTransaction(
 		importRowId,
 		latestRev.id,
 	);
+}
+
+/**
+ * Builds the latest read models for a list of import rows using batch queries (no N+1).
+ * Preserves the input order of rowIds.
+ */
+export async function buildImportRowReadModelsInTransaction(
+	tx: DatabaseTransaction,
+	rowIds: string[],
+): Promise<ImportRowDetail[]> {
+	if (!rowIds || rowIds.length === 0) {
+		return [];
+	}
+
+	// 1. Fetch row anchors
+	const rows = await tx
+		.select()
+		.from(importRows)
+		.where(inArray(importRows.id, rowIds));
+
+	const rowMap = new Map<string, (typeof rows)[0]>();
+	for (const r of rows) {
+		rowMap.set(r.id, r);
+	}
+
+	// 2. Fetch latest revision per row using PostgreSQL DISTINCT ON
+	const latestRevs = await tx
+		.selectDistinctOn([importRowRevisions.importRowId])
+		.from(importRowRevisions)
+		.where(inArray(importRowRevisions.importRowId, rowIds))
+		.orderBy(
+			importRowRevisions.importRowId,
+			desc(importRowRevisions.revisionNo),
+		);
+
+	const latestRevMap = new Map<string, (typeof latestRevs)[0]>();
+	for (const rev of latestRevs) {
+		latestRevMap.set(rev.importRowId, rev);
+	}
+
+	// 3. Fetch duplicate candidates for all selected row IDs
+	const candidates = await tx
+		.select({
+			importRowId: importDuplicateCandidates.importRowId,
+			candidateType: importDuplicateCandidates.candidateType,
+			candidateId: importDuplicateCandidates.candidateId,
+			reasonCode: importDuplicateCandidates.reasonCode,
+		})
+		.from(importDuplicateCandidates)
+		.where(inArray(importDuplicateCandidates.importRowId, rowIds));
+
+	const candidateMap = new Map<
+		string,
+		Array<{
+			candidateType: ImportDuplicateCandidateType;
+			candidateId: string;
+			reasonCode: ImportDuplicateReasonCode;
+		}>
+	>();
+	for (const c of candidates) {
+		let list = candidateMap.get(c.importRowId);
+		if (!list) {
+			list = [];
+			candidateMap.set(c.importRowId, list);
+		}
+		list.push({
+			candidateType: c.candidateType as ImportDuplicateCandidateType,
+			candidateId: c.candidateId,
+			reasonCode: c.reasonCode as ImportDuplicateReasonCode,
+		});
+	}
+
+	// 4. Fetch results for relevant terminal rows
+	const terminalRowIds: string[] = [];
+	for (const rev of latestRevs) {
+		if (
+			rev.status === "APPLIED" ||
+			rev.status === "LINKED_EXISTING" ||
+			rev.status === "EXACT_DUPLICATE"
+		) {
+			terminalRowIds.push(rev.importRowId);
+		}
+	}
+
+	const resultMap = new Map<string, ImportRowDetail["result"]>();
+	if (terminalRowIds.length > 0) {
+		const results = await tx
+			.select()
+			.from(importRowResults)
+			.where(inArray(importRowResults.importRowId, terminalRowIds));
+
+		for (const res of results) {
+			resultMap.set(res.importRowId, {
+				resultKind: res.resultKind as ImportResultKind,
+				targetType: res.targetType as ImportResultTargetType,
+				targetId: res.targetId,
+				canonicalTransactionId: res.canonicalTransactionId,
+				externalIdentityClaimId: res.externalIdentityClaimId,
+			});
+		}
+	}
+
+	// 5. Assemble in original rowIds order
+	const rowDetails: ImportRowDetail[] = [];
+	for (const id of rowIds) {
+		const row = rowMap.get(id);
+		if (!row) {
+			continue;
+		}
+		const rev = latestRevMap.get(id);
+		if (!rev) {
+			continue;
+		}
+
+		rowDetails.push({
+			id: row.id,
+			userId: row.userId,
+			batchId: row.batchId,
+			rowOrdinal: row.rowOrdinal,
+			recordType: row.recordType as ImportRecordType,
+			latestRevisionNo: rev.revisionNo,
+			status: rev.status as ImportRowStatus,
+			payload: rev.payload as NormalizedImportPayload,
+			occurredAt: rev.occurredAt,
+			externalIdentityPresent: row.externalTransactionIdHash !== null,
+			duplicateCandidates: candidateMap.get(id) ?? [],
+			result: resultMap.get(id) ?? null,
+		});
+	}
+
+	return rowDetails;
 }
 
 /**
@@ -2334,14 +2465,16 @@ export async function applyImportRow(
 }
 
 /**
- * Applies all READY import rows for a given batch.
+ * Applies READY import rows for a given batch up to a bounded limit.
  */
 export async function applyReadyImportRows(
 	db: Database | DatabaseTransaction,
-	params: { userId: string; batchId: string },
+	params: { userId: string; batchId: string; limit?: number },
 ): Promise<{
 	appliedCount: number;
 	failedCount: number;
+	remainingReadyCount: number;
+	hasMore: boolean;
 	results: Array<{
 		importRowId: string;
 		status: "APPLIED" | "EXACT_DUPLICATE" | "FAILED";
@@ -2366,8 +2499,40 @@ export async function applyReadyImportRows(
 		);
 	}
 
-	const rows = await listImportRows(db, params.batchId);
-	const readyRows = rows.filter((r) => r.status === "READY");
+	const applyLimit = Math.min(Math.max(params.limit ?? 50, 1), 100);
+
+	const rawReadyRows = await db.execute(sql`
+		WITH latest_revisions AS (
+			SELECT DISTINCT ON (${importRowRevisions.importRowId})
+				${importRowRevisions.importRowId} AS import_row_id,
+				${importRowRevisions.revisionNo} AS revision_no,
+				${importRowRevisions.status} AS status
+			FROM ${importRowRevisions}
+			WHERE ${importRowRevisions.userId} = ${params.userId}
+			ORDER BY ${importRowRevisions.importRowId}, ${importRowRevisions.revisionNo} DESC
+		)
+		SELECT
+			${importRows.id} AS id,
+			${importRows.rowOrdinal} AS row_ordinal,
+			lr.revision_no AS latest_revision_no
+		FROM ${importRows}
+		INNER JOIN latest_revisions lr ON ${importRows.id} = lr.import_row_id
+		WHERE ${importRows.batchId} = ${params.batchId}
+		  AND ${importRows.userId} = ${params.userId}
+		  AND lr.status = 'READY'
+		ORDER BY ${importRows.rowOrdinal} ASC
+		LIMIT ${applyLimit}
+	`);
+
+	const readyRows = (
+		Array.isArray(rawReadyRows)
+			? rawReadyRows
+			: ((rawReadyRows as { rows?: unknown[] }).rows ?? [])
+	) as Array<{
+		id: string;
+		row_ordinal: number;
+		latest_revision_no: number;
+	}>;
 
 	let appliedCount = 0;
 	let failedCount = 0;
@@ -2384,14 +2549,14 @@ export async function applyReadyImportRows(
 			"IMPORT_APPLY_READY_ROW",
 			params.userId,
 			r.id,
-			r.latestRevisionNo.toString(),
+			r.latest_revision_no.toString(),
 		);
 
 		try {
 			const res = await applyImportRow(db, {
 				userId: params.userId,
 				importRowId: r.id,
-				expectedRevisionNo: r.latestRevisionNo,
+				expectedRevisionNo: r.latest_revision_no,
 				idempotencyKey: deterministicKey,
 			});
 
@@ -2429,9 +2594,36 @@ export async function applyReadyImportRows(
 		}
 	}
 
+	const rawRemaining = await db.execute(sql`
+		WITH latest_revisions AS (
+			SELECT DISTINCT ON (${importRowRevisions.importRowId})
+				${importRowRevisions.importRowId} AS import_row_id,
+				${importRowRevisions.status} AS status
+			FROM ${importRowRevisions}
+			WHERE ${importRowRevisions.userId} = ${params.userId}
+			ORDER BY ${importRowRevisions.importRowId}, ${importRowRevisions.revisionNo} DESC
+		)
+		SELECT COUNT(*)::int AS count
+		FROM ${importRows}
+		INNER JOIN latest_revisions lr ON ${importRows.id} = lr.import_row_id
+		WHERE ${importRows.batchId} = ${params.batchId}
+		  AND ${importRows.userId} = ${params.userId}
+		  AND lr.status = 'READY'
+	`);
+
+	const remainingRows = (
+		Array.isArray(rawRemaining)
+			? rawRemaining
+			: ((rawRemaining as { rows?: unknown[] }).rows ?? [])
+	) as Array<{ count: number | string }>;
+	const remainingReadyCount = Number(remainingRows[0]?.count ?? 0);
+	const hasMore = remainingReadyCount > 0;
+
 	return {
 		appliedCount,
 		failedCount,
+		remainingReadyCount,
+		hasMore,
 		results,
 	};
 }
@@ -2698,11 +2890,10 @@ async function listImportRowsInTransaction(
 		.where(eq(importRows.batchId, batchId))
 		.orderBy(importRows.rowOrdinal);
 
-	const rowDetails: ImportRowDetail[] = [];
-	for (const r of rows) {
-		rowDetails.push(await buildImportRowReadModelInTransaction(tx, r.id));
-	}
-	return rowDetails;
+	return await buildImportRowReadModelsInTransaction(
+		tx,
+		rows.map((r) => r.id),
+	);
 }
 
 /**
