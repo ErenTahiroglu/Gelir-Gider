@@ -13,7 +13,7 @@ Private, single-user personal finance backend built for high-integrity ledger ac
 - **Scheduled Workers (Cron):**
   - `0 * * * *` (Hourly): Notification scheduler and push delivery via Web Push (VAPID)
   - `17 2 * * *` (Daily): Automated encrypted database snapshot to Cloudflare R2 with retention management
-- **Testing & Quality:** Vitest + `@cloudflare/vitest-plugin` (185 test suites, 2648 unit, contract, and HTTP surface tests), Biome linter/formatter, TypeScript strict mode
+- **Testing & Quality:** Vitest + `@cloudflare/vitest-plugin` (185 test suites, 2651 passed tests), Biome linter/formatter, TypeScript strict mode
 
 ## Implemented Domains & Modules
 

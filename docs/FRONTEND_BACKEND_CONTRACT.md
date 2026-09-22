@@ -1743,85 +1743,161 @@ MOUNTED  GET   /imports/rows            ?batchId=&status=&limit=&after=
 ##### Notifications
 - `GET /notifications/subscriptions/:id`
   - **Auth:** Session cookie required.
-  - **Response:** `200 OK` with subscription DTO (`id`, `userId`, `userAgent`, `status`, `failureCount`, `lastFailureAt`, `createdAt`, `revokedAt`). Push credentials (`endpoint`, `p256dh`, `auth`) are omitted from GET responses for transport privacy.
+  - **Response:** `200 OK` with subscription DTO (`subscriptionId`, `userId`, `status`, `revisionNo`, `expirationTime`, `userAgent`, `createdAt`). Push credentials (`endpoint`, `p256dh`, `auth`) and internal counters (`failureCount`, `lastFailureAt`, `revokedAt`) are omitted from GET responses for transport privacy and minimal surface.
   - **Errors:** `404` (`NOTIFICATION_SUBSCRIPTION_NOT_FOUND`), `400` (`NOTIFICATION_INVALID_INPUT` on malformed UUID/query).
 - `GET /notifications/subscriptions?status=&limit=&after=`
   - **Auth:** Session cookie required.
-  - **Query:** `status` (`ACTIVE | INACTIVE`), `limit` (1..100, default 20), `after` (opaque cursor).
+  - **Query:** `status` (`ACTIVE | DISABLED`), `limit` (1..100, default 50), `after` (UUID subscriptionId cursor).
   - **Response:** `200 OK` with `{ items: SubscriptionDto[], nextCursor: string | null }`.
+  - **Errors:** `400` (`NOTIFICATION_INVALID_INPUT`).
 - `POST /notifications/subscriptions`
-  - **Auth:** Session cookie required + Same-Origin guard.
-  - **Body:** `{ endpoint: string, keys: { p256dh: string, auth: string }, userAgent?: string }`.
-  - **Behavior:** Upserts subscription using domain `upsertWebPushSubscription`.
-  - **Response:** `201 Created` with subscription DTO.
+  - **Auth:** Session cookie required + Same-Origin guard (`Origin` header) + `Idempotency-Key` header.
+  - **Body:** `{ endpoint: string, p256dh: string, auth: string, expirationTime?: string | null, userAgent?: string | null, occurredAt: string }` (`occurredAt` is required canonical UTC ISO instant).
+  - **Behavior:** Upserts web-push subscription via domain `registerPushSubscription`.
+  - **Response:**
+    - Fresh registration: `201 Created` with `{ ...SubscriptionDto, idempotentReplay: false }`.
+    - Exact replay: `200 OK` with `{ ...SubscriptionDto, idempotentReplay: true }`.
+  - **Errors:** `400` (`NOTIFICATION_INVALID_INPUT`), `409` (`NOTIFICATION_IDEMPOTENCY_CONFLICT`, `NOTIFICATION_REVISION_CONFLICT`).
 - `POST /notifications/subscriptions/:id/disable`
-  - **Auth:** Session cookie required + Same-Origin guard.
-  - **Body:** Optional empty JSON object (`{}`).
-  - **Response:** `200 OK` with `{ success: true }`.
+  - **Auth:** Session cookie required + Same-Origin guard (`Origin` header) + `Idempotency-Key` header.
+  - **Body:** `{ disableReason?: string, occurredAt: string }` (`occurredAt` is required canonical UTC ISO instant).
+  - **Response:** `200 OK` with updated `{ ...SubscriptionDto, idempotentReplay: boolean }`.
+  - **Errors:** `404` (`NOTIFICATION_SUBSCRIPTION_NOT_FOUND`), `400` (`NOTIFICATION_INVALID_INPUT`), `409` (`NOTIFICATION_SUBSCRIPTION_DISABLED`, `NOTIFICATION_IDEMPOTENCY_CONFLICT`).
 - `GET /notifications/events/:id`
   - **Auth:** Session cookie required.
-  - **Response:** `200 OK` with event DTO (`id`, `userId`, `eventType`, `eventDate`, `aggregateKey`, `payload`, `createdAt`). `payload` contains privacy-safe notification metadata (no raw tokens/secrets).
-  - **Errors:** `404` (`NOTIFICATION_EVENT_NOT_FOUND`).
+  - **Response:** `200 OK` with event DTO (`id`, `userId`, `notificationType`, `subjectId`, `scheduledLocalDate`, `scheduledFor`, `createdAt`). Push delivery payload is omitted at the HTTP layer to keep the contract minimal and prevent any financial leakage.
+  - **Errors:** `404` (`NOTIFICATION_EVENT_NOT_FOUND`), `400` (`NOTIFICATION_INVALID_INPUT`).
 - `GET /notifications/events?date=YYYY-MM-DD&limit=&after=`
   - **Auth:** Session cookie required.
-  - **Query:** `date` (required ISO date `YYYY-MM-DD`), `limit` (1..100, default 20), `after` (opaque cursor).
+  - **Query:** `date` (required ISO date `YYYY-MM-DD`), `limit` (1..100, default 50), `after` (UUID eventId cursor).
   - **Response:** `200 OK` with `{ items: EventDto[], nextCursor: string | null }`.
+  - **Errors:** `400` (`NOTIFICATION_INVALID_INPUT`).
 
 ##### Imports
 - `GET /imports/batches/:id`
   - **Auth:** Session cookie required.
-  - **Response:** `200 OK` with `ImportBatchSummary` DTO (`batchId`, `source`, `filename`, `status`, `totalRows`, `stagedRows`, `appliedRows`, `skippedRows`, `errorRows`, `createdAt`, `completedAt`).
-  - **Errors:** `404` (`IMPORT_BATCH_NOT_FOUND`).
+  - **Response:** `200 OK` with `ImportBatchSummary` DTO (`id`, `userId`, `provider`, `sourceKind`, `sourceContentHash`, `sourceFileName`, `parserType`, `parserVersion`, `observedAt`, `createdAt`, `totalRows`, `readyCount`, `needsReviewCount`, `possibleDuplicateCount`, `exactDuplicateCount`, `appliedCount`, `linkedCount`, `skippedCount`, `unsupportedCount`).
+  - **Errors:** `404` (`IMPORT_BATCH_NOT_FOUND`), `400` (`IMPORT_INVALID_INPUT`).
 - `GET /imports/batches?limit=&after=`
   - **Auth:** Session cookie required.
-  - **Query:** `limit` (1..100, default 20), `after` (opaque cursor).
+  - **Query:** `limit` (1..100, default 50), `after` (UUID batch id cursor).
   - **Response:** `200 OK` with `{ items: ImportBatchSummary[], nextCursor: string | null }`.
+  - **Errors:** `400` (`IMPORT_INVALID_INPUT`).
 - `POST /imports/batches`
-  - **Auth:** Session cookie required + Same-Origin guard.
-  - **Body:** `{ source: "QNB_FINANSBANK" | "GARANTI_BBVA" | "IS_BANKASI" | "YAPI_KREDI" | "MANUAL_CSV", filename: string, rawCsv: string, defaultAccountId?: string }`.
-  - **Response:** `201 Created` with `ImportBatchSummary` DTO.
+  - **Auth:** Session cookie required + Same-Origin guard (`Origin` header).
+  - **Body:** `{ provider?: string, sourceKind: "NORMALIZED_ROWS" | "GENERIC_CSV_V1", sourceContent?: string, sourceContentHash?: string, sourceFileName?: string | null, parserType?: string, parserVersion?: string, observedAt: string, rows?: RawImportRowInput[] }` (`observedAt` is required canonical UTC ISO instant).
+  - **Conditional Semantics:**
+    - If `sourceKind === "GENERIC_CSV_V1"`: Requires `sourceContent` (CSV text up to 10 MiB) which is parsed by the server's generic CSV parser.
+    - If `sourceKind === "NORMALIZED_ROWS"`: Requires pre-normalized `rows` array.
+  - **Response:**
+    - Fresh stage: `201 Created` with `{ batch: ImportBatchSummary, rows: ImportRowDetail[], idempotentReplay: false }`.
+    - Exact replay: `200 OK` with `{ batch: ImportBatchSummary, rows: ImportRowDetail[], idempotentReplay: true }`.
+  - **Errors:** `400` (`IMPORT_INVALID_INPUT`), `413` (`IMPORT_INVALID_INPUT` on payload or sourceContent exceeding byte ceiling).
 - `GET /imports/batches/:id/preview`
   - **Auth:** Session cookie required.
-  - **Response:** `200 OK` with `{ batch: ImportBatchSummary, rowSample: ImportRowDetail[], rowSampleLimit: 25 }`. Persisted preview returns batch summary and a bounded sample of up to 25 rows (no N-per-row materialization of the full batch). Full row inspection uses `GET /imports/rows`.
+  - **Response:** `200 OK` with `{ batch: ImportBatchSummary, rowSample: ImportRowDetail[], rowSampleLimit: 25 }`.
+  - **Semantics:** Persisted batch preview reading already-staged rows (not a pre-stage dry-run). Returns batch summary and at most 25 representative sample rows to prevent unbounded N-per-row materialization on large batches (e.g. 5,000 rows). Full row exploration is paged via `GET /imports/rows`.
+  - **Errors:** `404` (`IMPORT_BATCH_NOT_FOUND`), `400` (`IMPORT_INVALID_INPUT`).
 - `POST /imports/batches/:batchId/rows/:rowId/resolve`
-  - **Auth:** Session cookie required + Same-Origin guard.
-  - **Body:** `{ expectedRevisionNo: number, action: "CONFIRM_IMPORT" | "LINK_EXISTING" | "SKIP", resolutionReason?: string, resolvedMappings?: { accountId?: string, categoryId?: string, description?: string, personId?: string }, targetTransactionId?: string }`.
-  - **Response:** `200 OK` with updated `ImportRowDetail` DTO.
+  - **Auth:** Session cookie required + Same-Origin guard (`Origin` header) + `Idempotency-Key` header.
+  - **Body:**
+    ```json
+    {
+      "expectedRevisionNo": 1,
+      "action": "CONFIRM_IMPORT",
+      "resolvedMappings": {
+        "cardId": "uuid",
+        "purchaseCategory": "MANDATORY",
+        "shortTermGoalId": "uuid",
+        "incomeSourceId": "uuid",
+        "destinationAccountId": "uuid"
+      },
+      "linkTarget": {
+        "targetType": "CREDIT_CARD_PURCHASE",
+        "targetId": "uuid"
+      },
+      "reasonNote": "Optional note"
+    }
+    ```
+    - Allowed `action`: `"CONFIRM_IMPORT" | "LINK_EXISTING" | "RESOLVE_MAPPINGS" | "SKIP"`.
+    - Allowed `purchaseCategory`: `"MANDATORY" | "DISCRETIONARY" | "SHORT_TERM_PURCHASE" | "UNCLASSIFIED"`.
+    - Allowed `targetType`: `"CREDIT_CARD_PURCHASE" | "INCOME_RECEIPT"`.
+  - **Response:** `200 OK` with `{ row: ImportRowDetail, idempotentReplay: boolean }`.
+  - **Errors:** `404` (`IMPORT_ROW_NOT_FOUND`), `400` (`IMPORT_INVALID_INPUT`), `409` (`IMPORT_REVISION_CONFLICT`, `IMPORT_IDEMPOTENCY_CONFLICT`, `IMPORT_NEEDS_REVIEW`, `IMPORT_POSSIBLE_DUPLICATE`, `IMPORT_EXACT_DUPLICATE`, `IMPORT_INVALID_STATE`).
 - `POST /imports/batches/:id/apply`
-  - **Auth:** Session cookie required + Same-Origin guard.
+  - **Auth:** Session cookie required + Same-Origin guard (`Origin` header).
   - **Query:** `limit` (optional integer 1..100, default 50).
   - **Body:** Optional empty JSON object (`{}`).
-  - **Behavior:** Bounded chunk execution. Queries up to `limit` READY rows directly from the DB, applies them sequentially in individual transactions, and computes `remainingReadyCount`.
-  - **Response:** `200 OK` with `{ appliedCount: number, failedCount: number, remainingReadyCount: number, hasMore: boolean, results: { importRowId: string, status: "APPLIED" | "ERROR", transactionId?: string, errorMessage?: string }[] }`. Frontend should invoke repeatedly while `hasMore: true`.
+  - **Behavior:** Bounded chunk execution. Queries up to `limit` READY rows directly from the DB, sequentially applies them in individual transactions, and computes remaining count. Safe partial progress on failure. Frontend repeats requests while `hasMore: true`.
+  - **Response:** `200 OK` with:
+    ```json
+    {
+      "appliedCount": 48,
+      "failedCount": 2,
+      "remainingReadyCount": 137,
+      "hasMore": true,
+      "results": [
+        {
+          "importRowId": "uuid",
+          "status": "APPLIED",
+          "result": { ... }
+        },
+        {
+          "importRowId": "uuid",
+          "status": "FAILED",
+          "errorCode": "IMPORT_MISSING_CARD_MAPPING",
+          "errorMessage": "..."
+        }
+      ]
+    }
+    ```
+    Result status values: `"APPLIED" | "EXACT_DUPLICATE" | "FAILED"`.
+  - **Errors:** `404` (`IMPORT_BATCH_NOT_FOUND`), `400` (`IMPORT_INVALID_INPUT`), `409` (`IMPORT_INVALID_STATE`).
 - `GET /imports/rows/:id`
   - **Auth:** Session cookie required.
-  - **Response:** `200 OK` with `ImportRowDetail` DTO.
+  - **Response:** `200 OK` with `ImportRowDetail` DTO (`id`, `userId`, `batchId`, `rowOrdinal`, `recordType`, `latestRevisionNo`, `status`, `payload`, `occurredAt`, `externalIdentityPresent`, `duplicateCandidates`, `result`).
+  - **Errors:** `404` (`IMPORT_ROW_NOT_FOUND`), `400` (`IMPORT_INVALID_INPUT`).
 - `GET /imports/rows?batchId=&status=&limit=&after=`
   - **Auth:** Session cookie required.
-  - **Query:** `batchId` (required UUID), `status` (`PENDING | READY | APPLIED | SKIPPED | ERROR`), `limit` (1..100, default 50), `after` (opaque cursor).
+  - **Query:** `batchId` (required UUID), `status` (optional `READY | NEEDS_REVIEW | POSSIBLE_DUPLICATE | EXACT_DUPLICATE | APPLIED | LINKED_EXISTING | SKIPPED | UNSUPPORTED`), `limit` (1..100, default 50), `after` (UUID import-row id cursor).
   - **Behavior:** Status filtering is evaluated DB-side on the latest revision of each row before keyset pagination cutoff (`LIMIT limit + 1`), guaranteeing exact limit semantics. Selected rows are batch-materialized in a constant query count without N+1 queries.
   - **Response:** `200 OK` with `{ items: ImportRowDetail[], nextCursor: string | null }`.
+  - **Errors:** `404` (`IMPORT_BATCH_NOT_FOUND`), `400` (`IMPORT_INVALID_INPUT`).
 
 #### 2. Keyset Pagination & Isolation
-Opaque base64url-encoded cursors bind user ownership and query filters:
-- Subscription cursors: `{ v: 1, userId, status, createdAt, id }`
-- Notification event cursors: `{ v: 1, userId, date, createdAt, id }`
-- Import batch cursors: `{ v: 1, userId, createdAt, id }`
-- Import row cursors: `{ v: 1, userId, batchId, status, rowNumber, id }`
-Any cursor tampering, schema mismatch, or foreign user ID instantly fails with `400` (`NOTIFICATION_INVALID_INPUT` / `IMPORT_INVALID_INPUT`).
+7B.9 Notifications/Imports list routes use direct UUID keyset coordinates via `after`. Ownership is independently enforced by authenticated user scope and parent-resource checks:
+- Subscription list: `after = subscriptionId` (ordered by `subscription_id ASC`, scoped to authenticated `userId`)
+- Notification event list: `after = eventId` (ordered by `id ASC`, scoped to authenticated `userId` and `date`)
+- Import batch list: `after = batchId` (ordered by `id ASC`, scoped to authenticated `userId`)
+- Import row list: `after = rowId` (ordered by `id ASC`, scoped to authenticated `userId` and `batchId`)
 
 #### 3. Error Codes & HTTP Mapping
 
 | Code | HTTP Status | Context / Description |
 |---|---|---|
-| `NOTIFICATION_INVALID_INPUT` | 400 | Malformed query parameters, invalid UUID, cursor tampering, or invalid body schema |
+| `NOTIFICATION_INVALID_INPUT` | 400 | Malformed query parameters, invalid UUID, or invalid body schema |
 | `NOTIFICATION_SUBSCRIPTION_NOT_FOUND` | 404 | Subscription ID not found or belongs to another user |
+| `NOTIFICATION_SUBSCRIPTION_DISABLED` | 409 | Subscription is already disabled |
+| `NOTIFICATION_REVISION_CONFLICT` | 409 | Subscription revision conflict |
+| `NOTIFICATION_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different payload |
 | `NOTIFICATION_EVENT_NOT_FOUND` | 404 | Notification event ID not found or belongs to another user |
+| `NOTIFICATION_INVALID_STATE` | 500 | Inconsistent notification state |
 | `IMPORT_INVALID_INPUT` | 400 | Invalid payload, unknown CSV dialect, missing required parameters, or invalid action |
 | `IMPORT_BATCH_NOT_FOUND` | 404 | Batch ID not found or belongs to another user |
 | `IMPORT_ROW_NOT_FOUND` | 404 | Row ID not found or belongs to another user |
-| `IMPORT_CONCURRENCY_CONFLICT` | 409 | `expectedRevisionNo` mismatch when resolving an import row |
+| `IMPORT_REVISION_CONFLICT` | 409 | `expectedRevisionNo` mismatch when resolving an import row |
+| `IMPORT_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different payload |
+| `IMPORT_NEEDS_REVIEW` | 409 | Row requires manual resolution before apply |
+| `IMPORT_POSSIBLE_DUPLICATE` | 409 | Row has duplicate candidates requiring review |
+| `IMPORT_EXACT_DUPLICATE` | 409 | Row has an exact duplicate match |
+| `IMPORT_UNSUPPORTED_RECORD` | 422 | Record type or schema is unsupported for automated apply |
+| `IMPORT_TARGET_NOT_FOUND` | 404 | Target entity for link/import not found |
+| `IMPORT_TARGET_MISMATCH` | 409 | Target entity attributes do not match row |
+| `IMPORT_MISSING_CARD_MAPPING` | 409 | Missing card mapping for card purchase row |
+| `IMPORT_MISSING_INCOME_MAPPING` | 409 | Missing income mapping for income receipt row |
+| `IMPORT_MISSING_EXPENSE_MAPPING` | 409 | Missing expense mapping for expense row |
 | `IMPORT_INVALID_STATE` | 409 | Attempting to apply or resolve a batch/row in an incompatible terminal state |
+| `INTERNAL_ERROR` | 500 | Internal server or unhandled database error |
 
 ---
 
