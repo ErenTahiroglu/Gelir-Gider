@@ -1,3 +1,4 @@
+import type { NotificationType } from "../db/schema/notifications";
 import { NotificationError } from "./errors";
 
 const UUID_PATTERN =
@@ -85,6 +86,49 @@ export function validateNotificationLocalDate(
 export function istanbulNoonToUtcInstant(localDate: string): Date {
 	validateNotificationLocalDate(localDate, "localDate");
 	return new Date(`${localDate}T12:00:00+03:00`);
+}
+
+export function istanbulLocalHourToUtcInstant(
+	localDate: string,
+	hour: number,
+): Date {
+	validateNotificationLocalDate(localDate, "localDate");
+	if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
+		throw new NotificationError(
+			"NOTIFICATION_INVALID_INPUT",
+			`hour must be an integer between 0 and 23: ${hour}`,
+		);
+	}
+	const hStr = String(hour).padStart(2, "0");
+	return new Date(`${localDate}T${hStr}:00:00+03:00`);
+}
+
+export function getPreviousDayIstanbul(localDate: string): string {
+	validateNotificationLocalDate(localDate, "localDate");
+	const parts = localDate.split("-");
+	const y = Number(parts[0]);
+	const m = Number(parts[1]);
+	const d = Number(parts[2]);
+	const dt = new Date(Date.UTC(y, m - 1, d));
+	dt.setUTCDate(dt.getUTCDate() - 1);
+	const py = dt.getUTCFullYear();
+	const pm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+	const pd = String(dt.getUTCDate()).padStart(2, "0");
+	return `${py}-${pm}-${pd}`;
+}
+
+export function getNextDayIstanbul(localDate: string): string {
+	validateNotificationLocalDate(localDate, "localDate");
+	const parts = localDate.split("-");
+	const y = Number(parts[0]);
+	const m = Number(parts[1]);
+	const d = Number(parts[2]);
+	const dt = new Date(Date.UTC(y, m - 1, d));
+	dt.setUTCDate(dt.getUTCDate() + 1);
+	const py = dt.getUTCFullYear();
+	const pm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+	const pd = String(dt.getUTCDate()).padStart(2, "0");
+	return `${py}-${pm}-${pd}`;
 }
 
 /**
@@ -378,19 +422,24 @@ export function validateNotificationOptionalExpirationTime(
 	return value;
 }
 
-const NOTIFICATION_TYPE_VALUES = new Set(["CREDIT_CARD_DUE"]);
+const NOTIFICATION_TYPE_VALUES = new Set([
+	"CREDIT_CARD_DUE",
+	"CREDIT_CARD_DUE_SOON",
+	"BUDGET_THRESHOLD",
+	"NO_SPEND_CHECK",
+]);
 
 export function validateNotificationOptionalType(
 	value: unknown,
-): "CREDIT_CARD_DUE" | undefined {
+): NotificationType | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string" || !NOTIFICATION_TYPE_VALUES.has(value)) {
 		throw new NotificationError(
 			"NOTIFICATION_INVALID_INPUT",
-			`notification type must be one of CREDIT_CARD_DUE (or omitted): "${String(value)}"`,
+			`notification type must be one of CREDIT_CARD_DUE, CREDIT_CARD_DUE_SOON, BUDGET_THRESHOLD, NO_SPEND_CHECK (or omitted): "${String(value)}"`,
 		);
 	}
-	return value as "CREDIT_CARD_DUE";
+	return value as NotificationType;
 }
 
 /**

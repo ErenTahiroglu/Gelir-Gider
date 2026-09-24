@@ -14,6 +14,10 @@ import {
 	authorizeRecoveryAndIssueGrant,
 } from "../auth/bootstrap";
 import {
+	generateReauthOptionsForUser,
+	verifyReauthForUser,
+} from "../auth/reauth";
+import {
 	buildClearSessionCookie,
 	buildSessionCookie,
 } from "../auth/session-cookie";
@@ -41,10 +45,17 @@ import {
 	users,
 	webauthnCredentials,
 } from "../db/schema/auth";
-import { resolveAuthenticatedSession } from "./auth-middleware";
+import {
+	type AuthVariables,
+	requireAuthenticatedSession,
+	resolveAuthenticatedSession,
+} from "./auth-middleware";
 import { checkAuthRateLimit, RATE_LIMITED_AUTH_PATHS } from "./auth-rate-limit";
 
-export const authRouter = new Hono<{ Bindings: AppEnv }>();
+export const authRouter = new Hono<{
+	Bindings: AppEnv;
+	Variables: AuthVariables;
+}>();
 
 const BODY_LIMIT_BYTES = 256 * 1024; // 256 KiB
 
@@ -64,6 +75,7 @@ const JSON_BODY_PATHS = new Set([
 	"/auth/passkey/enrollment/options",
 	"/auth/passkey/enrollment/verify",
 	"/auth/passkey/authentication/verify",
+	"/auth/passkey/reauth/verify",
 ]);
 
 // Helper to create sanitized error response
@@ -165,7 +177,7 @@ authRouter.post(
 );
 
 // Centralized error handler helper for auth routes
-function handleAuthError(c: Context<{ Bindings: AppEnv }>, err: unknown) {
+function handleAuthError(c: Context<any>, err: unknown) {
 	if (err instanceof AuthError) {
 		switch (err.code) {
 			case "BOOTSTRAP_INVALID":
@@ -214,9 +226,7 @@ function handleAuthError(c: Context<{ Bindings: AppEnv }>, err: unknown) {
 }
 
 // Helper to safely parse JSON body
-async function parseJsonBody<T>(
-	c: Context<{ Bindings: AppEnv }>,
-): Promise<T | null> {
+async function parseJsonBody<T>(c: Context<any>): Promise<T | null> {
 	try {
 		return await c.req.json();
 	} catch {
@@ -628,6 +638,98 @@ authRouter.post("/passkey/authentication/verify", async (c) => {
 		return handleAuthError(c, err);
 	}
 });
+
+// POST /auth/passkey/reauth/options
+authRouter.post(
+	"/passkey/reauth/options",
+	requireAuthenticatedSession,
+	async (c) => {
+		try {
+			const auth = c.get("auth");
+			const db = createDatabase(getDatabaseUrl(c.env));
+			const config = getWebAuthnConfig(c.env);
+
+			const activeCredentials = await db
+				.select({
+					credentialId: webauthnCredentials.credentialId,
+					transports: webauthnCredentials.transports,
+					revokedAt: webauthnCredentials.revokedAt,
+				})
+				.from(webauthnCredentials)
+				.where(
+					and(
+						eq(webauthnCredentials.userId, auth.userId),
+						isNull(webauthnCredentials.revokedAt),
+					),
+				);
+
+			if (activeCredentials.length === 0) {
+				return c.json(
+					{
+						error: {
+							code: "AUTH_STATE_INCONSISTENT",
+							message: "No active credentials found for authenticated user",
+						},
+					},
+					503,
+				);
+			}
+
+			const options = await generateReauthOptionsForUser({
+				db,
+				config,
+				user: { id: auth.userId },
+				existingCredentials: activeCredentials.map((cred) => ({
+					credentialId: cred.credentialId,
+					transports: cred.transports as AuthenticatorTransportFuture[] | null,
+					revokedAt: cred.revokedAt,
+				})),
+			});
+
+			return c.json(options);
+		} catch (err) {
+			return handleAuthError(c, err);
+		}
+	},
+);
+
+// POST /auth/passkey/reauth/verify
+authRouter.post(
+	"/passkey/reauth/verify",
+	requireAuthenticatedSession,
+	async (c) => {
+		const body = await parseJsonBody<{
+			response?: AuthenticationResponseJSON;
+		}>(c);
+		if (!body?.response) {
+			return c.json(
+				{ error: { code: "INVALID_REQUEST", message: "Invalid request body" } },
+				400,
+			);
+		}
+
+		try {
+			const auth = c.get("auth");
+			const db = createDatabase(getDatabaseUrl(c.env));
+			const config = getWebAuthnConfig(c.env);
+
+			const result = await verifyReauthForUser({
+				db,
+				config,
+				user: { id: auth.userId },
+				response: body.response,
+			});
+
+			// Isolated REAUTH: No new session created, no Set-Cookie header issued
+			return c.json({
+				verified: result.verified,
+				credential: result.credential,
+			});
+		} catch (err) {
+			return handleAuthError(c, err);
+		}
+	},
+);
 
 // GET /auth/session
 authRouter.get("/session", async (c) => {

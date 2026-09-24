@@ -44,7 +44,9 @@ import {
 	getPerson,
 	updatePerson,
 } from "../people/people";
+import { settlePersonReceivables } from "../people/person-settlement-orchestrator";
 import {
+	getPersonBalanceSummary,
 	listBoundedObligations,
 	listBoundedPeople,
 	listBoundedSettlements,
@@ -1578,3 +1580,90 @@ peopleRouter.post(
 		}
 	},
 );
+
+/**
+ * GET /people/:personId/balance-summary
+ * Returns person balance summary and collection target.
+ */
+peopleRouter.get("/:personId/balance-summary", async (c) => {
+	const personId = c.req.param("personId");
+	if (!isUuid(personId)) {
+		return fail(c, "PEOPLE_INVALID_INPUT", 400);
+	}
+
+	const auth = c.get("auth");
+	const db = createDatabase(getDatabaseUrl(c.env));
+
+	try {
+		const summary = await getPersonBalanceSummary({
+			db,
+			userId: auth.userId,
+			personId,
+		});
+		return c.json(summary, 200);
+	} catch (err) {
+		return mapPeopleDomainError(c, err);
+	}
+});
+
+/**
+ * POST /people/:personId/settle-receivables
+ * Multi-obligation person receivable settlement with waterfall routing.
+ */
+peopleRouter.post("/:personId/settle-receivables", async (c) => {
+	const personId = c.req.param("personId");
+	if (!isUuid(personId)) {
+		return fail(c, "PEOPLE_INVALID_INPUT", 400);
+	}
+
+	const keyRes = readIdempotencyKey(c);
+	if (!keyRes.ok) return fail(c, "PEOPLE_INVALID_INPUT", 400);
+
+	let body: Record<string, unknown>;
+	try {
+		body = await c.req.json();
+	} catch {
+		return fail(c, "PEOPLE_INVALID_INPUT", 400);
+	}
+
+	if (
+		typeof body !== "object" ||
+		body === null ||
+		typeof body.cashAmount !== "string" ||
+		typeof body.destinationAssetAccountId !== "string" ||
+		typeof body.isCash !== "boolean"
+	) {
+		return fail(c, "PEOPLE_INVALID_INPUT", 400);
+	}
+
+	let occurredAt: Date | undefined;
+	if (body.occurredAt !== undefined) {
+		if (typeof body.occurredAt !== "string") {
+			return fail(c, "PEOPLE_INVALID_INPUT", 400);
+		}
+		occurredAt = new Date(body.occurredAt);
+		if (Number.isNaN(occurredAt.getTime())) {
+			return fail(c, "PEOPLE_INVALID_INPUT", 400);
+		}
+	}
+
+	const auth = c.get("auth");
+	const db = createDatabase(getDatabaseUrl(c.env));
+
+	try {
+		const result = await settlePersonReceivables({
+			db,
+			userId: auth.userId,
+			personId,
+			cashAmount: body.cashAmount,
+			destinationAssetAccountId: body.destinationAssetAccountId,
+			occurredAt,
+			idempotencyKey: keyRes.key,
+			isCash: body.isCash,
+		});
+
+		return c.json(result, 200);
+	} catch (err) {
+		return mapPeopleDomainError(c, err);
+	}
+});

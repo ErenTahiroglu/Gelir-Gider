@@ -21,6 +21,7 @@ import {
 	parsePositiveMoneyString,
 } from "../ledger/money";
 import { runPeopleReadTransaction } from "./boundary";
+import { PeopleError } from "./errors";
 import type { ObligationReadModel } from "./obligations";
 import type {
 	ObligationCursor,
@@ -829,6 +830,131 @@ export async function listBoundedSettlements({
 			settlements: dtos,
 			hasMore,
 			nextCursor,
+		};
+	});
+}
+
+export interface PersonBalanceSummaryDto {
+	personId: string;
+	displayName: string;
+	relationship: PersonRelationship;
+	exactReceivableBalance: string;
+	exactPayableBalance: string;
+	collectionTarget?: string | undefined;
+}
+
+export async function getPersonBalanceSummary({
+	db,
+	userId,
+	personId,
+}: {
+	db: Database;
+	userId: string;
+	personId: string;
+}): Promise<PersonBalanceSummaryDto> {
+	const validUserId = validateCanonicalUuid(userId, "userId");
+	const validPersonId = validateCanonicalUuid(personId, "personId");
+
+	return runPeopleReadTransaction(db, async (tx) => {
+		const [person] = await tx
+			.select({
+				id: people.id,
+				displayName: personRevisions.displayName,
+				relationship: personRevisions.relationship,
+				status: personRevisions.status,
+			})
+			.from(people)
+			.innerJoin(personRevisions, eq(people.id, personRevisions.personId))
+			.where(and(eq(people.userId, validUserId), eq(people.id, validPersonId)))
+			.orderBy(desc(personRevisions.revisionNo))
+			.limit(1);
+
+		if (!person) {
+			throw new PeopleError(
+				"PEOPLE_NOT_FOUND",
+				`Person ${validPersonId} not found`,
+			);
+		}
+
+		const [link] = await tx
+			.select()
+			.from(personLedgerLinks)
+			.where(
+				and(
+					eq(personLedgerLinks.userId, validUserId),
+					eq(personLedgerLinks.personId, validPersonId),
+				),
+			)
+			.limit(1);
+
+		let recSignedCents = 0n;
+		let paySignedCents = 0n;
+
+		if (link) {
+			const accountIds = [
+				link.receivableAccountId,
+				link.payableAccountId,
+			].filter((id): id is string => Boolean(id));
+
+			if (accountIds.length > 0) {
+				const aggregatedLines = await tx
+					.select({
+						accountId: journalLines.accountId,
+						debitSum: sql<string>`COALESCE(SUM(${journalLines.debit}), 0.00)`,
+						creditSum: sql<string>`COALESCE(SUM(${journalLines.credit}), 0.00)`,
+					})
+					.from(journalLines)
+					.innerJoin(
+						journalEntries,
+						eq(journalLines.journalEntryId, journalEntries.id),
+					)
+					.where(
+						and(
+							eq(journalEntries.userId, validUserId),
+							eq(journalEntries.status, "POSTED"),
+							inArray(journalLines.accountId, accountIds),
+						),
+					)
+					.groupBy(journalLines.accountId);
+
+				for (const r of aggregatedLines) {
+					const debitCents = parseAggregateMoneyString(r.debitSum).cents;
+					const creditCents = parseAggregateMoneyString(r.creditSum).cents;
+					if (r.accountId === link.receivableAccountId) {
+						recSignedCents = debitCents - creditCents;
+					}
+					if (r.accountId === link.payableAccountId) {
+						paySignedCents = creditCents - debitCents;
+					}
+				}
+			}
+		}
+
+		const exactReceivableBalance = formatSignedCentsToMoney(
+			recSignedCents < 0n ? 0n : recSignedCents,
+		);
+		const exactPayableBalance = formatSignedCentsToMoney(
+			paySignedCents < 0n ? 0n : paySignedCents,
+		);
+
+		let collectionTarget: string | undefined;
+		if (person.relationship === "FRIEND") {
+			if (recSignedCents <= 0n) {
+				collectionTarget = "0.00";
+			} else {
+				const step = 500n; // 5.00 TRY = 500 cents
+				const roundedCents = ((recSignedCents + step - 1n) / step) * step;
+				collectionTarget = formatSignedCentsToMoney(roundedCents);
+			}
+		}
+
+		return {
+			personId: validPersonId,
+			displayName: person.displayName,
+			relationship: person.relationship as PersonRelationship,
+			exactReceivableBalance,
+			exactPayableBalance,
+			collectionTarget,
 		};
 	});
 }

@@ -24,10 +24,12 @@ import { importsRouter } from "./http/imports-routes";
 import { incomeRouter } from "./http/income-routes";
 import { ledgerRouter } from "./http/ledger-routes";
 import { longTermRouter } from "./http/long-term-routes";
+import { manualExpenseRouter } from "./http/manual-expense-routes";
 import { midasRouter } from "./http/midas-routes";
 import { monthCloseRouter } from "./http/month-close-routes";
 import { notificationsRouter } from "./http/notifications-routes";
 import { peopleRouter } from "./http/people-routes";
+import { quickEntryTemplateRouter } from "./http/quick-entry-template-routes";
 import { rewardsRouter } from "./http/rewards-routes";
 import type { RequestIdVariables } from "./http/security-middleware";
 import {
@@ -35,6 +37,7 @@ import {
 	securityHeadersMiddleware,
 } from "./http/security-middleware";
 import { shortTermGoalsRouter } from "./http/short-term-goal-routes";
+import { spendingCategoryRouter } from "./http/spending-category-routes";
 import { transactionsRouter } from "./http/transactions-routes";
 import { runNotificationScheduler } from "./notifications/scheduler";
 import { WebPushTransport } from "./notifications/web-push";
@@ -116,6 +119,9 @@ app.route("/long-term", longTermRouter);
 app.route("/month-close", monthCloseRouter);
 app.route("/notifications", notificationsRouter);
 app.route("/imports", importsRouter);
+app.route("/spending", spendingCategoryRouter);
+app.route("/quick-entry", quickEntryTemplateRouter);
+app.route("/manual-expenses", manualExpenseRouter);
 
 app.notFound((c) => {
 	return c.json(

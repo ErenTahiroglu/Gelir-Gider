@@ -1,4 +1,5 @@
 import type { Database } from "../db/client";
+import type { NotificationType } from "../db/schema/notifications";
 import {
 	runNotificationReadTransaction,
 	runNotificationTransaction,
@@ -23,6 +24,7 @@ import {
 	getLatestStatementRevisionInTransaction,
 	listEventsForLocalDateInTransaction,
 	materializeCreditCardDueEventsInTransaction,
+	materializeCreditCardDueSoonEventsInTransaction,
 } from "./events";
 import { deriveNotificationChildIdempotencyKey } from "./fingerprint";
 import {
@@ -138,12 +140,18 @@ async function reserveInTransaction(
 			resolvedAt: scheduledAt,
 		});
 
-		const statement = await getLatestStatementRevisionInTransaction(
-			tx,
-			event.subjectId,
-		);
-		const currentStatementStatus =
-			(statement?.status as "OPEN" | "PAID" | "VOID" | undefined) ?? "VOID";
+		let currentStatementStatus: "OPEN" | "PAID" | "VOID" = "OPEN";
+		if (
+			event.notificationType === "CREDIT_CARD_DUE" ||
+			event.notificationType === "CREDIT_CARD_DUE_SOON"
+		) {
+			const statement = await getLatestStatementRevisionInTransaction(
+				tx,
+				event.subjectId,
+			);
+			currentStatementStatus =
+				(statement?.status as "OPEN" | "PAID" | "VOID" | undefined) ?? "VOID";
+		}
 
 		const plan = planDeliveryAttempt({
 			history: toAttemptHistory(history),
@@ -430,10 +438,13 @@ export async function runNotificationScheduler(
 	const summary = zeroSummary();
 	const currentHourSlot = truncateToSchedulerHourSlot(scheduledAt);
 
-	const result = await runNotificationTransaction(db, (tx) =>
+	const resultDue = await runNotificationTransaction(db, (tx) =>
 		materializeCreditCardDueEventsInTransaction(tx, localDate),
 	);
-	summary.eventsCreated = result.eventsCreated;
+	const resultDueSoon = await runNotificationTransaction(db, (tx) =>
+		materializeCreditCardDueSoonEventsInTransaction(tx, localDate),
+	);
+	summary.eventsCreated = resultDue.eventsCreated + resultDueSoon.eventsCreated;
 
 	// Phase 15-R2 Section C: created once per run, threaded through every
 	// `processEventSubscription` call so `transport.prepare()` is invoked at
@@ -479,7 +490,7 @@ export async function runNotificationScheduler(
 			const event: NotificationEventReadModel = {
 				id: rawEvent.id,
 				userId: rawEvent.userId,
-				notificationType: rawEvent.notificationType as "CREDIT_CARD_DUE",
+				notificationType: rawEvent.notificationType as NotificationType,
 				subjectId: rawEvent.subjectId,
 				scheduledLocalDate: rawEvent.scheduledLocalDate,
 				scheduledFor: rawEvent.scheduledFor,

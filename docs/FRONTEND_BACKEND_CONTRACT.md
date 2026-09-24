@@ -1956,9 +1956,58 @@ The following headers are set globally on every response:
 
 ## 11. Backend Code Freeze Status
 
-> **PRE-FRONTEND BACKEND CODE FREEZE: COMPLETE**
+> **PRE-FRONTEND BACKEND CODE FREEZE: RE-FROZEN AFTER PRODUCT GAP PATCH**
 
-With the delivery and verification of Checkpoint 7B.9 (Notifications + Imports), all planned product HTTP surfaces (7B.1–7B.9) have been mounted, guarded with Same-Origin protection, keyset-paginated, and covered by comprehensive contract tests.
+All planned product HTTP surfaces, including the Frontend-Enabling Product Gap Patch (Spending Categories, Quick Entry Templates, Manual Expenses, Smart Receivable Waterfall Settlement, Notifications V1 Expansion, Passkey Reauth), have been mounted, guarded with Same-Origin protection, keyset-paginated, migration-backed (0000–0077), and covered by 191 test suites (2694 unit/contract tests + 2300 pg tests).
 
-The backend core and HTTP product surfaces are fully frozen. No further backend feature changes are planned prior to frontend integration.
+The backend core and HTTP product surfaces are fully frozen.
+
+---
+
+## 12. Frontend-Enabling Product Gap Patch Specifications
+
+### 12.1 Spending Categories & Metadata (`/spending/*`)
+- `GET /spending/categories`: Lists all active spending categories for user. Auto-seeds 8 default categories (`Market & Gıda`, `Ulaşım & Yakıt`, `Restoran & Kafe`, `Abonelikler & Faturalar`, `Giyim & Alışveriş`, `Kişisel Bakım & Sağlık`, `Eğlence & Hobi`, `Ev & Yaşam`) on first fetch.
+- `POST /spending/categories`: Creates custom category (`name`, `defaultBudgetCategory`, `sortOrder`).
+- `PUT /spending/categories/:id`: Updates category properties.
+- `POST /spending/categories/:id/archive`: Soft-archives category (`status = 'ARCHIVED'`).
+- `GET /spending/category-assignments`: Resolves category assignments by `subjectType` and `subjectIds` / `subjectId`.
+- `POST /spending/category-assignments`: Upserts assignment (`subjectType`, `subjectId`, `categoryId`).
+- `GET /spending/summary?periodMonth=YYYY-MM`: Returns classified category aggregation (`totalPersonalSpending`, `categories`, `unclassifiedAmount`).
+
+### 12.2 Synced Quick-Entry Templates (`/quick-entry/*`)
+- Client-synced quick entry definitions stored on server for cross-device consistency.
+- **Explicit Invariant:** There is **NO `/quick-entry/templates/:id/execute` endpoint**. Templates are client UX blueprints. Execution flows through canonical domain APIs (`/manual-expenses`, `/credit-cards/*`, etc.).
+- `GET /quick-entry/templates`: Lists templates ordered by `sortOrder ASC`.
+- `POST /quick-entry/templates`: Creates template (`name`, `templateType`, `config`, `sortOrder`).
+- `POST /quick-entry/templates/:id`: Updates template properties.
+- `POST /quick-entry/templates/:id/archive`: Soft-archives template (`isArchived = true`).
+
+### 12.3 Manual Expenses (`/manual-expenses/*`)
+- Canonical `MANUAL_EXPENSE` transactions with balanced double-entry ledger posting (DR System Expense Account, CR Source Asset Account).
+- `GET /manual-expenses`: Lists manual expenses with pagination (`limit`, `status`, `beforeOccurredAt`, `beforeTransactionId`).
+- `GET /manual-expenses/:id`: Fetches single expense by ID.
+- `POST /manual-expenses`: Creates manual expense. Requires `Idempotency-Key` header.
+- `POST /manual-expenses/:id`: Updates manual expense. Requires `Idempotency-Key` header and `expectedRevisionNo`.
+- `POST /manual-expenses/:id/void`: Voids manual expense and posts reversing ledger lines. Requires `Idempotency-Key` header and `expectedRevisionNo`.
+
+### 12.4 Smart Receivable Settlement & Waterfall (`/people/*`)
+- `GET /people/:personId/balance-summary`: Computes person net balance. For `relationship = 'FRIEND'`, computes `friendCeilingRoundedAmount` rounding up to the nearest 5 TL (e.g. 142.30 -> 145.00).
+- `POST /people/:personId/settle-receivables`: Multi-obligation settlement with deterministic ordering (`dueDate ASC, obligationId ASC`) and automated overpayment waterfall:
+  1. Credit Card Reserve (if available and open statement liability exists).
+  2. Short-Term Goals (sorted by priority and target date).
+  3. Long-Term Investment / Unallocated cash buffer.
+
+### 12.5 Notifications V1 Expansion
+- Expanded notification events with `dedupeKey` unique constraint on `(user_id, dedupe_key)`.
+- Event types: `CREDIT_CARD_DUE`, `CREDIT_CARD_DUE_SOON`, `BUDGET_THRESHOLD`, `NO_SPEND_CHECK`.
+- Privacy-safe payloads: Never expose raw monetary balances or card numbers in notifications.
+- Automatic dedupe key collapse for threshold progression (skips redundant intermediate tiers).
+
+### 12.6 Passkey Reauthentication (`/auth/passkey/reauth/*`)
+- Step-up reauthentication for sensitive actions without session mutation.
+- `POST /auth/passkey/reauth/options`: Generates challenge with purpose `REAUTH` for active user credentials.
+- `POST /auth/passkey/reauth/verify`: Verifies authenticator assertion. Consumes `REAUTH` challenge atomically.
+- **Strict Isolation Invariant:** Returns `{ verified: true, credential }`. **Never** calls `createSession`, never sets or modifies `Set-Cookie` (`__Host-gg_session`).
+
 

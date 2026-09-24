@@ -25,6 +25,8 @@ export const RATE_LIMITED_AUTH_PATHS = new Set([
 	"/auth/passkey/enrollment/verify",
 	"/auth/passkey/authentication/options",
 	"/auth/passkey/authentication/verify",
+	"/auth/passkey/reauth/options",
+	"/auth/passkey/reauth/verify",
 ]);
 
 /**

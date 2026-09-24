@@ -38,10 +38,37 @@ export async function createAuthenticationChallenge({
 	return created;
 }
 
+/**
+ * Persists a REAUTH WebAuthn challenge row for re-authentication.
+ * Enrollment grant is strictly null.
+ */
+export async function createReauthChallenge({
+	db,
+	userId,
+	challenge,
+}: CreateAuthenticationChallengeParams) {
+	const expiresAt = new Date(
+		Date.now() + WEBAUTHN_CHALLENGE_TTL_SECONDS * 1000,
+	);
+
+	const [created] = await db
+		.insert(webauthnChallenges)
+		.values({
+			userId,
+			purpose: "REAUTH",
+			challenge,
+			enrollmentGrantId: null,
+			expiresAt,
+		})
+		.returning();
+
+	return created;
+}
+
 export interface ConsumeActiveChallengeParams {
 	db: Database;
 	userId: string;
-	purpose: "REGISTRATION" | "AUTHENTICATION";
+	purpose: "REGISTRATION" | "AUTHENTICATION" | "REAUTH";
 	challenge: string;
 }
 

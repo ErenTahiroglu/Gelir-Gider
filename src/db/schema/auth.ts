@@ -234,11 +234,11 @@ export const webauthnChallenges = pgTable(
 	(table) => [
 		check(
 			"webauthn_challenges_purpose_check",
-			sql`${table.purpose} IN ('REGISTRATION', 'AUTHENTICATION')`,
+			sql`${table.purpose} IN ('REGISTRATION', 'AUTHENTICATION', 'REAUTH')`,
 		),
 		check(
 			"webauthn_challenges_purpose_enrollment_grant_relation_check",
-			sql`(${table.purpose} = 'REGISTRATION' AND ${table.enrollmentGrantId} IS NOT NULL) OR (${table.purpose} = 'AUTHENTICATION' AND ${table.enrollmentGrantId} IS NULL)`,
+			sql`(${table.purpose} = 'REGISTRATION' AND ${table.enrollmentGrantId} IS NOT NULL) OR (${table.purpose} IN ('AUTHENTICATION', 'REAUTH') AND ${table.enrollmentGrantId} IS NULL)`,
 		),
 		check(
 			"webauthn_challenges_expires_at_check",

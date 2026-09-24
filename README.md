@@ -13,7 +13,7 @@ Private, single-user personal finance backend built for high-integrity ledger ac
 - **Scheduled Workers (Cron):**
   - `0 * * * *` (Hourly): Notification scheduler and push delivery via Web Push (VAPID)
   - `17 2 * * *` (Daily): Automated encrypted database snapshot to Cloudflare R2 with retention management
-- **Testing & Quality:** Vitest + `@cloudflare/vitest-plugin` (185 test suites, 2651 passed tests), Biome linter/formatter, TypeScript strict mode
+- **Testing & Quality:** Vitest + `@cloudflare/vitest-plugin` (191 test suites, 2694 passed tests + 2300 pg tests), Biome linter/formatter, TypeScript strict mode
 
 ## Implemented Domains & Modules
 
@@ -27,17 +27,21 @@ Private, single-user personal finance backend built for high-integrity ledger ac
 8. **Rewards & Points:** Reward accounts, point accruals, redemptions, and valuation accounting.
 9. **Long-Term Sends & Scheduled Tasks:** Scheduled transfer tasks, calendar projection, execution records, and state transitions.
 10. **Month Close & Financial Reporting:** Formal accounting period close, unclassified transaction reviews, balance freezes, and variance rollups.
-11. **Notifications & Alerts:** Notification event queue, delivery planning, push subscription management, and VAPID payload delivery.
+11. **Notifications & Alerts:** Notification event queue, delivery planning, push subscription management, deduplication keys, and VAPID payload delivery.
 12. **Campaigns & Merchant Tracking:** Card/bank merchant campaigns, spending thresholds, review candidates, reward credits, and family tracking.
 13. **Bank/Statement CSV Imports:** Raw file parsing, duplicate candidate detection, external identity claims, mutation receipts, and batch ingestion.
 14. **Encrypted Backups & Disaster Recovery:** AES-256-GCM envelope encryption, bounded encrypted Backup V1 10 MiB plaintext ceiling chunked DB export full snapshot/envelope materialization R2 upload, retention cleanup, and safe restore tooling with empty-target protection.
-15. **WebAuthn Passkey Authentication:** Single-user authentication, challenge generation, credential management, rate limiting, and session cookie lifecycle.
+15. **WebAuthn Passkey Authentication & Reauth:** Single-user authentication, challenge generation, credential management, isolated step-up reauthentication, rate limiting, and session cookie lifecycle.
+16. **Spending Categories & Metadata:** User custom and starter categories, transaction/split category assignments, and monthly spending analytics rollups.
+17. **Synced Quick-Entry Templates:** Server-persisted quick entry templates for cross-device client prefill without backend execution endpoints.
+18. **Manual Expenses:** Canonical manual expenses with balanced double-entry ledger lines (DR system expense, CR source asset account) and voiding lifecycle.
+19. **Smart Receivable Settlement & Waterfall:** Bilateral receivable settlement with FRIEND 5-TL ceiling rounding and automated overpayment waterfall routing (CC Reserve -> Short-Term Goals -> Long-Term).
 
 ## Current Backend Status
 
-- **Backend Core & HTTP Surface (Phases 0–20 & 7B.1–7B.9):** **100% COMPLETE & PRE-FRONTEND CODE-FROZEN**.
-- **Database Migrations:** Migrations `0000` through `0076` are complete, audited, and immutable.
-- **Financial HTTP Adapters:** All financial HTTP adapters (transactions, ledger, income, credit cards, people, rewards, campaigns, goals, midas, long-term, month-close, notifications, imports) are mounted, tested, and guarded by same-origin mutation checks.
+- **Backend Core & HTTP Surface (Phases 0–20, 7B.1–7B.9 & Product Gap Patch):** **100% COMPLETE & PRE-FRONTEND RE-FROZEN**.
+- **Database Migrations:** Migrations `0000` through `0077` are complete, audited, and immutable.
+- **Financial HTTP Adapters:** All financial HTTP adapters (transactions, ledger, income, credit cards, people, rewards, campaigns, goals, midas, long-term, month-close, notifications, imports, spending categories, quick entry templates, manual expenses) are mounted, tested, and guarded by same-origin mutation checks.
 - **Production Deployment:** Full end-to-end production cutover is deferred until the production frontend domain and WebAuthn RP ID are configured.
 
 ## Prerequisites

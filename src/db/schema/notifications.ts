@@ -27,7 +27,12 @@ export const PUSH_SUBSCRIPTION_STATUSES = ["ACTIVE", "DISABLED"] as const;
 export type PushSubscriptionStatus =
 	(typeof PUSH_SUBSCRIPTION_STATUSES)[number];
 
-export const NOTIFICATION_TYPES = ["CREDIT_CARD_DUE"] as const;
+export const NOTIFICATION_TYPES = [
+	"CREDIT_CARD_DUE",
+	"CREDIT_CARD_DUE_SOON",
+	"BUDGET_THRESHOLD",
+	"NO_SPEND_CHECK",
+] as const;
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
 
 export const NOTIFICATION_DELIVERY_ATTEMPT_STATUSES = [
@@ -173,10 +178,21 @@ export const pushSubscriptionRevisions = pgTable(
 
 /**
  * Notification Events Table (Insert-Only Logical Event Log)
- * One row per logical notification, ever. V1 notification_type is
- * CREDIT_CARD_DUE only (subject_id = the credit_card_statements.id). The
- * CHECK constraint is intentionally narrow for V1; a future phase widens it
- * via its own forward migration.
+ * One row per logical notification, ever.
+ *
+ * V1 notification types:
+ *   CREDIT_CARD_DUE       — statement payment due today
+ *   CREDIT_CARD_DUE_SOON  — statement payment due tomorrow
+ *   BUDGET_THRESHOLD      — monthly personal spending crossed a 5000 TRY multiple
+ *   NO_SPEND_CHECK        — daily check: no personal spending today
+ *
+ * dedupe_key is the domain-level idempotency key for ON CONFLICT DO NOTHING.
+ * UNIQUE(user_id, dedupe_key) replaces the old UNIQUE(user_id, type, subject_id).
+ * Key format:
+ *   CREDIT_CARD_DUE:      'CC_DUE:<statementId>'
+ *   CREDIT_CARD_DUE_SOON: 'CC_DUE_SOON:<statementId>'
+ *   BUDGET_THRESHOLD:     'BUDGET:<YYYY-MM>:<thresholdCents>'
+ *   NO_SPEND_CHECK:       'NO_SPEND:<YYYY-MM-DD>'
  */
 export const notificationEvents = pgTable(
 	"notification_events",
@@ -187,6 +203,7 @@ export const notificationEvents = pgTable(
 			.references(() => users.id, { onDelete: "restrict" }),
 		notificationType: varchar("notification_type", { length: 30 }).notNull(),
 		subjectId: uuid("subject_id").notNull(),
+		dedupeKey: varchar("dedupe_key", { length: 256 }).notNull(),
 		scheduledLocalDate: date("scheduled_local_date").notNull(),
 		scheduledFor: timestamp("scheduled_for", {
 			withTimezone: true,
@@ -198,18 +215,26 @@ export const notificationEvents = pgTable(
 			.notNull(),
 	},
 	(table) => [
-		uniqueIndex("notification_events_user_type_subject_idx").on(
+		uniqueIndex("notification_events_user_dedupe_key_idx").on(
+			table.userId,
+			table.dedupeKey,
+		),
+		index("notification_events_user_idx").on(table.userId),
+		index("notification_events_user_type_subject_idx").on(
 			table.userId,
 			table.notificationType,
 			table.subjectId,
 		),
-		index("notification_events_user_idx").on(table.userId),
 		index("notification_events_scheduled_local_date_idx").on(
 			table.scheduledLocalDate,
 		),
 		check(
 			"notification_events_type_check",
-			sql`${table.notificationType} IN ('CREDIT_CARD_DUE')`,
+			sql`${table.notificationType} IN ('CREDIT_CARD_DUE', 'CREDIT_CARD_DUE_SOON', 'BUDGET_THRESHOLD', 'NO_SPEND_CHECK')`,
+		),
+		check(
+			"notification_events_dedupe_key_check",
+			sql`length(trim(${table.dedupeKey})) >= 1 AND length(${table.dedupeKey}) <= 256`,
 		),
 	],
 );
