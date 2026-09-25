@@ -72,6 +72,10 @@ import {
 } from "../src/short-term-goals/service.ts";
 import { ShortTermGoalError } from "../src/short-term-goals/errors.ts";
 import { recordPostCloseAdjustmentIfClosedInTransaction } from "../src/month-close/service.ts";
+import { createPerson } from "../src/people/people.ts";
+import { recordPersonReceivable } from "../src/people/obligations.ts";
+import { settlePersonReceivables } from "../src/people/person-settlement-orchestrator.ts";
+import { PeopleError } from "../src/people/errors.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const migDir = path.join(root, "migrations");
@@ -1809,6 +1813,233 @@ async function run() {
 		} catch (test11Err) {
 			console.error("[Test 11 Fatal Error]:", test11Err);
 			bad("Test 11 threw unexpected error", String(test11Err));
+		}
+
+		// --------------------------------------------------------------------------
+		// 12. REAL PG ROOT SETTLEMENT IDEMPOTENCY CONCURRENCY (C1, C2, C3)
+		// --------------------------------------------------------------------------
+		console.log("\n--- Test 12: Real PG Root Settlement Idempotency Concurrency (C1, C2, C3) ---");
+		try {
+			// Seed dedicated cash account for settlement test
+			const settleAssetRes = await createProductLedgerAccount({
+				db: dbA,
+				userId: USER_A,
+				code: `SETTLE_CASH_${Date.now()}`.slice(0, 50),
+				name: "Settlement Cash Account",
+				accountType: "ASSET",
+			});
+			const settleAssetId = settleAssetRes.account.id;
+
+			// Seed Person 12A and Person 12B
+			const p12ARes = await createPerson({
+				db: dbA,
+				userId: USER_A,
+				displayName: "Settlement Person 12A",
+				relationship: "FRIEND",
+				idempotencyKey: `p12a-create-${crypto.randomUUID()}`,
+			});
+			const personId12A = p12ARes.person.personId;
+
+			const p12BRes = await createPerson({
+				db: dbA,
+				userId: USER_A,
+				displayName: "Settlement Person 12B",
+				relationship: "FRIEND",
+				idempotencyKey: `p12b-create-${crypto.randomUUID()}`,
+			});
+			const personId12B = p12BRes.person.personId;
+
+			// Seed receivable obligations
+			await recordPersonReceivable({
+				db: dbA,
+				userId: USER_A,
+				personId: personId12A,
+				amount: "1000.00",
+				fundingAssetAccountId: settleAssetId,
+				occurredAt: new Date("2026-06-01T10:00:00Z"),
+				dueDate: "2026-07-01",
+				description: "Obligation for Person 12A",
+				idempotencyKey: `obl-12a-${crypto.randomUUID()}`,
+			});
+
+			await recordPersonReceivable({
+				db: dbA,
+				userId: USER_A,
+				personId: personId12B,
+				amount: "1000.00",
+				fundingAssetAccountId: settleAssetId,
+				occurredAt: new Date("2026-06-01T10:00:00Z"),
+				dueDate: "2026-07-01",
+				description: "Obligation for Person 12B",
+				idempotencyKey: `obl-12b-${crypto.randomUUID()}`,
+			});
+
+			// --- C1: Same Key + Same Fingerprint + Same Person Concurrent ---
+			const keyC1 = `race-c1-${crypto.randomUUID()}`;
+			await controlClient.query("BEGIN; LOCK TABLE users IN ACCESS EXCLUSIVE MODE;");
+
+			const promiseC1A = settlePersonReceivables({
+				db: dbA,
+				userId: USER_A,
+				personId: personId12A,
+				cashAmount: "100.00",
+				destinationAssetAccountId: settleAssetId,
+				isCash: true,
+				occurredAt: new Date("2026-06-15T12:00:00Z"),
+				idempotencyKey: keyC1,
+			});
+
+			const promiseC1B = settlePersonReceivables({
+				db: dbB,
+				userId: USER_A,
+				personId: personId12A,
+				cashAmount: "100.00",
+				destinationAssetAccountId: settleAssetId,
+				isCash: true,
+				occurredAt: new Date("2026-06-15T12:00:00Z"),
+				idempotencyKey: keyC1,
+			});
+
+			const blockedC1 = await waitUntilBothCompetitorsBlockedOnRelation(
+				controlClient,
+				"users",
+				[pidA, pidB],
+			);
+			ok(
+				"C1: both competitors observed waiting on users in pg_locks",
+				`(pidA=${blockedC1.pidA}, pidB=${blockedC1.pidB})`,
+			);
+
+			await controlClient.query("COMMIT;");
+
+			const [resC1A, resC1B] = await Promise.allSettled([promiseC1A, promiseC1B]);
+			chk(resC1A.status === "fulfilled", "C1: competitor A fulfilled");
+			chk(resC1B.status === "fulfilled", "C1: competitor B fulfilled");
+			if (resC1A.status === "fulfilled" && resC1B.status === "fulfilled") {
+				eq(resC1A.value.cashReceived, resC1B.value.cashReceived, "C1: identical cashReceived on idempotent replay");
+				eq(resC1A.value.receivableApplied, resC1B.value.receivableApplied, "C1: identical receivableApplied");
+				eq(resC1A.value.remainingReceivable, resC1B.value.remainingReceivable, "C1: identical remainingReceivable");
+				eq(resC1A.value.excess, resC1B.value.excess, "C1: identical excess");
+			}
+
+			const [receiptCountC1] = await controlClient.query(
+				"select count(*)::int as cnt from person_receivable_settlement_requests where user_id = $1 and idempotency_key = $2",
+				[USER_A, keyC1],
+			).then((r: any) => r.rows);
+			eq(receiptCountC1.cnt, 1, "C1: exactly one root receipt in database");
+
+			// --- C2: Same Key + Different Fingerprint Concurrent ---
+			const keyC2 = `race-c2-${crypto.randomUUID()}`;
+			await controlClient.query("BEGIN; LOCK TABLE users IN ACCESS EXCLUSIVE MODE;");
+
+			const promiseC2A = settlePersonReceivables({
+				db: dbA,
+				userId: USER_A,
+				personId: personId12A,
+				cashAmount: "100.00",
+				destinationAssetAccountId: settleAssetId,
+				isCash: true,
+				occurredAt: new Date("2026-06-15T12:00:00Z"),
+				idempotencyKey: keyC2,
+			});
+
+			const promiseC2B = settlePersonReceivables({
+				db: dbB,
+				userId: USER_A,
+				personId: personId12A,
+				cashAmount: "200.00",
+				destinationAssetAccountId: settleAssetId,
+				isCash: true,
+				occurredAt: new Date("2026-06-15T12:00:00Z"),
+				idempotencyKey: keyC2,
+			});
+
+			const blockedC2 = await waitUntilBothCompetitorsBlockedOnRelation(
+				controlClient,
+				"users",
+				[pidA, pidB],
+			);
+			ok(
+				"C2: both competitors observed waiting on users in pg_locks",
+				`(pidA=${blockedC2.pidA}, pidB=${blockedC2.pidB})`,
+			);
+
+			await controlClient.query("COMMIT;");
+
+			const [resC2A, resC2B] = await Promise.allSettled([promiseC2A, promiseC2B]);
+			const winnerC2 = [resC2A, resC2B].find((s) => s.status === "fulfilled") as any;
+			const loserC2 = [resC2A, resC2B].find((s) => s.status === "rejected") as any;
+
+			chk(winnerC2 !== undefined, "C2: exactly one winner committed");
+			chk(loserC2 !== undefined, "C2: exactly one loser was rejected");
+			if (loserC2) {
+				chk(loserC2.reason instanceof PeopleError, "C2: loser threw PeopleError");
+				eq((loserC2.reason as PeopleError).code, "PEOPLE_IDEMPOTENCY_CONFLICT", "C2: loser code = PEOPLE_IDEMPOTENCY_CONFLICT");
+			}
+
+			const [receiptCountC2] = await controlClient.query(
+				"select count(*)::int as cnt from person_receivable_settlement_requests where user_id = $1 and idempotency_key = $2",
+				[USER_A, keyC2],
+			).then((r: any) => r.rows);
+			eq(receiptCountC2.cnt, 1, "C2: exactly one root receipt in database");
+
+			// --- C3: Same Key + Different Person Concurrent ---
+			const keyC3 = `race-c3-${crypto.randomUUID()}`;
+			await controlClient.query("BEGIN; LOCK TABLE users IN ACCESS EXCLUSIVE MODE;");
+
+			const promiseC3A = settlePersonReceivables({
+				db: dbA,
+				userId: USER_A,
+				personId: personId12A,
+				cashAmount: "50.00",
+				destinationAssetAccountId: settleAssetId,
+				isCash: true,
+				occurredAt: new Date("2026-06-15T12:00:00Z"),
+				idempotencyKey: keyC3,
+			});
+
+			const promiseC3B = settlePersonReceivables({
+				db: dbB,
+				userId: USER_A,
+				personId: personId12B,
+				cashAmount: "50.00",
+				destinationAssetAccountId: settleAssetId,
+				isCash: true,
+				occurredAt: new Date("2026-06-15T12:00:00Z"),
+				idempotencyKey: keyC3,
+			});
+
+			const blockedC3 = await waitUntilBothCompetitorsBlockedOnRelation(
+				controlClient,
+				"users",
+				[pidA, pidB],
+			);
+			ok(
+				"C3: both competitors observed waiting on users in pg_locks",
+				`(pidA=${blockedC3.pidA}, pidB=${blockedC3.pidB})`,
+			);
+
+			await controlClient.query("COMMIT;");
+
+			const [resC3A, resC3B] = await Promise.allSettled([promiseC3A, promiseC3B]);
+			const winnerC3 = [resC3A, resC3B].find((s) => s.status === "fulfilled") as any;
+			const loserC3 = [resC3A, resC3B].find((s) => s.status === "rejected") as any;
+
+			chk(winnerC3 !== undefined, "C3: exactly one winner committed");
+			chk(loserC3 !== undefined, "C3: exactly one loser was rejected");
+			if (loserC3) {
+				chk(loserC3.reason instanceof PeopleError, "C3: loser threw PeopleError");
+				eq((loserC3.reason as PeopleError).code, "PEOPLE_IDEMPOTENCY_CONFLICT", "C3: loser code = PEOPLE_IDEMPOTENCY_CONFLICT");
+			}
+
+			const [receiptCountC3] = await controlClient.query(
+				"select count(*)::int as cnt from person_receivable_settlement_requests where user_id = $1 and idempotency_key = $2",
+				[USER_A, keyC3],
+			).then((r: any) => r.rows);
+			eq(receiptCountC3.cnt, 1, "C3: exactly one root receipt in database");
+		} catch (test12Err) {
+			console.error("[Test 12 Fatal Error]:", test12Err);
+			bad("Test 12 threw unexpected error", String(test12Err));
 		}
 	} catch (fatalErr) {
 		console.error("FATAL RUN ERROR:", fatalErr);

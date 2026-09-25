@@ -39,25 +39,35 @@ describe("Person Settlement Atomicity, Idempotency & Waterfall", () => {
 					where: (cond?: any) => chain,
 					orderBy: (order?: any) => chain,
 					limit: (num?: number) => {
-						if (handlers.selectHandler)
-							return Promise.resolve(
-								handlers.selectHandler(currentTable, fields),
-							);
+						if (handlers.selectHandler) {
+							const custom = handlers.selectHandler(currentTable, fields);
+							if (custom !== undefined) return Promise.resolve(custom);
+						}
+						if (currentTable === users)
+							return Promise.resolve([{ id: userId }]);
 						return Promise.resolve([]);
 					},
 					for: (mode?: string) => {
-						const res = handlers.selectHandler
-							? handlers.selectHandler(currentTable, fields)
-							: [];
+						let res: any;
+						if (handlers.selectHandler) {
+							res = handlers.selectHandler(currentTable, fields);
+						}
+						if (res === undefined) {
+							res = currentTable === users ? [{ id: userId }] : [];
+						}
 						return Object.assign(Promise.resolve(res), {
 							limit: () => Promise.resolve(res),
 						});
 					},
 					// biome-ignore lint/suspicious/noThenProperty: mock query builder is thenable to support await query
 					then: (resolve: any) => {
-						const res = handlers.selectHandler
-							? handlers.selectHandler(currentTable, fields)
-							: [];
+						let res: any;
+						if (handlers.selectHandler) {
+							res = handlers.selectHandler(currentTable, fields);
+						}
+						if (res === undefined) {
+							res = currentTable === users ? [{ id: userId }] : [];
+						}
 						return Promise.resolve(res).then(resolve);
 					},
 				};
@@ -143,6 +153,7 @@ describe("Person Settlement Atomicity, Idempotency & Waterfall", () => {
 		it("throws PEOPLE_NO_OPEN_RECEIVABLES when person has no open receivable obligations", async () => {
 			const mockTx = createMockTx({
 				selectHandler: (table: any) => {
+					if (table === users) return [{ id: userId }];
 					if (table === people) return [{ id: personId, userId }];
 					if (table === personRevisions)
 						return [{ personId, revisionNo: 1, status: "ACTIVE" }];

@@ -366,6 +366,17 @@ export function mapDbError(err: unknown, _context?: string): never {
 		);
 	}
 	if (
+		causeChain.includes(
+			"person_receivable_settlement_requests_user_id_idempotency_key_idx",
+		) ||
+		causeChain.includes("person_receivable_settlement_requests")
+	) {
+		throw new PeopleError(
+			"PEOPLE_IDEMPOTENCY_CONFLICT",
+			"Idempotency key already used with different settlement request payload",
+		);
+	}
+	if (
 		causeChain.includes("does not reconcile") ||
 		causeChain.includes("cannot become negative")
 	) {

@@ -1,5 +1,5 @@
 import { and, desc, eq } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { Database, DatabaseOrTransaction } from "../db/client";
 import { effectiveRevisionAsOf } from "../db/effective-revision";
 import { creditCardLiabilityEventRevisions } from "../db/schema/credit-card-ledger";
 import {
@@ -373,7 +373,7 @@ async function findReconRevisionByIdempotencyKey(
 }
 
 async function componentsFor(
-	tx: Database,
+	tx: DatabaseOrTransaction,
 	reconciliationRevisionId: string,
 ): Promise<ReconciliationComponentItem[]> {
 	const rows = await tx
@@ -400,7 +400,7 @@ async function componentsFor(
 }
 
 async function isSealed(
-	tx: Database,
+	tx: DatabaseOrTransaction,
 	reconciliationRevisionId: string,
 ): Promise<boolean> {
 	const [row] = await tx
@@ -607,7 +607,7 @@ async function purchaseComponentStaleReason(
  * ONE authoritative as-of split reader -- an inconsistent / unsealed effective
  * split makes the component (and the reconciliation) STALE / unusable. */
 async function purchaseComponentStaleReasonAsOf(
-	db: Database,
+	db: DatabaseOrTransaction,
 	userId: string,
 	item: ReconciliationComponentItem,
 	asOf: Date,
@@ -665,7 +665,7 @@ async function purchaseComponentStaleReasonAsOf(
 }
 
 async function reconRevisionAsOf(
-	db: Database,
+	db: DatabaseOrTransaction,
 	reconciliationId: string,
 	asOf: Date,
 ): Promise<
@@ -684,7 +684,7 @@ async function reconRevisionAsOf(
 }
 
 async function statementRevisionAsOf(
-	db: Database,
+	db: DatabaseOrTransaction,
 	statementId: string,
 	asOf: Date,
 ): Promise<typeof creditCardStatementRevisions.$inferSelect | undefined> {
@@ -1287,7 +1287,7 @@ export async function getStatementReconciliation(params: {
  * UNSEALED / STALE / STATEMENT_VOID / RECONCILED view. Does not mutate history.
  */
 export async function getStatementReconciliationAsOf(params: {
-	db: Database;
+	db: DatabaseOrTransaction;
 	userId: string;
 	statementId: string;
 	asOf: Date;

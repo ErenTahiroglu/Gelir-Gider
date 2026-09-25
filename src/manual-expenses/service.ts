@@ -10,7 +10,7 @@ import {
 	transactionRevisions,
 } from "../db/schema/transactions";
 import { LedgerError } from "../ledger/errors";
-import { formatCentsToMoney, parsePositiveMoneyString } from "../ledger/money";
+import { parsePositiveMoneyString } from "../ledger/money";
 import type { JournalLineInput } from "../ledger/posting";
 import { ensureUserExpenseSystemAccountsInTransaction } from "../ledger/system-expense-accounts";
 import { upsertAssignment } from "../spending-categories/assignments";

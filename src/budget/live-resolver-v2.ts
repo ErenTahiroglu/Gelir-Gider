@@ -1,7 +1,7 @@
 import { and, eq, lt, lte, or, sql } from "drizzle-orm";
 import { resolveAuthoritativePurchaseSplitAsOf } from "../credit-cards/purchase-split-read";
 import { getStatementReconciliationAsOf } from "../credit-cards/statement-reconciliation";
-import type { Database } from "../db/client";
+import type { Database, DatabaseOrTransaction } from "../db/client";
 import { effectiveRevisionAsOf } from "../db/effective-revision";
 import { budgetV2BasicLivingConfigRevisions } from "../db/schema/budget-basic-living";
 import {
@@ -99,7 +99,7 @@ export interface BudgetV2LiveResolution {
 }
 
 export interface ResolveBudgetV2LiveParams {
-	db: Database;
+	db: DatabaseOrTransaction;
 	userId: string;
 	periodMonth: string;
 	asOf?: Date | undefined;
@@ -208,7 +208,7 @@ function asDate(v: unknown): Date {
  *    transfer exactly at `at` does NOT count.
  */
 async function bucketNetCents(
-	db: Database,
+	db: DatabaseOrTransaction,
 	userId: string,
 	bucketId: string,
 	at: Date,
@@ -246,7 +246,7 @@ interface LatestGoalState {
 }
 
 async function loadGoalStates(
-	db: Database,
+	db: DatabaseOrTransaction,
 	userId: string,
 	asOf: Date,
 ): Promise<LatestGoalState[]> {
@@ -287,7 +287,7 @@ async function loadGoalStates(
 }
 
 async function goalPurposeAsOf(
-	db: Database,
+	db: DatabaseOrTransaction,
 	goalId: string,
 	asOf: Date,
 ): Promise<string | null> {
@@ -316,7 +316,7 @@ interface RealizedIncomeResult {
 }
 
 async function resolveRealizedIncome(
-	db: Database,
+	db: DatabaseOrTransaction,
 	userId: string,
 	win: ResolverWindow,
 ): Promise<RealizedIncomeResult> {
@@ -423,7 +423,7 @@ async function resolveRealizedIncome(
 // ============================================================================
 
 async function resolveEmergencyFund(
-	db: Database,
+	db: DatabaseOrTransaction,
 	userId: string,
 	asOf: Date,
 ): Promise<{ bucketId: string; balanceCents: bigint; gapCents: bigint }> {
@@ -456,7 +456,7 @@ async function resolveEmergencyFund(
 }
 
 async function resolveMobilityBalance(
-	db: Database,
+	db: DatabaseOrTransaction,
 	userId: string,
 	goals: LatestGoalState[],
 	asOf: Date,
@@ -501,7 +501,7 @@ function inclusiveBudgetMonths(
 }
 
 async function resolveDateBoundNecessary(
-	db: Database,
+	db: DatabaseOrTransaction,
 	userId: string,
 	goals: LatestGoalState[],
 	periodMonth: string,
@@ -588,7 +588,7 @@ interface MandatoryPurchaseShare {
  * unsealed split's userShareAmount is NEVER read.
  */
 async function mandatoryPurchasePersonalShareAsOf(
-	db: Database,
+	db: DatabaseOrTransaction,
 	userId: string,
 	purchaseEventId: string,
 	grossCents: bigint,
@@ -640,7 +640,7 @@ interface BasicLivingResult {
 }
 
 async function resolveBasicLiving(
-	db: Database,
+	db: DatabaseOrTransaction,
 	userId: string,
 	periodMonth: string,
 	win: ResolverWindow,
@@ -924,7 +924,7 @@ interface CurrentObligationsResult {
  * statement revision (preferring its linked payment event). Never inferred.
  */
 async function statementPaidInstant(
-	db: Database,
+	db: DatabaseOrTransaction,
 	statementId: string,
 	asOf: Date,
 ): Promise<Date | null> {
@@ -957,7 +957,7 @@ async function statementPaidInstant(
 }
 
 async function resolveCurrentObligations(
-	db: Database,
+	db: DatabaseOrTransaction,
 	userId: string,
 	periodMonth: string,
 	win: ResolverWindow,
@@ -1258,7 +1258,7 @@ export interface CurrentObligationsOverlap {
 }
 
 export async function resolveBudgetV2CurrentObligationsOverlap(params: {
-	db: Database;
+	db: DatabaseOrTransaction;
 	userId: string;
 	periodMonth: string;
 	asOf: Date;
@@ -1574,7 +1574,7 @@ function inputsFromStoredRevision(
 }
 
 export async function resolveBudgetV2SnapshotForWrite(params: {
-	db: Database;
+	db: DatabaseOrTransaction;
 	userId: string;
 	periodMonth: string;
 	idempotencyKey: string;

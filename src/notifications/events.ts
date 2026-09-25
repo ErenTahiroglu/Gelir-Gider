@@ -1,9 +1,11 @@
 import { and, asc, desc, eq, gt, gte, lte, sql } from "drizzle-orm";
+import { resolveBudgetV2LiveSnapshot } from "../budget/live-resolver-v2";
+import { validateBudgetPeriodMonth } from "../budget/utils";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
-	monthlyBudgetPlanRevisions,
-	monthlyBudgetPlans,
-} from "../db/schema/budget";
+	monthlyBudgetV2PlanRevisions,
+	monthlyBudgetV2Plans,
+} from "../db/schema/budget-v2";
 import {
 	creditCardStatementRevisions,
 	creditCardStatements,
@@ -478,8 +480,9 @@ export async function materializeBudgetThresholdEventInTransaction(
 }
 
 /**
- * Scans all users who have an active budget plan for the given month,
- * evaluates personal spending, and emits budget threshold events if crossed.
+ * Scans all users who have an active Budget V2 plan for the given month,
+ * resolves authoritative Budget V2 total budget B, evaluates authoritative
+ * personal spending S, and emits budget threshold events if crossed.
  */
 export async function materializeAllActiveBudgetThresholdEventsInTransaction(
 	tx: DatabaseTransaction,
@@ -487,73 +490,85 @@ export async function materializeAllActiveBudgetThresholdEventsInTransaction(
 	scheduledAt: Date,
 ): Promise<MaterializeDueEventsResult> {
 	const periodMonth = localDate.slice(0, 7);
+	const validPeriodMonth = validateBudgetPeriodMonth(`${periodMonth}-01`);
 	const { start } = getMonthCloseIstanbulPeriodBoundaries(periodMonth);
 
-	const latestPlanRevisions = tx
+	const latestV2PlanRevisions = tx
 		.select({
-			budgetPlanId: monthlyBudgetPlanRevisions.budgetPlanId,
-			maxRev: sql<number>`max(${monthlyBudgetPlanRevisions.revisionNo})`.as(
+			budgetPlanId: monthlyBudgetV2PlanRevisions.budgetPlanId,
+			maxRev: sql<number>`max(${monthlyBudgetV2PlanRevisions.revisionNo})`.as(
 				"max_rev",
 			),
 		})
-		.from(monthlyBudgetPlanRevisions)
-		.groupBy(monthlyBudgetPlanRevisions.budgetPlanId)
-		.as("latest_plan_rev");
+		.from(monthlyBudgetV2PlanRevisions)
+		.groupBy(monthlyBudgetV2PlanRevisions.budgetPlanId)
+		.as("latest_v2_plan_rev");
 
-	const activeBudgetPlans = await tx
+	const activeV2Plans = await tx
 		.select({
-			userId: monthlyBudgetPlans.userId,
-			mandatoryCeiling: monthlyBudgetPlanRevisions.mandatoryCeilingAmount,
-			discretionaryCeiling:
-				monthlyBudgetPlanRevisions.discretionaryCeilingAmount,
+			userId: monthlyBudgetV2Plans.userId,
+			budgetPlanId: monthlyBudgetV2Plans.id,
 		})
-		.from(monthlyBudgetPlans)
+		.from(monthlyBudgetV2Plans)
 		.innerJoin(
-			monthlyBudgetPlanRevisions,
-			eq(monthlyBudgetPlans.id, monthlyBudgetPlanRevisions.budgetPlanId),
+			monthlyBudgetV2PlanRevisions,
+			eq(monthlyBudgetV2Plans.id, monthlyBudgetV2PlanRevisions.budgetPlanId),
 		)
 		.innerJoin(
-			latestPlanRevisions,
+			latestV2PlanRevisions,
 			and(
 				eq(
-					monthlyBudgetPlanRevisions.budgetPlanId,
-					latestPlanRevisions.budgetPlanId,
+					monthlyBudgetV2PlanRevisions.budgetPlanId,
+					latestV2PlanRevisions.budgetPlanId,
 				),
-				eq(monthlyBudgetPlanRevisions.revisionNo, latestPlanRevisions.maxRev),
+				eq(
+					monthlyBudgetV2PlanRevisions.revisionNo,
+					latestV2PlanRevisions.maxRev,
+				),
 			),
 		)
 		.where(
 			and(
-				eq(monthlyBudgetPlans.periodMonth, periodMonth),
-				sql`${monthlyBudgetPlanRevisions.operation} != 'VOID'`,
+				eq(monthlyBudgetV2Plans.periodMonth, validPeriodMonth),
+				sql`${monthlyBudgetV2PlanRevisions.operation} != 'VOID'`,
 			),
 		);
 
 	let eventsCreated = 0;
-	for (const plan of activeBudgetPlans) {
-		const spend = await calculatePersonalSpendInTransaction({
-			db: tx,
-			userId: plan.userId,
-			start,
-			end: scheduledAt,
-		});
+	for (const plan of activeV2Plans) {
+		try {
+			const resolution = await resolveBudgetV2LiveSnapshot({
+				db: tx,
+				userId: plan.userId,
+				periodMonth,
+				asOf: scheduledAt,
+			});
 
-		const mandatoryCents = parseAggregateMoneyString(
-			plan.mandatoryCeiling,
-		).cents;
-		const discretionaryCents = parseAggregateMoneyString(
-			plan.discretionaryCeiling,
-		).cents;
-		const budgetCents = mandatoryCents + discretionaryCents;
+			const budgetCents =
+				resolution.policyResult.inputs.currentObligations.cents +
+				resolution.policyResult.inputs.basicLivingFunding.cents +
+				resolution.policyResult.inputs.dateBoundNecessaryPurchaseFunding.cents +
+				resolution.policyResult.outputs.discretionaryAllocation.cents;
 
-		const res = await materializeBudgetThresholdEventInTransaction(tx, {
-			userId: plan.userId,
-			periodMonth,
-			currentSpendCents: spend.totalPersonalSpendCents,
-			budgetCents,
-			localDate,
-		});
-		eventsCreated += res.eventsCreated;
+			const spend = await calculatePersonalSpendInTransaction({
+				db: tx,
+				userId: plan.userId,
+				start,
+				end: scheduledAt,
+			});
+
+			const res = await materializeBudgetThresholdEventInTransaction(tx, {
+				userId: plan.userId,
+				periodMonth,
+				currentSpendCents: spend.totalPersonalSpendCents,
+				budgetCents,
+				localDate,
+			});
+			eventsCreated += res.eventsCreated;
+		} catch {
+			// Fail-closed: if budget cannot be proven (e.g. BUDGET_RESOLVER_FAIL_CLOSED)
+			// or personal spend cannot be proven (UNRESOLVED split), do NOT emit threshold events.
+		}
 	}
 
 	return { eventsCreated };
@@ -627,19 +642,24 @@ export async function materializeAllNoSpendCheckEventsInTransaction(
 
 	let eventsCreated = 0;
 	for (const u of usersWithSubscriptions) {
-		const spend = await calculatePersonalSpendInTransaction({
-			db: tx,
-			userId: u.userId,
-			start,
-			end,
-		});
+		try {
+			const spend = await calculatePersonalSpendInTransaction({
+				db: tx,
+				userId: u.userId,
+				start,
+				end,
+			});
 
-		const res = await materializeNoSpendCheckEventInTransaction(tx, {
-			userId: u.userId,
-			localDate,
-			hasSpending: spend.hasSpending,
-		});
-		eventsCreated += res.eventsCreated;
+			const res = await materializeNoSpendCheckEventInTransaction(tx, {
+				userId: u.userId,
+				localDate,
+				hasSpending: spend.hasSpending,
+			});
+			eventsCreated += res.eventsCreated;
+		} catch {
+			// Fail-closed: if personal spend cannot be proven (UNRESOLVED split / exception),
+			// do NOT emit NO_SPEND_CHECK (never convert uncertainty into hasSpending=false).
+		}
 	}
 
 	return { eventsCreated };

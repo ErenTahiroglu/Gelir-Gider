@@ -6,14 +6,12 @@ import { createDatabase } from "../db/client";
 import { getSpendingSummary } from "../spending-categories/analytics";
 import {
 	bulkResolveAssignments,
-	getAssignment,
 	upsertAssignment,
 } from "../spending-categories/assignments";
 import { SpendingCategoryError } from "../spending-categories/errors";
 import {
 	archiveSpendingCategory,
 	createSpendingCategory,
-	getSpendingCategory,
 	listSpendingCategories,
 	updateSpendingCategory,
 } from "../spending-categories/service";

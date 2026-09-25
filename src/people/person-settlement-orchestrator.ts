@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, sql } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
+import { users } from "../db/schema/auth";
 import {
 	creditCardStatementRevisions,
 	creditCardStatements,
@@ -91,7 +92,18 @@ export async function settlePersonReceivables(
 		});
 
 	return runPeopleTransaction(params.db, async (tx: DatabaseTransaction) => {
-		// 1. Root Idempotency Check
+		// 0. Stable user-level row lock before definitive root idempotency decision
+		const [user] = await tx
+			.select({ id: users.id })
+			.from(users)
+			.where(eq(users.id, userId))
+			.for("update");
+
+		if (!user) {
+			throw new PeopleError("PEOPLE_INVALID_INPUT", "User does not exist");
+		}
+
+		// 1. Root Idempotency Check (Definitive lookup under user-level serialization lock)
 		const [existingRequest] = await tx
 			.select()
 			.from(personReceivableSettlementRequests)
