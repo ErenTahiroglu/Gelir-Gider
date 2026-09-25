@@ -1958,7 +1958,7 @@ The following headers are set globally on every response:
 
 > **PRE-FRONTEND BACKEND CODE FREEZE: RE-FROZEN AFTER PRODUCT GAP PATCH**
 
-All planned product HTTP surfaces, including the Frontend-Enabling Product Gap Patch (Spending Categories, Quick Entry Templates, Manual Expenses, Smart Receivable Waterfall Settlement, Notifications V1 Expansion, Passkey Reauth), have been mounted, guarded with Same-Origin protection, keyset-paginated, migration-backed (0000–0077), and covered by 191 test suites (2694 unit/contract tests + 2300 pg tests).
+All planned product HTTP surfaces, including the Frontend-Enabling Product Gap Patch (Spending Categories, Quick Entry Templates, Manual Expenses, Smart Receivable Waterfall Settlement, Notifications V1 Expansion, Passkey Reauth), have been mounted, guarded with Same-Origin protection, keyset-paginated, migration-backed (0000–0078), and covered by comprehensive contract and integration test suites.
 
 The backend core and HTTP product surfaces are fully frozen.
 
@@ -1967,7 +1967,7 @@ The backend core and HTTP product surfaces are fully frozen.
 ## 12. Frontend-Enabling Product Gap Patch Specifications
 
 ### 12.1 Spending Categories & Metadata (`/spending/*`)
-- `GET /spending/categories`: Lists all active spending categories for user. Auto-seeds 8 default categories (`Market & Gıda`, `Ulaşım & Yakıt`, `Restoran & Kafe`, `Abonelikler & Faturalar`, `Giyim & Alışveriş`, `Kişisel Bakım & Sağlık`, `Eğlence & Hobi`, `Ev & Yaşam`) on first fetch.
+- `GET /spending/categories`: Lists all active spending categories for user. Auto-seeds 14 default starter categories (`Market`, `Dışarıda Yemek`, `Ulaşım`, `Akaryakıt`, `Sağlık`, `Giyim`, `Eğlence`, `Abonelikler`, `Eğitim`, `Seyahat`, `Ev`, `Yurt Ücreti`, `Hediye`, `Diğer`) on first fetch.
 - `POST /spending/categories`: Creates custom category (`name`, `defaultBudgetCategory`, `sortOrder`).
 - `PUT /spending/categories/:id`: Updates category properties.
 - `POST /spending/categories/:id/archive`: Soft-archives category (`status = 'ARCHIVED'`).

@@ -107,6 +107,7 @@ function mapPeopleDomainError(c: Context<PeopleEnv>, err: unknown) {
 			case "PEOPLE_OBLIGATION_SPLIT_MANAGED":
 			case "PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE":
 			case "PEOPLE_SETTLEMENT_NOT_ACTIVE":
+			case "PEOPLE_NO_OPEN_RECEIVABLES":
 				return fail(c, err.code, 409);
 			default:
 				return fail(c, "INTERNAL_ERROR", 500);

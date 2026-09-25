@@ -4,10 +4,7 @@ import {
 	runNotificationReadTransaction,
 	runNotificationTransaction,
 } from "./boundary";
-import {
-	getIstanbulLocalDateAndHour,
-	isAtOrAfterNotificationDeliveryHour,
-} from "./calendar";
+import { getIstanbulLocalDateAndHour } from "./calendar";
 import {
 	ensureDeliveryInTransaction,
 	insertDeliveryAttemptInTransaction,
@@ -23,6 +20,8 @@ import type { NotificationEventReadModel } from "./events";
 import {
 	getLatestStatementRevisionInTransaction,
 	listEventsForLocalDateInTransaction,
+	materializeAllActiveBudgetThresholdEventsInTransaction,
+	materializeAllNoSpendCheckEventsInTransaction,
 	materializeCreditCardDueEventsInTransaction,
 	materializeCreditCardDueSoonEventsInTransaction,
 } from "./events";
@@ -431,10 +430,6 @@ export async function runNotificationScheduler(
 	} = params;
 	const { localDate, localHour } = getIstanbulLocalDateAndHour(scheduledAt);
 
-	if (!isAtOrAfterNotificationDeliveryHour(localHour)) {
-		return zeroSummary();
-	}
-
 	const summary = zeroSummary();
 	const currentHourSlot = truncateToSchedulerHourSlot(scheduledAt);
 
@@ -444,13 +439,31 @@ export async function runNotificationScheduler(
 	const resultDueSoon = await runNotificationTransaction(db, (tx) =>
 		materializeCreditCardDueSoonEventsInTransaction(tx, localDate),
 	);
-	summary.eventsCreated = resultDue.eventsCreated + resultDueSoon.eventsCreated;
+	const resultBudget = await runNotificationTransaction(db, (tx) =>
+		materializeAllActiveBudgetThresholdEventsInTransaction(
+			tx,
+			localDate,
+			scheduledAt,
+		),
+	);
+	let noSpendEventsCreated = 0;
+	if (localHour >= 22) {
+		const resultNoSpend = await runNotificationTransaction(db, (tx) =>
+			materializeAllNoSpendCheckEventsInTransaction(tx, localDate),
+		);
+		noSpendEventsCreated = resultNoSpend.eventsCreated;
+	}
+
+	summary.eventsCreated =
+		resultDue.eventsCreated +
+		resultDueSoon.eventsCreated +
+		resultBudget.eventsCreated +
+		noSpendEventsCreated;
 
 	// Phase 15-R2 Section C: created once per run, threaded through every
 	// `processEventSubscription` call so `transport.prepare()` is invoked at
 	// most once -- lazily, only once this point is reached (i.e. there is at
-	// least one event for today), never on an empty run or the pre-12:00
-	// early return above.
+	// least one event for today), never on an empty run.
 	const transportPreparedState = { prepared: false };
 	let dispatchesAttempted = 0;
 	let subscriptionsExamined = 0;
@@ -470,6 +483,7 @@ export async function runNotificationScheduler(
 				pageLimit,
 				afterEventId,
 				true,
+				scheduledAt,
 			),
 		);
 		if (events.length === 0) {

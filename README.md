@@ -40,7 +40,7 @@ Private, single-user personal finance backend built for high-integrity ledger ac
 ## Current Backend Status
 
 - **Backend Core & HTTP Surface (Phases 0–20, 7B.1–7B.9 & Product Gap Patch):** **100% COMPLETE & PRE-FRONTEND RE-FROZEN**.
-- **Database Migrations:** Migrations `0000` through `0077` are complete, audited, and immutable.
+- **Database Migrations:** Migrations `0000` through `0078` are complete, audited, and immutable.
 - **Financial HTTP Adapters:** All financial HTTP adapters (transactions, ledger, income, credit cards, people, rewards, campaigns, goals, midas, long-term, month-close, notifications, imports, spending categories, quick entry templates, manual expenses) are mounted, tested, and guarded by same-origin mutation checks.
 - **Production Deployment:** Full end-to-end production cutover is deferred until the production frontend domain and WebAuthn RP ID are configured.
 

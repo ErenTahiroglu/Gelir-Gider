@@ -80,6 +80,17 @@ export interface RecordPersonReceivableSettlementParams {
 	idempotencyKey: string;
 }
 
+export interface RecordPersonReceivableSettlementInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	obligationId: string;
+	cashAmount: string;
+	destinationAssetAccountId: string;
+	occurredAt: Date;
+	note?: string | null | undefined;
+	idempotencyKey: string;
+}
+
 export interface RecordPersonPayableSettlementParams {
 	db: Database;
 	userId: string;
@@ -304,309 +315,313 @@ async function createSettlementCore(
 	core: SettlementCreateCore,
 ): Promise<{ settlement: SettlementReadModel; idempotentReplay: boolean }> {
 	return runPeopleTransaction(db, async (tx) => {
-		const [earlyRev] = await tx
-			.select()
-			.from(personSettlementRevisions)
-			.where(
-				and(
-					eq(personSettlementRevisions.userId, core.userId),
-					eq(personSettlementRevisions.idempotencyKey, core.idempotencyKey),
-				),
-			)
-			.limit(1);
+		return createSettlementCoreInTransaction(tx, core);
+	});
+}
 
-		if (earlyRev) {
-			return checkSettlementCreateReplay(tx, earlyRev, core);
+export async function createSettlementCoreInTransaction(
+	tx: DatabaseTransaction,
+	core: SettlementCreateCore,
+): Promise<{ settlement: SettlementReadModel; idempotentReplay: boolean }> {
+	const [earlyRev] = await tx
+		.select()
+		.from(personSettlementRevisions)
+		.where(
+			and(
+				eq(personSettlementRevisions.userId, core.userId),
+				eq(personSettlementRevisions.idempotencyKey, core.idempotencyKey),
+			),
+		)
+		.limit(1);
+
+	if (earlyRev) {
+		return checkSettlementCreateReplay(tx, earlyRev, core);
+	}
+
+	const [obligationPeek] = await tx
+		.select()
+		.from(personObligations)
+		.where(
+			and(
+				eq(personObligations.id, core.obligationId),
+				eq(personObligations.userId, core.userId),
+			),
+		)
+		.limit(1);
+
+	if (!obligationPeek) {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_NOT_FOUND",
+			`Obligation "${core.obligationId}" not found`,
+		);
+	}
+	if (obligationPeek.direction !== core.direction) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_INPUT",
+			`Obligation "${core.obligationId}" direction does not match this settlement type`,
+		);
+	}
+
+	await tx
+		.select({ id: people.id })
+		.from(people)
+		.where(eq(people.id, obligationPeek.personId))
+		.for("update");
+
+	await tx
+		.select({ id: personObligations.id })
+		.from(personObligations)
+		.where(eq(personObligations.id, core.obligationId))
+		.for("update");
+
+	const [secondRev] = await tx
+		.select()
+		.from(personSettlementRevisions)
+		.where(
+			and(
+				eq(personSettlementRevisions.userId, core.userId),
+				eq(personSettlementRevisions.idempotencyKey, core.idempotencyKey),
+			),
+		)
+		.limit(1);
+
+	if (secondRev) {
+		return checkSettlementCreateReplay(tx, secondRev, core);
+	}
+
+	await verifyPersonActiveInTransaction(tx, obligationPeek.personId);
+
+	const [latestObligationRev] = await tx
+		.select()
+		.from(personObligationRevisions)
+		.where(eq(personObligationRevisions.obligationId, core.obligationId))
+		.orderBy(desc(personObligationRevisions.revisionNo))
+		.limit(1);
+
+	if (!latestObligationRev || latestObligationRev.operation === "VOID") {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_NOT_ACTIVE",
+			`Obligation "${core.obligationId}" is VOID or has no revisions`,
+		);
+	}
+
+	const existingSettlements = await tx
+		.select({ id: personSettlements.id })
+		.from(personSettlements)
+		.where(eq(personSettlements.obligationId, core.obligationId));
+
+	let activeSettledCents = 0n;
+	for (const s of existingSettlements) {
+		const latestSettleRev = await getLatestSettlementRevision(tx, s.id);
+		if (latestSettleRev && latestSettleRev.operation !== "VOID") {
+			activeSettledCents += parsePositiveMoneyString(
+				latestSettleRev.appliedAmount,
+			).cents;
 		}
+	}
 
-		const [obligationPeek] = await tx
-			.select()
-			.from(personObligations)
-			.where(
-				and(
-					eq(personObligations.id, core.obligationId),
-					eq(personObligations.userId, core.userId),
-				),
-			)
-			.limit(1);
+	const principalCents = parsePositiveMoneyString(
+		latestObligationRev.principalAmount,
+	).cents;
+	const remainingCents = principalCents - activeSettledCents;
 
-		if (!obligationPeek) {
+	if (remainingCents <= 0n) {
+		throw new PeopleError(
+			"PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT",
+			`Obligation "${core.obligationId}" has no remaining balance to settle`,
+		);
+	}
+
+	const cashCents = parsePositiveMoneyString(core.cashAmountNormalized).cents;
+	let appliedCents: bigint;
+	let excessCents: bigint;
+
+	if (core.direction === "PAYABLE") {
+		if (cashCents > remainingCents) {
 			throw new PeopleError(
-				"PEOPLE_OBLIGATION_NOT_FOUND",
-				`Obligation "${core.obligationId}" not found`,
+				"PEOPLE_OBLIGATION_OVERSETTLEMENT",
+				`Payment ${core.cashAmountNormalized} exceeds remaining balance ${formatCentsToMoney(remainingCents)}`,
 			);
 		}
-		if (obligationPeek.direction !== core.direction) {
-			throw new PeopleError(
-				"PEOPLE_INVALID_INPUT",
-				`Obligation "${core.obligationId}" direction does not match this settlement type`,
-			);
-		}
+		appliedCents = cashCents;
+		excessCents = 0n;
+	} else {
+		appliedCents = cashCents < remainingCents ? cashCents : remainingCents;
+		excessCents = cashCents - appliedCents;
+	}
 
-		await tx
-			.select({ id: people.id })
-			.from(people)
-			.where(eq(people.id, obligationPeek.personId))
-			.for("update");
+	await validateAssetAccount(
+		tx,
+		core.userId,
+		core.assetAccountId,
+		core.direction === "RECEIVABLE"
+			? "destinationAssetAccountId"
+			: "sourceAssetAccountId",
+	);
 
-		await tx
-			.select({ id: personObligations.id })
-			.from(personObligations)
-			.where(eq(personObligations.id, core.obligationId))
-			.for("update");
+	const link = await ensurePersonLedgerLinkOrThrow(tx, obligationPeek.personId);
 
-		const [secondRev] = await tx
-			.select()
-			.from(personSettlementRevisions)
-			.where(
-				and(
-					eq(personSettlementRevisions.userId, core.userId),
-					eq(personSettlementRevisions.idempotencyKey, core.idempotencyKey),
-				),
-			)
-			.limit(1);
+	const peopleLedgerAccountId =
+		core.direction === "RECEIVABLE"
+			? link.receivableAccountId
+			: link.payableAccountId;
 
-		if (secondRev) {
-			return checkSettlementCreateReplay(tx, secondRev, core);
-		}
+	await lockLedgerAccountsInTransaction({
+		tx,
+		userId: core.userId,
+		accountIds: [peopleLedgerAccountId, core.assetAccountId],
+	});
 
-		await verifyPersonActiveInTransaction(tx, obligationPeek.personId);
+	const settlementId = crypto.randomUUID();
+	const appliedNormalized = formatCentsToMoney(appliedCents);
+	const cashNormalized = formatCentsToMoney(cashCents);
+	const excessNormalized = formatCentsToMoney(excessCents);
 
-		const [latestObligationRev] = await tx
-			.select()
-			.from(personObligationRevisions)
-			.where(eq(personObligationRevisions.obligationId, core.obligationId))
-			.orderBy(desc(personObligationRevisions.revisionNo))
-			.limit(1);
+	const canonicalPayload: Record<string, unknown> = {
+		settlementId,
+		obligationId: core.obligationId,
+		personId: obligationPeek.personId,
+		direction: core.direction,
+		appliedAmount: appliedNormalized,
+		cashAmount: cashNormalized,
+		excessAmount: excessNormalized,
+		assetAccountId: core.assetAccountId,
+		note: core.note,
+	};
 
-		if (!latestObligationRev || latestObligationRev.operation === "VOID") {
-			throw new PeopleError(
-				"PEOPLE_OBLIGATION_NOT_ACTIVE",
-				`Obligation "${core.obligationId}" is VOID or has no revisions`,
-			);
-		}
+	const ledgerLines =
+		core.direction === "RECEIVABLE"
+			? [
+					{
+						accountId: core.assetAccountId,
+						side: "DEBIT" as const,
+						amount: appliedNormalized,
+					},
+					{
+						accountId: link.receivableAccountId,
+						side: "CREDIT" as const,
+						amount: appliedNormalized,
+					},
+				]
+			: [
+					{
+						accountId: link.payableAccountId,
+						side: "DEBIT" as const,
+						amount: appliedNormalized,
+					},
+					{
+						accountId: core.assetAccountId,
+						side: "CREDIT" as const,
+						amount: appliedNormalized,
+					},
+				];
 
-		const existingSettlements = await tx
-			.select({ id: personSettlements.id })
-			.from(personSettlements)
-			.where(eq(personSettlements.obligationId, core.obligationId));
+	const boundRes = await createCanonicalTransactionWithLedgerInTransaction({
+		tx,
+		userId: core.userId,
+		kind: "PERSON_OBLIGATION_SETTLEMENT",
+		idempotencyKey: core.idempotencyKey,
+		occurredAt: core.occurredAt,
+		payload: canonicalPayload,
+		source: {
+			type: "PERSON_OBLIGATION_SETTLEMENT",
+			ref: core.idempotencyKey,
+		},
+		ledger: {
+			memo:
+				core.direction === "RECEIVABLE"
+					? "Person receivable settlement"
+					: "Person payable settlement",
+			lines: ledgerLines,
+		},
+	});
 
-		let activeSettledCents = 0n;
-		for (const s of existingSettlements) {
-			const latestSettleRev = await getLatestSettlementRevision(tx, s.id);
-			if (latestSettleRev && latestSettleRev.operation !== "VOID") {
-				activeSettledCents += parsePositiveMoneyString(
-					latestSettleRev.appliedAmount,
-				).cents;
-			}
-		}
+	await tx.insert(personSettlements).values({
+		id: settlementId,
+		userId: core.userId,
+		obligationId: core.obligationId,
+		canonicalTransactionId: boundRes.transactionId,
+	});
 
-		const principalCents = parsePositiveMoneyString(
-			latestObligationRev.principalAmount,
-		).cents;
-		const remainingCents = principalCents - activeSettledCents;
-
-		if (remainingCents <= 0n) {
-			throw new PeopleError(
-				"PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT",
-				`Obligation "${core.obligationId}" has no remaining balance to settle`,
-			);
-		}
-
-		const cashCents = parsePositiveMoneyString(core.cashAmountNormalized).cents;
-		let appliedCents: bigint;
-		let excessCents: bigint;
-
-		if (core.direction === "PAYABLE") {
-			if (cashCents > remainingCents) {
-				throw new PeopleError(
-					"PEOPLE_OBLIGATION_OVERSETTLEMENT",
-					`Payment ${core.cashAmountNormalized} exceeds remaining balance ${formatCentsToMoney(remainingCents)}`,
-				);
-			}
-			appliedCents = cashCents;
-			excessCents = 0n;
-		} else {
-			appliedCents = cashCents < remainingCents ? cashCents : remainingCents;
-			excessCents = cashCents - appliedCents;
-		}
-
-		await validateAssetAccount(
+	let overpaymentIncomeReceiptId: string | null = null;
+	if (excessCents > 0n) {
+		const sourceInfo = await ensurePeopleOverpaymentIncomeSourceInTransaction(
 			tx,
 			core.userId,
-			core.assetAccountId,
-			core.direction === "RECEIVABLE"
-				? "destinationAssetAccountId"
-				: "sourceAssetAccountId",
 		);
-
-		const link = await ensurePersonLedgerLinkOrThrow(
-			tx,
-			obligationPeek.personId,
-		);
-
-		const peopleLedgerAccountId =
-			core.direction === "RECEIVABLE"
-				? link.receivableAccountId
-				: link.payableAccountId;
-
-		await lockLedgerAccountsInTransaction({
-			tx,
-			userId: core.userId,
-			accountIds: [peopleLedgerAccountId, core.assetAccountId],
-		});
-
-		const settlementId = crypto.randomUUID();
-		const appliedNormalized = formatCentsToMoney(appliedCents);
-		const cashNormalized = formatCentsToMoney(cashCents);
-		const excessNormalized = formatCentsToMoney(excessCents);
-
-		const canonicalPayload: Record<string, unknown> = {
+		const overpaymentCreateKey = await derivePeopleIncomeIdempotencyKey(
+			core.idempotencyKey,
 			settlementId,
-			obligationId: core.obligationId,
-			personId: obligationPeek.personId,
-			direction: core.direction,
-			appliedAmount: appliedNormalized,
-			cashAmount: cashNormalized,
-			excessAmount: excessNormalized,
-			assetAccountId: core.assetAccountId,
-			note: core.note,
-		};
-
-		const ledgerLines =
-			core.direction === "RECEIVABLE"
-				? [
-						{
-							accountId: core.assetAccountId,
-							side: "DEBIT" as const,
-							amount: appliedNormalized,
-						},
-						{
-							accountId: link.receivableAccountId,
-							side: "CREDIT" as const,
-							amount: appliedNormalized,
-						},
-					]
-				: [
-						{
-							accountId: link.payableAccountId,
-							side: "DEBIT" as const,
-							amount: appliedNormalized,
-						},
-						{
-							accountId: core.assetAccountId,
-							side: "CREDIT" as const,
-							amount: appliedNormalized,
-						},
-					];
-
-		const boundRes = await createCanonicalTransactionWithLedgerInTransaction({
+			"OVERPAYMENT_CREATE",
+		);
+		const incomeRes = await createIncomeReceiptInTransaction({
 			tx,
 			userId: core.userId,
-			kind: "PERSON_OBLIGATION_SETTLEMENT",
-			idempotencyKey: core.idempotencyKey,
-			occurredAt: core.occurredAt,
-			payload: canonicalPayload,
-			source: {
-				type: "PERSON_OBLIGATION_SETTLEMENT",
-				ref: core.idempotencyKey,
-			},
-			ledger: {
-				memo:
-					core.direction === "RECEIVABLE"
-						? "Person receivable settlement"
-						: "Person payable settlement",
-				lines: ledgerLines,
+			sourceId: sourceInfo.incomeSourceId,
+			idempotencyKey: overpaymentCreateKey,
+			receivedAt: core.occurredAt,
+			amount: excessNormalized,
+			destinationAccountId: core.assetAccountId,
+			note: core.note,
+			provenance: {
+				type: "PERSON_OBLIGATION_SETTLEMENT_OVERPAYMENT",
+				ref: settlementId,
 			},
 		});
+		overpaymentIncomeReceiptId = incomeRes.incomeReceipt.incomeReceiptId;
+	}
 
-		await tx.insert(personSettlements).values({
-			id: settlementId,
+	const fingerprint = await calculateSettlementCreateFingerprint({
+		userId: core.userId,
+		obligationId: core.obligationId,
+		direction: core.direction,
+		assetAccountId: core.assetAccountId,
+		cashAmount: cashNormalized,
+		occurredAt: core.occurredAt,
+		note: core.note,
+	});
+
+	const [insertedRev] = await tx
+		.insert(personSettlementRevisions)
+		.values({
 			userId: core.userId,
-			obligationId: core.obligationId,
-			canonicalTransactionId: boundRes.transactionId,
-		});
-
-		let overpaymentIncomeReceiptId: string | null = null;
-		if (excessCents > 0n) {
-			const sourceInfo = await ensurePeopleOverpaymentIncomeSourceInTransaction(
-				tx,
-				core.userId,
-			);
-			const overpaymentCreateKey = await derivePeopleIncomeIdempotencyKey(
-				core.idempotencyKey,
-				settlementId,
-				"OVERPAYMENT_CREATE",
-			);
-			const incomeRes = await createIncomeReceiptInTransaction({
-				tx,
-				userId: core.userId,
-				sourceId: sourceInfo.incomeSourceId,
-				idempotencyKey: overpaymentCreateKey,
-				receivedAt: core.occurredAt,
-				amount: excessNormalized,
-				destinationAccountId: core.assetAccountId,
-				note: core.note,
-				provenance: {
-					type: "PERSON_OBLIGATION_SETTLEMENT_OVERPAYMENT",
-					ref: settlementId,
-				},
-			});
-			overpaymentIncomeReceiptId = incomeRes.incomeReceipt.incomeReceiptId;
-		}
-
-		const fingerprint = await calculateSettlementCreateFingerprint({
-			userId: core.userId,
-			obligationId: core.obligationId,
-			direction: core.direction,
+			settlementId,
+			revisionNo: 1,
+			previousRevisionId: null,
+			operation: "CREATE",
 			assetAccountId: core.assetAccountId,
 			cashAmount: cashNormalized,
-			occurredAt: core.occurredAt,
+			appliedAmount: appliedNormalized,
+			excessAmount: excessNormalized,
+			overpaymentIncomeReceiptId,
 			note: core.note,
-		});
+			occurredAt: core.occurredAt,
+			canonicalRevisionId: boundRes.revisionId,
+			idempotencyKey: core.idempotencyKey,
+			revisionFingerprint: fingerprint,
+		})
+		.returning();
 
-		const [insertedRev] = await tx
-			.insert(personSettlementRevisions)
-			.values({
-				userId: core.userId,
-				settlementId,
-				revisionNo: 1,
-				previousRevisionId: null,
-				operation: "CREATE",
-				assetAccountId: core.assetAccountId,
-				cashAmount: cashNormalized,
-				appliedAmount: appliedNormalized,
-				excessAmount: excessNormalized,
-				overpaymentIncomeReceiptId,
-				note: core.note,
-				occurredAt: core.occurredAt,
-				canonicalRevisionId: boundRes.revisionId,
-				idempotencyKey: core.idempotencyKey,
-				revisionFingerprint: fingerprint,
-			})
-			.returning();
+	if (!insertedRev) {
+		throw new PeopleError(
+			"PEOPLE_INVALID_STATE",
+			"Failed to insert person settlement revision",
+		);
+	}
 
-		if (!insertedRev) {
-			throw new PeopleError(
-				"PEOPLE_INVALID_STATE",
-				"Failed to insert person settlement revision",
-			);
-		}
-
-		return {
-			settlement: buildSettlementReadModel(
-				{
-					id: settlementId,
-					obligationId: core.obligationId,
-					canonicalTransactionId: boundRes.transactionId,
-				},
-				obligationPeek.personId,
-				core.direction,
-				insertedRev,
-			),
-			idempotentReplay: false,
-		};
-	});
+	return {
+		settlement: buildSettlementReadModel(
+			{
+				id: settlementId,
+				obligationId: core.obligationId,
+				canonicalTransactionId: boundRes.transactionId,
+			},
+			obligationPeek.personId,
+			core.direction,
+			insertedRev,
+		),
+		idempotentReplay: false,
+	};
 }
 
 async function ensurePersonLedgerLinkOrThrow(
@@ -706,6 +721,35 @@ export async function recordPersonReceivableSettlement(
 	const idempotencyKey = validateIdempotencyKey(params.idempotencyKey);
 
 	return createSettlementCore(params.db, {
+		direction: "RECEIVABLE",
+		userId,
+		obligationId,
+		cashAmountNormalized: cashAmount.normalized,
+		assetAccountId: destinationAssetAccountId,
+		occurredAt,
+		note,
+		idempotencyKey,
+	});
+}
+
+/**
+ * Records a receivable settlement within an existing database transaction.
+ */
+export async function recordPersonReceivableSettlementInTransaction(
+	params: RecordPersonReceivableSettlementInTransactionParams,
+): Promise<{ settlement: SettlementReadModel; idempotentReplay: boolean }> {
+	const userId = validateUserId(params.userId);
+	const obligationId = validateObligationId(params.obligationId);
+	const cashAmount = validatePositiveAmount(params.cashAmount);
+	const destinationAssetAccountId = validateAccountId(
+		params.destinationAssetAccountId,
+		"destinationAssetAccountId",
+	);
+	const occurredAt = validateOccurredAt(params.occurredAt);
+	const note = validateNote(params.note);
+	const idempotencyKey = validateIdempotencyKey(params.idempotencyKey);
+
+	return createSettlementCoreInTransaction(params.tx, {
 		direction: "RECEIVABLE",
 		userId,
 		obligationId,

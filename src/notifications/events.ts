@@ -1,18 +1,26 @@
 import { and, asc, desc, eq, gt, gte, lte, sql } from "drizzle-orm";
 import type { Database, DatabaseTransaction } from "../db/client";
 import {
+	monthlyBudgetPlanRevisions,
+	monthlyBudgetPlans,
+} from "../db/schema/budget";
+import {
 	creditCardStatementRevisions,
 	creditCardStatements,
 } from "../db/schema/credit-cards";
 import {
 	type NotificationType,
 	notificationEvents,
+	pushSubscriptionRevisions,
+	pushSubscriptions,
 } from "../db/schema/notifications";
+import { parseAggregateMoneyString } from "../ledger/money";
+import { getMonthCloseIstanbulPeriodBoundaries } from "../month-close/calendar";
+import { calculatePersonalSpendInTransaction } from "../spending/personal-spend-calculator";
 import { runNotificationReadTransaction } from "./boundary";
 import {
 	getNextDayIstanbul,
 	istanbulLocalHourToUtcInstant,
-	istanbulNoonToUtcInstant,
 	validateNotificationCanonicalUuid,
 	validateNotificationLocalDate,
 	validateNotificationOptionalType,
@@ -92,14 +100,12 @@ export interface BudgetThresholdPayload {
 	data: {
 		type: "BUDGET_THRESHOLD";
 		periodMonth: string;
-		thresholdCents: string;
 		deepLink: string;
 	};
 }
 
 export function buildBudgetThresholdPayload(params: {
 	periodMonth: string;
-	thresholdCents: string;
 }): BudgetThresholdPayload {
 	return {
 		title: "Bütçe uyarısı",
@@ -107,7 +113,6 @@ export function buildBudgetThresholdPayload(params: {
 		data: {
 			type: "BUDGET_THRESHOLD",
 			periodMonth: params.periodMonth,
-			thresholdCents: params.thresholdCents,
 			deepLink: "/budget",
 		},
 	};
@@ -321,7 +326,7 @@ export async function materializeCreditCardDueEventsInTransaction(
 		localDate,
 		limit,
 	);
-	const scheduledFor = istanbulNoonToUtcInstant(localDate);
+	const scheduledFor = istanbulLocalHourToUtcInstant(localDate, 10);
 	let eventsCreated = 0;
 
 	for (const statement of eligible) {
@@ -393,6 +398,8 @@ export async function materializeCreditCardDueSoonEventsInTransaction(
 
 /**
  * Materializes a single collapsed BUDGET_THRESHOLD event if threshold is crossed.
+ * Never inserts fake historical catch-up rows; queries existing thresholds for
+ * (userId, periodMonth) and emits only when currentHighestCrossed > previousHighest.
  */
 export async function materializeBudgetThresholdEventInTransaction(
 	tx: DatabaseTransaction,
@@ -416,26 +423,41 @@ export async function materializeBudgetThresholdEventInTransaction(
 	const stepsCrossed = delta / step;
 	const highestThresholdCents = params.budgetCents + stepsCrossed * step;
 
-	const highestDedupeKey = `BUDGET:${params.periodMonth}:${highestThresholdCents.toString()}`;
-	const [existing] = await tx
-		.select({ id: notificationEvents.id })
+	// Query highest previously emitted threshold for this (userId, periodMonth)
+	const existingEvents = await tx
+		.select({ dedupeKey: notificationEvents.dedupeKey })
 		.from(notificationEvents)
 		.where(
 			and(
 				eq(notificationEvents.userId, params.userId),
-				eq(notificationEvents.dedupeKey, highestDedupeKey),
+				eq(notificationEvents.notificationType, "BUDGET_THRESHOLD"),
+				sql`${notificationEvents.dedupeKey} LIKE ${`BUDGET:${params.periodMonth}:%`}`,
 			),
-		)
-		.limit(1);
+		);
 
-	if (existing) {
+	let previousHighestThreshold = 0n;
+	for (const ev of existingEvents) {
+		const parts = ev.dedupeKey.split(":");
+		if (parts.length >= 3 && parts[2] !== undefined) {
+			try {
+				const val = BigInt(parts[2]);
+				if (val > previousHighestThreshold) {
+					previousHighestThreshold = val;
+				}
+			} catch {
+				// ignore malformed keys
+			}
+		}
+	}
+
+	if (highestThresholdCents <= previousHighestThreshold) {
 		return { eventsCreated: 0 };
 	}
 
+	const highestDedupeKey = `BUDGET:${params.periodMonth}:${highestThresholdCents.toString()}`;
 	const scheduledFor = istanbulLocalHourToUtcInstant(params.localDate, 10);
 	const payload = buildBudgetThresholdPayload({
 		periodMonth: params.periodMonth,
-		thresholdCents: highestThresholdCents.toString(),
 	});
 
 	const [inserted] = await tx
@@ -452,28 +474,89 @@ export async function materializeBudgetThresholdEventInTransaction(
 		.onConflictDoNothing()
 		.returning({ id: notificationEvents.id });
 
-	// Catch-up collapse: populate historical dedupe keys for lower thresholds so they don't fire later
-	for (let s = 0n; s < stepsCrossed; s++) {
-		const lowerThresholdCents = params.budgetCents + s * step;
-		const lowerKey = `BUDGET:${params.periodMonth}:${lowerThresholdCents.toString()}`;
-		await tx
-			.insert(notificationEvents)
-			.values({
-				userId: params.userId,
-				notificationType: "BUDGET_THRESHOLD",
-				subjectId: params.userId,
-				dedupeKey: lowerKey,
-				scheduledLocalDate: "2000-01-01",
-				scheduledFor: new Date(0),
-				payload: buildBudgetThresholdPayload({
-					periodMonth: params.periodMonth,
-					thresholdCents: lowerThresholdCents.toString(),
-				}),
-			})
-			.onConflictDoNothing();
+	return { eventsCreated: inserted ? 1 : 0 };
+}
+
+/**
+ * Scans all users who have an active budget plan for the given month,
+ * evaluates personal spending, and emits budget threshold events if crossed.
+ */
+export async function materializeAllActiveBudgetThresholdEventsInTransaction(
+	tx: DatabaseTransaction,
+	localDate: string,
+	scheduledAt: Date,
+): Promise<MaterializeDueEventsResult> {
+	const periodMonth = localDate.slice(0, 7);
+	const { start } = getMonthCloseIstanbulPeriodBoundaries(periodMonth);
+
+	const latestPlanRevisions = tx
+		.select({
+			budgetPlanId: monthlyBudgetPlanRevisions.budgetPlanId,
+			maxRev: sql<number>`max(${monthlyBudgetPlanRevisions.revisionNo})`.as(
+				"max_rev",
+			),
+		})
+		.from(monthlyBudgetPlanRevisions)
+		.groupBy(monthlyBudgetPlanRevisions.budgetPlanId)
+		.as("latest_plan_rev");
+
+	const activeBudgetPlans = await tx
+		.select({
+			userId: monthlyBudgetPlans.userId,
+			mandatoryCeiling: monthlyBudgetPlanRevisions.mandatoryCeilingAmount,
+			discretionaryCeiling:
+				monthlyBudgetPlanRevisions.discretionaryCeilingAmount,
+		})
+		.from(monthlyBudgetPlans)
+		.innerJoin(
+			monthlyBudgetPlanRevisions,
+			eq(monthlyBudgetPlans.id, monthlyBudgetPlanRevisions.budgetPlanId),
+		)
+		.innerJoin(
+			latestPlanRevisions,
+			and(
+				eq(
+					monthlyBudgetPlanRevisions.budgetPlanId,
+					latestPlanRevisions.budgetPlanId,
+				),
+				eq(monthlyBudgetPlanRevisions.revisionNo, latestPlanRevisions.maxRev),
+			),
+		)
+		.where(
+			and(
+				eq(monthlyBudgetPlans.periodMonth, periodMonth),
+				sql`${monthlyBudgetPlanRevisions.operation} != 'VOID'`,
+			),
+		);
+
+	let eventsCreated = 0;
+	for (const plan of activeBudgetPlans) {
+		const spend = await calculatePersonalSpendInTransaction({
+			db: tx,
+			userId: plan.userId,
+			start,
+			end: scheduledAt,
+		});
+
+		const mandatoryCents = parseAggregateMoneyString(
+			plan.mandatoryCeiling,
+		).cents;
+		const discretionaryCents = parseAggregateMoneyString(
+			plan.discretionaryCeiling,
+		).cents;
+		const budgetCents = mandatoryCents + discretionaryCents;
+
+		const res = await materializeBudgetThresholdEventInTransaction(tx, {
+			userId: plan.userId,
+			periodMonth,
+			currentSpendCents: spend.totalPersonalSpendCents,
+			budgetCents,
+			localDate,
+		});
+		eventsCreated += res.eventsCreated;
 	}
 
-	return { eventsCreated: inserted ? 1 : 0 };
+	return { eventsCreated };
 }
 
 /**
@@ -513,6 +596,56 @@ export async function materializeNoSpendCheckEventInTransaction(
 }
 
 /**
+ * For all users with active push subscriptions who have not yet received a NO_SPEND_CHECK
+ * event today, checks if they had personal spending today. If no spending occurred,
+ * materializes a NO_SPEND_CHECK notification event scheduled for 22:00.
+ */
+export async function materializeAllNoSpendCheckEventsInTransaction(
+	tx: DatabaseTransaction,
+	localDate: string,
+): Promise<MaterializeDueEventsResult> {
+	const start = istanbulLocalHourToUtcInstant(localDate, 0);
+	const end = istanbulLocalHourToUtcInstant(getNextDayIstanbul(localDate), 0);
+
+	const usersWithSubscriptions = await tx
+		.selectDistinct({ userId: pushSubscriptions.userId })
+		.from(pushSubscriptions)
+		.innerJoin(
+			pushSubscriptionRevisions,
+			eq(pushSubscriptions.id, pushSubscriptionRevisions.subscriptionId),
+		)
+		.where(
+			and(
+				eq(pushSubscriptionRevisions.status, "ACTIVE"),
+				sql`NOT EXISTS (
+					SELECT 1 FROM ${notificationEvents}
+					WHERE ${notificationEvents.userId} = ${pushSubscriptions.userId}
+						AND ${notificationEvents.dedupeKey} = 'NO_SPEND:' || ${localDate}
+				)`,
+			),
+		);
+
+	let eventsCreated = 0;
+	for (const u of usersWithSubscriptions) {
+		const spend = await calculatePersonalSpendInTransaction({
+			db: tx,
+			userId: u.userId,
+			start,
+			end,
+		});
+
+		const res = await materializeNoSpendCheckEventInTransaction(tx, {
+			userId: u.userId,
+			localDate,
+			hasSpending: spend.hasSpending,
+		});
+		eventsCreated += res.eventsCreated;
+	}
+
+	return { eventsCreated };
+}
+
+/**
  * Lists today's (i.e. `scheduledLocalDate = localDate`) notification events,
  * across all users -- used by the scheduler to drive delivery fan-out.
  */
@@ -522,10 +655,14 @@ export async function listEventsForLocalDateInTransaction(
 	limit = 500,
 	afterEventId?: string | undefined,
 	onlyPendingDeliveries = false,
+	scheduledAt?: Date,
 ): Promise<(typeof notificationEvents.$inferSelect)[]> {
 	const conditions = [eq(notificationEvents.scheduledLocalDate, localDate)];
 	if (afterEventId) {
 		conditions.push(gt(notificationEvents.id, afterEventId));
+	}
+	if (scheduledAt) {
+		conditions.push(lte(notificationEvents.scheduledFor, scheduledAt));
 	}
 	if (onlyPendingDeliveries) {
 		conditions.push(sql`EXISTS (

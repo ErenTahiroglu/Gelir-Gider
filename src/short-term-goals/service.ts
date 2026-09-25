@@ -2015,6 +2015,32 @@ export async function fundShortTermGoal(
 	return await executeInTx(params.db as DatabaseTransaction);
 }
 
+export interface FundShortTermGoalInTransactionParams {
+	tx: DatabaseTransaction;
+	userId: string;
+	goalId: string;
+	fromBucketId?: string | null;
+	amount: string;
+	occurredAt: Date;
+	memo?: string | null;
+	idempotencyKey: string;
+}
+
+export async function fundShortTermGoalInTransaction(
+	params: FundShortTermGoalInTransactionParams,
+): Promise<ShortTermGoalFundingResult> {
+	return await fundShortTermGoal({
+		db: params.tx,
+		userId: params.userId,
+		goalId: params.goalId,
+		fromBucketId: params.fromBucketId ?? null,
+		amount: params.amount,
+		occurredAt: params.occurredAt,
+		memo: params.memo ?? null,
+		idempotencyKey: params.idempotencyKey,
+	});
+}
+
 /**
  * Virtually releases funding from a short-term goal back to unallocated liquidity or another bucket.
  */

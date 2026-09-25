@@ -190,7 +190,7 @@ async function fetchBoundedActivePriorityPage(
 // ============================================================================
 
 export interface ListBoundedShortTermGoalsParams {
-	db: Database;
+	db: DatabaseOrTransaction;
 	userId: string;
 	midasAccountId?: string | undefined;
 	status?: ShortTermGoalStatus | undefined;
@@ -216,7 +216,9 @@ export async function listBoundedShortTermGoals({
 }: ListBoundedShortTermGoalsParams): Promise<ListBoundedShortTermGoalsResult> {
 	const validUserId = validateCanonicalUuid(userId, "userId");
 
-	return await db.transaction(async (tx) => {
+	const executeInTx = async (
+		tx: Parameters<Parameters<Database["transaction"]>[0]>[0],
+	): Promise<ListBoundedShortTermGoalsResult> => {
 		let resolvedMidasAccountId: string;
 		if (midasAccountId !== undefined) {
 			resolvedMidasAccountId = validateCanonicalUuid(
@@ -632,7 +634,14 @@ export async function listBoundedShortTermGoals({
 			hasMore,
 			nextCursor,
 		};
-	});
+	};
+
+	if ("transaction" in db && typeof db.transaction === "function") {
+		return await db.transaction(executeInTx);
+	}
+	return await executeInTx(
+		db as Parameters<Parameters<Database["transaction"]>[0]>[0],
+	);
 }
 
 // ============================================================================

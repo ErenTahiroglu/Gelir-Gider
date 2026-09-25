@@ -1,10 +1,12 @@
 import { sql } from "drizzle-orm";
 import {
 	type AnyPgColumn,
+	boolean,
 	check,
 	date,
 	index,
 	integer,
+	jsonb,
 	numeric,
 	pgTable,
 	timestamp,
@@ -493,6 +495,62 @@ export const peopleSystemIncomeLinks = pgTable(
 		check(
 			"people_system_income_links_role_check",
 			sql`${table.role} IN ('OVERPAYMENT_EXTRA')`,
+		),
+	],
+);
+
+/**
+ * Person Receivable Settlement Requests Table (Root Idempotency Receipt)
+ * Guarantees exactly-once atomic execution for multi-obligation person receivable settlement commands.
+ */
+export const personReceivableSettlementRequests = pgTable(
+	"person_receivable_settlement_requests",
+	{
+		id: uuid("id").defaultRandom().primaryKey().notNull(),
+		userId: uuid("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "restrict" }),
+		personId: uuid("person_id")
+			.notNull()
+			.references(() => people.id, { onDelete: "restrict" }),
+		idempotencyKey: varchar("idempotency_key", { length: 128 }).notNull(),
+		requestFingerprint: varchar("request_fingerprint", {
+			length: 64,
+		}).notNull(),
+		cashAmount: numeric("cash_amount", { precision: 18, scale: 2 }).notNull(),
+		destinationAssetAccountId: uuid("destination_asset_account_id")
+			.notNull()
+			.references(() => ledgerAccounts.id, { onDelete: "restrict" }),
+		isCash: boolean("is_cash").notNull(),
+		occurredAt: timestamp("occurred_at", {
+			withTimezone: true,
+			mode: "date",
+		}).notNull(),
+		resultJson: jsonb("result_json").notNull(),
+		createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+			.defaultNow()
+			.notNull(),
+	},
+	(table) => [
+		uniqueIndex("person_receivable_settlement_requests_user_idemp_idx").on(
+			table.userId,
+			table.idempotencyKey,
+		),
+		index("person_receivable_settlement_requests_user_person_idx").on(
+			table.userId,
+			table.personId,
+		),
+		check(
+			"person_receivable_settlement_requests_amount_check",
+			sql`${table.cashAmount} > 0`,
+		),
+		check(
+			"person_receivable_settlement_requests_fingerprint_check",
+			sql`${table.requestFingerprint} ~ '^[0-9a-f]{64}$'`,
+		),
+		check(
+			"person_receivable_settlement_requests_idempotency_check",
+			sql`${table.idempotencyKey} = btrim(${table.idempotencyKey}) AND length(${table.idempotencyKey}) BETWEEN 1 AND 128`,
 		),
 	],
 );

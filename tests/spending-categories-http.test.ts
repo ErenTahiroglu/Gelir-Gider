@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as dbClientModule from "../src/db/client";
 import * as analyticsModule from "../src/spending-categories/analytics";
 import * as assignmentsModule from "../src/spending-categories/assignments";
-import { SpendingCategoryError } from "../src/spending-categories/errors";
 import * as serviceModule from "../src/spending-categories/service";
 
 const U1 = "11111111-1111-4111-8111-111111111111";

@@ -1,5 +1,5 @@
 import { eq } from "drizzle-orm";
-import type { Database } from "../db/client";
+import type { Database, DatabaseOrTransaction } from "../db/client";
 import { effectiveRevisionAsOf } from "../db/effective-revision";
 import {
 	creditCardPurchaseSplitParticipants,
@@ -72,7 +72,7 @@ export type AuthoritativePurchaseSplit =
 	| { kind: "UNRESOLVED"; reason: string; inconsistent: boolean };
 
 export interface ResolveAuthoritativePurchaseSplitParams {
-	db: Database;
+	db: DatabaseOrTransaction;
 	userId: string;
 	purchaseEventId: string;
 	asOf: Date;

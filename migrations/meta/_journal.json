@@ -547,6 +547,13 @@
       "when": 1790231841048,
       "tag": "0077_yielding_sphinx",
       "breakpoints": true
+    },
+    {
+      "idx": 78,
+      "version": "7",
+      "when": 1790239831952,
+      "tag": "0078_sudden_brother_voodoo",
+      "breakpoints": true
     }
   ]
 }

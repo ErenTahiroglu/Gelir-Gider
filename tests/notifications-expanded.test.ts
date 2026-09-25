@@ -47,12 +47,11 @@ describe("Notifications V1 Expansion & Privacy", () => {
 		it("BUDGET_THRESHOLD payload contains sanitized message", () => {
 			const payload = buildBudgetThresholdPayload({
 				periodMonth: "2026-09",
-				thresholdCents: "500000",
 			});
 
 			expect(payload.data.type).toBe("BUDGET_THRESHOLD");
 			expect(payload.data.periodMonth).toBe("2026-09");
-			expect(payload.data.thresholdCents).toBe("500000");
+			expect((payload.data as any).thresholdCents).toBeUndefined();
 			expect(payload.data.deepLink).toBe("/budget");
 		});
 
@@ -109,9 +108,10 @@ describe("Notifications V1 Expansion & Privacy", () => {
 			const mockTx = {
 				select: () => ({
 					from: () => ({
-						where: () => ({
-							limit: () => Promise.resolve([]), // no existing
-						}),
+						where: () =>
+							Object.assign(Promise.resolve([]), {
+								limit: () => Promise.resolve([]),
+							}),
 					}),
 				}),
 				insert: () => ({

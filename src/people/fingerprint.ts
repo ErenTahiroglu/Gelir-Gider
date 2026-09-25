@@ -262,3 +262,26 @@ export async function derivePeopleIncomeIdempotencyKey(
 	]);
 	return `PPL_${operation}_${hash}`.slice(0, 128);
 }
+
+export interface PersonReceivableSettlementRequestFingerprintParams {
+	userId: string;
+	personId: string;
+	cashAmount: string;
+	destinationAssetAccountId: string;
+	isCash: boolean;
+	occurredAt: Date;
+}
+
+export async function calculatePersonReceivableSettlementRequestFingerprint(
+	params: PersonReceivableSettlementRequestFingerprintParams,
+): Promise<string> {
+	return sha256Hex([
+		"person-receivable-settlement-request-v1",
+		params.userId.trim().toLowerCase(),
+		params.personId.trim().toLowerCase(),
+		params.cashAmount,
+		params.destinationAssetAccountId.trim().toLowerCase(),
+		params.isCash,
+		params.occurredAt.toISOString(),
+	]);
+}

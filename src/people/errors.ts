@@ -14,7 +14,8 @@ export type PeopleErrorCode =
 	| "PEOPLE_INVALID_STATE"
 	| "PEOPLE_OBLIGATION_SPLIT_MANAGED"
 	| "PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE"
-	| "PEOPLE_SETTLEMENT_NOT_ACTIVE";
+	| "PEOPLE_SETTLEMENT_NOT_ACTIVE"
+	| "PEOPLE_NO_OPEN_RECEIVABLES";
 
 export class PeopleError extends Error {
 	readonly code: PeopleErrorCode;
