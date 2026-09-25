@@ -11,7 +11,11 @@
 			"tests/**/*.ts",
 			"vitest.config.ts",
 			"wrangler.jsonc",
-			"biome.json"
+			"biome.json",
+			"frontend/**/*.ts",
+			"frontend/**/*.tsx",
+			"vite.config.ts",
+			"vitest.ui.config.ts"
 		]
 	},
 	"formatter": {
