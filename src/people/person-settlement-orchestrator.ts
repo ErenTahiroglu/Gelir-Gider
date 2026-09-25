@@ -15,7 +15,11 @@ import {
 	personSettlementRevisions,
 	personSettlements,
 } from "../db/schema/people";
-import { formatCentsToMoney, parsePositiveMoneyString } from "../ledger/money";
+import {
+	formatCentsToMoney,
+	parseMoneyString,
+	parsePositiveMoneyString,
+} from "../ledger/money";
 import { allocateLongTermInvestmentInTransaction } from "../long-term/service";
 import {
 	createMidasAllocationTransferInTransaction,
@@ -318,10 +322,10 @@ export async function settlePersonReceivables(
 				idempotencyKey: childKey,
 			});
 
-			const appliedCents = parsePositiveMoneyString(
+			const appliedCents = parseMoneyString(
 				settlement.settlement.appliedAmount,
 			).cents;
-			const excessCents = parsePositiveMoneyString(
+			const excessCents = parseMoneyString(
 				settlement.settlement.excessAmount,
 			).cents;
 
