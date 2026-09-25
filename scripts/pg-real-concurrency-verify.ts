@@ -1836,6 +1836,7 @@ async function run() {
 				userId: USER_A,
 				displayName: "Settlement Person 12A",
 				relationship: "FRIEND",
+				occurredAt: new Date("2026-06-01T00:00:00Z"),
 				idempotencyKey: `p12a-create-${crypto.randomUUID()}`,
 			});
 			const personId12A = p12ARes.person.personId;
@@ -1845,6 +1846,7 @@ async function run() {
 				userId: USER_A,
 				displayName: "Settlement Person 12B",
 				relationship: "FRIEND",
+				occurredAt: new Date("2026-06-01T00:00:00Z"),
 				idempotencyKey: `p12b-create-${crypto.randomUUID()}`,
 			});
 			const personId12B = p12BRes.person.personId;
