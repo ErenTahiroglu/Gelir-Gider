@@ -11,6 +11,9 @@ DATABASE_URL=postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require
 # WebAuthn / Passkey Authentication Configuration
 WEBAUTHN_RP_ID=localhost
 WEBAUTHN_RP_NAME=Gelir Gider
+# Default for direct Worker access is http://localhost:8787.
+# For local frontend development running Vite on port 5173 with proxy to port 8787:
+# WEBAUTHN_ORIGIN=http://localhost:5173
 WEBAUTHN_ORIGIN=http://localhost:8787
 
 # SHA-256 hash of single-user bootstrap token (64 lowercase hex characters)

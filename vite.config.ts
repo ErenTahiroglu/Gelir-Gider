@@ -18,5 +18,12 @@ export default defineConfig({
 	server: {
 		port: 5173,
 		strictPort: true,
+		proxy: {
+			"^/(health|ready|auth|budget-v2|credit-cards|transactions|manual-expenses|quick-entry|spending|people|short-term-goals|midas|long-term|income|month-close|imports|notifications|rewards|campaigns|ledger)":
+				{
+					target: "http://localhost:8787",
+					changeOrigin: false,
+				},
+		},
 	},
 });

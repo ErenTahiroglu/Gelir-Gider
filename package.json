@@ -27,7 +27,9 @@
   },
   "dependencies": {
     "@neondatabase/serverless": "1.1.0",
+    "@simplewebauthn/browser": "^13.3.0",
     "@simplewebauthn/server": "13.3.3",
+    "@tanstack/react-router": "^1.170.39",
     "drizzle-orm": "0.45.2",
     "hono": "4.13.5",
     "react": "^19.3.0",
