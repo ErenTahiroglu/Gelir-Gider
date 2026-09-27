@@ -8,7 +8,7 @@ import { RecoveryFlow } from "./RecoveryFlow";
 import { UnlockScreen } from "./UnlockScreen";
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
-	const { state, retryBootstrapOrInit } = useAuth();
+	const { state, retryBootstrapOrInit, logout } = useAuth();
 
 	if (state.status === "BOOTING") {
 		return (
@@ -49,7 +49,40 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 			</main>
 		);
 	}
-
+	if (state.status === "LOGOUT_FAILED_LOCKED") {
+		return (
+			<main className="auth-surface" data-testid="logout-failed-screen">
+				<div className="auth-card">
+					<header className="auth-header">
+						<h1 className="auth-title">Çıkış Tamamlanamadı</h1>
+						<p className="auth-subtitle">
+							Sunucudaki oturum güvenli biçimde kapatılamadı. Finansal bilgiler
+							gizlendi.
+						</p>
+					</header>
+					<div className="auth-alert" role="alert">
+						{state.error}
+					</div>
+					<div className="auth-actions">
+						<button
+							type="button"
+							className="btn btn-primary"
+							onClick={() => void logout()}
+							data-testid="retry-logout-button"
+						>
+							Çıkışı Tekrar Dene
+						</button>
+						<p
+							className="auth-subtitle"
+							style={{ textAlign: "center", marginTop: "var(--space-2)" }}
+						>
+							Tarayıcı sekmesini kapatabilirsiniz.
+						</p>
+					</div>
+				</div>
+			</main>
+		);
+	}
 	if (
 		state.status === "BOOTSTRAP_REQUIRED" ||
 		state.status === "BOOTSTRAP_AUTHORIZING" ||

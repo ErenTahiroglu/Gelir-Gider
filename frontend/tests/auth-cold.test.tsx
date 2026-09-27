@@ -200,4 +200,114 @@ describe("Cold Launch Passkey Authentication", () => {
 			screen.queryByTestId("protected-finance-dashboard"),
 		).not.toBeInTheDocument();
 	});
+
+	it("enforces passkey unlock even when valid server session cookie exists (cold launch passkey bypass prevention)", async () => {
+		const mockAdapter: WebAuthnAdapter = {
+			isSupported: vi.fn().mockReturnValue(true),
+			authenticate: vi.fn().mockResolvedValue({
+				id: "cred-cold-session-id",
+				rawId: "raw-cred-id",
+				response: {
+					authenticatorData: "authData",
+					clientDataJSON: "clientDataJSON",
+					signature: "signature",
+				},
+				type: "public-key",
+			}),
+			register: vi.fn(),
+		};
+		setWebAuthnAdapter(mockAdapter);
+
+		const fetchMock = vi.fn().mockImplementation((url: string) => {
+			if (url === "/auth/status") {
+				return Promise.resolve(
+					new Response(JSON.stringify({ state: "INITIALIZED" }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+				);
+			}
+			if (url === "/auth/session") {
+				// Server reports a valid, active session!
+				return Promise.resolve(
+					new Response(
+						JSON.stringify({
+							authenticated: true,
+							user: { displayName: "Eren" },
+						}),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					),
+				);
+			}
+			if (url === "/auth/passkey/authentication/options") {
+				return Promise.resolve(
+					new Response(
+						JSON.stringify({
+							challenge: "test-cold-auth-challenge",
+							rpId: "localhost",
+						}),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					),
+				);
+			}
+			if (url === "/auth/passkey/authentication/verify") {
+				return Promise.resolve(
+					new Response(
+						JSON.stringify({
+							authenticated: true,
+							user: { displayName: "Eren" },
+						}),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					),
+				);
+			}
+			return Promise.reject(new Error(`Unhandled route ${url}`));
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		render(
+			<AuthProvider>
+				<AuthGate>
+					<div data-testid="protected-finance-dashboard">
+						Protected Financial Content
+					</div>
+				</AuthGate>
+			</AuthProvider>,
+		);
+
+		// Critical check: despite valid server session, protected content MUST NOT render initially
+		expect(
+			screen.queryByTestId("protected-finance-dashboard"),
+		).not.toBeInTheDocument();
+
+		// Unlock screen MUST render
+		const unlockBtn = await screen.findByTestId("unlock-passkey-button");
+		expect(unlockBtn).toBeInTheDocument();
+		expect(
+			screen.queryByTestId("protected-finance-dashboard"),
+		).not.toBeInTheDocument();
+
+		// Click passkey button
+		await act(async () => {
+			fireEvent.click(unlockBtn);
+		});
+
+		// Only now, after passkey assertion ceremony, does protected content render
+		await waitFor(() => {
+			expect(
+				screen.getByTestId("protected-finance-dashboard"),
+			).toBeInTheDocument();
+		});
+
+		expect(mockAdapter.authenticate).toHaveBeenCalledTimes(1);
+	});
 });

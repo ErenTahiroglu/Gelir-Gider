@@ -39,7 +39,12 @@ describe("App Privacy Shield (App Switcher Protection)", () => {
 		vi.stubGlobal("fetch", fetchMock);
 
 		render(
-			<AuthProvider>
+			<AuthProvider
+				initialAuthState={{
+					status: "UNLOCKED",
+					user: { displayName: "Eren" },
+				}}
+			>
 				<AuthGate>
 					<div data-testid="sensitive-financial-portfolio">
 						Gizli Finansal Veriler

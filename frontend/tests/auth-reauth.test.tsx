@@ -84,7 +84,12 @@ describe("Background Reauthentication (>=120s)", () => {
 		vi.stubGlobal("fetch", fetchMock);
 
 		render(
-			<AuthProvider>
+			<AuthProvider
+				initialAuthState={{
+					status: "UNLOCKED",
+					user: { displayName: "Eren" },
+				}}
+			>
 				<AuthGate>
 					<div data-testid="protected-content">Unlocked Content</div>
 				</AuthGate>
@@ -183,7 +188,12 @@ describe("Background Reauthentication (>=120s)", () => {
 		vi.stubGlobal("fetch", fetchMock);
 
 		render(
-			<AuthProvider>
+			<AuthProvider
+				initialAuthState={{
+					status: "UNLOCKED",
+					user: { displayName: "Eren" },
+				}}
+			>
 				<AuthGate>
 					<div>Protected</div>
 				</AuthGate>

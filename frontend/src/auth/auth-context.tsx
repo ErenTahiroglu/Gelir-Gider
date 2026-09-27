@@ -30,16 +30,31 @@ export interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-export function AuthProvider({ children }: { children: React.ReactNode }) {
-	const [state, setState] = useState<AuthState>({ status: "BOOTING" });
+export function AuthProvider({
+	children,
+	initialAuthState,
+}: {
+	children: React.ReactNode;
+	initialAuthState?: AuthState;
+}) {
+	const [state, setState] = useState<AuthState>(
+		initialAuthState ?? { status: "BOOTING" },
+	);
 
 	// Use refs to track current user and state without stale closure in event callbacks
 	const stateRef = useRef<AuthState>(state);
 	stateRef.current = state;
 
-	const currentUserRef = useRef<{ displayName: string } | null>(null);
+	const currentUserRef = useRef<{ displayName: string } | null>(
+		initialAuthState && "user" in initialAuthState
+			? initialAuthState.user
+			: null,
+	);
 
 	const initAuth = useCallback(async () => {
+		if (initialAuthState) {
+			return;
+		}
 		setState({ status: "BOOTING" });
 		try {
 			const statusRes = await authApi.fetchAuthStatus();
@@ -50,32 +65,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 			}
 
 			if (statusRes.state === "INITIALIZED") {
-				try {
-					const sessionRes = await authApi.fetchAuthSession();
-					if (sessionRes.authenticated && sessionRes.user) {
-						currentUserRef.current = {
-							displayName: sessionRes.user.displayName,
-						};
-						setState({
-							status: "UNLOCKED",
-							user: { displayName: sessionRes.user.displayName },
-						});
-					} else {
-						setState({ status: "AUTH_REQUIRED" });
-					}
-				} catch (sessionErr) {
-					if (sessionErr instanceof ApiError && sessionErr.status === 401) {
-						setState({ status: "AUTH_REQUIRED" });
-					} else {
-						setState({
-							status: "AUTH_REQUIRED",
-							error:
-								sessionErr instanceof ApiError
-									? sessionErr.userMessage
-									: "Oturum doğrulanamadı.",
-						});
-					}
-				}
+				// R1 Locked Semantic: Every cold launch starts locked.
+				// A valid server session cookie alone MUST NEVER unlock financial content without a new Passkey assertion.
+				currentUserRef.current = null;
+				setState({ status: "AUTH_REQUIRED" });
 				return;
 			}
 
@@ -93,7 +86,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 						: "Sistem durumu alınamadı. Lütfen daha sonra tekrar deneyin.",
 			});
 		}
-	}, []);
+	}, [initialAuthState]);
 
 	useEffect(() => {
 		void initAuth();
@@ -335,12 +328,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 	const logout = useCallback(async () => {
 		try {
 			await authApi.logout();
-		} catch (err) {
-			// Even if logout fails on server, clear client memory
-			console.error("Logout error:", err);
-		} finally {
+			// Successful logout: server revoked cookie/session
 			currentUserRef.current = null;
 			setState({ status: "AUTH_REQUIRED" });
+		} catch (err) {
+			// R2 Locked Semantic: Logout failure does not claim success.
+			// Hide financial content immediately, but enter LOGOUT_FAILED_LOCKED.
+			currentUserRef.current = null;
+			const errorMessage =
+				err instanceof ApiError
+					? err.userMessage
+					: "Sunucudaki oturum güvenli biçimde kapatılamadı. Finansal bilgiler gizlendi.";
+			setState({
+				status: "LOGOUT_FAILED_LOCKED",
+				error: errorMessage,
+			});
 		}
 	}, []);
 

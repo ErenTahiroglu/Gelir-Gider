@@ -110,6 +110,7 @@ export type AuthState =
 			error?: string | undefined;
 	  }
 	| { status: "REAUTHENTICATING"; user: { displayName: string } }
+	| { status: "LOGOUT_FAILED_LOCKED"; error: string }
 	| { status: "FATAL_AUTH_STATE"; error: string };
 
 export type {
