@@ -1,4 +1,5 @@
 import { and, asc, eq, gte, lt, sql } from "drizzle-orm";
+import { CreditCardError } from "../credit-cards/errors";
 import { resolveAuthoritativePurchaseSplitAsOf } from "../credit-cards/purchase-split-read";
 import type { Database } from "../db/client";
 import {
@@ -141,22 +142,33 @@ export async function getSpendingSummary(
 	for (const p of purchaseRows) {
 		if (p.operation === "VOID") continue;
 
-		// Authoritative personal share
+		const effectivePurchaseGrossCents = parseAggregateMoneyString(
+			p.amount,
+		).cents;
+
+		const split = await resolveAuthoritativePurchaseSplitAsOf({
+			db,
+			userId,
+			purchaseEventId: p.eventId,
+			asOf: p.occurredAt,
+			expectedPurchaseCents: effectivePurchaseGrossCents,
+		});
+
 		let personalCents: bigint;
-		try {
-			const split = await resolveAuthoritativePurchaseSplitAsOf({
-				db,
-				userId,
-				purchaseEventId: p.eventId,
-				asOf: p.occurredAt,
-			});
-			if (split.kind === "ACTIVE") {
-				personalCents = split.userShareCents;
-			} else {
-				personalCents = parseAggregateMoneyString(p.amount).cents;
-			}
-		} catch {
-			personalCents = parseAggregateMoneyString(p.amount).cents;
+		if (split.kind === "ACTIVE") {
+			personalCents = split.userShareCents;
+		} else if (split.kind === "NO_SPLIT" || split.kind === "VOID_SPLIT") {
+			personalCents = effectivePurchaseGrossCents;
+		} else if (split.kind === "UNRESOLVED") {
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_CONFLICT",
+				`Purchase ${p.eventId} split is unresolved: ${split.reason}`,
+			);
+		} else {
+			throw new CreditCardError(
+				"CREDIT_CARD_SPLIT_CONFLICT",
+				`Purchase ${p.eventId} split returned unknown split kind`,
+			);
 		}
 
 		if (personalCents <= 0n) continue;

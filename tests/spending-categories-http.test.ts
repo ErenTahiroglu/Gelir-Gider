@@ -238,4 +238,26 @@ describe("Spending Categories HTTP", () => {
 		expect(data.totalPersonalSpending).toBe("1000.00");
 		expect(data.categories[0].amount).toBe("800.00");
 	});
+
+	it("GET /spending/summary fails closed with non-200 sanitized error when getSpendingSummary throws", async () => {
+		vi.spyOn(analyticsModule, "getSpendingSummary").mockRejectedValue(
+			new Error("Purchase split unresolved conflict"),
+		);
+
+		const res = await app.request(
+			"http://localhost/spending/summary?periodMonth=2026-09",
+			{
+				method: "GET",
+				headers: {
+					Cookie: COOKIE,
+				},
+			},
+			mockEnv,
+		);
+
+		expect(res.status).toBe(500);
+		const data = (await res.json()) as any;
+		expect(data.error.code).toBe("INTERNAL_ERROR");
+		expect(data.totalPersonalSpending).toBeUndefined();
+	});
 });
