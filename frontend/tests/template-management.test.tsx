@@ -336,4 +336,180 @@ describe("Template Management & Server Synchronization (Section 71-73)", () => {
 			);
 		});
 	});
+
+	describe("R1 — AccessibleModal integration for Template Management", () => {
+		function setupMocks(templates: QuickEntryTemplateItem[]) {
+			vi.spyOn(quickEntryApi, "fetchQuickEntryTemplates").mockResolvedValue({
+				templates,
+			});
+			vi.spyOn(manualExpensesApi, "fetchAllLedgerAccounts").mockResolvedValue(
+				mockAccounts,
+			);
+			vi.spyOn(manualExpensesApi, "fetchSpendingCategories").mockResolvedValue({
+				categories: [],
+			});
+			vi.spyOn(quickEntryApi, "fetchAllActiveCreditCards").mockResolvedValue(
+				mockCards,
+			);
+		}
+
+		it("R1-A: Escape key closes the create modal", async () => {
+			setupMocks(initialTemplates);
+			await renderWithProviders(<TemplateManagement />);
+
+			expect(await screen.findByText("Market")).toBeInTheDocument();
+			fireEvent.click(screen.getByTestId("create-template-btn"));
+
+			// modal visible
+			expect(await screen.findByRole("dialog")).toBeInTheDocument();
+
+			// press Escape
+			fireEvent.keyDown(window, { key: "Escape" });
+
+			await waitFor(() => {
+				expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+			});
+		});
+
+		it("R1-C: dialog has role=dialog, aria-modal=true, and accessible name", async () => {
+			setupMocks(initialTemplates);
+			await renderWithProviders(<TemplateManagement />);
+
+			expect(await screen.findByText("Market")).toBeInTheDocument();
+			fireEvent.click(screen.getByTestId("create-template-btn"));
+
+			const dialog = await screen.findByRole("dialog");
+			expect(dialog).toBeInTheDocument();
+			expect(dialog).toHaveAttribute("aria-modal", "true");
+
+			// Accessible name comes from the title h2 via aria-labelledby
+			expect(
+				screen.getByRole("heading", { name: "Yeni Şablon" }),
+			).toBeInTheDocument();
+		});
+
+		it("R1-C (edit): dialog accessible name is Şablonu Düzenle in edit mode", async () => {
+			setupMocks(initialTemplates);
+			await renderWithProviders(<TemplateManagement />);
+
+			expect(await screen.findByText("Market")).toBeInTheDocument();
+			fireEvent.click(screen.getByTestId("edit-template-btn-tpl-1"));
+
+			await screen.findByRole("dialog");
+			expect(
+				screen.getByRole("heading", { name: "Şablonu Düzenle" }),
+			).toBeInTheDocument();
+		});
+	});
+
+	describe("R2 — Unsupported template edit safety", () => {
+		const incomeTemplate: QuickEntryTemplateItem = {
+			id: "income-template",
+			userId: "usr-1",
+			name: "Burs",
+			templateType: "INCOME",
+			status: "ACTIVE",
+			config: {
+				incomeSourceId: "src-abc",
+				description: "Aylık burs",
+				defaultAmount: "5000.00",
+			},
+			sortOrder: 3,
+			createdAt: "2026-01-01T00:00:00Z",
+			updatedAt: "2026-01-01T00:00:00Z",
+		};
+
+		function setupMocksR2(templates: QuickEntryTemplateItem[]) {
+			vi.spyOn(quickEntryApi, "fetchQuickEntryTemplates").mockResolvedValue({
+				templates,
+			});
+			vi.spyOn(manualExpensesApi, "fetchAllLedgerAccounts").mockResolvedValue(
+				mockAccounts,
+			);
+			vi.spyOn(manualExpensesApi, "fetchSpendingCategories").mockResolvedValue({
+				categories: [],
+			});
+			vi.spyOn(quickEntryApi, "fetchAllActiveCreditCards").mockResolvedValue(
+				mockCards,
+			);
+		}
+
+		it("R2: editing INCOME template shows immutable type, name, sortOrder, future-domain notice; hides config fields", async () => {
+			setupMocksR2([incomeTemplate]);
+			await renderWithProviders(<TemplateManagement />);
+
+			const editBtn = await screen.findByTestId(
+				"edit-template-btn-income-template",
+			);
+			fireEvent.click(editBtn);
+
+			// immutable type label should say "Gelir"
+			expect(screen.getByTestId("immutable-template-type")).toHaveTextContent(
+				"Gelir",
+			);
+
+			// name and sort order inputs visible
+			expect(screen.getByTestId("tpl-name-input")).toBeInTheDocument();
+			expect(screen.getByTestId("tpl-sort-order-input")).toBeInTheDocument();
+
+			// future-domain notice visible
+			expect(screen.getByTestId("future-domain-notice")).toBeInTheDocument();
+
+			// manual / card config fields MUST NOT be rendered
+			expect(
+				screen.queryByTestId("tpl-source-account-select"),
+			).not.toBeInTheDocument();
+			expect(screen.queryByTestId("tpl-card-select")).not.toBeInTheDocument();
+			expect(
+				screen.queryByTestId("tpl-category-select"),
+			).not.toBeInTheDocument();
+			expect(
+				screen.queryByTestId("tpl-merchant-input"),
+			).not.toBeInTheDocument();
+			expect(
+				screen.queryByTestId("tpl-description-input"),
+			).not.toBeInTheDocument();
+		});
+
+		it("R2: saving INCOME template sends exact existing config and does NOT send templateType", async () => {
+			setupMocksR2([incomeTemplate]);
+			const apiPostSpy = vi.spyOn(client, "apiPost").mockResolvedValue({
+				template: incomeTemplate,
+			});
+
+			const queryClient = createTestQueryClient();
+			await renderWithProviders(<TemplateManagement />, queryClient);
+
+			const editBtn = await screen.findByTestId(
+				"edit-template-btn-income-template",
+			);
+			fireEvent.click(editBtn);
+			await screen.findByRole("dialog");
+
+			// Change the name
+			fireEvent.change(screen.getByTestId("tpl-name-input"), {
+				target: { value: "Burs Güncellendi" },
+			});
+			fireEvent.change(screen.getByTestId("tpl-sort-order-input"), {
+				target: { value: "5" },
+			});
+
+			fireEvent.click(screen.getByTestId("tpl-save-btn"));
+
+			await waitFor(() => {
+				expect(apiPostSpy).toHaveBeenCalledWith(
+					"/quick-entry/templates/income-template",
+					expect.objectContaining({
+						name: "Burs Güncellendi",
+						sortOrder: 5,
+						config: incomeTemplate.config,
+					}),
+				);
+			});
+
+			// templateType must NOT be in the payload
+			const callArg = apiPostSpy.mock.calls[0]?.[1] as Record<string, unknown>;
+			expect(callArg).not.toHaveProperty("templateType");
+		});
+	});
 });

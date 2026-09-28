@@ -20,7 +20,6 @@ import {
 	CreditCard,
 	Edit2,
 	Plus,
-	Sliders,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { ApiError } from "../../api/errors";
@@ -42,6 +41,7 @@ import type {
 	QuickEntryTemplateType,
 	UpdateTemplatePayload,
 } from "../../api/quick-entry-types";
+import { AccessibleModal } from "../common/AccessibleModal";
 import { MoneyInput } from "../common/MoneyInput";
 
 export function TemplateManagement() {
@@ -104,7 +104,9 @@ export function TemplateManagement() {
 
 	// Form State
 	const [name, setName] = useState("");
-	const [templateType, setTemplateType] = useState<
+	// createTemplateType: only used when modalMode === "create".
+	// For edit mode, authority is editingTemplate.templateType.
+	const [createTemplateType, setCreateTemplateType] = useState<
 		"MANUAL_EXPENSE" | "CREDIT_CARD_EXPENSE"
 	>("MANUAL_EXPENSE");
 	const [sortOrder, setSortOrder] = useState<number>(0);
@@ -135,7 +137,7 @@ export function TemplateManagement() {
 		setModalMode("create");
 		setEditingTemplate(null);
 		setName("");
-		setTemplateType("MANUAL_EXPENSE");
+		setCreateTemplateType("MANUAL_EXPENSE");
 		setSortOrder(0);
 		setSourceAssetAccountId(selectableAccounts[0]?.accountId ?? "");
 		setCardId(activeCards[0]?.cardId ?? "");
@@ -160,7 +162,6 @@ export function TemplateManagement() {
 		const cfg = t.config as Record<string, unknown>;
 
 		if (t.templateType === "MANUAL_EXPENSE") {
-			setTemplateType("MANUAL_EXPENSE");
 			setSourceAssetAccountId((cfg.sourceAssetAccountId as string) ?? "");
 			setSpendingCategoryId((cfg.spendingCategoryId as string) ?? "");
 			setBudgetCategoryOverride(
@@ -182,7 +183,6 @@ export function TemplateManagement() {
 			}
 			setDefaultAmountValid(true);
 		} else if (t.templateType === "CREDIT_CARD_EXPENSE") {
-			setTemplateType("CREDIT_CARD_EXPENSE");
 			setCardId((cfg.cardId as string) ?? "");
 			setSpendingCategoryId((cfg.spendingCategoryId as string) ?? "");
 			setBudgetCategoryOverride(
@@ -203,10 +203,9 @@ export function TemplateManagement() {
 				setDefaultAmountDisplay("");
 			}
 			setDefaultAmountValid(true);
-		} else {
-			// Unsupported template type: only name and sortOrder can be safely updated
-			setFormError(null);
 		}
+		// Unsupported types (INCOME, RECEIVABLE, PAYABLE): authority is editingTemplate.templateType;
+		// no local form state to populate — config preserved on submit.
 
 		setFormError(null);
 		setNetworkUncertaintyWarning(null);
@@ -247,7 +246,13 @@ export function TemplateManagement() {
 			return;
 		}
 
-		if (!defaultAmountValid) {
+		// Skip amount validation for unsupported-type edits (no amount field shown)
+		const isUnsupportedEditSubmit =
+			modalMode === "edit" &&
+			editingTemplate !== null &&
+			editingTemplate.templateType !== "MANUAL_EXPENSE" &&
+			editingTemplate.templateType !== "CREDIT_CARD_EXPENSE";
+		if (!defaultAmountValid && !isUnsupportedEditSubmit) {
 			setFormError("Lütfen geçerli bir varsayılan tutar girin.");
 			return;
 		}
@@ -260,7 +265,7 @@ export function TemplateManagement() {
 			if (modalMode === "create") {
 				let config: Record<string, unknown> = {};
 
-				if (templateType === "MANUAL_EXPENSE") {
+				if (createTemplateType === "MANUAL_EXPENSE") {
 					if (!sourceAssetAccountId) {
 						setFormError("Lütfen bir ödeme kaynağı seçin.");
 						setFormSubmitting(false);
@@ -274,7 +279,7 @@ export function TemplateManagement() {
 						description: description.trim() || undefined,
 						defaultAmount: defaultAmountCanonical || undefined,
 					};
-				} else if (templateType === "CREDIT_CARD_EXPENSE") {
+				} else if (createTemplateType === "CREDIT_CARD_EXPENSE") {
 					if (!cardId) {
 						setFormError("Lütfen bir kart seçin.");
 						setFormSubmitting(false);
@@ -292,7 +297,7 @@ export function TemplateManagement() {
 
 				const payload: CreateTemplatePayload = {
 					name: trimmedName,
-					templateType,
+					templateType: createTemplateType,
 					config,
 					sortOrder,
 				};
@@ -382,7 +387,7 @@ export function TemplateManagement() {
 			await queryClient.invalidateQueries({
 				queryKey: ["quick-entry-templates"],
 			});
-		} catch (err) {
+		} catch (_err) {
 			setFormError("Şablon arşivlenirken bir hata oluştu.");
 		}
 	};
@@ -403,6 +408,20 @@ export function TemplateManagement() {
 				return type;
 		}
 	};
+
+	// Derived values for render logic
+	// effectiveType: in create mode use createTemplateType; in edit mode use the server-authoritative type.
+	const effectiveType =
+		modalMode === "create"
+			? createTemplateType
+			: (editingTemplate?.templateType ?? "MANUAL_EXPENSE");
+
+	// isUnsupportedEdit: true when editing a template whose type F4 does not own (INCOME / RECEIVABLE / PAYABLE).
+	const isUnsupportedEdit =
+		modalMode === "edit" &&
+		editingTemplate !== null &&
+		editingTemplate.templateType !== "MANUAL_EXPENSE" &&
+		editingTemplate.templateType !== "CREDIT_CARD_EXPENSE";
 
 	return (
 		<div
@@ -606,365 +625,346 @@ export function TemplateManagement() {
 				</div>
 			)}
 
-			{/* Create / Edit Modal */}
-			{isModalOpen && (
-				<div
-					className="accessible-modal-overlay"
-					data-testid="template-form-modal"
-				>
+			{/* Create / Edit Modal — uses AccessibleModal for focus trap, Escape, scroll lock, focus return */}
+			<AccessibleModal
+				isOpen={isModalOpen}
+				onClose={closeModal}
+				title={modalMode === "create" ? "Yeni Şablon" : "Şablonu Düzenle"}
+				variant="center-dialog"
+			>
+				{/* Network Uncertainty Warning */}
+				{networkUncertaintyWarning && (
 					<div
-						className="accessible-modal-backdrop"
-						onClick={closeModal}
-						aria-hidden="true"
-					/>
-					<div
-						className="accessible-modal-content modal-variant-center-dialog"
-						role="dialog"
-						aria-modal="true"
-						aria-labelledby="template-modal-title"
-						tabIndex={-1}
+						className="form-warning-banner"
+						role="alert"
+						data-testid="network-uncertainty-warning"
 					>
-						<header className="modal-header">
-							<h2 id="template-modal-title" className="modal-title">
-								{modalMode === "create" ? "Yeni Şablon" : "Şablonu Düzenle"}
-							</h2>
-							<button
-								type="button"
-								onClick={closeModal}
-								className="modal-close-btn"
-								aria-label="Kapat"
-							>
-								✕
-							</button>
-						</header>
-
-						<div className="modal-body">
-							{/* Network Uncertainty Warning */}
-							{networkUncertaintyWarning && (
-								<div
-									className="form-warning-banner"
-									role="alert"
-									data-testid="network-uncertainty-warning"
-								>
-									{networkUncertaintyWarning}
-								</div>
-							)}
-
-							{/* Form Error */}
-							{formError && (
-								<div
-									className="form-error-banner"
-									role="alert"
-									data-testid="template-form-error"
-								>
-									{formError}
-								</div>
-							)}
-
-							<form onSubmit={handleFormSubmit} noValidate>
-								{/* Şablon Adı * */}
-								<div className="form-group">
-									<label htmlFor="tpl-name" className="form-label required">
-										Şablon Adı *
-									</label>
-									<input
-										type="text"
-										id="tpl-name"
-										value={name}
-										onChange={(e) => setName(e.target.value)}
-										maxLength={100}
-										required
-										className="form-input"
-										data-testid="tpl-name-input"
-									/>
-								</div>
-
-								{/* Şablon Türü (Create mode: choose; Edit mode: immutable text) */}
-								<div className="form-group">
-									<span className="form-label required">Şablon Türü *</span>
-									{modalMode === "create" ? (
-										<div className="financial-class-options" role="radiogroup">
-											<label className="radio-option">
-												<input
-													type="radio"
-													name="createTemplateType"
-													value="MANUAL_EXPENSE"
-													checked={templateType === "MANUAL_EXPENSE"}
-													onChange={() => setTemplateType("MANUAL_EXPENSE")}
-													data-testid="tpl-type-manual"
-												/>
-												<span>Nakit / Banka Harcaması</span>
-											</label>
-											<label className="radio-option">
-												<input
-													type="radio"
-													name="createTemplateType"
-													value="CREDIT_CARD_EXPENSE"
-													checked={templateType === "CREDIT_CARD_EXPENSE"}
-													onChange={() =>
-														setTemplateType("CREDIT_CARD_EXPENSE")
-													}
-													data-testid="tpl-type-cc"
-												/>
-												<span>Kredi Kartı Harcaması</span>
-											</label>
-										</div>
-									) : (
-										<p
-											className="immutable-type-text"
-											data-testid="immutable-template-type"
-										>
-											<strong>
-												{getTemplateTypeLabel(
-													editingTemplate?.templateType ?? "MANUAL_EXPENSE",
-												)}
-											</strong>
-											<span
-												style={{
-													color: "var(--text-secondary)",
-													fontSize: "var(--font-size-xs)",
-													marginLeft: "8px",
-												}}
-											>
-												(Şablon türü değiştirilemez)
-											</span>
-										</p>
-									)}
-								</div>
-
-								{/* MANUAL_EXPENSE Specific: Ödeme Kaynağı * */}
-								{templateType === "MANUAL_EXPENSE" && (
-									<div className="form-group">
-										<label
-											htmlFor="tpl-source-account"
-											className="form-label required"
-										>
-											Ödeme Kaynağı *
-										</label>
-										<select
-											id="tpl-source-account"
-											value={sourceAssetAccountId}
-											onChange={(e) => setSourceAssetAccountId(e.target.value)}
-											required
-											className="form-select"
-											data-testid="tpl-source-account-select"
-										>
-											<option value="">Hesap Seçin...</option>
-											{selectableAccounts.map((acc) => (
-												<option key={acc.accountId} value={acc.accountId}>
-													{acc.name} ({acc.currency})
-												</option>
-											))}
-										</select>
-									</div>
-								)}
-
-								{/* CREDIT_CARD_EXPENSE Specific: Kart * */}
-								{templateType === "CREDIT_CARD_EXPENSE" && (
-									<div className="form-group">
-										<label htmlFor="tpl-card" className="form-label required">
-											Kart *
-										</label>
-										<select
-											id="tpl-card"
-											value={cardId}
-											onChange={(e) => setCardId(e.target.value)}
-											required
-											className="form-select"
-											data-testid="tpl-card-select"
-										>
-											<option value="">Kart Seçin...</option>
-											{activeCards.map((c) => (
-												<option key={c.cardId} value={c.cardId}>
-													{c.displayName || c.issuer} ({c.code})
-												</option>
-											))}
-										</select>
-									</div>
-								)}
-
-								{/* Kategori */}
-								{(templateType === "MANUAL_EXPENSE" ||
-									templateType === "CREDIT_CARD_EXPENSE") && (
-									<div className="form-group">
-										<label htmlFor="tpl-category" className="form-label">
-											Kategori
-										</label>
-										<select
-											id="tpl-category"
-											value={spendingCategoryId}
-											onChange={(e) => handleCategoryChange(e.target.value)}
-											className="form-select"
-											data-testid="tpl-category-select"
-										>
-											<option value="">Kategori Seçin (İsteğe bağlı)</option>
-											{activeCategories.map((cat) => (
-												<option key={cat.id} value={cat.id}>
-													{cat.name}
-												</option>
-											))}
-										</select>
-									</div>
-								)}
-
-								{/* Finansal Sınıf * */}
-								{(templateType === "MANUAL_EXPENSE" ||
-									templateType === "CREDIT_CARD_EXPENSE") && (
-									<div className="form-group">
-										<span className="form-label required">
-											Harcama Türü / Finansal Sınıf *
-										</span>
-										<div className="financial-class-options" role="radiogroup">
-											<label className="radio-option">
-												<input
-													type="radio"
-													name="tplBudgetCategory"
-													value="MANDATORY_EXPENSE"
-													checked={
-														budgetCategoryOverride === "MANDATORY_EXPENSE"
-													}
-													onChange={() =>
-														setBudgetCategoryOverride("MANDATORY_EXPENSE")
-													}
-													data-testid="tpl-class-mandatory"
-												/>
-												<span>Zorunlu Temel İhtiyaç</span>
-											</label>
-											<label className="radio-option">
-												<input
-													type="radio"
-													name="tplBudgetCategory"
-													value="DISCRETIONARY_SPEND"
-													checked={
-														budgetCategoryOverride === "DISCRETIONARY_SPEND"
-													}
-													onChange={() =>
-														setBudgetCategoryOverride("DISCRETIONARY_SPEND")
-													}
-													data-testid="tpl-class-discretionary"
-												/>
-												<span>Keyfi / Esnek Harcama</span>
-											</label>
-											<label className="radio-option">
-												<input
-													type="radio"
-													name="tplBudgetCategory"
-													value="SHORT_TERM_PURCHASE"
-													checked={
-														budgetCategoryOverride === "SHORT_TERM_PURCHASE"
-													}
-													onChange={() =>
-														setBudgetCategoryOverride("SHORT_TERM_PURCHASE")
-													}
-													data-testid="tpl-class-short-term"
-												/>
-												<span>Planlı Kısa Vadeli Alım</span>
-											</label>
-										</div>
-									</div>
-								)}
-
-								{/* Varsayılan Tutar */}
-								{(templateType === "MANUAL_EXPENSE" ||
-									templateType === "CREDIT_CARD_EXPENSE") && (
-									<div className="form-group">
-										<label htmlFor="tpl-default-amount" className="form-label">
-											Varsayılan Tutar (İsteğe bağlı)
-										</label>
-										<MoneyInput
-											id="tpl-default-amount"
-											value={defaultAmountDisplay}
-											onChange={(canonical, raw, isValid) => {
-												setDefaultAmountCanonical(canonical);
-												setDefaultAmountDisplay(raw);
-												setDefaultAmountValid(isValid);
-											}}
-										/>
-									</div>
-								)}
-
-								{/* İşyeri */}
-								{(templateType === "MANUAL_EXPENSE" ||
-									templateType === "CREDIT_CARD_EXPENSE") && (
-									<div className="form-group">
-										<label htmlFor="tpl-merchant" className="form-label">
-											İşyeri (İsteğe bağlı)
-										</label>
-										<input
-											type="text"
-											id="tpl-merchant"
-											value={merchant}
-											onChange={(e) => setMerchant(e.target.value)}
-											maxLength={100}
-											placeholder="Örn: Migros"
-											className="form-input"
-											data-testid="tpl-merchant-input"
-										/>
-									</div>
-								)}
-
-								{/* Açıklama */}
-								{(templateType === "MANUAL_EXPENSE" ||
-									templateType === "CREDIT_CARD_EXPENSE") && (
-									<div className="form-group">
-										<label htmlFor="tpl-description" className="form-label">
-											Açıklama (İsteğe bağlı)
-										</label>
-										<input
-											type="text"
-											id="tpl-description"
-											value={description}
-											onChange={(e) => setDescription(e.target.value)}
-											maxLength={255}
-											placeholder="Örn: Haftalık alışveriş"
-											className="form-input"
-											data-testid="tpl-description-input"
-										/>
-									</div>
-								)}
-
-								{/* Sıra */}
-								<div className="form-group">
-									<label htmlFor="tpl-sort-order" className="form-label">
-										Sıra (Görüntüleme Önceliği)
-									</label>
-									<input
-										type="number"
-										id="tpl-sort-order"
-										value={sortOrder}
-										onChange={(e) =>
-											setSortOrder(Math.max(0, Number(e.target.value) || 0))
-										}
-										min={0}
-										className="form-input"
-										data-testid="tpl-sort-order-input"
-									/>
-								</div>
-
-								{/* Actions */}
-								<div className="form-actions">
-									<button
-										type="button"
-										onClick={closeModal}
-										disabled={formSubmitting}
-										className="btn btn-secondary"
-									>
-										Vazgeç
-									</button>
-									<button
-										type="submit"
-										disabled={formSubmitting || !defaultAmountValid}
-										className="btn btn-primary"
-										data-testid="tpl-save-btn"
-									>
-										{formSubmitting ? "Kaydediliyor..." : "Kaydet"}
-									</button>
-								</div>
-							</form>
-						</div>
+						{networkUncertaintyWarning}
 					</div>
-				</div>
-			)}
+				)}
+
+				{/* Form Error */}
+				{formError && (
+					<div
+						className="form-error-banner"
+						role="alert"
+						data-testid="template-form-error"
+					>
+						{formError}
+					</div>
+				)}
+
+				<form onSubmit={handleFormSubmit} noValidate>
+					{/* Şablon Adı * */}
+					<div className="form-group">
+						<label htmlFor="tpl-name" className="form-label required">
+							Şablon Adı *
+						</label>
+						<input
+							type="text"
+							id="tpl-name"
+							value={name}
+							onChange={(e) => setName(e.target.value)}
+							maxLength={100}
+							required
+							className="form-input"
+							data-testid="tpl-name-input"
+						/>
+					</div>
+
+					{/* Şablon Türü (Create mode: choose; Edit mode: immutable text) */}
+					<div className="form-group">
+						<span className="form-label required">Şablon Türü *</span>
+						{modalMode === "create" ? (
+							<div className="financial-class-options" role="radiogroup">
+								<label className="radio-option">
+									<input
+										type="radio"
+										name="createTemplateType"
+										value="MANUAL_EXPENSE"
+										checked={createTemplateType === "MANUAL_EXPENSE"}
+										onChange={() => setCreateTemplateType("MANUAL_EXPENSE")}
+										data-testid="tpl-type-manual"
+									/>
+									<span>Nakit / Banka Harcaması</span>
+								</label>
+								<label className="radio-option">
+									<input
+										type="radio"
+										name="createTemplateType"
+										value="CREDIT_CARD_EXPENSE"
+										checked={createTemplateType === "CREDIT_CARD_EXPENSE"}
+										onChange={() =>
+											setCreateTemplateType("CREDIT_CARD_EXPENSE")
+										}
+										data-testid="tpl-type-cc"
+									/>
+									<span>Kredi Kartı Harcaması</span>
+								</label>
+							</div>
+						) : (
+							<p
+								className="immutable-type-text"
+								data-testid="immutable-template-type"
+							>
+								<strong>
+									{getTemplateTypeLabel(
+										editingTemplate?.templateType ?? "MANUAL_EXPENSE",
+									)}
+								</strong>
+								<span
+									style={{
+										color: "var(--text-secondary)",
+										fontSize: "var(--font-size-xs)",
+										marginLeft: "8px",
+									}}
+								>
+									(Şablon türü değiştirilemez)
+								</span>
+							</p>
+						)}
+					</div>
+
+					{/* Future-domain notice for unsupported edit types */}
+					{isUnsupportedEdit && (
+						<div
+							className="form-info-banner"
+							data-testid="future-domain-notice"
+						>
+							Bu şablon türünün ayrıntılı ayarları ilgili özellik kullanıma
+							açıldığında düzenlenebilecek. Mevcut ayarlar korunacaktır.
+						</div>
+					)}
+
+					{/* MANUAL_EXPENSE Specific: Ödeme Kaynağı * */}
+					{!isUnsupportedEdit && effectiveType === "MANUAL_EXPENSE" && (
+						<div className="form-group">
+							<label
+								htmlFor="tpl-source-account"
+								className="form-label required"
+							>
+								Ödeme Kaynağı *
+							</label>
+							<select
+								id="tpl-source-account"
+								value={sourceAssetAccountId}
+								onChange={(e) => setSourceAssetAccountId(e.target.value)}
+								required
+								className="form-select"
+								data-testid="tpl-source-account-select"
+							>
+								<option value="">Hesap Seçin...</option>
+								{selectableAccounts.map((acc) => (
+									<option key={acc.accountId} value={acc.accountId}>
+										{acc.name} ({acc.currency})
+									</option>
+								))}
+							</select>
+						</div>
+					)}
+
+					{/* CREDIT_CARD_EXPENSE Specific: Kart * */}
+					{!isUnsupportedEdit && effectiveType === "CREDIT_CARD_EXPENSE" && (
+						<div className="form-group">
+							<label htmlFor="tpl-card" className="form-label required">
+								Kart *
+							</label>
+							<select
+								id="tpl-card"
+								value={cardId}
+								onChange={(e) => setCardId(e.target.value)}
+								required
+								className="form-select"
+								data-testid="tpl-card-select"
+							>
+								<option value="">Kart Seçin...</option>
+								{activeCards.map((c) => (
+									<option key={c.cardId} value={c.cardId}>
+										{c.displayName || c.issuer} ({c.code})
+									</option>
+								))}
+							</select>
+						</div>
+					)}
+
+					{/* Kategori */}
+					{!isUnsupportedEdit &&
+						(effectiveType === "MANUAL_EXPENSE" ||
+							effectiveType === "CREDIT_CARD_EXPENSE") && (
+							<div className="form-group">
+								<label htmlFor="tpl-category" className="form-label">
+									Kategori
+								</label>
+								<select
+									id="tpl-category"
+									value={spendingCategoryId}
+									onChange={(e) => handleCategoryChange(e.target.value)}
+									className="form-select"
+									data-testid="tpl-category-select"
+								>
+									<option value="">Kategori Seçin (İsteğe bağlı)</option>
+									{activeCategories.map((cat) => (
+										<option key={cat.id} value={cat.id}>
+											{cat.name}
+										</option>
+									))}
+								</select>
+							</div>
+						)}
+
+					{/* Finansal Sınıf * */}
+					{!isUnsupportedEdit &&
+						(effectiveType === "MANUAL_EXPENSE" ||
+							effectiveType === "CREDIT_CARD_EXPENSE") && (
+							<div className="form-group">
+								<span className="form-label required">
+									Harcama Türü / Finansal Sınıf *
+								</span>
+								<div className="financial-class-options" role="radiogroup">
+									<label className="radio-option">
+										<input
+											type="radio"
+											name="tplBudgetCategory"
+											value="MANDATORY_EXPENSE"
+											checked={budgetCategoryOverride === "MANDATORY_EXPENSE"}
+											onChange={() =>
+												setBudgetCategoryOverride("MANDATORY_EXPENSE")
+											}
+											data-testid="tpl-class-mandatory"
+										/>
+										<span>Zorunlu Temel İhtiyaç</span>
+									</label>
+									<label className="radio-option">
+										<input
+											type="radio"
+											name="tplBudgetCategory"
+											value="DISCRETIONARY_SPEND"
+											checked={budgetCategoryOverride === "DISCRETIONARY_SPEND"}
+											onChange={() =>
+												setBudgetCategoryOverride("DISCRETIONARY_SPEND")
+											}
+											data-testid="tpl-class-discretionary"
+										/>
+										<span>Keyfi / Esnek Harcama</span>
+									</label>
+									<label className="radio-option">
+										<input
+											type="radio"
+											name="tplBudgetCategory"
+											value="SHORT_TERM_PURCHASE"
+											checked={budgetCategoryOverride === "SHORT_TERM_PURCHASE"}
+											onChange={() =>
+												setBudgetCategoryOverride("SHORT_TERM_PURCHASE")
+											}
+											data-testid="tpl-class-short-term"
+										/>
+										<span>Planlı Kısa Vadeli Alım</span>
+									</label>
+								</div>
+							</div>
+						)}
+
+					{/* Varsayılan Tutar */}
+					{!isUnsupportedEdit &&
+						(effectiveType === "MANUAL_EXPENSE" ||
+							effectiveType === "CREDIT_CARD_EXPENSE") && (
+							<div className="form-group">
+								<label htmlFor="tpl-default-amount" className="form-label">
+									Varsayılan Tutar (İsteğe bağlı)
+								</label>
+								<MoneyInput
+									id="tpl-default-amount"
+									value={defaultAmountDisplay}
+									onChange={(canonical, raw, isValid) => {
+										setDefaultAmountCanonical(canonical);
+										setDefaultAmountDisplay(raw);
+										setDefaultAmountValid(isValid);
+									}}
+								/>
+							</div>
+						)}
+
+					{/* İşyeri */}
+					{!isUnsupportedEdit &&
+						(effectiveType === "MANUAL_EXPENSE" ||
+							effectiveType === "CREDIT_CARD_EXPENSE") && (
+							<div className="form-group">
+								<label htmlFor="tpl-merchant" className="form-label">
+									İşyeri (İsteğe bağlı)
+								</label>
+								<input
+									type="text"
+									id="tpl-merchant"
+									value={merchant}
+									onChange={(e) => setMerchant(e.target.value)}
+									maxLength={100}
+									placeholder="Örn: Migros"
+									className="form-input"
+									data-testid="tpl-merchant-input"
+								/>
+							</div>
+						)}
+
+					{/* Açıklama */}
+					{!isUnsupportedEdit &&
+						(effectiveType === "MANUAL_EXPENSE" ||
+							effectiveType === "CREDIT_CARD_EXPENSE") && (
+							<div className="form-group">
+								<label htmlFor="tpl-description" className="form-label">
+									Açıklama (İsteğe bağlı)
+								</label>
+								<input
+									type="text"
+									id="tpl-description"
+									value={description}
+									onChange={(e) => setDescription(e.target.value)}
+									maxLength={255}
+									placeholder="Örn: Haftalık alışveriş"
+									className="form-input"
+									data-testid="tpl-description-input"
+								/>
+							</div>
+						)}
+
+					{/* Sıra */}
+					<div className="form-group">
+						<label htmlFor="tpl-sort-order" className="form-label">
+							Sıra (Görüntüleme Önceliği)
+						</label>
+						<input
+							type="number"
+							id="tpl-sort-order"
+							value={sortOrder}
+							onChange={(e) =>
+								setSortOrder(Math.max(0, Number(e.target.value) || 0))
+							}
+							min={0}
+							className="form-input"
+							data-testid="tpl-sort-order-input"
+						/>
+					</div>
+
+					{/* Actions */}
+					<div className="form-actions">
+						<button
+							type="button"
+							onClick={closeModal}
+							disabled={formSubmitting}
+							className="btn btn-secondary"
+						>
+							Vazgeç
+						</button>
+						<button
+							type="submit"
+							disabled={formSubmitting || !defaultAmountValid}
+							className="btn btn-primary"
+							data-testid="tpl-save-btn"
+						>
+							{formSubmitting ? "Kaydediliyor..." : "Kaydet"}
+						</button>
+					</div>
+				</form>
+			</AccessibleModal>
 		</div>
 	);
 }
