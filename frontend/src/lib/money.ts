@@ -104,3 +104,163 @@ export function formatMoneyToTry(amount: string): string {
 	const cents = parseMoneyToCents(amount);
 	return formatCentsToTry(cents);
 }
+
+export interface MoneyNormalizationResult {
+	valid: boolean;
+	canonical?: string;
+	cents?: bigint;
+	error?: string;
+}
+
+/**
+ * Normalizes user-entered Turkish money input string into canonical backend format ("123.45").
+ *
+ * Rules:
+ *   - Accepts "350", "350,5", "350,50", "350.5", "350.50".
+ *   - Also handles thousands dots if entered like "1.250,50" or "14.250".
+ *   - Rejects negative, zero, letters, NaN, >2 decimal places, ambiguous dots/commas.
+ *   - NO JavaScript float arithmetic! String and BigInt only.
+ */
+export function normalizeTurkishMoneyInput(
+	raw: string,
+): MoneyNormalizationResult {
+	if (typeof raw !== "string") {
+		return { valid: false, error: "Tutar bir metin olmalıdır" };
+	}
+
+	let trimmed = raw.trim();
+	if (trimmed === "") {
+		return { valid: false, error: "Tutar boş olamaz" };
+	}
+
+	// Reject negative numbers
+	if (trimmed.startsWith("-") || trimmed.includes("-")) {
+		return { valid: false, error: "Tutar negatif olamaz" };
+	}
+
+	// Remove currency symbol if user typed/pasted ₺ or TL
+	trimmed = trimmed
+		.replace(/₺/g, "")
+		.replace(/\bTL\b/gi, "")
+		.trim();
+
+	// Check for invalid characters (only digits, dots, commas allowed)
+	if (!/^[0-9.,]+$/.test(trimmed)) {
+		return { valid: false, error: "Geçersiz karakter içeriyor" };
+	}
+
+	// Determine separator:
+	// If both comma and dot exist:
+	//   Case 1: "1.250,50" -> dot is thousand separator, comma is decimal
+	//   Case 2: "1,250.50" -> comma is thousand separator, dot is decimal
+	let wholePartStr = "";
+	let decimalPartStr = "";
+
+	const hasComma = trimmed.includes(",");
+	const hasDot = trimmed.includes(".");
+
+	if (hasComma && hasDot) {
+		const lastCommaIndex = trimmed.lastIndexOf(",");
+		const lastDotIndex = trimmed.lastIndexOf(".");
+
+		if (lastCommaIndex > lastDotIndex) {
+			// e.g. "1.250,50" -> comma is decimal
+			const parts = trimmed.split(",");
+			const p0 = parts[0];
+			const p1 = parts[1];
+			if (parts.length > 2 || p0 === undefined || p1 === undefined) {
+				return { valid: false, error: "Geçersiz sayı formatı" };
+			}
+			wholePartStr = p0.replace(/\./g, "");
+			decimalPartStr = p1;
+		} else {
+			// e.g. "1,250.50" -> dot is decimal
+			const parts = trimmed.split(".");
+			const p0 = parts[0];
+			const p1 = parts[1];
+			if (parts.length > 2 || p0 === undefined || p1 === undefined) {
+				return { valid: false, error: "Geçersiz sayı formatı" };
+			}
+			wholePartStr = p0.replace(/,/g, "");
+			decimalPartStr = p1;
+		}
+	} else if (hasComma) {
+		// Only comma exists
+		const parts = trimmed.split(",");
+		const p0 = parts[0];
+		const p1 = parts[1];
+		if (parts.length > 2 || p0 === undefined || p1 === undefined) {
+			return { valid: false, error: "Birden fazla virgül içeremez" };
+		}
+		wholePartStr = p0;
+		decimalPartStr = p1;
+	} else if (hasDot) {
+		// Only dot exists.
+		const parts = trimmed.split(".");
+		if (parts.length > 2) {
+			// Multiple dots: e.g. 1.000.000 -> thousands separators
+			wholePartStr = parts.join("");
+			decimalPartStr = "";
+		} else {
+			const p0 = parts[0];
+			const p1 = parts[1];
+			if (p0 === undefined || p1 === undefined) {
+				return { valid: false, error: "Geçersiz sayı formatı" };
+			}
+			if (p1.length > 2) {
+				return {
+					valid: false,
+					error: "Kuruş hanesi en fazla 2 basamak olabilir",
+				};
+			}
+			wholePartStr = p0;
+			decimalPartStr = p1;
+		}
+	} else {
+		// Integer only
+		wholePartStr = trimmed;
+		decimalPartStr = "";
+	}
+
+	// Validate decimal part length
+	if (decimalPartStr.length > 2) {
+		return {
+			valid: false,
+			error: "Kuruş hanesi en fazla 2 basamak olabilir",
+		};
+	}
+
+	// Normalize whole part
+	if (!/^\d+$/.test(wholePartStr)) {
+		return { valid: false, error: "Geçersiz tam sayı kısmı" };
+	}
+
+	// Remove leading zeroes unless the whole part is just "0"
+	const wholeBigInt = BigInt(wholePartStr);
+	wholePartStr = wholeBigInt.toString();
+
+	// Pad or truncate decimal part
+	let fractionBigInt = 0n;
+	if (decimalPartStr.length === 1) {
+		decimalPartStr = `${decimalPartStr}0`;
+		fractionBigInt = BigInt(decimalPartStr);
+	} else if (decimalPartStr.length === 2) {
+		fractionBigInt = BigInt(decimalPartStr);
+	} else if (decimalPartStr.length === 0) {
+		decimalPartStr = "00";
+		fractionBigInt = 0n;
+	}
+
+	const totalCents = wholeBigInt * 100n + fractionBigInt;
+
+	if (totalCents <= 0n) {
+		return { valid: false, error: "Tutar sıfırdan büyük olmalıdır" };
+	}
+
+	const canonical = `${wholePartStr}.${decimalPartStr}`;
+	return {
+		valid: true,
+		canonical,
+		cents: totalCents,
+	};
+}

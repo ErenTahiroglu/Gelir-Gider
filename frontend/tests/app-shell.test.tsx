@@ -43,17 +43,16 @@ describe("App Shell — Responsive Desktop Sidebar & Mobile Nav Invariants", () 
 		expect(homeLink).toHaveAttribute("aria-current", "page");
 		expect(homeLink).toHaveAttribute("href", "/");
 
-		// 2. Hareketler is disabled
-		const txBtn = screen.getByTestId("mobile-nav-transactions");
-		expect(txBtn).toBeDisabled();
-		expect(txBtn).toHaveAttribute("aria-disabled", "true");
+		// 2. Hareketler is active in F3
+		const txLink = screen.getByTestId("mobile-nav-transactions");
+		expect(txLink).toHaveAttribute("href", "/transactions");
 
-		// 3. Central elevated FAB is disabled in F2 (no fake modal)
+		// 3. Central elevated FAB is disabled in F3 (owned by F4)
 		const fab = screen.getByTestId("mobile-quick-entry-fab");
 		expect(fab).toBeDisabled();
 		expect(fab).toHaveAttribute("aria-disabled", "true");
 
-		// 4. Kartlar is disabled
+		// 4. Kartlar is disabled (F5)
 		const cardsBtn = screen.getByTestId("mobile-nav-cards");
 		expect(cardsBtn).toBeDisabled();
 		expect(cardsBtn).toHaveAttribute("aria-disabled", "true");
@@ -91,8 +90,11 @@ describe("App Shell — Responsive Desktop Sidebar & Mobile Nav Invariants", () 
 		const homeLink = screen.getByTestId("nav-link-home");
 		expect(homeLink).toHaveAttribute("aria-current", "page");
 
+		// Hareketler active link in F3
+		const txLink = screen.getByTestId("nav-link-transactions");
+		expect(txLink).toHaveAttribute("href", "/transactions");
+
 		// Future links disabled
-		expect(screen.getByTestId("nav-link-transactions")).toBeDisabled();
 		expect(screen.getByTestId("nav-link-cards")).toBeDisabled();
 		expect(screen.getByTestId("nav-link-people")).toBeDisabled();
 		expect(screen.getByTestId("nav-link-budget")).toBeDisabled();

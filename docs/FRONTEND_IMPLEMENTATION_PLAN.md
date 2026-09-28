@@ -177,7 +177,13 @@ A closed phase is **never reopened** unless an explicit regression is reproduced
 - **Acceptance Criteria:**
   1. Manual expense records immediately appear on timeline upon creation.
   2. Transaction list supports infinite scrolling / keyset pagination.
-  3. Voiding an expense visually reflects reversing entry and updates available budget.
+  3. Manual expense mutations immediately update/refetch:
+     - transaction timeline
+     - manual-expense detail
+     - spending summary
+     - affected ledger account balances
+     Budget V2 hero continues to reflect the latest authoritative persisted checkpoint
+     and changes only when a new authoritative checkpoint exists.
 
 ---
 

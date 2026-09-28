@@ -1,4 +1,4 @@
-import { Link } from "@tanstack/react-router";
+import { Link, useRouterState } from "@tanstack/react-router";
 import {
 	ChevronLeft,
 	ChevronRight,
@@ -21,6 +21,13 @@ export function DesktopSidebar({
 	collapsed,
 	onToggleCollapse,
 }: DesktopSidebarProps) {
+	const routerState = useRouterState();
+	const currentPath = routerState.location.pathname;
+
+	const isHomeActive = currentPath === "/";
+	const isTransactionsActive =
+		currentPath.startsWith("/transactions") ||
+		currentPath.startsWith("/manual-expenses");
 	// Keyboard shortcut: Cmd/Ctrl + B to toggle sidebar
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -82,8 +89,8 @@ export function DesktopSidebar({
 					<li className="nav-item">
 						<Link
 							to="/"
-							className="nav-link active"
-							aria-current="page"
+							className={`nav-link ${isHomeActive ? "active" : ""}`}
+							aria-current={isHomeActive ? "page" : undefined}
 							title={collapsed ? "Ana Sayfa" : undefined}
 							data-testid="nav-link-home"
 						>
@@ -93,17 +100,16 @@ export function DesktopSidebar({
 					</li>
 
 					<li className="nav-item">
-						<button
-							type="button"
-							className="nav-link disabled"
-							disabled
-							aria-disabled="true"
-							title={collapsed ? "Hareketler (F3)" : "F3 aşamasında eklenecek"}
+						<Link
+							to="/transactions"
+							className={`nav-link ${isTransactionsActive ? "active" : ""}`}
+							aria-current={isTransactionsActive ? "page" : undefined}
+							title={collapsed ? "Hareketler" : undefined}
 							data-testid="nav-link-transactions"
 						>
 							<Repeat size={20} aria-hidden="true" />
 							{!collapsed && <span className="nav-label">Hareketler</span>}
-						</button>
+						</Link>
 					</li>
 
 					<li className="nav-item">

@@ -1,7 +1,15 @@
-import { Link } from "@tanstack/react-router";
+import { Link, useRouterState } from "@tanstack/react-router";
 import { CreditCard, Home, MoreHorizontal, Plus, Repeat } from "lucide-react";
 
 export function MobileNav() {
+	const routerState = useRouterState();
+	const currentPath = routerState.location.pathname;
+
+	const isHomeActive = currentPath === "/";
+	const isTransactionsActive =
+		currentPath.startsWith("/transactions") ||
+		currentPath.startsWith("/manual-expenses");
+
 	return (
 		<nav
 			className="mobile-bottom-nav"
@@ -11,8 +19,8 @@ export function MobileNav() {
 			<div className="mobile-nav-inner">
 				<Link
 					to="/"
-					className="mobile-nav-item active"
-					aria-current="page"
+					className={`mobile-nav-item ${isHomeActive ? "active" : ""}`}
+					aria-current={isHomeActive ? "page" : undefined}
 					data-testid="mobile-nav-home"
 					aria-label="Ana Sayfa"
 				>
@@ -20,17 +28,16 @@ export function MobileNav() {
 					<span className="mobile-nav-label">Ana Sayfa</span>
 				</Link>
 
-				<button
-					type="button"
-					className="mobile-nav-item disabled"
-					disabled
-					aria-disabled="true"
+				<Link
+					to="/transactions"
+					className={`mobile-nav-item ${isTransactionsActive ? "active" : ""}`}
+					aria-current={isTransactionsActive ? "page" : undefined}
 					data-testid="mobile-nav-transactions"
-					aria-label="Hareketler (F3 aşamasında eklenecek)"
+					aria-label="Hareketler"
 				>
 					<Repeat size={22} aria-hidden="true" />
 					<span className="mobile-nav-label">Hareketler</span>
-				</button>
+				</Link>
 
 				<div className="mobile-nav-center">
 					<button

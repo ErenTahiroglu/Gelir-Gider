@@ -149,3 +149,124 @@ export function formatDueDateRelativeTurkish(
 	if (days > 1) return `${days} gün sonra`;
 	return `${Math.abs(days)} gün gecikti`;
 }
+
+/**
+ * Returns timeline group label in Europe/Istanbul for an instant.
+ * Labels:
+ *   - "Bugün" (if calendar date matches today in Europe/Istanbul)
+ *   - "Dün" (if calendar date matches yesterday in Europe/Istanbul)
+ *   - "14 Eylül 2026" (for older/other dates)
+ */
+export function formatTimelineDateGroupTurkish(
+	occurredAtInstant: string | Date,
+	now: Date = new Date(),
+): string {
+	const date =
+		typeof occurredAtInstant === "string"
+			? new Date(occurredAtInstant)
+			: occurredAtInstant;
+
+	const txCal = getIstanbulCalendarDate(date);
+	const nowCal = getIstanbulCalendarDate(now);
+
+	const txUtc = Date.UTC(txCal.year, txCal.month - 1, txCal.day);
+	const nowUtc = Date.UTC(nowCal.year, nowCal.month - 1, nowCal.day);
+
+	const diffDays = Math.round((nowUtc - txUtc) / (1000 * 60 * 60 * 24));
+
+	if (diffDays === 0) return "Bugün";
+	if (diffDays === 1) return "Dün";
+
+	const monthKey = String(txCal.month).padStart(2, "0");
+	const monthName = TURKISH_MONTH_NAMES[monthKey] ?? `${txCal.month}`;
+	return `${txCal.day} ${monthName} ${txCal.year}`;
+}
+
+/**
+ * Formats a Date instant into a datetime-local input string ("YYYY-MM-DDTHH:mm")
+ * evaluated strictly in Europe/Istanbul timezone.
+ */
+export function formatIstanbulDateTimeLocal(now: Date = new Date()): string {
+	const formatter = new Intl.DateTimeFormat("en-US", {
+		timeZone: "Europe/Istanbul",
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+		hour12: false,
+	});
+
+	const parts = formatter.formatToParts(now);
+	let yearStr = "";
+	let monthStr = "";
+	let dayStr = "";
+	let hourStr = "00";
+	let minuteStr = "00";
+
+	for (const part of parts) {
+		if (part.type === "year") yearStr = part.value;
+		else if (part.type === "month") monthStr = part.value;
+		else if (part.type === "day") dayStr = part.value;
+		else if (part.type === "hour") hourStr = part.value;
+		else if (part.type === "minute") minuteStr = part.value;
+	}
+
+	if (hourStr === "24") hourStr = "00";
+
+	return `${yearStr}-${monthStr}-${dayStr}T${hourStr}:${minuteStr}`;
+}
+
+/**
+ * Converts a datetime-local input string ("YYYY-MM-DDTHH:mm") entered by the user
+ * in Europe/Istanbul time into a canonical ISO string (UTC instant).
+ *
+ * Turkey is UTC+3 permanently with no DST.
+ */
+export function parseIstanbulDateTimeLocalToIso(dtLocalStr: string): string {
+	const trimmed = dtLocalStr.trim();
+	const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(
+		trimmed,
+	);
+	if (!match) {
+		throw new Error(
+			`Invalid datetime-local format: "${dtLocalStr}". Expected YYYY-MM-DDTHH:mm`,
+		);
+	}
+
+	const year = match[1];
+	const month = match[2];
+	const day = match[3];
+	const hour = match[4];
+	const minute = match[5];
+	const second = match[6] ?? "00";
+
+	// Europe/Istanbul is UTC+03:00 fixed
+	const isoWithOffset = `${year}-${month}-${day}T${hour}:${minute}:${second}+03:00`;
+	const d = new Date(isoWithOffset);
+	if (Number.isNaN(d.getTime())) {
+		throw new Error(`Invalid date/time value: "${dtLocalStr}"`);
+	}
+	return d.toISOString();
+}
+
+/**
+ * Formats an instant into Turkish display date and time (e.g. "29 Eylül 2026, 20:30")
+ * strictly in Europe/Istanbul.
+ */
+export function formatIstanbulDateTimeTurkish(instant: string | Date): string {
+	const date = typeof instant === "string" ? new Date(instant) : instant;
+	const cal = getIstanbulCalendarDate(date);
+	const monthKey = String(cal.month).padStart(2, "0");
+	const monthName = TURKISH_MONTH_NAMES[monthKey] ?? `${cal.month}`;
+
+	const timeFormatter = new Intl.DateTimeFormat("tr-TR", {
+		timeZone: "Europe/Istanbul",
+		hour: "2-digit",
+		minute: "2-digit",
+		hour12: false,
+	});
+
+	const timePart = timeFormatter.format(date);
+	return `${cal.day} ${monthName} ${cal.year}, ${timePart}`;
+}

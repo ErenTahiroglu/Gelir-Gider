@@ -13,6 +13,8 @@ import { AuthGate } from "./components/auth/AuthGate";
 import { UnlockScreen } from "./components/auth/UnlockScreen";
 import { DashboardPage } from "./components/dashboard/DashboardPage";
 import { AppShell } from "./components/layout/AppShell";
+import { ManualExpenseForm } from "./components/manual-expenses/ManualExpenseForm";
+import { TransactionTimeline } from "./components/transactions/TransactionTimeline";
 import { QuerySecurityBoundary } from "./query/QuerySecurityBoundary";
 import { queryClient } from "./query/query-client";
 
@@ -20,6 +22,50 @@ function AuthenticatedDashboard() {
 	return (
 		<AppShell>
 			<DashboardPage />
+		</AppShell>
+	);
+}
+
+function AuthenticatedTransactions() {
+	return (
+		<AppShell>
+			<TransactionTimeline />
+		</AppShell>
+	);
+}
+
+function AuthenticatedTransactionDetail() {
+	const params = transactionsDetailRoute.useParams();
+	return (
+		<AppShell>
+			<TransactionTimeline initialTransactionId={params.transactionId} />
+		</AppShell>
+	);
+}
+
+function AuthenticatedManualExpenseNew() {
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Yeni Nakit / Banka Harcaması</h1>
+					<ManualExpenseForm mode="create" />
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedManualExpenseEdit() {
+	const params = manualExpenseEditRoute.useParams();
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Harcamayı Düzenle</h1>
+					<ManualExpenseForm mode="edit" expenseId={params.expenseId} />
+				</div>
+			</div>
 		</AppShell>
 	);
 }
@@ -61,7 +107,38 @@ const unlockRoute = createRoute({
 	component: UnlockRouteComponent,
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, unlockRoute]);
+const transactionsRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/transactions",
+	component: AuthenticatedTransactions,
+});
+
+const transactionsDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/transactions/$transactionId",
+	component: AuthenticatedTransactionDetail,
+});
+
+const manualExpenseNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/manual-expenses/new",
+	component: AuthenticatedManualExpenseNew,
+});
+
+const manualExpenseEditRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/manual-expenses/$expenseId/edit",
+	component: AuthenticatedManualExpenseEdit,
+});
+
+const routeTree = rootRoute.addChildren([
+	indexRoute,
+	unlockRoute,
+	transactionsRoute,
+	transactionsDetailRoute,
+	manualExpenseNewRoute,
+	manualExpenseEditRoute,
+]);
 
 export const router = createRouter({ routeTree });
 
