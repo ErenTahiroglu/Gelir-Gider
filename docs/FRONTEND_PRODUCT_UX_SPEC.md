@@ -313,7 +313,8 @@ Desktop surfaces utilize multi-column hybrid table/card layouts with slide-out c
 
 ### 12.1 Primary Hero Metric: "BU AY KULLANILABİLİR TUTAR" (Fail-Closed Semantics)
 - **Authoritative Source:** Budget V2 latest checkpoint Decision Center read model (`GET /budget-v2/checkpoints/:paymentEventId/decision-center`).
-- **Contract Field:** `checkpoint.report.mtd.availableToAllocateNow` (`AvailableToAllocateNowSection`).
+- **Contract Field:** `checkpoint.report.availableToAllocateNow` (`AvailableToAllocateNowSection`). Top-level field of `BudgetV2CheckpointReport`.
+- **Checkpoint Selection Rule:** The frontend only chooses a checkpoint automatically when the newest checkpoint is unambiguous. If `sharedMaxCheckpointAt === true`, the product must NOT silently choose one row as uniquely latest.
 - **Authoritative Behavioral States:**
   1. **When `availableToAllocateNow.available === true`:**
      - Displays the exact authoritative `amount` string formatted in Turkish currency (e.g. `₺14.250,00`).
@@ -347,7 +348,7 @@ Desktop surfaces utilize multi-column hybrid table/card layouts with slide-out c
 ```
 
 ### 12.2 Secondary Metrics (Below Hero)
-1. **Bu Ay Harcanan:** Total personal card & manual expenses MTD (`checkpoint.report.mtd.spending.personalCardSpendMTD` + manual expenses).
+1. **Bu Ay Harcanan:** Total personal spending MTD from authoritative endpoint (`GET /spending/summary?periodMonth=YYYY-MM` -> `totalPersonalSpending`). Does not recompute or sum multiple separate financial fields on the client.
 2. **Kartlarda Bu Dönem:** Sum of open statement liabilities across active credit cards (`liveLiabilityBalance`).
 3. **Yaklaşan Ödeme:** Nearest due credit card payment date and amount with relative time tag (`"3 gün sonra"`).
 

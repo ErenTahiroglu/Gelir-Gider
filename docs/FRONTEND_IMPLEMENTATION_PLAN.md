@@ -122,8 +122,9 @@ A closed phase is **never reopened** unless an explicit regression is reproduced
 - **Screens:**
   - `/`: Ana Sayfa (Dashboard).
 - **API Contracts:**
-  - `GET /budget-v2/checkpoints`: Retrieve checkpoint timeline.
-  - `GET /budget-v2/checkpoints/:paymentEventId/decision-center`: Retrieve verified Decision Center view (`availableToAllocateNow`, `spending`, `budget`, `emergencyFund`).
+  - `GET /budget-v2/checkpoints`: Retrieve checkpoint timeline. The frontend only automatically selects a latest checkpoint when unambiguous (if `sharedMaxCheckpointAt === true`, it does not designate any row as uniquely latest).
+  - `GET /budget-v2/checkpoints/:paymentEventId/decision-center`: Retrieve verified Decision Center view (`checkpoint.report.availableToAllocateNow`, `spending`, `budget`, `emergencyFund`).
+  - `GET /spending/summary?periodMonth=YYYY-MM`: Retrieve authoritative current-month spending (`totalPersonalSpending`) for Bu Ay Harcanan.
   - `GET /credit-cards`: Retrieve active credit cards and live liabilities for summary pills.
 - **Components:**
   - `src/components/composed/MobileNav.tsx`: 5-Tab bar with elevated `+` button.

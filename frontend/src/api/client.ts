@@ -124,3 +124,18 @@ export async function apiFetch<T>(
 		});
 	}
 }
+
+export function apiGet<T>(
+	path: string,
+	options: Omit<RequestOptions, "method" | "json"> = {},
+): Promise<T> {
+	return apiFetch<T>(path, { ...options, method: "GET" });
+}
+
+export function apiPost<T>(
+	path: string,
+	json?: unknown,
+	options: Omit<RequestOptions, "method" | "json"> = {},
+): Promise<T> {
+	return apiFetch<T>(path, { ...options, method: "POST", json });
+}

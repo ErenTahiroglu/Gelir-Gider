@@ -26,6 +26,7 @@ export interface AuthContextValue {
 	submitRecoveryCode: (recoveryCode: string) => Promise<void>;
 	logout: () => Promise<void>;
 	retryBootstrapOrInit: () => Promise<void>;
+	lockNow: () => void;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -350,6 +351,16 @@ export function AuthProvider({
 		await initAuth();
 	}, [initAuth]);
 
+	const lockNow = useCallback(() => {
+		const current = stateRef.current;
+		if (current.status === "UNLOCKED") {
+			setState({
+				status: "REAUTH_REQUIRED",
+				user: current.user,
+			});
+		}
+	}, []);
+
 	return (
 		<AuthContext.Provider
 			value={{
@@ -364,6 +375,7 @@ export function AuthProvider({
 				submitRecoveryCode,
 				logout,
 				retryBootstrapOrInit,
+				lockNow,
 			}}
 		>
 			{children}

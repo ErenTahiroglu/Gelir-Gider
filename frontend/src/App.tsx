@@ -1,3 +1,4 @@
+import { QueryClientProvider } from "@tanstack/react-query";
 import {
 	createRootRoute,
 	createRoute,
@@ -10,37 +11,16 @@ import { useEffect } from "react";
 import { AuthProvider, useAuth } from "./auth/auth-context";
 import { AuthGate } from "./components/auth/AuthGate";
 import { UnlockScreen } from "./components/auth/UnlockScreen";
+import { DashboardPage } from "./components/dashboard/DashboardPage";
+import { AppShell } from "./components/layout/AppShell";
+import { QuerySecurityBoundary } from "./query/QuerySecurityBoundary";
+import { queryClient } from "./query/query-client";
 
-function AuthenticatedHome() {
-	const { state, logout } = useAuth();
-	const displayName = state.status === "UNLOCKED" ? state.user.displayName : "";
-
+function AuthenticatedDashboard() {
 	return (
-		<main className="app-shell" data-testid="authenticated-home">
-			<header className="f0-header">
-				<h1 className="f0-title">Gelir-Gider</h1>
-				<p className="f0-subtitle">Oturum açık.</p>
-				{displayName && (
-					<p
-						className="user-welcome"
-						style={{ marginTop: "0.5rem" }}
-						data-testid="user-display-name"
-					>
-						Hoş geldiniz, <strong>{displayName}</strong>
-					</p>
-				)}
-				<div style={{ marginTop: "1.5rem" }}>
-					<button
-						type="button"
-						className="btn btn-secondary"
-						onClick={() => void logout()}
-						data-testid="logout-button"
-					>
-						Çıkış Yap
-					</button>
-				</div>
-			</header>
-		</main>
+		<AppShell>
+			<DashboardPage />
+		</AppShell>
 	);
 }
 
@@ -55,7 +35,7 @@ function UnlockRouteComponent() {
 	}, [state.status, navigate]);
 
 	if (state.status === "UNLOCKED") {
-		return <AuthenticatedHome />;
+		return <AuthenticatedDashboard />;
 	}
 
 	return <UnlockScreen />;
@@ -72,7 +52,7 @@ const rootRoute = createRootRoute({
 const indexRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/",
-	component: AuthenticatedHome,
+	component: AuthenticatedDashboard,
 });
 
 const unlockRoute = createRoute({
@@ -94,7 +74,11 @@ declare module "@tanstack/react-router" {
 export function App() {
 	return (
 		<AuthProvider>
-			<RouterProvider router={router} />
+			<QueryClientProvider client={queryClient}>
+				<QuerySecurityBoundary>
+					<RouterProvider router={router} />
+				</QuerySecurityBoundary>
+			</QueryClientProvider>
 		</AuthProvider>
 	);
 }
