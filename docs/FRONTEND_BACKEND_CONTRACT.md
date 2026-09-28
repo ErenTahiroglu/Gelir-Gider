@@ -1981,7 +1981,7 @@ The backend core and HTTP product surfaces are fully frozen.
 - `GET /quick-entry/templates`: Lists templates ordered by `sortOrder ASC`.
 - `POST /quick-entry/templates`: Creates template (`name`, `templateType`, `config`, `sortOrder`).
 - `POST /quick-entry/templates/:id`: Updates template properties.
-- `POST /quick-entry/templates/:id/archive`: Soft-archives template (`isArchived = true`).
+- `POST /quick-entry/templates/:id/archive`: Soft-archives template (`status = 'ARCHIVED'`).
 
 ### 12.3 Manual Expenses (`/manual-expenses/*`)
 - Canonical `MANUAL_EXPENSE` transactions with balanced double-entry ledger posting (DR System Expense Account, CR Source Asset Account).

@@ -47,10 +47,10 @@ describe("App Shell — Responsive Desktop Sidebar & Mobile Nav Invariants", () 
 		const txLink = screen.getByTestId("mobile-nav-transactions");
 		expect(txLink).toHaveAttribute("href", "/transactions");
 
-		// 3. Central elevated FAB is disabled in F3 (owned by F4)
+		// 3. Central elevated FAB is active in F4
 		const fab = screen.getByTestId("mobile-quick-entry-fab");
-		expect(fab).toBeDisabled();
-		expect(fab).toHaveAttribute("aria-disabled", "true");
+		expect(fab).not.toBeDisabled();
+		expect(fab).not.toHaveAttribute("aria-disabled", "true");
 
 		// 4. Kartlar is disabled (F5)
 		const cardsBtn = screen.getByTestId("mobile-nav-cards");

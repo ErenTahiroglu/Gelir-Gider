@@ -14,6 +14,7 @@ import { UnlockScreen } from "./components/auth/UnlockScreen";
 import { DashboardPage } from "./components/dashboard/DashboardPage";
 import { AppShell } from "./components/layout/AppShell";
 import { ManualExpenseForm } from "./components/manual-expenses/ManualExpenseForm";
+import { TemplateManagement } from "./components/quick-entry/TemplateManagement";
 import { TransactionTimeline } from "./components/transactions/TransactionTimeline";
 import { QuerySecurityBoundary } from "./query/QuerySecurityBoundary";
 import { queryClient } from "./query/query-client";
@@ -131,6 +132,20 @@ const manualExpenseEditRoute = createRoute({
 	component: AuthenticatedManualExpenseEdit,
 });
 
+function AuthenticatedTemplateManagement() {
+	return (
+		<AppShell>
+			<TemplateManagement />
+		</AppShell>
+	);
+}
+
+const templateManagementRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/settings/quick-templates",
+	component: AuthenticatedTemplateManagement,
+});
+
 const routeTree = rootRoute.addChildren([
 	indexRoute,
 	unlockRoute,
@@ -138,6 +153,7 @@ const routeTree = rootRoute.addChildren([
 	transactionsDetailRoute,
 	manualExpenseNewRoute,
 	manualExpenseEditRoute,
+	templateManagementRoute,
 ]);
 
 export const router = createRouter({ routeTree });

@@ -1,7 +1,9 @@
 import { Link, useRouterState } from "@tanstack/react-router";
 import { CreditCard, Home, MoreHorizontal, Plus, Repeat } from "lucide-react";
+import { useQuickEntry } from "../../context/QuickEntryContext";
 
 export function MobileNav() {
+	const { openQuickEntry } = useQuickEntry();
 	const routerState = useRouterState();
 	const currentPath = routerState.location.pathname;
 
@@ -42,12 +44,11 @@ export function MobileNav() {
 				<div className="mobile-nav-center">
 					<button
 						type="button"
-						className="mobile-quick-entry-fab disabled"
-						disabled
-						aria-disabled="true"
+						className="mobile-quick-entry-fab"
+						onClick={() => openQuickEntry()}
 						data-testid="mobile-quick-entry-fab"
-						aria-label="Hızlı Kayıt (F4 aşamasında eklenecek)"
-						title="Hızlı Kayıt (F4)"
+						aria-label="Hızlı Kayıt"
+						title="Hızlı Kayıt"
 					>
 						<Plus size={26} aria-hidden="true" />
 					</button>

@@ -48,6 +48,10 @@ export function MoneyInput({
 	const [localError, setLocalError] = useState<string | null>(null);
 
 	useEffect(() => {
+		setDisplayValue(value);
+	}, [value]);
+
+	useEffect(() => {
 		if (autoFocus && inputRef.current) {
 			inputRef.current.focus();
 		}

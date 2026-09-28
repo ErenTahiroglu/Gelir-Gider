@@ -138,18 +138,7 @@ export interface CreditCardStatementsListResponse {
 }
 
 // --- Quick Entry Templates ---
-
-export interface QuickEntryTemplateItem {
-	id: string;
-	userId: string;
-	name: string;
-	type: string;
-	config: unknown;
-	sortOrder: number;
-	createdAt: string;
-	updatedAt: string;
-}
-
-export interface QuickEntryTemplatesResponse {
-	templates: QuickEntryTemplateItem[];
-}
+export type {
+	QuickEntryTemplateItem,
+	QuickEntryTemplatesResponse,
+} from "./quick-entry-types";

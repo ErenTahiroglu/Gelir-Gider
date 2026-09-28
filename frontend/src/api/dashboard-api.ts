@@ -56,8 +56,10 @@ export async function fetchOpenCreditCardStatements(
 	);
 }
 
+import * as quickEntryApi from "./quick-entry-api";
+
 export async function fetchQuickEntryTemplates(): Promise<QuickEntryTemplatesResponse> {
-	return apiGet<QuickEntryTemplatesResponse>("/quick-entry/templates");
+	return quickEntryApi.fetchQuickEntryTemplates();
 }
 
 /**

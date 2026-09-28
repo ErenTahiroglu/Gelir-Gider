@@ -23,14 +23,15 @@ describe("Dashboard Quick Templates — Read-Only F2 Chips", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("renders up to 5 templates in server-provided order as non-mutating chips", async () => {
+	it("renders up to 5 templates in server-provided order as clickable buttons", async () => {
 		const templatesResponse: QuickEntryTemplatesResponse = {
 			templates: [
 				{
 					id: "tpl-1",
 					userId: "user-1",
 					name: "Market Alışverişi",
-					type: "EXPENSE",
+					templateType: "MANUAL_EXPENSE",
+					status: "ACTIVE",
 					config: {},
 					sortOrder: 1,
 					createdAt: "2026-01-01T00:00:00Z",
@@ -40,7 +41,8 @@ describe("Dashboard Quick Templates — Read-Only F2 Chips", () => {
 					id: "tpl-2",
 					userId: "user-1",
 					name: "Kahve",
-					type: "EXPENSE",
+					templateType: "MANUAL_EXPENSE",
+					status: "ACTIVE",
 					config: {},
 					sortOrder: 2,
 					createdAt: "2026-01-01T00:00:00Z",
@@ -50,7 +52,8 @@ describe("Dashboard Quick Templates — Read-Only F2 Chips", () => {
 					id: "tpl-3",
 					userId: "user-1",
 					name: "Akaryakıt",
-					type: "EXPENSE",
+					templateType: "MANUAL_EXPENSE",
+					status: "ACTIVE",
 					config: {},
 					sortOrder: 3,
 					createdAt: "2026-01-01T00:00:00Z",

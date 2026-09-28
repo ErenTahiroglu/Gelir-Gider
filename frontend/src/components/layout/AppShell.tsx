@@ -1,5 +1,7 @@
 import type React from "react";
 import { useCallback, useState } from "react";
+import { QuickEntryProvider } from "../../context/QuickEntryContext";
+import { QuickEntrySheet } from "../quick-entry/QuickEntrySheet";
 import { DesktopSidebar } from "./DesktopSidebar";
 import { MobileNav } from "./MobileNav";
 import { TopBar } from "./TopBar";
@@ -28,24 +30,27 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 	}, []);
 
 	return (
-		<div
-			className={`app-container ${collapsed ? "sidebar-collapsed" : "sidebar-expanded"}`}
-			data-testid="app-shell"
-		>
-			<DesktopSidebar
-				collapsed={collapsed}
-				onToggleCollapse={handleToggleCollapse}
-			/>
+		<QuickEntryProvider>
+			<div
+				className={`app-container ${collapsed ? "sidebar-collapsed" : "sidebar-expanded"}`}
+				data-testid="app-shell"
+			>
+				<DesktopSidebar
+					collapsed={collapsed}
+					onToggleCollapse={handleToggleCollapse}
+				/>
 
-			<div className="app-main-area">
-				<TopBar />
+				<div className="app-main-area">
+					<TopBar />
 
-				<main className="app-content-scroll" tabIndex={-1}>
-					<div className="content-container">{children}</div>
-				</main>
+					<main className="app-content-scroll" tabIndex={-1}>
+						<div className="content-container">{children}</div>
+					</main>
+				</div>
+
+				<MobileNav />
+				<QuickEntrySheet />
 			</div>
-
-			<MobileNav />
-		</div>
+		</QuickEntryProvider>
 	);
 }

@@ -39,9 +39,20 @@ import {
 import { formatMoneyToTry } from "../../lib/money";
 import { MoneyInput } from "../common/MoneyInput";
 
+export interface ManualExpenseInitialValues {
+	amount?: string | undefined;
+	sourceAssetAccountId?: string | undefined;
+	spendingCategoryId?: string | undefined;
+	budgetCategoryOverride?: BudgetCategorySelection | undefined;
+	merchant?: string | undefined;
+	description?: string | undefined;
+}
+
 export interface ManualExpenseFormProps {
 	mode: "create" | "edit";
 	expenseId?: string | undefined;
+	initialValues?: ManualExpenseInitialValues | undefined;
+	quickEntryMode?: boolean | undefined;
 	onSuccess?: ((transactionId: string) => void) | undefined;
 	onCancel?: (() => void) | undefined;
 }
@@ -49,6 +60,8 @@ export interface ManualExpenseFormProps {
 export function ManualExpenseForm({
 	mode,
 	expenseId,
+	initialValues,
+	quickEntryMode = false,
 	onSuccess,
 	onCancel,
 }: ManualExpenseFormProps) {
@@ -119,6 +132,15 @@ export function ManualExpenseForm({
 	);
 	const [reasonNote, setReasonNote] = useState<string>("");
 
+	// Stale reference warnings for Quick Entry templates
+	const [staleAccountWarning, setStaleAccountWarning] = useState<string | null>(
+		null,
+	);
+	const [staleCategoryWarning, setStaleCategoryWarning] = useState<
+		string | null
+	>(null);
+	const initialValuesAppliedRef = useRef<boolean>(false);
+
 	// Submission state
 	const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 	const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -136,6 +158,37 @@ export function ManualExpenseForm({
 	const lastSubmittedPayloadRef = useRef<
 		CreateManualExpensePayload | UpdateManualExpensePayload | null
 	>(null);
+
+	// Pre-fill form when in create mode with initialValues (Quick Entry Template)
+	useEffect(() => {
+		if (
+			mode === "create" &&
+			initialValues &&
+			!initialValuesAppliedRef.current
+		) {
+			if (initialValues.amount) {
+				const amtNum = Number(initialValues.amount);
+				if (!Number.isNaN(amtNum) && amtNum > 0) {
+					setAmountCanonical(initialValues.amount);
+					const parts = initialValues.amount.split(".");
+					const w = parts[0] ?? initialValues.amount;
+					const d = parts[1];
+					setAmountDisplay(d !== undefined ? `${w},${d}` : w);
+					setAmountValid(true);
+				}
+			}
+			if (initialValues.merchant) {
+				setMerchant(initialValues.merchant);
+			}
+			if (initialValues.description) {
+				setDescription(initialValues.description);
+			}
+			if (initialValues.budgetCategoryOverride) {
+				setBudgetCategory(initialValues.budgetCategoryOverride);
+			}
+			initialValuesAppliedRef.current = true;
+		}
+	}, [mode, initialValues]);
 
 	// Pre-fill form when editing
 	useEffect(() => {
@@ -185,17 +238,84 @@ export function ManualExpenseForm({
 		}
 	}, [mode, existingExpense]);
 
-	// Auto-select first available asset account if creating and none selected
+	// Account selection & stale reference validation for Create / Quick Entry mode
 	useEffect(() => {
-		const first = selectableAccounts[0];
-		if (mode === "create" && !sourceAssetAccountId && first) {
-			setSourceAssetAccountId(first.accountId);
+		if (mode !== "create" || accountsLoading) return;
+
+		if (quickEntryMode && initialValues?.sourceAssetAccountId) {
+			const isUsable = selectableAccounts.some(
+				(acc) => acc.accountId === initialValues.sourceAssetAccountId,
+			);
+			if (isUsable) {
+				setSourceAssetAccountId(initialValues.sourceAssetAccountId);
+				setStaleAccountWarning(null);
+			} else {
+				// Section 40: Stale explicit account reference
+				setSourceAssetAccountId("");
+				setStaleAccountWarning(
+					"Şablondaki ödeme kaynağı artık kullanılamıyor. Lütfen yeni bir ödeme kaynağı seçin.",
+				);
+			}
+		} else if (quickEntryMode && !initialValues?.sourceAssetAccountId) {
+			// Template has no account: auto-select only if exactly one usable account
+			if (selectableAccounts.length === 1 && selectableAccounts[0]) {
+				setSourceAssetAccountId(selectableAccounts[0].accountId);
+			}
+		} else if (!quickEntryMode) {
+			// Standard F3 create: auto-select first available account if none selected
+			const first = selectableAccounts[0];
+			if (!sourceAssetAccountId && first) {
+				setSourceAssetAccountId(first.accountId);
+			}
 		}
-	}, [mode, sourceAssetAccountId, selectableAccounts]);
+	}, [
+		mode,
+		quickEntryMode,
+		initialValues?.sourceAssetAccountId,
+		selectableAccounts,
+		accountsLoading,
+		sourceAssetAccountId,
+	]);
+
+	// Category selection & stale reference validation for Create / Quick Entry mode
+	useEffect(() => {
+		if (mode !== "create" || categoriesLoading) return;
+
+		if (quickEntryMode && initialValues?.spendingCategoryId) {
+			const cat = activeCategories.find(
+				(c) => c.id === initialValues.spendingCategoryId,
+			);
+			if (cat) {
+				setSpendingCategoryId(cat.id);
+				setStaleCategoryWarning(null);
+				if (!initialValues.budgetCategoryOverride) {
+					if (cat.defaultBudgetCategory === "ASK") {
+						setIsAskCategory(true);
+						setBudgetCategory("MANDATORY_EXPENSE");
+					} else {
+						setIsAskCategory(false);
+						setBudgetCategory(cat.defaultBudgetCategory);
+					}
+				}
+			} else {
+				// Section 41: Stale category reference
+				setSpendingCategoryId("");
+				setStaleCategoryWarning("Şablondaki kategori artık kullanılamıyor.");
+			}
+		}
+	}, [
+		mode,
+		quickEntryMode,
+		initialValues?.spendingCategoryId,
+		initialValues?.budgetCategoryOverride,
+		activeCategories,
+		categoriesLoading,
+	]);
 
 	// When user changes category, apply category default budgetCategory
 	const handleCategoryChange = (catId: string) => {
 		setSpendingCategoryId(catId);
+		setStaleCategoryWarning(null);
 		if (!catId) {
 			setIsAskCategory(false);
 			return;
@@ -350,13 +470,20 @@ export function ManualExpenseForm({
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
 
+		if (staleCategoryWarning) {
+			setErrorMessage(
+				"Şablondaki kategori artık kullanılamıyor. Lütfen yeni bir kategori seçin veya kategoriyi temizleyin.",
+			);
+			return;
+		}
+
 		if (!amountValid || !amountCanonical) {
 			setErrorMessage("Lütfen geçerli bir tutar girin.");
 			return;
 		}
 
 		if (!sourceAssetAccountId) {
-			setErrorMessage("Lütfen bir ödeme kaynağı seçin.");
+			setErrorMessage(staleAccountWarning || "Lütfen bir ödeme kaynağı seçin.");
 			return;
 		}
 
@@ -576,6 +703,28 @@ export function ManualExpenseForm({
 				</div>
 			)}
 
+			{/* Stale Account Warning Banner */}
+			{staleAccountWarning && (
+				<div
+					className="form-warning-banner"
+					role="alert"
+					data-testid="stale-account-warning"
+				>
+					{staleAccountWarning}
+				</div>
+			)}
+
+			{/* Stale Category Warning Banner */}
+			{staleCategoryWarning && (
+				<div
+					className="form-warning-banner"
+					role="alert"
+					data-testid="stale-category-warning"
+				>
+					{staleCategoryWarning}
+				</div>
+			)}
+
 			{/* 1. Tutar * */}
 			<div className="form-group">
 				<label htmlFor="expense-amount" className="form-label required">
@@ -590,7 +739,10 @@ export function ManualExpenseForm({
 						setAmountValid(isValid);
 					}}
 					required
-					autoFocus={mode === "create"}
+					autoFocus={
+						mode === "create" &&
+						(!initialValues?.amount || Number(initialValues.amount) <= 0)
+					}
 				/>
 			</div>
 
@@ -602,7 +754,10 @@ export function ManualExpenseForm({
 				<select
 					id="expense-account"
 					value={sourceAssetAccountId}
-					onChange={(e) => setSourceAssetAccountId(e.target.value)}
+					onChange={(e) => {
+						setSourceAssetAccountId(e.target.value);
+						setStaleAccountWarning(null);
+					}}
 					disabled={accountsLoading || isSubmitting}
 					required
 					className="form-select"
@@ -611,11 +766,16 @@ export function ManualExpenseForm({
 					{accountsLoading ? (
 						<option value="">Hesaplar yükleniyor...</option>
 					) : (
-						selectableAccounts.map((acc) => (
-							<option key={acc.accountId} value={acc.accountId}>
-								{acc.name} ({formatMoneyToTry(acc.balance)})
-							</option>
-						))
+						<>
+							{!sourceAssetAccountId && (
+								<option value="">Hesap Seçin...</option>
+							)}
+							{selectableAccounts.map((acc) => (
+								<option key={acc.accountId} value={acc.accountId}>
+									{acc.name} ({formatMoneyToTry(acc.balance)})
+								</option>
+							))}
+						</>
 					)}
 				</select>
 			</div>
