@@ -30,20 +30,20 @@ describe("Manual Expense Form Component — Create, Edit & OCC", () => {
 			code: "100.01",
 			name: "Nakit Kasa",
 			accountType: "ASSET",
-			normalBalance: "DEBIT",
+			normalBalance: "DEBIT" as const,
 			currency: "TRY",
 			archived: false,
-			balance: { balance: "5000.00", normalBalanceSide: "DEBIT" },
+			balance: "5000.00",
 		},
 		{
 			accountId: "acc-archived",
 			code: "100.02",
 			name: "Eski Kasa",
 			accountType: "ASSET",
-			normalBalance: "DEBIT",
+			normalBalance: "DEBIT" as const,
 			currency: "TRY",
 			archived: true,
-			balance: { balance: "0.00", normalBalanceSide: "DEBIT" },
+			balance: "0.00",
 		},
 	];
 
@@ -104,7 +104,7 @@ describe("Manual Expense Form Component — Create, Edit & OCC", () => {
 
 		await waitFor(() => {
 			expect(
-				screen.getByRole("option", { name: /Nakit Kasa/i }),
+				screen.getByRole("option", { name: /Nakit Kasa \(₺5\.000,00\)/i }),
 			).toBeInTheDocument();
 		});
 
@@ -326,5 +326,301 @@ describe("Manual Expense Form Component — Create, Edit & OCC", () => {
 		});
 
 		expect(fetchExpenseCount).toBeGreaterThan(1);
+	});
+
+	it("handles category verification mismatch by showing persistent warning without duplicating financial mutation", async () => {
+		let postCount = 0;
+		const mockOnSuccess = vi.fn();
+
+		global.fetch = vi
+			.fn()
+			.mockImplementation((url: string, init?: RequestInit) => {
+				if (url.includes("/ledger/accounts")) {
+					return Promise.resolve({
+						ok: true,
+						status: 200,
+						json: () =>
+							Promise.resolve({ accounts: mockAccounts, nextCursor: null }),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				if (url.includes("/spending/categories")) {
+					return Promise.resolve({
+						ok: true,
+						status: 200,
+						json: () => Promise.resolve({ categories: mockCategories }),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				if (url.includes("/manual-expenses") && init?.method === "POST") {
+					postCount++;
+					return Promise.resolve({
+						ok: true,
+						status: 201,
+						json: () =>
+							Promise.resolve({
+								transactionId: "tx-mismatch-1",
+								revisionId: "rev-1",
+								revisionNo: 1,
+								operation: "CREATE",
+							}),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				if (url.includes("/spending/category-assignments")) {
+					return Promise.resolve({
+						ok: true,
+						status: 200,
+						json: () =>
+							Promise.resolve({
+								assignments: { "tx-mismatch-1": "different-category" },
+							}),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				return Promise.reject(new Error(`Unhandled URL: ${url}`));
+			});
+
+		render(
+			<QueryClientProvider client={queryClient}>
+				<ManualExpenseForm mode="create" onSuccess={mockOnSuccess} />
+			</QueryClientProvider>,
+		);
+
+		await waitFor(() => {
+			expect(screen.getByTestId("expense-category-select")).toBeInTheDocument();
+			expect(screen.getByTestId("expense-account-select")).toHaveValue(
+				"acc-111",
+			);
+		});
+
+		// Select category "cat-market"
+		fireEvent.change(screen.getByTestId("expense-category-select"), {
+			target: { value: "cat-market" },
+		});
+
+		// Enter amount
+		const moneyInput = screen.getByTestId("money-input");
+		fireEvent.change(moneyInput, { target: { value: "100" } });
+		fireEvent.blur(moneyInput);
+
+		// Submit form
+		const submitBtn = screen.getByTestId("expense-submit-btn");
+		fireEvent.click(submitBtn);
+
+		// Wait for category warning card to appear
+		await waitFor(() => {
+			expect(
+				screen.getByTestId("success-category-warning-card"),
+			).toBeInTheDocument();
+		});
+
+		// Verify warning messages per Section 13-14
+		expect(screen.getByText("Harcama kaydedildi")).toBeInTheDocument();
+		expect(
+			screen.getByText("Kategori eşlemesi doğrulanamadı."),
+		).toBeInTheDocument();
+		expect(
+			screen.getByText("İşlem finansal olarak kaydedildi; tekrar göndermeyin."),
+		).toBeInTheDocument();
+
+		// POST called exactly once
+		expect(postCount).toBe(1);
+
+		// onSuccess was not called yet (user must review warning)
+		expect(mockOnSuccess).not.toHaveBeenCalled();
+
+		// Submit button should NOT be rendered in this post-success state (prevents duplicate submissions)
+		expect(screen.queryByTestId("expense-submit-btn")).not.toBeInTheDocument();
+
+		// User clicks return to transactions
+		const returnBtn = screen.getByTestId("return-to-transactions-btn");
+		fireEvent.click(returnBtn);
+
+		expect(mockOnSuccess).toHaveBeenCalledWith("tx-mismatch-1");
+		expect(postCount).toBe(1);
+	});
+
+	it("handles category verification network failure by preserving financial success and showing warning", async () => {
+		let postCount = 0;
+		const mockOnSuccess = vi.fn();
+
+		global.fetch = vi
+			.fn()
+			.mockImplementation((url: string, init?: RequestInit) => {
+				if (url.includes("/ledger/accounts")) {
+					return Promise.resolve({
+						ok: true,
+						status: 200,
+						json: () =>
+							Promise.resolve({ accounts: mockAccounts, nextCursor: null }),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				if (url.includes("/spending/categories")) {
+					return Promise.resolve({
+						ok: true,
+						status: 200,
+						json: () => Promise.resolve({ categories: mockCategories }),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				if (url.includes("/manual-expenses") && init?.method === "POST") {
+					postCount++;
+					return Promise.resolve({
+						ok: true,
+						status: 201,
+						json: () =>
+							Promise.resolve({
+								transactionId: "tx-netfail-1",
+								revisionId: "rev-1",
+								revisionNo: 1,
+								operation: "CREATE",
+							}),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				if (url.includes("/spending/category-assignments")) {
+					// Simulate network failure
+					return Promise.reject(new TypeError("Failed to fetch"));
+				}
+				return Promise.reject(new Error(`Unhandled URL: ${url}`));
+			});
+
+		render(
+			<QueryClientProvider client={queryClient}>
+				<ManualExpenseForm mode="create" onSuccess={mockOnSuccess} />
+			</QueryClientProvider>,
+		);
+
+		await waitFor(() => {
+			expect(screen.getByTestId("expense-category-select")).toBeInTheDocument();
+			expect(screen.getByTestId("expense-account-select")).toHaveValue(
+				"acc-111",
+			);
+		});
+
+		// Select category
+		fireEvent.change(screen.getByTestId("expense-category-select"), {
+			target: { value: "cat-market" },
+		});
+
+		// Enter amount
+		const moneyInput = screen.getByTestId("money-input");
+		fireEvent.change(moneyInput, { target: { value: "250" } });
+		fireEvent.blur(moneyInput);
+
+		// Submit form
+		const submitBtn = screen.getByTestId("expense-submit-btn");
+		fireEvent.click(submitBtn);
+
+		await waitFor(() => {
+			expect(
+				screen.getByTestId("success-category-warning-card"),
+			).toBeInTheDocument();
+		});
+
+		expect(postCount).toBe(1);
+		expect(
+			screen.getByText("Kategori eşlemesi doğrulanamadı."),
+		).toBeInTheDocument();
+		// Retry financial mutation button must NOT be offered
+		expect(screen.queryByTestId("expense-retry-btn")).not.toBeInTheDocument();
+		expect(screen.queryByTestId("expense-submit-btn")).not.toBeInTheDocument();
+
+		// User clicks return to transactions
+		fireEvent.click(screen.getByTestId("return-to-transactions-btn"));
+		expect(mockOnSuccess).toHaveBeenCalledWith("tx-netfail-1");
+		expect(postCount).toBe(1);
+	});
+
+	it("navigates immediately on full success when category assignment is confirmed", async () => {
+		let postCount = 0;
+		const mockOnSuccess = vi.fn();
+
+		global.fetch = vi
+			.fn()
+			.mockImplementation((url: string, init?: RequestInit) => {
+				if (url.includes("/ledger/accounts")) {
+					return Promise.resolve({
+						ok: true,
+						status: 200,
+						json: () =>
+							Promise.resolve({ accounts: mockAccounts, nextCursor: null }),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				if (url.includes("/spending/categories")) {
+					return Promise.resolve({
+						ok: true,
+						status: 200,
+						json: () => Promise.resolve({ categories: mockCategories }),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				if (url.includes("/manual-expenses") && init?.method === "POST") {
+					postCount++;
+					return Promise.resolve({
+						ok: true,
+						status: 201,
+						json: () =>
+							Promise.resolve({
+								transactionId: "tx-full-success-1",
+								revisionId: "rev-1",
+								revisionNo: 1,
+								operation: "CREATE",
+							}),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				if (url.includes("/spending/category-assignments")) {
+					return Promise.resolve({
+						ok: true,
+						status: 200,
+						json: () =>
+							Promise.resolve({
+								assignments: { "tx-full-success-1": "cat-market" },
+							}),
+						headers: new Headers({ "content-type": "application/json" }),
+					});
+				}
+				return Promise.reject(new Error(`Unhandled URL: ${url}`));
+			});
+
+		render(
+			<QueryClientProvider client={queryClient}>
+				<ManualExpenseForm mode="create" onSuccess={mockOnSuccess} />
+			</QueryClientProvider>,
+		);
+
+		await waitFor(() => {
+			expect(screen.getByTestId("expense-category-select")).toBeInTheDocument();
+			expect(screen.getByTestId("expense-account-select")).toHaveValue(
+				"acc-111",
+			);
+		});
+
+		// Select category
+		fireEvent.change(screen.getByTestId("expense-category-select"), {
+			target: { value: "cat-market" },
+		});
+
+		// Enter amount
+		const moneyInput = screen.getByTestId("money-input");
+		fireEvent.change(moneyInput, { target: { value: "300" } });
+		fireEvent.blur(moneyInput);
+
+		// Submit form
+		const submitBtn = screen.getByTestId("expense-submit-btn");
+		fireEvent.click(submitBtn);
+
+		await waitFor(() => {
+			expect(mockOnSuccess).toHaveBeenCalledWith("tx-full-success-1");
+		});
+
+		expect(postCount).toBe(1);
+		expect(
+			screen.queryByTestId("success-category-warning-card"),
+		).not.toBeInTheDocument();
 	});
 });

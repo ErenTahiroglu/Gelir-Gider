@@ -16,7 +16,7 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "../../api/errors";
 import {
 	createManualExpense,
@@ -71,16 +71,22 @@ export function ManualExpenseForm({
 	});
 
 	// Filter usable source asset accounts: ASSET, TRY, not archived
-	const selectableAccounts = (accounts ?? []).filter(
-		(acc) =>
-			acc.accountType === "ASSET" &&
-			acc.currency === "TRY" &&
-			acc.archived === false,
+	const selectableAccounts = useMemo(
+		() =>
+			(accounts ?? []).filter(
+				(acc) =>
+					acc.accountType === "ASSET" &&
+					acc.currency === "TRY" &&
+					acc.archived === false,
+			),
+		[accounts],
 	);
 
 	// Filter selectable categories: ACTIVE only
-	const activeCategories = (categoriesData?.categories ?? []).filter(
-		(c) => c.status === "ACTIVE",
+	const activeCategories = useMemo(
+		() =>
+			(categoriesData?.categories ?? []).filter((c) => c.status === "ACTIVE"),
+		[categoriesData?.categories],
 	);
 
 	// 2. Fetch existing expense detail for Edit mode
@@ -118,6 +124,12 @@ export function ManualExpenseForm({
 	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 	const [secondaryWarning, setSecondaryWarning] = useState<string | null>(null);
 	const [canRetry, setCanRetry] = useState<boolean>(false);
+	const [resultState, setResultState] = useState<
+		"IDLE" | "FULL_SUCCESS" | "FINANCIAL_SUCCESS_CATEGORY_UNVERIFIED"
+	>("IDLE");
+	const [committedTransactionId, setCommittedTransactionId] = useState<
+		string | null
+	>(null);
 
 	// Stable idempotency key for the current logical submission attempt
 	const currentIdempotencyKeyRef = useRef<string | null>(null);
@@ -257,27 +269,22 @@ export function ManualExpenseForm({
 			}
 
 			// Financial mutation succeeded!
-			// Check secondary category assignment if spendingCategoryId was supplied
+			// Check secondary category assignment if spendingCategoryId was supplied per Section 13-16
+			let categoryUnverified = false;
 			if (payload.spendingCategoryId) {
 				try {
 					const assignRes = await fetchCategoryAssignment(resultTransactionId);
-					const confirmedCatId =
-						assignRes.assignments?.[resultTransactionId] ??
-						assignRes.assignment?.categoryId;
+					const confirmedCatId = assignRes.assignments[resultTransactionId];
 
 					if (confirmedCatId !== payload.spendingCategoryId) {
-						setSecondaryWarning(
-							"Harcama kaydedildi ancak kategori eşlemesi doğrulanamadı.",
-						);
+						categoryUnverified = true;
 					}
 				} catch {
-					setSecondaryWarning(
-						"Harcama kaydedildi ancak kategori eşlemesi doğrulanamadı.",
-					);
+					categoryUnverified = true;
 				}
 			}
 
-			// Invalidate all relevant queries per Section 49
+			// Invalidate all relevant queries per Section 49 & Section 19
 			await Promise.all([
 				queryClient.invalidateQueries({ queryKey: ["transactions"] }),
 				queryClient.invalidateQueries({
@@ -291,16 +298,26 @@ export function ManualExpenseForm({
 				}),
 				queryClient.invalidateQueries({ queryKey: ["ledger-accounts"] }),
 				queryClient.invalidateQueries({ queryKey: ["spending-summary"] }),
+				queryClient.invalidateQueries({
+					queryKey: ["category-assignment", resultTransactionId],
+				}),
 			]);
 
+			// Section 18: Clear financial mutation retry state
 			setCanRetry(false);
 			currentIdempotencyKeyRef.current = null;
 			lastSubmittedPayloadRef.current = null;
 
-			if (onSuccess) {
-				onSuccess(resultTransactionId);
+			if (categoryUnverified) {
+				setCommittedTransactionId(resultTransactionId);
+				setResultState("FINANCIAL_SUCCESS_CATEGORY_UNVERIFIED");
 			} else {
-				void navigate({ to: "/transactions" });
+				setResultState("FULL_SUCCESS");
+				if (onSuccess) {
+					onSuccess(resultTransactionId);
+				} else {
+					void navigate({ to: "/transactions" });
+				}
 			}
 		} catch (err) {
 			const mapped = mapFormError(err);
@@ -402,6 +419,68 @@ export function ManualExpenseForm({
 			);
 		}
 	};
+
+	// Guard: Financial success with unverified category warning per Section 13-14
+	if (resultState === "FINANCIAL_SUCCESS_CATEGORY_UNVERIFIED") {
+		return (
+			<div
+				className="category-unverified-success card"
+				data-testid="success-category-warning-card"
+				style={{ padding: "var(--space-6)", textAlign: "center" }}
+			>
+				<div
+					style={{
+						fontSize: "var(--font-size-3xl)",
+						color: "var(--color-warning-500)",
+						marginBottom: "var(--space-2)",
+					}}
+				>
+					✓
+				</div>
+				<h2
+					style={{
+						fontSize: "var(--font-size-xl)",
+						fontWeight: "bold",
+						margin: "0 0 var(--space-3) 0",
+					}}
+				>
+					Harcama kaydedildi
+				</h2>
+				<p
+					style={{
+						margin: "0 0 var(--space-2) 0",
+						color: "var(--text-primary)",
+						fontWeight: "var(--font-weight-medium)",
+					}}
+				>
+					Kategori eşlemesi doğrulanamadı.
+				</p>
+				<p
+					style={{
+						margin: "0 0 var(--space-6) 0",
+						color: "var(--text-secondary)",
+						fontSize: "var(--font-size-sm)",
+					}}
+				>
+					İşlem finansal olarak kaydedildi; tekrar göndermeyin.
+				</p>
+				<button
+					type="button"
+					onClick={() => {
+						if (onSuccess && committedTransactionId) {
+							onSuccess(committedTransactionId);
+						} else {
+							void navigate({ to: "/transactions" });
+						}
+					}}
+					className="btn btn-primary"
+					data-testid="return-to-transactions-btn"
+				>
+					Hareketlere Dön
+				</button>
+			</div>
+		);
+	}
 
 	// Guard: If editing a VOIDED expense
 	if (mode === "edit" && existingExpense?.status === "VOIDED") {
@@ -534,7 +613,7 @@ export function ManualExpenseForm({
 					) : (
 						selectableAccounts.map((acc) => (
 							<option key={acc.accountId} value={acc.accountId}>
-								{acc.name} ({formatMoneyToTry(acc.balance.balance)})
+								{acc.name} ({formatMoneyToTry(acc.balance)})
 							</option>
 						))
 					)}

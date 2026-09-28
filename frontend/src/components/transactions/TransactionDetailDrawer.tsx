@@ -140,9 +140,7 @@ export function TransactionDetailDrawer({
 		(a) => a.accountId === display?.sourceAccountId,
 	);
 	const categoryId =
-		display?.spendingCategoryId ??
-		categoryAssign?.assignments?.[transactionId] ??
-		categoryAssign?.assignment?.categoryId;
+		display?.spendingCategoryId ?? categoryAssign?.assignments[transactionId];
 	const spendingCategory = categoriesData?.categories.find(
 		(c) => c.id === categoryId,
 	);

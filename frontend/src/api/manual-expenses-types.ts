@@ -68,15 +68,11 @@ export interface LedgerAccountItem {
 	accountId: string;
 	code: string;
 	name: string;
-	accountType: "ASSET" | "LIABILITY" | "EQUITY" | "REVENUE" | "EXPENSE";
+	accountType: string;
 	normalBalance: "DEBIT" | "CREDIT";
 	currency: string;
 	archived: boolean;
-	balance: {
-		balance: string;
-		normalBalanceSide: "DEBIT" | "CREDIT";
-		asOfJournalEntryId?: string;
-	};
+	balance: string;
 }
 
 export interface LedgerAccountsResponse {
@@ -102,8 +98,5 @@ export interface SpendingCategoriesResponse {
 }
 
 export interface SpendingCategoryAssignmentsResponse {
-	assignments?: Record<string, string>;
-	assignment?: {
-		categoryId: string;
-	};
+	assignments: Record<string, string>;
 }
