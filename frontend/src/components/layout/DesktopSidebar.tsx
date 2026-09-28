@@ -1,3 +1,4 @@
+import { Link } from "@tanstack/react-router";
 import {
 	ChevronLeft,
 	ChevronRight,
@@ -79,8 +80,8 @@ export function DesktopSidebar({
 			<nav className="sidebar-nav" aria-label="Sayfalar">
 				<ul className="nav-list">
 					<li className="nav-item">
-						<a
-							href="/"
+						<Link
+							to="/"
 							className="nav-link active"
 							aria-current="page"
 							title={collapsed ? "Ana Sayfa" : undefined}
@@ -88,7 +89,7 @@ export function DesktopSidebar({
 						>
 							<Home size={20} aria-hidden="true" />
 							{!collapsed && <span className="nav-label">Ana Sayfa</span>}
-						</a>
+						</Link>
 					</li>
 
 					<li className="nav-item">

@@ -1,3 +1,4 @@
+import { Link } from "@tanstack/react-router";
 import { CreditCard, Home, MoreHorizontal, Plus, Repeat } from "lucide-react";
 
 export function MobileNav() {
@@ -8,8 +9,8 @@ export function MobileNav() {
 			aria-label="Mobil Gezinme Menüsü"
 		>
 			<div className="mobile-nav-inner">
-				<a
-					href="/"
+				<Link
+					to="/"
 					className="mobile-nav-item active"
 					aria-current="page"
 					data-testid="mobile-nav-home"
@@ -17,7 +18,7 @@ export function MobileNav() {
 				>
 					<Home size={22} aria-hidden="true" />
 					<span className="mobile-nav-label">Ana Sayfa</span>
-				</a>
+				</Link>
 
 				<button
 					type="button"
