@@ -21,8 +21,15 @@ import { SplitDetailPage } from "./components/cards/purchases/SplitDetailPage";
 import { StatementDetailPage } from "./components/cards/statements/StatementDetailPage";
 import { StatementForm } from "./components/cards/statements/StatementForm";
 import { DashboardPage } from "./components/dashboard/DashboardPage";
+import { GoalDetailPage } from "./components/goals/GoalDetailPage";
+import { GoalForm } from "./components/goals/GoalForm";
+import { GoalsPage } from "./components/goals/GoalsPage";
 import { AppShell } from "./components/layout/AppShell";
+import { LongTermPage } from "./components/long-term/LongTermPage";
+import { LongTermTaskDetailPage } from "./components/long-term/LongTermTaskDetailPage";
+import { LongTermTaskForm } from "./components/long-term/LongTermTaskForm";
 import { ManualExpenseForm } from "./components/manual-expenses/ManualExpenseForm";
+import { MidasPage } from "./components/midas/MidasPage";
 import { ObligationDetailPage } from "./components/people/obligations/ObligationDetailPage";
 import { ObligationForm } from "./components/people/obligations/ObligationForm";
 import { PeoplePage } from "./components/people/PeoplePage";
@@ -559,6 +566,137 @@ const personSettleRoute = createRoute({
 	component: AuthenticatedPersonSettle,
 });
 
+// ============================================================================
+// Phase F7: Goals, Midas & Long-Term Routes
+// ============================================================================
+
+function AuthenticatedGoals() {
+	return (
+		<AppShell>
+			<GoalsPage />
+		</AppShell>
+	);
+}
+
+function AuthenticatedGoalNew() {
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Yeni Kısa Vadeli Hedef</h1>
+					<GoalForm mode="create" />
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedGoalDetail() {
+	const params = goalDetailRoute.useParams();
+	return (
+		<AppShell>
+			<GoalDetailPage goalId={params.goalId} />
+		</AppShell>
+	);
+}
+
+function AuthenticatedGoalEdit() {
+	const params = goalEditRoute.useParams();
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Hedefi Düzenle</h1>
+					<GoalForm mode="edit" goalId={params.goalId} />
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedMidas() {
+	return (
+		<AppShell>
+			<MidasPage />
+		</AppShell>
+	);
+}
+
+function AuthenticatedLongTerm() {
+	return (
+		<AppShell>
+			<LongTermPage />
+		</AppShell>
+	);
+}
+
+function AuthenticatedLongTermNew() {
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<LongTermTaskForm />
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedLongTermDetail() {
+	const params = longTermDetailRoute.useParams();
+	return (
+		<AppShell>
+			<LongTermTaskDetailPage taskId={params.taskId} />
+		</AppShell>
+	);
+}
+
+const goalsRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/goals",
+	component: AuthenticatedGoals,
+});
+
+const goalNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/goals/new",
+	component: AuthenticatedGoalNew,
+});
+
+const goalDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/goals/$goalId",
+	component: AuthenticatedGoalDetail,
+});
+
+const goalEditRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/goals/$goalId/edit",
+	component: AuthenticatedGoalEdit,
+});
+
+const midasRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/midas",
+	component: AuthenticatedMidas,
+});
+
+const longTermRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/long-term",
+	component: AuthenticatedLongTerm,
+});
+
+const longTermNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/long-term/new",
+	component: AuthenticatedLongTermNew,
+});
+
+const longTermDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/long-term/$taskId",
+	component: AuthenticatedLongTermDetail,
+});
+
 const routeTree = rootRoute.addChildren([
 	indexRoute,
 	unlockRoute,
@@ -583,6 +721,14 @@ const routeTree = rootRoute.addChildren([
 	obligationNewRoute,
 	obligationDetailRoute,
 	personSettleRoute,
+	goalsRoute,
+	goalNewRoute,
+	goalDetailRoute,
+	goalEditRoute,
+	midasRoute,
+	longTermRoute,
+	longTermNewRoute,
+	longTermDetailRoute,
 ]);
 
 export const router = createRouter({ routeTree });

@@ -117,6 +117,80 @@ export function mapErrorCodeToUserMessage(
 			return "Bu işlem daha önce farklı bilgilerle gönderilmiş. Lütfen işlemi yenileyin.";
 		case "PEOPLE_NO_OPEN_RECEIVABLES":
 			return "Bu kişinin tahsil edilecek açık alacağı bulunmuyor.";
+		// Short-Term Goals
+		case "SHORT_TERM_GOAL_INVALID_INPUT":
+			return "Girilen hedef bilgileri geçersiz. Lütfen alanları kontrol edin.";
+		case "SHORT_TERM_GOAL_NOT_FOUND":
+			return "Kısa vadeli hedef bulunamadı.";
+		case "SHORT_TERM_GOAL_NOT_ACTIVE":
+			return "Bu hedef aktif durumda değil.";
+		case "SHORT_TERM_GOAL_NON_ZERO_BALANCE":
+		case "SHORT_TERM_GOAL_BALANCE_NOT_ZERO":
+			return "Bu hedefte ayrılmış para bulunduğu için işlem tamamlanamaz. Önce bakiyeyi serbest bırakın.";
+		case "SHORT_TERM_GOAL_BUCKET_NOT_FOUND":
+			return "Hedefe ait Midas bütçe havuzu bulunamadı.";
+		case "SHORT_TERM_GOAL_MIDAS_ACCOUNT_NOT_FOUND":
+			return "Midas likidite hesabı bulunamadı. Lütfen önce Midas hesabını bağlayın.";
+		case "SHORT_TERM_GOAL_MAX_BUDGET_EXCEEDED":
+			return "Toplam hedef birikimi belirlenen azami bütçeyi aşamaz.";
+		case "SHORT_TERM_GOAL_PRIORITY_COLLISION":
+		case "SHORT_TERM_GOAL_PRIORITY_MISMATCH":
+		case "SHORT_TERM_GOAL_PRIORITY_CONFLICT":
+			return "Hedef öncelik sıralamasında çakışma oluştu. Lütfen güncel listeyi inceleyip tekrar sıralayın.";
+		case "SHORT_TERM_GOAL_REVISION_CONFLICT":
+			return "Hedef bilgileri başka bir işlem tarafından güncellendi. Lütfen sayfayı yenileyip tekrar deneyin.";
+		case "SHORT_TERM_GOAL_INSUFFICIENT_FREE_BALANCE":
+			return "Midas serbest bakiyeniz bu fonlama için yetersiz.";
+		case "SHORT_TERM_GOAL_INSUFFICIENT_BALANCE":
+			return "Hedef havuzunda çekilmek istenen tutarda bakiye bulunmuyor.";
+		case "SHORT_TERM_GOAL_IDEMPOTENCY_CONFLICT":
+			return "Bu işlem daha önce farklı bilgilerle gönderilmiş. Lütfen işlemi yenileyin.";
+		// Midas
+		case "MIDAS_INVALID_INPUT":
+			return "Girilen Midas bilgileri geçersiz.";
+		case "MIDAS_ACCOUNT_NOT_FOUND":
+			return "Midas likidite hesabı bulunamadı.";
+		case "MIDAS_ACCOUNT_CONFLICT":
+			return "Bu kullanıcı için zaten bir Midas hesabı bağlı.";
+		case "MIDAS_LEDGER_ACCOUNT_INVALID":
+			return "Seçilen kasa/banka hesabı Midas likidite hesabı için uygun değil.";
+		case "MIDAS_BUCKET_NOT_FOUND":
+			return "İlgili Midas havuzu bulunamadı.";
+		case "MIDAS_BUCKET_CONFLICT":
+			return "Bu isim veya koda sahip bir Midas havuzu zaten mevcut.";
+		case "MIDAS_INSUFFICIENT_FREE_BALANCE":
+			return "Midas serbest / dağıtılmamış bakiyesi yetersiz.";
+		case "MIDAS_INSUFFICIENT_BUCKET_BALANCE":
+			return "Havuz bakiyesi bu aktarım için yetersiz.";
+		case "MIDAS_IDEMPOTENCY_CONFLICT":
+			return "Bu transfer daha önce farklı bilgilerle gönderilmiş. Lütfen işlemi yenileyin.";
+		case "MIDAS_TRANSFER_NOT_FOUND":
+			return "Midas transfer kaydı bulunamadı.";
+		case "MIDAS_TRANSFER_ALREADY_REVERSED":
+			return "Bu transfer kaydı daha önce tersine çevrilmiş.";
+		case "MIDAS_BUCKET_INACTIVE":
+			return "Bu Midas havuzu aktif değil.";
+		case "MIDAS_BUCKET_CAP_EXCEEDED":
+			return "Havuz için belirlenen azami limit aşılıyor.";
+		case "MIDAS_LONG_TERM_BUCKET_RESTRICTED":
+			return "Uzun vadeli yatırım havuzuna genel transfer yapılamaz. Lütfen Uzun Vadeli Görevler akışını kullanın.";
+		// Long-Term
+		case "LONG_TERM_INVALID_INPUT":
+			return "Girilen uzun vadeli görev bilgileri geçersiz.";
+		case "LONG_TERM_TASK_NOT_FOUND":
+			return "Uzun vadeli yatırım görevi bulunamadı.";
+		case "LONG_TERM_TASK_NOT_PENDING":
+			return "Bu görev bekleme durumunda değil.";
+		case "LONG_TERM_TASK_NOT_SENT":
+			return "Bu görev gönderildi durumunda değil.";
+		case "LONG_TERM_TASK_CANCELLED":
+			return "Bu görev iptal edilmiş ve üzerinde işlem yapılamaz.";
+		case "LONG_TERM_REVISION_CONFLICT":
+			return "Görev başka bir işlem tarafından güncellendi. Lütfen sayfayı yenileyip tekrar deneyin.";
+		case "LONG_TERM_IDEMPOTENCY_CONFLICT":
+			return "Bu görev işlemi daha önce farklı bilgilerle gönderilmiş. Lütfen işlemi yenileyin.";
+		case "LONG_TERM_INSUFFICIENT_UNALLOCATED":
+			return "Midas serbest bakiyesi bu görev tutarını karşılamak için yetersiz.";
 		default:
 			return fallback && fallback.trim() !== ""
 				? fallback

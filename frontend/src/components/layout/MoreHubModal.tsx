@@ -5,6 +5,8 @@ import {
 	FileText,
 	PieChart,
 	Sliders,
+	Target,
+	TrendingUp,
 	Users,
 } from "lucide-react";
 import { AccessibleModal } from "../common/AccessibleModal";
@@ -20,6 +22,9 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 
 	const isPeopleActive = currentPath.startsWith("/people");
 	const isTemplatesActive = currentPath.startsWith("/settings/quick-templates");
+	const isGoalsActive = currentPath.startsWith("/goals");
+	const isMidasActive = currentPath.startsWith("/midas");
+	const isLongTermActive = currentPath.startsWith("/long-term");
 
 	return (
 		<AccessibleModal
@@ -76,36 +81,75 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 								</div>
 							</Link>
 						</li>
+
+						{/* Active item: Hedefler */}
+						<li className="more-hub-item">
+							<Link
+								to="/goals"
+								className={`more-hub-link ${isGoalsActive ? "active" : ""}`}
+								onClick={onClose}
+								aria-current={isGoalsActive ? "page" : undefined}
+								data-testid="more-hub-link-goals"
+							>
+								<div className="more-hub-icon-wrapper">
+									<Target size={20} aria-hidden="true" />
+								</div>
+								<div className="more-hub-item-info">
+									<span className="more-hub-item-name">Hedefler</span>
+									<span className="more-hub-item-desc">
+										Kısa vadeli birikim ve harcama hedefleri
+									</span>
+								</div>
+							</Link>
+						</li>
+
+						{/* Active item: Midas Likidite */}
+						<li className="more-hub-item">
+							<Link
+								to="/midas"
+								className={`more-hub-link ${isMidasActive ? "active" : ""}`}
+								onClick={onClose}
+								aria-current={isMidasActive ? "page" : undefined}
+								data-testid="more-hub-link-midas"
+							>
+								<div className="more-hub-icon-wrapper">
+									<PieChart size={20} aria-hidden="true" />
+								</div>
+								<div className="more-hub-item-info">
+									<span className="more-hub-item-name">Midas Likidite</span>
+									<span className="more-hub-item-desc">
+										Kart rezervi ve serbest bakiye yönetimi
+									</span>
+								</div>
+							</Link>
+						</li>
+
+						{/* Active item: Uzun Vadeli */}
+						<li className="more-hub-item">
+							<Link
+								to="/long-term"
+								className={`more-hub-link ${isLongTermActive ? "active" : ""}`}
+								onClick={onClose}
+								aria-current={isLongTermActive ? "page" : undefined}
+								data-testid="more-hub-link-long-term"
+							>
+								<div className="more-hub-icon-wrapper">
+									<TrendingUp size={20} aria-hidden="true" />
+								</div>
+								<div className="more-hub-item-info">
+									<span className="more-hub-item-name">Uzun Vadeli</span>
+									<span className="more-hub-item-desc">
+										Uzun vadeli yatırım transfer görevleri
+									</span>
+								</div>
+							</Link>
+						</li>
 					</ul>
 				</div>
 
 				<div className="more-hub-section">
 					<h3 className="more-hub-section-title">Gelecek Özellikler</h3>
 					<ul className="more-hub-list">
-						{/* Disabled F7: Bütçe & Hedefler */}
-						<li className="more-hub-item">
-							<button
-								type="button"
-								className="more-hub-link disabled"
-								disabled
-								aria-disabled="true"
-								data-testid="more-hub-link-budget"
-							>
-								<div className="more-hub-icon-wrapper">
-									<PieChart size={20} aria-hidden="true" />
-								</div>
-								<div className="more-hub-item-info">
-									<div className="more-hub-item-header">
-										<span className="more-hub-item-name">Bütçe & Hedefler</span>
-										<span className="more-hub-badge">F7</span>
-									</div>
-									<span className="more-hub-item-desc">
-										Aylık bütçe ve birikim hedefleri
-									</span>
-								</div>
-							</button>
-						</li>
-
 						{/* Disabled F8: Ayı Tamamla */}
 						<li className="more-hub-item">
 							<button

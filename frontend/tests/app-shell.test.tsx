@@ -104,10 +104,18 @@ describe("App Shell — Responsive Desktop Sidebar & Mobile Nav Invariants", () 
 		expect(peopleLink).toHaveAttribute("href", "/people");
 		expect(peopleLink).not.toBeDisabled();
 
-		// Future links disabled (F7+)
-		expect(screen.getByTestId("nav-link-budget")).toBeDisabled();
-		expect(screen.getByTestId("nav-link-goals")).toBeDisabled();
-		expect(screen.getByTestId("nav-link-investments")).toBeDisabled();
+		// F7 active links: Likidite (/midas), Hedefler (/goals), Uzun Vadeli (/long-term)
+		const midasLink = screen.getByTestId("nav-link-midas");
+		expect(midasLink).toHaveAttribute("href", "/midas");
+		expect(midasLink).not.toBeDisabled();
+
+		const goalsLink = screen.getByTestId("nav-link-goals");
+		expect(goalsLink).toHaveAttribute("href", "/goals");
+		expect(goalsLink).not.toBeDisabled();
+
+		const longTermLink = screen.getByTestId("nav-link-long-term");
+		expect(longTermLink).toHaveAttribute("href", "/long-term");
+		expect(longTermLink).not.toBeDisabled();
 
 		// Toggle button
 		const toggleBtn = screen.getByTestId("sidebar-toggle-btn");

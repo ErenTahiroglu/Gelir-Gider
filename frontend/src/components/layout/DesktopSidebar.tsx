@@ -30,6 +30,9 @@ export function DesktopSidebar({
 		currentPath.startsWith("/manual-expenses");
 	const isCardsActive = currentPath.startsWith("/cards");
 	const isPeopleActive = currentPath.startsWith("/people");
+	const isMidasActive = currentPath.startsWith("/midas");
+	const isGoalsActive = currentPath.startsWith("/goals");
+	const isLongTermActive = currentPath.startsWith("/long-term");
 	// Keyboard shortcut: Cmd/Ctrl + B to toggle sidebar
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -141,45 +144,42 @@ export function DesktopSidebar({
 					</li>
 
 					<li className="nav-item">
-						<button
-							type="button"
-							className="nav-link disabled"
-							disabled
-							aria-disabled="true"
-							title={collapsed ? "Bütçe (F7)" : "F7 aşamasında eklenecek"}
-							data-testid="nav-link-budget"
+						<Link
+							to="/midas"
+							className={`nav-link ${isMidasActive ? "active" : ""}`}
+							aria-current={isMidasActive ? "page" : undefined}
+							title={collapsed ? "Likidite" : undefined}
+							data-testid="nav-link-midas"
 						>
 							<PieChart size={20} aria-hidden="true" />
-							{!collapsed && <span className="nav-label">Bütçe</span>}
-						</button>
+							{!collapsed && <span className="nav-label">Likidite</span>}
+						</Link>
 					</li>
 
 					<li className="nav-item">
-						<button
-							type="button"
-							className="nav-link disabled"
-							disabled
-							aria-disabled="true"
-							title={collapsed ? "Hedefler (F8)" : "F8 aşamasında eklenecek"}
+						<Link
+							to="/goals"
+							className={`nav-link ${isGoalsActive ? "active" : ""}`}
+							aria-current={isGoalsActive ? "page" : undefined}
+							title={collapsed ? "Hedefler" : undefined}
 							data-testid="nav-link-goals"
 						>
 							<Target size={20} aria-hidden="true" />
 							{!collapsed && <span className="nav-label">Hedefler</span>}
-						</button>
+						</Link>
 					</li>
 
 					<li className="nav-item">
-						<button
-							type="button"
-							className="nav-link disabled"
-							disabled
-							aria-disabled="true"
-							title={collapsed ? "Yatırımlar (F8)" : "F8 aşamasında eklenecek"}
-							data-testid="nav-link-investments"
+						<Link
+							to="/long-term"
+							className={`nav-link ${isLongTermActive ? "active" : ""}`}
+							aria-current={isLongTermActive ? "page" : undefined}
+							title={collapsed ? "Uzun Vadeli" : undefined}
+							data-testid="nav-link-long-term"
 						>
 							<TrendingUp size={20} aria-hidden="true" />
-							{!collapsed && <span className="nav-label">Yatırımlar</span>}
-						</button>
+							{!collapsed && <span className="nav-label">Uzun Vadeli</span>}
+						</Link>
 					</li>
 				</ul>
 			</nav>

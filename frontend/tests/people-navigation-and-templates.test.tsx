@@ -105,8 +105,21 @@ describe("F6 Navigation & Quick Entry Templates — More Hub, Desktop & Obligati
 		const peopleLink = screen.getByTestId("more-hub-link-people");
 		expect(peopleLink).toHaveAttribute("href", "/people");
 
-		// Future domain links disabled (F7, F8, F9, etc.)
-		expect(screen.getByTestId("more-hub-link-budget")).toHaveClass("disabled");
+		// F7 domain links active
+		expect(screen.getByTestId("more-hub-link-midas")).toHaveAttribute(
+			"href",
+			"/midas",
+		);
+		expect(screen.getByTestId("more-hub-link-goals")).toHaveAttribute(
+			"href",
+			"/goals",
+		);
+		expect(screen.getByTestId("more-hub-link-long-term")).toHaveAttribute(
+			"href",
+			"/long-term",
+		);
+
+		// Future domain links disabled (F8, F9, etc.)
 		expect(screen.getByTestId("more-hub-link-month-close")).toHaveClass(
 			"disabled",
 		);
@@ -130,9 +143,19 @@ describe("F6 Navigation & Quick Entry Templates — More Hub, Desktop & Obligati
 		expect(peopleLink).toHaveAttribute("href", "/people");
 		expect(peopleLink).toHaveAttribute("aria-current", "page");
 
-		// Future F7+ links remain disabled
-		expect(screen.getByTestId("nav-link-budget")).toBeDisabled();
-		expect(screen.getByTestId("nav-link-goals")).toBeDisabled();
+		// F7 links active
+		expect(screen.getByTestId("nav-link-midas")).toHaveAttribute(
+			"href",
+			"/midas",
+		);
+		expect(screen.getByTestId("nav-link-goals")).toHaveAttribute(
+			"href",
+			"/goals",
+		);
+		expect(screen.getByTestId("nav-link-long-term")).toHaveAttribute(
+			"href",
+			"/long-term",
+		);
 	});
 
 	it("creates a RECEIVABLE template with config strictly containing personId, description, defaultAmount, dueDate", async () => {

@@ -17,7 +17,10 @@ export function MobileNav() {
 	const isCardsActive = currentPath.startsWith("/cards");
 	const isMoreActive =
 		currentPath.startsWith("/people") ||
-		currentPath.startsWith("/settings/quick-templates");
+		currentPath.startsWith("/settings/quick-templates") ||
+		currentPath.startsWith("/goals") ||
+		currentPath.startsWith("/midas") ||
+		currentPath.startsWith("/long-term");
 
 	return (
 		<>
