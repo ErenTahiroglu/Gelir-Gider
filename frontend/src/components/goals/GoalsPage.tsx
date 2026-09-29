@@ -27,6 +27,7 @@ import type {
 	ShortTermGoalStatus,
 } from "../../api/f7-types";
 import { formatDueDateRelativeTurkish } from "../../lib/istanbul-date";
+import { classifyMidasLiquidityState } from "../../lib/midas-state";
 import { formatMoneyToTry } from "../../lib/money";
 
 export function GoalsPage() {
@@ -50,16 +51,32 @@ export function GoalsPage() {
 		payload: ReorderShortTermGoalsPayload;
 	} | null>(null);
 
-	// Check Midas liquidity state
-	const { data: liquidityData, isLoading: liquidityLoading } = useQuery({
+	// Check Midas liquidity state (R1)
+	const {
+		data: liquidityData,
+		isLoading: liquidityLoading,
+		error: liquidityError,
+		refetch: refetchLiquidity,
+	} = useQuery({
 		queryKey: ["midas-liquidity"],
 		queryFn: () => fetchMidasLiquidity(),
 		staleTime: 30_000,
 		retry: false,
 	});
 
-	const midasAccountId = liquidityData?.liquidity?.midasAccountId;
-	const isMidasConfigured = Boolean(midasAccountId);
+	const midasClassification = classifyMidasLiquidityState(
+		liquidityLoading,
+		liquidityData,
+		liquidityError,
+	);
+
+	const isMidasConfigured = midasClassification.status === "CONFIGURED";
+	const isMidasNotConfigured = midasClassification.status === "NOT_CONFIGURED";
+	const isMidasError = midasClassification.status === "ERROR";
+	const midasAccountId =
+		midasClassification.status === "CONFIGURED"
+			? midasClassification.liquidity.midasAccountId
+			: undefined;
 
 	// Fetch short-term goals for current tab
 	const {
@@ -257,19 +274,36 @@ export function GoalsPage() {
 						/>
 					</button>
 
-					<Link
-						to="/goals/new"
-						className="btn btn-primary btn-sm"
-						data-testid="create-goal-btn"
-					>
-						<Plus size={16} aria-hidden="true" />
-						<span>Yeni Hedef</span>
-					</Link>
+					{isMidasConfigured ? (
+						<Link
+							to="/goals/new"
+							className="btn btn-primary btn-sm"
+							data-testid="create-goal-btn"
+						>
+							<Plus size={16} aria-hidden="true" />
+							<span>Yeni Hedef</span>
+						</Link>
+					) : (
+						<button
+							type="button"
+							className="btn btn-primary btn-sm opacity-50 cursor-not-allowed"
+							disabled
+							title={
+								isMidasNotConfigured
+									? "Hedef oluşturmak için önce Midas likidite hesabını bağlayın"
+									: "Midas likidite durumu doğrulanamadı"
+							}
+							data-testid="create-goal-btn"
+						>
+							<Plus size={16} aria-hidden="true" />
+							<span>Yeni Hedef</span>
+						</button>
+					)}
 				</div>
 			</div>
 
-			{/* Midas setup warning if not configured (Section 31) */}
-			{!liquidityLoading && !isMidasConfigured && (
+			{/* Midas setup warning if not configured (Section 31 & R1) */}
+			{isMidasNotConfigured && (
 				<div
 					className="alert alert-warning mb-6"
 					role="alert"
@@ -288,6 +322,31 @@ export function GoalsPage() {
 						>
 							<span>Midas'ı Kur</span>
 						</Link>
+					</div>
+				</div>
+			)}
+
+			{/* Midas authority error (R1) */}
+			{isMidasError && (
+				<div
+					className="alert alert-danger mb-6"
+					role="alert"
+					data-testid="midas-authority-error-alert"
+				>
+					<AlertCircle size={20} aria-hidden="true" />
+					<div className="alert-content flex-1">
+						<span>
+							Midas likidite durumu doğrulanamadı. Fonlama ve yeni hedef
+							işlemleri için tekrar deneyin.
+						</span>
+						<button
+							type="button"
+							className="btn btn-sm btn-secondary mt-2 inline-flex"
+							onClick={() => void refetchLiquidity()}
+							data-testid="retry-liquidity-btn"
+						>
+							<span>Yeniden Dene</span>
+						</button>
 					</div>
 				</div>
 			)}
@@ -335,7 +394,7 @@ export function GoalsPage() {
 							type="button"
 							className="btn btn-secondary btn-sm"
 							onClick={handleStartReordering}
-							disabled={isFetchingAllForReorder}
+							disabled={isFetchingAllForReorder || !isMidasConfigured}
 							data-testid="start-reorder-btn"
 						>
 							{isFetchingAllForReorder ? (

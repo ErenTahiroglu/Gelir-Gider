@@ -78,12 +78,11 @@ describe("Phase F7 — Short-Term Goals", () => {
 		const mockFund = vi.spyOn(f7Api, "fundShortTermGoal").mockResolvedValue({
 			funding: {
 				goalId: "goal-1",
-				midasAccountId: "midas-1",
-				midasBucketId: "b-goal-1",
 				transferId: "tr-1",
 				amount: "200.00",
-				occurredAt: "2026-03-29T10:00:00Z",
+				idempotentReplay: false,
 			},
+			idempotentReplay: false,
 		});
 
 		const { wrapper } = createWrapper();
@@ -150,12 +149,11 @@ describe("Phase F7 — Short-Term Goals", () => {
 		const mockFund = vi.spyOn(f7Api, "fundShortTermGoal").mockResolvedValue({
 			funding: {
 				goalId: "goal-1",
-				midasAccountId: "midas-1",
-				midasBucketId: "b-goal-1",
 				transferId: "tr-1",
 				amount: "200.00",
-				occurredAt: "2026-03-29T10:00:00Z",
+				idempotentReplay: false,
 			},
+			idempotentReplay: false,
 		});
 
 		const goalWithoutMaxBudget: ShortTermGoalProductDto = {
@@ -333,11 +331,12 @@ describe("Phase F7 — Short-Term Goals", () => {
 			})
 			.mockResolvedValueOnce({
 				reorder: {
-					midasAccountId: "midas-1",
-					orderedGoalIds: ["goal-B", "goal-A", "goal-C"],
+					priorityRevisionId: "rev-123",
 					revisionNo: 1,
-					occurredAt: "2026-03-29T10:00:00Z",
+					orderedGoalIds: ["goal-B", "goal-A", "goal-C"],
+					idempotentReplay: false,
 				},
+				idempotentReplay: false,
 			});
 
 		const { wrapper } = createWrapper();
@@ -413,5 +412,174 @@ describe("Phase F7 — Short-Term Goals", () => {
 			expect(targetInput).toHaveValue("1000.00");
 			expect(targetInput).not.toHaveValue("200.00");
 		});
+	});
+
+	it("R1 regression: GoalForm create mode differentiates generic liquidity failure from NOT_CONFIGURED", async () => {
+		// 1. Generic 500 failure
+		vi.spyOn(f7Api, "fetchMidasLiquidity").mockRejectedValue(
+			new ApiError({
+				status: 500,
+				code: "INTERNAL_ERROR",
+				message: "Server error",
+			}),
+		);
+
+		const { wrapper: errorWrapper } = createWrapper();
+		render(<GoalForm mode="create" />, { wrapper: errorWrapper });
+
+		// Assert authority-error guard is shown, NOT setup CTA
+		expect(
+			await screen.findByTestId("midas-authority-error-guard"),
+		).toBeInTheDocument();
+		expect(
+			screen.getByText(
+				/Yeni hedef oluşturulmadan önce Midas likidite durumu doğrulanmalıdır/i,
+			),
+		).toBeInTheDocument();
+		expect(screen.queryByTestId("midas-not-configured-guard")).toBeNull();
+		expect(screen.queryByTestId("goal-form")).toBeNull();
+
+		cleanup();
+
+		// 2. Exact 404 MIDAS_ACCOUNT_NOT_FOUND
+		vi.spyOn(f7Api, "fetchMidasLiquidity").mockRejectedValue(
+			new ApiError({
+				status: 404,
+				code: "MIDAS_ACCOUNT_NOT_FOUND",
+				message: "Not found",
+			}),
+		);
+
+		const { wrapper: setupWrapper } = createWrapper();
+		render(<GoalForm mode="create" />, { wrapper: setupWrapper });
+
+		// Assert setup CTA is shown, NOT authority-error guard
+		expect(
+			await screen.findByTestId("midas-not-configured-guard"),
+		).toBeInTheDocument();
+		expect(screen.getByText(/Midas'ı Kur/i)).toBeInTheDocument();
+		expect(screen.queryByTestId("midas-authority-error-guard")).toBeNull();
+	});
+
+	it("R1 regression: GoalDetailPage when liquidity query fails does not invent ₺0,00 and disables funding with authority error", async () => {
+		vi.spyOn(f7Api, "fetchShortTermGoal").mockResolvedValue({
+			goal: mockGoalBase,
+		});
+		vi.spyOn(f7Api, "fetchMidasLiquidity").mockRejectedValue(
+			new ApiError({
+				status: 500,
+				code: "INTERNAL_ERROR",
+				message: "Midas service down",
+			}),
+		);
+
+		const { wrapper } = createWrapper();
+		render(<GoalDetailPage goalId="goal-1" />, { wrapper });
+
+		// Wait for goal to load
+		await screen.findByText("Yeni Laptop");
+
+		// No fake "Serbest Midas Bakiye ₺0,00" displayed
+		expect(screen.queryByText(/Serbest Midas Bakiye: ₺0,00/i)).toBeNull();
+
+		// Fund action button must be disabled
+		const fundBtn = screen.getByTestId("open-fund-modal-btn");
+		expect(fundBtn).toBeDisabled();
+
+		// Explicit authority error alert must be visible with retry button
+		expect(
+			screen.getByTestId("midas-authority-error-alert"),
+		).toBeInTheDocument();
+		expect(
+			screen.getByText(
+				/Midas serbest bakiye durumu doğrulanamadığı için fonlama işlemi yapılamaz/i,
+			),
+		).toBeInTheDocument();
+	});
+
+	it("R2 regression: reorder, funding, and release responses match exact backend source DTO contract", async () => {
+		// Mock reorder response exactly matching backend
+		const mockReorder = vi
+			.spyOn(f7Api, "reorderShortTermGoals")
+			.mockResolvedValue({
+				reorder: {
+					priorityRevisionId: "rev-uuid-1",
+					revisionNo: 2,
+					orderedGoalIds: ["goal-1", "goal-2"],
+					idempotentReplay: false,
+				},
+				idempotentReplay: false,
+			});
+
+		const reorderRes = await f7Api.reorderShortTermGoals(
+			{
+				midasAccountId: "midas-1",
+				orderedGoalIds: ["goal-1", "goal-2"],
+				occurredAt: "2026-03-29T10:00:00Z",
+			},
+			"key-1",
+		);
+
+		// Assert priorityRevisionId exists on reorder and fictional fields are absent
+		expect(reorderRes.reorder.priorityRevisionId).toBe("rev-uuid-1");
+		expect(reorderRes.reorder.revisionNo).toBe(2);
+		expect(reorderRes.reorder.orderedGoalIds).toEqual(["goal-1", "goal-2"]);
+		expect(reorderRes.reorder.idempotentReplay).toBe(false);
+		expect((reorderRes.reorder as any).midasAccountId).toBeUndefined();
+		expect((reorderRes.reorder as any).occurredAt).toBeUndefined();
+
+		// Mock fund response exactly matching backend
+		const mockFund = vi.spyOn(f7Api, "fundShortTermGoal").mockResolvedValue({
+			funding: {
+				goalId: "goal-1",
+				transferId: "tr-1",
+				amount: "150.00",
+				idempotentReplay: false,
+			},
+			idempotentReplay: false,
+		});
+
+		const fundRes = await f7Api.fundShortTermGoal(
+			"goal-1",
+			{ amount: "150.00", occurredAt: "2026-03-29T10:00:00Z" },
+			"key-2",
+		);
+
+		// Assert only actual backend fields exist on funding
+		expect(fundRes.funding.goalId).toBe("goal-1");
+		expect(fundRes.funding.transferId).toBe("tr-1");
+		expect(fundRes.funding.amount).toBe("150.00");
+		expect(fundRes.funding.idempotentReplay).toBe(false);
+		expect((fundRes.funding as any).midasAccountId).toBeUndefined();
+		expect((fundRes.funding as any).midasBucketId).toBeUndefined();
+		expect((fundRes.funding as any).occurredAt).toBeUndefined();
+
+		// Mock release response exactly matching backend
+		const mockRelease = vi
+			.spyOn(f7Api, "releaseShortTermGoal")
+			.mockResolvedValue({
+				release: {
+					goalId: "goal-1",
+					transferId: "tr-2",
+					amount: "150.00",
+					idempotentReplay: false,
+				},
+				idempotentReplay: false,
+			});
+
+		const releaseRes = await f7Api.releaseShortTermGoal(
+			"goal-1",
+			{ amount: "150.00", occurredAt: "2026-03-29T10:00:00Z" },
+			"key-3",
+		);
+
+		// Assert only actual backend fields exist on release
+		expect(releaseRes.release.goalId).toBe("goal-1");
+		expect(releaseRes.release.transferId).toBe("tr-2");
+		expect(releaseRes.release.amount).toBe("150.00");
+		expect(releaseRes.release.idempotentReplay).toBe(false);
+		expect((releaseRes.release as any).midasAccountId).toBeUndefined();
+		expect((releaseRes.release as any).midasBucketId).toBeUndefined();
+		expect((releaseRes.release as any).occurredAt).toBeUndefined();
 	});
 });

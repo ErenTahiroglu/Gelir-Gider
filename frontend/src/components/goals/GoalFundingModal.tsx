@@ -26,7 +26,7 @@ interface GoalFundingModalProps {
 	isOpen: boolean;
 	onClose: () => void;
 	goal: ShortTermGoalProductDto;
-	unallocatedBalance: string;
+	unallocatedBalance?: string | undefined;
 	mode: "fund" | "release";
 }
 
@@ -61,12 +61,17 @@ export function GoalFundingModal({
 	// If maxBudget !== null: maxAllowed = min(unallocatedBalance, maxBudget - accumulatedAmount)
 	// If maxBudget === null: maxAllowed = unallocatedBalance
 	// IMPORTANT: fundingTarget is NOT the hard cap!
-	const unallocatedCents = parseMoneyToCents(unallocatedBalance);
+	const unallocatedCents =
+		unallocatedBalance !== undefined
+			? parseMoneyToCents(unallocatedBalance)
+			: 0n;
 	const accumulatedCents = parseMoneyToCents(goal.accumulatedAmount);
 
 	let maxAllowedCents = 0n;
 	if (isFund) {
-		if (goal.maxBudget !== null) {
+		if (unallocatedBalance === undefined) {
+			maxAllowedCents = 0n;
+		} else if (goal.maxBudget !== null) {
 			const maxBudgetCents = parseMoneyToCents(goal.maxBudget);
 			const budgetRemainingCents =
 				maxBudgetCents > accumulatedCents
@@ -172,6 +177,13 @@ export function GoalFundingModal({
 		e.preventDefault();
 		if (isNetworkUncertain) return;
 
+		if (isFund && unallocatedBalance === undefined) {
+			setErrorMessage(
+				"Midas serbest bakiye durumu doğrulanamadığı için fonlama işlemi yapılamaz.",
+			);
+			return;
+		}
+
 		const norm = normalizeTurkishMoneyInput(amount);
 		if (!norm.valid || !norm.canonical || norm.cents === undefined) {
 			setErrorMessage(norm.error ?? "Geçersiz tutar girdiniz.");
@@ -264,12 +276,14 @@ export function GoalFundingModal({
 							{formatMoneyToTry(goal.fundingTarget)}
 						</span>
 					</div>
-					<div className="summary-item">
-						<span className="summary-label">Serbest Midas Bakiye:</span>
-						<span className="summary-value font-mono">
-							{formatMoneyToTry(unallocatedBalance)}
-						</span>
-					</div>
+					{unallocatedBalance !== undefined && (
+						<div className="summary-item">
+							<span className="summary-label">Serbest Midas Bakiye:</span>
+							<span className="summary-value font-mono">
+								{formatMoneyToTry(unallocatedBalance)}
+							</span>
+						</div>
+					)}
 				</div>
 
 				{errorMessage && (

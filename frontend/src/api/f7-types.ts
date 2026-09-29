@@ -176,12 +176,12 @@ export interface ReorderShortTermGoalsPayload {
 
 export interface ReorderShortTermGoalsResponse {
 	reorder: {
-		midasAccountId: string;
-		orderedGoalIds: string[];
+		priorityRevisionId: string;
 		revisionNo: number;
-		occurredAt: string;
+		orderedGoalIds: string[];
+		idempotentReplay: boolean;
 	};
-	idempotentReplay?: boolean;
+	idempotentReplay: boolean;
 }
 
 export interface FundShortTermGoalPayload {
@@ -194,13 +194,11 @@ export interface FundShortTermGoalPayload {
 export interface FundShortTermGoalResponse {
 	funding: {
 		goalId: string;
-		midasAccountId: string;
-		midasBucketId: string;
 		transferId: string;
 		amount: string;
-		occurredAt: string;
+		idempotentReplay: boolean;
 	};
-	idempotentReplay?: boolean;
+	idempotentReplay: boolean;
 }
 
 export interface ReleaseShortTermGoalPayload {
@@ -213,13 +211,11 @@ export interface ReleaseShortTermGoalPayload {
 export interface ReleaseShortTermGoalResponse {
 	release: {
 		goalId: string;
-		midasAccountId: string;
-		midasBucketId: string;
 		transferId: string;
 		amount: string;
-		occurredAt: string;
+		idempotentReplay: boolean;
 	};
-	idempotentReplay?: boolean;
+	idempotentReplay: boolean;
 }
 
 // ============================================================================

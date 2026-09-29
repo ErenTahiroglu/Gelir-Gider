@@ -14,6 +14,7 @@ import type {
 	ShortTermGoalProductDto,
 	UpdateShortTermGoalPayload,
 } from "../../api/f7-types";
+import { classifyMidasLiquidityState } from "../../lib/midas-state";
 import { normalizeTurkishMoneyInput } from "../../lib/money";
 import { MoneyInput } from "../common/MoneyInput";
 
@@ -29,7 +30,12 @@ export function GoalForm({ mode, goalId, onSuccess, onCancel }: GoalFormProps) {
 	const navigate = useNavigate();
 
 	// Fetch Midas liquidity for MidasAccountId in create mode
-	const { data: liquidityData, isLoading: liquidityLoading } = useQuery({
+	const {
+		data: liquidityData,
+		isLoading: liquidityLoading,
+		error: liquidityError,
+		refetch: refetchLiquidity,
+	} = useQuery({
 		queryKey: ["midas-liquidity"],
 		queryFn: () => fetchMidasLiquidity(),
 		enabled: mode === "create",
@@ -85,9 +91,16 @@ export function GoalForm({ mode, goalId, onSuccess, onCancel }: GoalFormProps) {
 		}
 	}, [mode, existingGoal]);
 
-	const midasAccountId = liquidityData?.liquidity?.midasAccountId;
-	const isMidasNotConfigured =
-		mode === "create" && !liquidityLoading && !midasAccountId;
+	const midasClassification = classifyMidasLiquidityState(
+		liquidityLoading,
+		liquidityData,
+		liquidityError,
+	);
+
+	const midasAccountId =
+		midasClassification.status === "CONFIGURED"
+			? midasClassification.liquidity.midasAccountId
+			: undefined;
 
 	const createMutation = useMutation({
 		mutationFn: async (attempt: {
@@ -341,33 +354,71 @@ export function GoalForm({ mode, goalId, onSuccess, onCancel }: GoalFormProps) {
 		}
 	};
 
-	// Guard: Midas not configured (Section 31)
-	if (isMidasNotConfigured) {
-		return (
-			<div
-				className="card text-center p-6"
-				data-testid="midas-not-configured-guard"
-			>
-				<div className="header-icon-badge mx-auto mb-4 bg-warning-subtle text-warning">
-					<Wallet size={32} aria-hidden="true" />
+	// Guard: Midas states in create mode (Section 31 & R1)
+	if (mode === "create") {
+		if (midasClassification.status === "LOADING") {
+			return (
+				<div className="loading-state p-8">
+					<RefreshCw size={24} className="spin" aria-hidden="true" />
+					<span>Bilgiler yükleniyor...</span>
 				</div>
-				<h2 className="text-lg font-bold mb-2">Midas Hesabı Bulunamadı</h2>
-				<p className="text-muted mb-4 max-w-md mx-auto">
-					Kısa vadeli hedef oluşturmak için önce Midas likidite hesabını
-					bağlayın.
-				</p>
-				<Link
-					to="/midas"
-					className="btn btn-primary"
-					data-testid="link-to-setup-midas"
+			);
+		}
+
+		if (midasClassification.status === "NOT_CONFIGURED") {
+			return (
+				<div
+					className="card text-center p-6"
+					data-testid="midas-not-configured-guard"
 				>
-					<span>Midas'ı Kur</span>
-				</Link>
-			</div>
-		);
+					<div className="header-icon-badge mx-auto mb-4 bg-warning-subtle text-warning">
+						<Wallet size={32} aria-hidden="true" />
+					</div>
+					<h2 className="text-lg font-bold mb-2">Midas Hesabı Bulunamadı</h2>
+					<p className="text-muted mb-4 max-w-md mx-auto">
+						Kısa vadeli hedef oluşturmak için önce Midas likidite hesabını
+						bağlayın.
+					</p>
+					<Link
+						to="/midas"
+						className="btn btn-primary"
+						data-testid="link-to-setup-midas"
+					>
+						<span>Midas'ı Kur</span>
+					</Link>
+				</div>
+			);
+		}
+
+		if (midasClassification.status === "ERROR") {
+			return (
+				<div
+					className="card text-center p-6"
+					data-testid="midas-authority-error-guard"
+				>
+					<div className="header-icon-badge mx-auto mb-4 bg-danger-subtle text-danger">
+						<AlertCircle size={32} aria-hidden="true" />
+					</div>
+					<h2 className="text-lg font-bold mb-2">Midas Durumu Doğrulanamadı</h2>
+					<p className="text-muted mb-4 max-w-md mx-auto">
+						Yeni hedef oluşturulmadan önce Midas likidite durumu
+						doğrulanmalıdır.
+					</p>
+					<button
+						type="button"
+						className="btn btn-secondary inline-flex items-center gap-2"
+						onClick={() => void refetchLiquidity()}
+						data-testid="retry-liquidity-btn"
+					>
+						<RefreshCw size={16} aria-hidden="true" />
+						<span>Yeniden Dene</span>
+					</button>
+				</div>
+			);
+		}
 	}
 
-	if (goalLoading || liquidityLoading) {
+	if (goalLoading) {
 		return (
 			<div className="loading-state p-8">
 				<RefreshCw size={24} className="spin" aria-hidden="true" />

@@ -8,6 +8,7 @@ import type {
 	CreateLongTermTaskPayload,
 	LongTermTaskProductDto,
 } from "../../api/f7-types";
+import { classifyMidasLiquidityState } from "../../lib/midas-state";
 import {
 	formatCentsToTry,
 	formatMoneyToTry,
@@ -17,8 +18,8 @@ import {
 import { MoneyInput } from "../common/MoneyInput";
 
 interface LongTermTaskFormProps {
-	onSuccess?: (task: LongTermTaskProductDto) => void;
-	onCancel?: () => void;
+	onSuccess?: ((task: LongTermTaskProductDto) => void) | undefined;
+	onCancel?: (() => void) | undefined;
 }
 
 export function LongTermTaskForm({
@@ -41,18 +42,31 @@ export function LongTermTaskForm({
 		payload: CreateLongTermTaskPayload;
 	} | null>(null);
 
-	// Load Midas liquidity to check account and unallocated balance
-	const { data: liquidityData, isLoading: liquidityLoading } = useQuery({
+	// Load Midas liquidity to check account and unallocated balance (R1)
+	const {
+		data: liquidityData,
+		isLoading: liquidityLoading,
+		error: liquidityError,
+		refetch: refetchLiquidity,
+	} = useQuery({
 		queryKey: ["midas-liquidity"],
 		queryFn: () => fetchMidasLiquidity(),
 		staleTime: 30_000,
 		retry: false,
 	});
 
-	const liquidity = liquidityData?.liquidity;
+	const midasClassification = classifyMidasLiquidityState(
+		liquidityLoading,
+		liquidityData,
+		liquidityError,
+	);
+
+	const liquidity =
+		midasClassification.status === "CONFIGURED"
+			? midasClassification.liquidity
+			: null;
 	const midasAccountId = liquidity?.midasAccountId;
-	const unallocatedBalance = liquidity?.unallocatedBalance ?? "0.00";
-	const isMidasNotConfigured = !liquidityLoading && !midasAccountId;
+	const unallocatedBalance = liquidity?.unallocatedBalance;
 
 	const createMutation = useMutation({
 		mutationFn: async (attempt: {
@@ -104,9 +118,9 @@ export function LongTermTaskForm({
 		setValidationError(null);
 		setErrorMessage(null);
 
-		if (!midasAccountId) {
+		if (!midasAccountId || unallocatedBalance === undefined) {
 			setValidationError(
-				"Uzun vadeli görev oluşturmak için önce Midas likidite hesabını bağlayın.",
+				"Serbest Midas bakiyesi doğrulanamadı. Yeni uzun vadeli görev oluşturulamaz.",
 			);
 			return;
 		}
@@ -160,8 +174,17 @@ export function LongTermTaskForm({
 		}
 	};
 
-	// Guard: Midas not configured
-	if (isMidasNotConfigured) {
+	// Section 8: State machine (LOADING, NOT_CONFIGURED, ERROR, CONFIGURED)
+	if (midasClassification.status === "LOADING") {
+		return (
+			<div className="loading-state p-8">
+				<RefreshCw size={24} className="spin" aria-hidden="true" />
+				<span>Midas bilgileri yükleniyor...</span>
+			</div>
+		);
+	}
+
+	if (midasClassification.status === "NOT_CONFIGURED") {
 		return (
 			<div
 				className="card text-center p-6"
@@ -186,11 +209,29 @@ export function LongTermTaskForm({
 		);
 	}
 
-	if (liquidityLoading) {
+	if (midasClassification.status === "ERROR") {
 		return (
-			<div className="loading-state p-8">
-				<RefreshCw size={24} className="spin" aria-hidden="true" />
-				<span>Midas bilgileri yükleniyor...</span>
+			<div
+				className="card text-center p-6"
+				data-testid="midas-authority-error-guard"
+			>
+				<div className="header-icon-badge mx-auto mb-4 bg-danger-subtle text-danger">
+					<AlertCircle size={32} aria-hidden="true" />
+				</div>
+				<h2 className="text-lg font-bold mb-2">Midas Durumu Doğrulanamadı</h2>
+				<p className="text-muted mb-4 max-w-md mx-auto">
+					Serbest Midas bakiyesi doğrulanamadı. Yeni uzun vadeli görev
+					oluşturulamaz.
+				</p>
+				<button
+					type="button"
+					className="btn btn-secondary inline-flex items-center gap-2"
+					onClick={() => void refetchLiquidity()}
+					data-testid="retry-liquidity-btn"
+				>
+					<RefreshCw size={16} aria-hidden="true" />
+					<span>Yeniden Dene</span>
+				</button>
 			</div>
 		);
 	}
@@ -227,7 +268,8 @@ export function LongTermTaskForm({
 							className="summary-value font-mono font-bold"
 							data-testid="form-unallocated-balance"
 						>
-							{formatMoneyToTry(unallocatedBalance)}
+							{/* unallocatedBalance is guaranteed string — CONFIGURED branch rendered above early returns */}
+							{formatMoneyToTry(unallocatedBalance as string)}
 						</span>
 					</div>
 				</div>
@@ -292,7 +334,8 @@ export function LongTermTaskForm({
 						required
 					/>
 					<span className="form-hint">
-						Azami: {formatMoneyToTry(unallocatedBalance)}
+						{/* unallocatedBalance is guaranteed string — CONFIGURED branch rendered above early returns */}
+						Azami: {formatMoneyToTry(unallocatedBalance as string)}
 					</span>
 				</div>
 

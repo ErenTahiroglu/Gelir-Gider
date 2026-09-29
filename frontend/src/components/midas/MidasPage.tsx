@@ -15,9 +15,9 @@ import {
 	Wallet,
 } from "lucide-react";
 import { useMemo, useState } from "react";
-import { ApiError } from "../../api/errors";
 import { fetchMidasLiquidity } from "../../api/f7-api";
 import type { MidasBucketProductDto } from "../../api/f7-types";
+import { classifyMidasLiquidityState } from "../../lib/midas-state";
 import { formatMoneyToTry } from "../../lib/money";
 import { MidasSetupCard } from "./MidasSetupCard";
 import { MidasTransferHistory } from "./MidasTransferHistory";
@@ -42,14 +42,14 @@ export function MidasPage() {
 		retry: false,
 	});
 
-	const isNotConfigured = useMemo(() => {
-		if (error instanceof ApiError) {
-			return error.status === 404 || error.code === "MIDAS_ACCOUNT_NOT_FOUND";
-		}
-		return false;
-	}, [error]);
+	const classification = classifyMidasLiquidityState(
+		isLoading,
+		liquidityData,
+		error,
+	);
 
-	const liquidity = liquidityData?.liquidity;
+	const liquidity =
+		classification.status === "CONFIGURED" ? classification.liquidity : null;
 
 	// Categorize buckets
 	const cardReserveBuckets = useMemo(
@@ -97,7 +97,7 @@ export function MidasPage() {
 		setModalMode("release");
 	};
 
-	if (isLoading) {
+	if (classification.status === "LOADING") {
 		return (
 			<div
 				className="page-container midas-page"
@@ -111,8 +111,8 @@ export function MidasPage() {
 		);
 	}
 
-	// Section 5, 11: NOT_CONFIGURED state (404 MIDAS_ACCOUNT_NOT_FOUND)
-	if (isNotConfigured || !liquidity) {
+	// Section 5, 11: NOT_CONFIGURED state (exact 404 MIDAS_ACCOUNT_NOT_FOUND only)
+	if (classification.status === "NOT_CONFIGURED") {
 		return (
 			<div className="page-container midas-page" data-testid="midas-page-setup">
 				<div className="page-header">
@@ -126,22 +126,19 @@ export function MidasPage() {
 		);
 	}
 
-	// Generic error
-	if (error) {
+	// Generic error / authority unavailable / malformed liquidity
+	if (classification.status === "ERROR") {
 		return (
 			<div className="page-container midas-page" data-testid="midas-page-error">
 				<div className="alert alert-danger" role="alert">
 					<AlertCircle size={20} aria-hidden="true" />
 					<div className="alert-content">
-						<span>
-							{error instanceof ApiError
-								? error.userMessage
-								: "Likidite bilgileri alınamadı."}
-						</span>
+						<span>{classification.message}</span>
 						<button
 							type="button"
 							className="btn btn-sm btn-secondary mt-2"
 							onClick={() => void refetch()}
+							data-testid="midas-retry-btn"
 						>
 							Yeniden Dene
 						</button>
@@ -149,6 +146,10 @@ export function MidasPage() {
 				</div>
 			</div>
 		);
+	}
+
+	if (!liquidity) {
+		return null;
 	}
 
 	return (

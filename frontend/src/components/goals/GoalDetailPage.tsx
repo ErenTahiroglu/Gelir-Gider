@@ -25,6 +25,7 @@ import type {
 	CompleteShortTermGoalPayload,
 } from "../../api/f7-types";
 import { formatDueDateRelativeTurkish } from "../../lib/istanbul-date";
+import { classifyMidasLiquidityState } from "../../lib/midas-state";
 import { formatMoneyToTry, parseMoneyToCents } from "../../lib/money";
 import { GoalFundingModal } from "./GoalFundingModal";
 
@@ -63,15 +64,32 @@ export function GoalDetailPage({ goalId }: GoalDetailPageProps) {
 		staleTime: 30_000,
 	});
 
-	const { data: liquidityData } = useQuery({
+	const goal = goalData?.goal;
+
+	// Check Midas liquidity authority (R1)
+	const {
+		data: liquidityData,
+		isLoading: liquidityLoading,
+		error: liquidityError,
+		refetch: refetchLiquidity,
+	} = useQuery({
 		queryKey: ["midas-liquidity"],
 		queryFn: () => fetchMidasLiquidity(),
 		staleTime: 30_000,
+		retry: false,
 	});
 
-	const goal = goalData?.goal;
+	const midasClassification = classifyMidasLiquidityState(
+		liquidityLoading,
+		liquidityData,
+		liquidityError,
+	);
+
+	const isMidasConfigured = midasClassification.status === "CONFIGURED";
 	const unallocatedBalance =
-		liquidityData?.liquidity?.unallocatedBalance ?? "0.00";
+		midasClassification.status === "CONFIGURED"
+			? midasClassification.liquidity.unallocatedBalance
+			: undefined;
 
 	const hasNonZeroBalance = useMemo(() => {
 		if (!goal) return false;
@@ -422,38 +440,79 @@ export function GoalDetailPage({ goalId }: GoalDetailPageProps) {
 
 					{/* Goal Funding Actions */}
 					{goal.status === "ACTIVE" && (
-						<div className="goal-funding-action-btns mt-6 flex gap-3">
-							<button
-								type="button"
-								className="btn btn-primary flex-1"
-								onClick={() => {
-									setFundingMode("fund");
-									setIsFundingModalOpen(true);
-								}}
-								data-testid="open-fund-modal-btn"
-							>
-								<ArrowUpRight size={16} aria-hidden="true" />
-								<span>Para Aktar (Fonla)</span>
-							</button>
+						<div className="goal-funding-section mt-6">
+							<div className="goal-funding-action-btns flex gap-3">
+								<button
+									type="button"
+									className="btn btn-primary flex-1"
+									onClick={() => {
+										setFundingMode("fund");
+										setIsFundingModalOpen(true);
+									}}
+									disabled={!isMidasConfigured}
+									title={
+										midasClassification.status === "LOADING"
+											? "Midas likidite durumu yükleniyor..."
+											: midasClassification.status === "NOT_CONFIGURED"
+												? "Midas hesabı bağlı olmadığı için fonlama yapılamaz"
+												: midasClassification.status === "ERROR"
+													? "Midas serbest bakiye durumu doğrulanamadığı için fonlama yapılamaz"
+													: undefined
+									}
+									data-testid="open-fund-modal-btn"
+								>
+									{midasClassification.status === "LOADING" ? (
+										<RefreshCw size={16} className="spin" aria-hidden="true" />
+									) : (
+										<ArrowUpRight size={16} aria-hidden="true" />
+									)}
+									<span>Para Aktar (Fonla)</span>
+								</button>
 
-							<button
-								type="button"
-								className="btn btn-secondary flex-1"
-								onClick={() => {
-									setFundingMode("release");
-									setIsFundingModalOpen(true);
-								}}
-								disabled={!hasNonZeroBalance}
-								title={
-									!hasNonZeroBalance
-										? "Hedefte çekilecek bakiye bulunmuyor"
-										: undefined
-								}
-								data-testid="open-release-modal-btn"
-							>
-								<ArrowDownLeft size={16} aria-hidden="true" />
-								<span>Para Çek (Serbeste)</span>
-							</button>
+								<button
+									type="button"
+									className="btn btn-secondary flex-1"
+									onClick={() => {
+										setFundingMode("release");
+										setIsFundingModalOpen(true);
+									}}
+									disabled={!hasNonZeroBalance}
+									title={
+										!hasNonZeroBalance
+											? "Hedefte çekilecek bakiye bulunmuyor"
+											: undefined
+									}
+									data-testid="open-release-modal-btn"
+								>
+									<ArrowDownLeft size={16} aria-hidden="true" />
+									<span>Para Çek (Serbeste)</span>
+								</button>
+							</div>
+
+							{/* Midas Authority Error Alert (R1) */}
+							{midasClassification.status === "ERROR" && (
+								<div
+									className="alert alert-danger mt-3"
+									role="alert"
+									data-testid="midas-authority-error-alert"
+								>
+									<AlertCircle size={16} aria-hidden="true" />
+									<div className="alert-content flex-1">
+										<span>
+											Midas serbest bakiye durumu doğrulanamadığı için fonlama
+											işlemi yapılamaz.
+										</span>
+										<button
+											type="button"
+											className="btn btn-sm btn-secondary mt-1 inline-flex"
+											onClick={() => void refetchLiquidity()}
+											data-testid="retry-liquidity-btn"
+										>
+											<span>Yeniden Dene</span>
+										</button>
+									</div>
+								</div>
+							)}
 						</div>
 					)}
 				</div>

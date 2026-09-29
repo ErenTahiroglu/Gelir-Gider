@@ -17,6 +17,7 @@ import type {
 import * as manualExpensesApi from "../src/api/manual-expenses-api";
 import { GoalsPage } from "../src/components/goals/GoalsPage";
 import { LongTermPage } from "../src/components/long-term/LongTermPage";
+import { LongTermTaskForm } from "../src/components/long-term/LongTermTaskForm";
 import { MidasPage } from "../src/components/midas/MidasPage";
 import { MidasSetupCard } from "../src/components/midas/MidasSetupCard";
 import { ReserveTransferModal } from "../src/components/midas/ReserveTransferModal";
@@ -407,5 +408,207 @@ describe("Phase F7 — Midas Liquidity, Setup & Card Reserve", () => {
 				expect.any(String),
 			);
 		});
+	});
+
+	it("R1 regression: MidasPage handles Case A (404), Case B (500), and Case C (Network Error) correctly", async () => {
+		// Case A: 404 MIDAS_ACCOUNT_NOT_FOUND -> setup screen visible, "Midas'ı Kur" available, generic error absent
+		vi.spyOn(f7Api, "fetchMidasLiquidity").mockRejectedValue(
+			new ApiError({
+				status: 404,
+				code: "MIDAS_ACCOUNT_NOT_FOUND",
+				message: "No Midas account",
+			}),
+		);
+
+		const { wrapper: wrapperA } = createWrapper();
+		render(<MidasPage />, { wrapper: wrapperA });
+
+		expect(
+			await screen.findByText(/Midas Likidite Hesabını Bağla/i),
+		).toBeInTheDocument();
+		expect(screen.getByTestId("midas-page-setup")).toBeInTheDocument();
+		expect(screen.queryByTestId("midas-page-error")).toBeNull();
+
+		cleanup();
+
+		// Case B: 500 INTERNAL_ERROR -> generic authority error visible, setup card absent, "Midas'ı Kur" absent
+		vi.spyOn(f7Api, "fetchMidasLiquidity").mockRejectedValue(
+			new ApiError({
+				status: 500,
+				code: "INTERNAL_ERROR",
+				message: "Internal server error",
+			}),
+		);
+
+		const { wrapper: wrapperB } = createWrapper();
+		render(<MidasPage />, { wrapper: wrapperB });
+
+		expect(await screen.findByTestId("midas-page-error")).toBeInTheDocument();
+		expect(screen.queryByTestId("midas-page-setup")).toBeNull();
+		expect(screen.queryByText(/Midas Likidite Hesabını Bağla/i)).toBeNull();
+
+		cleanup();
+
+		// Case C: Network error -> error with retry button visible, setup card absent
+		vi.spyOn(f7Api, "fetchMidasLiquidity").mockRejectedValue(
+			new ApiError({
+				status: 0,
+				code: "NETWORK_ERROR",
+				message: "Network drop",
+			}),
+		);
+
+		const { wrapper: wrapperC } = createWrapper();
+		render(<MidasPage />, { wrapper: wrapperC });
+
+		expect(await screen.findByTestId("midas-page-error")).toBeInTheDocument();
+		expect(screen.getByTestId("midas-retry-btn")).toBeInTheDocument();
+		expect(screen.queryByTestId("midas-page-setup")).toBeNull();
+	});
+
+	it("R1 regression: LongTermPage and LongTermTaskForm differentiate generic Midas error from NOT_CONFIGURED", async () => {
+		// 1. Generic 500 error on liquidity
+		vi.spyOn(f7Api, "fetchMidasLiquidity").mockRejectedValue(
+			new ApiError({
+				status: 500,
+				code: "INTERNAL_ERROR",
+				message: "Database down",
+			}),
+		);
+		vi.spyOn(f7Api, "fetchLongTermTasks").mockResolvedValue({
+			tasks: [],
+			nextCursor: null,
+			limit: 50,
+			hasMore: false,
+		});
+
+		// LongTermPage: shows authority error alert, does NOT show not-configured alert
+		const { wrapper: pageErrorWrapper } = createWrapper();
+		render(<LongTermPage />, { wrapper: pageErrorWrapper });
+
+		expect(
+			await screen.findByTestId("midas-authority-error-alert"),
+		).toBeInTheDocument();
+		expect(screen.queryByTestId("midas-not-configured-alert")).toBeNull();
+		// Task tabs remain visible
+		expect(screen.getByTestId("tab-pending-tasks")).toBeInTheDocument();
+
+		cleanup();
+
+		// LongTermTaskForm: shows authority error guard, does NOT show setup CTA
+		const { wrapper: formErrorWrapper } = createWrapper();
+		render(<LongTermTaskForm />, { wrapper: formErrorWrapper });
+
+		expect(
+			await screen.findByTestId("midas-authority-error-guard"),
+		).toBeInTheDocument();
+		expect(
+			screen.getByText(
+				/Serbest Midas bakiyesi doğrulanamadı. Yeni uzun vadeli görev oluşturulamaz/i,
+			),
+		).toBeInTheDocument();
+		expect(screen.queryByTestId("midas-not-configured-guard")).toBeNull();
+
+		cleanup();
+
+		// 2. Exact 404 MIDAS_ACCOUNT_NOT_FOUND
+		vi.spyOn(f7Api, "fetchMidasLiquidity").mockRejectedValue(
+			new ApiError({
+				status: 404,
+				code: "MIDAS_ACCOUNT_NOT_FOUND",
+				message: "No account",
+			}),
+		);
+
+		// LongTermPage: shows not-configured alert with "Midas'ı Kur"
+		const { wrapper: pageSetupWrapper } = createWrapper();
+		render(<LongTermPage />, { wrapper: pageSetupWrapper });
+
+		expect(
+			await screen.findByTestId("midas-not-configured-alert"),
+		).toBeInTheDocument();
+		expect(screen.getByText(/Midas'ı Kur/i)).toBeInTheDocument();
+		expect(screen.queryByTestId("midas-authority-error-alert")).toBeNull();
+
+		cleanup();
+
+		// LongTermTaskForm: shows not-configured guard with "Midas'ı Kur"
+		const { wrapper: formSetupWrapper } = createWrapper();
+		render(<LongTermTaskForm />, { wrapper: formSetupWrapper });
+
+		expect(
+			await screen.findByTestId("midas-not-configured-guard"),
+		).toBeInTheDocument();
+		expect(screen.getByText(/Midas'ı Kur/i)).toBeInTheDocument();
+		expect(screen.queryByTestId("midas-authority-error-guard")).toBeNull();
+	});
+
+	it("R3 regression: 0.00 balance TRY ASSET is eligible for setup, negative balance is ineligible, and empty copy is corrected", async () => {
+		// Mock ledger accounts: one with 0.00 balance, one with negative balance, one non-TRY
+		vi.spyOn(manualExpensesApi, "fetchAllLedgerAccounts").mockResolvedValue([
+			{
+				accountId: "acc-zero",
+				code: "100.02",
+				name: "Midas Sıfır Bakiye",
+				accountType: "ASSET",
+				normalBalance: "DEBIT",
+				currency: "TRY",
+				balance: "0.00",
+				archived: false,
+			},
+			{
+				accountId: "acc-neg",
+				code: "100.03",
+				name: "Negatif Kasa",
+				accountType: "ASSET",
+				normalBalance: "DEBIT",
+				currency: "TRY",
+				balance: "-100.00",
+				archived: false,
+			},
+		]);
+
+		const { wrapper } = createWrapper();
+		render(<MidasSetupCard />, { wrapper });
+
+		// Wait for select options to populate
+		await screen.findByTestId("midas-ledger-account-select");
+
+		const select = screen.getByTestId(
+			"midas-ledger-account-select",
+		) as HTMLSelectElement;
+		const optionValues = Array.from(select.options).map((o) => o.value);
+
+		// acc-zero (0.00 balance) MUST be present as an eligible option
+		expect(optionValues).toContain("acc-zero");
+
+		// acc-neg (-100.00 balance) MUST NOT be present
+		expect(optionValues).not.toContain("acc-neg");
+
+		cleanup();
+
+		// When only negative accounts exist, verify corrected empty-state copy
+		vi.spyOn(manualExpensesApi, "fetchAllLedgerAccounts").mockResolvedValue([
+			{
+				accountId: "acc-neg-only",
+				code: "100.04",
+				name: "Yalnızca Negatif",
+				accountType: "ASSET",
+				normalBalance: "DEBIT",
+				currency: "TRY",
+				balance: "-50.00",
+				archived: false,
+			},
+		]);
+
+		const { wrapper: emptyWrapper } = createWrapper();
+		render(<MidasSetupCard />, { wrapper: emptyWrapper });
+
+		expect(
+			await screen.findByText(
+				/Uygun, negatif bakiyesi olmayan bir TL varlık hesabı bulunamadı/i,
+			),
+		).toBeInTheDocument();
+		expect(screen.queryByText(/pozitif bakiyeli bir ASSET hesabı/i)).toBeNull();
 	});
 });

@@ -188,8 +188,7 @@ export function MidasSetupCard({ onSetupSuccess }: MidasSetupCardProps) {
 							<div className="text-danger">Hesaplar yüklenemedi.</div>
 						) : eligibleAccounts.length === 0 ? (
 							<div className="text-muted">
-								Uygun TL varlık hesabı bulunamadı. Lütfen önce Muhasebe
-								modülünden pozitif bakiyeli bir ASSET hesabı oluşturun.
+								Uygun, negatif bakiyesi olmayan bir TL varlık hesabı bulunamadı.
 							</div>
 						) : (
 							<select

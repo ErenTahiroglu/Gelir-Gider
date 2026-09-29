@@ -80,24 +80,22 @@ describe("Phase F7 — Domain Separation & Anti-Bypass Invariants", () => {
 		const fundGoalSpy = vi.spyOn(f7Api, "fundShortTermGoal").mockResolvedValue({
 			funding: {
 				goalId: "goal-domain-1",
-				midasAccountId: "midas-1",
-				midasBucketId: "b-goal-1",
 				transferId: "tr-fund-1",
 				amount: "200.00",
-				occurredAt: "2026-03-29T10:00:00Z",
+				idempotentReplay: false,
 			},
+			idempotentReplay: false,
 		});
 		const releaseGoalSpy = vi
 			.spyOn(f7Api, "releaseShortTermGoal")
 			.mockResolvedValue({
 				release: {
 					goalId: "goal-domain-1",
-					midasAccountId: "midas-1",
-					midasBucketId: "b-goal-1",
 					transferId: "tr-rel-1",
 					amount: "200.00",
-					occurredAt: "2026-03-29T10:00:00Z",
+					idempotentReplay: false,
 				},
+				idempotentReplay: false,
 			});
 
 		const { wrapper } = createWrapper();
