@@ -28,6 +28,7 @@ export function DesktopSidebar({
 	const isTransactionsActive =
 		currentPath.startsWith("/transactions") ||
 		currentPath.startsWith("/manual-expenses");
+	const isCardsActive = currentPath.startsWith("/cards");
 	// Keyboard shortcut: Cmd/Ctrl + B to toggle sidebar
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -113,17 +114,16 @@ export function DesktopSidebar({
 					</li>
 
 					<li className="nav-item">
-						<button
-							type="button"
-							className="nav-link disabled"
-							disabled
-							aria-disabled="true"
-							title={collapsed ? "Kartlar (F5)" : "F5 aşamasında eklenecek"}
+						<Link
+							to="/cards"
+							className={`nav-link ${isCardsActive ? "active" : ""}`}
+							aria-current={isCardsActive ? "page" : undefined}
+							title={collapsed ? "Kredi Kartları" : undefined}
 							data-testid="nav-link-cards"
 						>
 							<CreditCard size={20} aria-hidden="true" />
-							{!collapsed && <span className="nav-label">Kartlar</span>}
-						</button>
+							{!collapsed && <span className="nav-label">Kredi Kartları</span>}
+						</Link>
 					</li>
 
 					<li className="nav-item">

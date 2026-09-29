@@ -11,6 +11,7 @@ export function MobileNav() {
 	const isTransactionsActive =
 		currentPath.startsWith("/transactions") ||
 		currentPath.startsWith("/manual-expenses");
+	const isCardsActive = currentPath.startsWith("/cards");
 
 	return (
 		<nav
@@ -54,17 +55,16 @@ export function MobileNav() {
 					</button>
 				</div>
 
-				<button
-					type="button"
-					className="mobile-nav-item disabled"
-					disabled
-					aria-disabled="true"
+				<Link
+					to="/cards"
+					className={`mobile-nav-item ${isCardsActive ? "active" : ""}`}
+					aria-current={isCardsActive ? "page" : undefined}
 					data-testid="mobile-nav-cards"
-					aria-label="Kartlar (F5 aşamasında eklenecek)"
+					aria-label="Kartlar"
 				>
 					<CreditCard size={22} aria-hidden="true" />
 					<span className="mobile-nav-label">Kartlar</span>
-				</button>
+				</Link>
 
 				<button
 					type="button"

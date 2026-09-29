@@ -94,6 +94,7 @@ export interface CreditCardPurchasePayload {
 	shortTermGoalId?: string | undefined;
 	merchant?: string | undefined;
 	description?: string | undefined;
+	installmentCount?: number | undefined;
 	occurredAt: string;
 }
 

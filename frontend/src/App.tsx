@@ -11,6 +11,14 @@ import { useEffect } from "react";
 import { AuthProvider, useAuth } from "./auth/auth-context";
 import { AuthGate } from "./components/auth/AuthGate";
 import { UnlockScreen } from "./components/auth/UnlockScreen";
+import { CardDetailPage } from "./components/cards/CardDetailPage";
+import { CardForm } from "./components/cards/CardForm";
+import { CardsPage } from "./components/cards/CardsPage";
+import { PurchaseDetailPage } from "./components/cards/purchases/PurchaseDetailPage";
+import { PurchaseForm } from "./components/cards/purchases/PurchaseForm";
+import { SplitDetailPage } from "./components/cards/purchases/SplitDetailPage";
+import { StatementDetailPage } from "./components/cards/statements/StatementDetailPage";
+import { StatementForm } from "./components/cards/statements/StatementForm";
 import { DashboardPage } from "./components/dashboard/DashboardPage";
 import { AppShell } from "./components/layout/AppShell";
 import { ManualExpenseForm } from "./components/manual-expenses/ManualExpenseForm";
@@ -146,6 +154,222 @@ const templateManagementRoute = createRoute({
 	component: AuthenticatedTemplateManagement,
 });
 
+function AuthenticatedCards() {
+	return (
+		<AppShell>
+			<CardsPage />
+		</AppShell>
+	);
+}
+
+function AuthenticatedCardNew() {
+	const navigate = useNavigate();
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Yeni Kredi Kartı</h1>
+					<CardForm
+						mode="create"
+						onSuccess={(c) =>
+							void navigate({
+								to: "/cards/$cardId",
+								params: { cardId: c.cardId },
+							})
+						}
+						onCancel={() => void navigate({ to: "/cards" })}
+					/>
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedCardDetail() {
+	const params = cardDetailRoute.useParams();
+	return (
+		<AppShell>
+			<CardDetailPage cardId={params.cardId} />
+		</AppShell>
+	);
+}
+
+function AuthenticatedCardEdit() {
+	const params = cardEditRoute.useParams();
+	const navigate = useNavigate();
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Kartı Düzenle</h1>
+					<CardForm
+						mode="edit"
+						cardId={params.cardId}
+						onSuccess={() =>
+							void navigate({
+								to: "/cards/$cardId",
+								params: { cardId: params.cardId },
+							})
+						}
+						onCancel={() =>
+							void navigate({
+								to: "/cards/$cardId",
+								params: { cardId: params.cardId },
+							})
+						}
+					/>
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedStatementNew() {
+	const params = statementNewRoute.useParams();
+	const navigate = useNavigate();
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Yeni Ekstre</h1>
+					<StatementForm
+						mode="create"
+						cardId={params.cardId}
+						onSuccess={(s) =>
+							void navigate({
+								to: "/cards/$cardId/statements/$statementId",
+								params: { cardId: params.cardId, statementId: s.statementId },
+							})
+						}
+						onCancel={() =>
+							void navigate({
+								to: "/cards/$cardId",
+								params: { cardId: params.cardId },
+							})
+						}
+					/>
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedStatementDetail() {
+	const params = statementDetailRoute.useParams();
+	return (
+		<AppShell>
+			<StatementDetailPage
+				cardId={params.cardId}
+				statementId={params.statementId}
+			/>
+		</AppShell>
+	);
+}
+
+function AuthenticatedPurchaseNew() {
+	const params = purchaseNewRoute.useParams();
+	const navigate = useNavigate();
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Yeni Kart Harcaması</h1>
+					<PurchaseForm
+						cardId={params.cardId}
+						onSuccess={() =>
+							void navigate({
+								to: "/cards/$cardId",
+								params: { cardId: params.cardId },
+							})
+						}
+						onCancel={() =>
+							void navigate({
+								to: "/cards/$cardId",
+								params: { cardId: params.cardId },
+							})
+						}
+					/>
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedPurchaseDetail() {
+	const params = purchaseDetailRoute.useParams();
+	return (
+		<AppShell>
+			<PurchaseDetailPage
+				cardId={params.cardId}
+				purchaseId={params.purchaseId}
+			/>
+		</AppShell>
+	);
+}
+
+function AuthenticatedSplitDetail() {
+	const params = splitDetailRoute.useParams();
+	return (
+		<AppShell>
+			<SplitDetailPage cardId={params.cardId} purchaseId={params.purchaseId} />
+		</AppShell>
+	);
+}
+
+const cardsRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/cards",
+	component: AuthenticatedCards,
+});
+
+const cardNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/cards/new",
+	component: AuthenticatedCardNew,
+});
+
+const cardDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/cards/$cardId",
+	component: AuthenticatedCardDetail,
+});
+
+const cardEditRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/cards/$cardId/edit",
+	component: AuthenticatedCardEdit,
+});
+
+const statementNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/cards/$cardId/statements/new",
+	component: AuthenticatedStatementNew,
+});
+
+const statementDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/cards/$cardId/statements/$statementId",
+	component: AuthenticatedStatementDetail,
+});
+
+const purchaseNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/cards/$cardId/purchases/new",
+	component: AuthenticatedPurchaseNew,
+});
+
+const purchaseDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/cards/$cardId/purchases/$purchaseId",
+	component: AuthenticatedPurchaseDetail,
+});
+
+const splitDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/cards/$cardId/purchases/$purchaseId/split",
+	component: AuthenticatedSplitDetail,
+});
+
 const routeTree = rootRoute.addChildren([
 	indexRoute,
 	unlockRoute,
@@ -154,6 +378,15 @@ const routeTree = rootRoute.addChildren([
 	manualExpenseNewRoute,
 	manualExpenseEditRoute,
 	templateManagementRoute,
+	cardsRoute,
+	cardNewRoute,
+	cardDetailRoute,
+	cardEditRoute,
+	statementNewRoute,
+	statementDetailRoute,
+	purchaseNewRoute,
+	purchaseDetailRoute,
+	splitDetailRoute,
 ]);
 
 export const router = createRouter({ routeTree });

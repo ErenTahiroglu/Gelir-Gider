@@ -52,10 +52,10 @@ describe("App Shell — Responsive Desktop Sidebar & Mobile Nav Invariants", () 
 		expect(fab).not.toBeDisabled();
 		expect(fab).not.toHaveAttribute("aria-disabled", "true");
 
-		// 4. Kartlar is disabled (F5)
+		// 4. Kartlar is active in F5
 		const cardsBtn = screen.getByTestId("mobile-nav-cards");
-		expect(cardsBtn).toBeDisabled();
-		expect(cardsBtn).toHaveAttribute("aria-disabled", "true");
+		expect(cardsBtn).toHaveAttribute("href", "/cards");
+		expect(cardsBtn).not.toHaveAttribute("aria-disabled", "true");
 
 		// 5. Daha Fazla is disabled
 		const moreBtn = screen.getByTestId("mobile-nav-more");
@@ -94,8 +94,12 @@ describe("App Shell — Responsive Desktop Sidebar & Mobile Nav Invariants", () 
 		const txLink = screen.getByTestId("nav-link-transactions");
 		expect(txLink).toHaveAttribute("href", "/transactions");
 
+		// Cards active in F5
+		const cardsLink = screen.getByTestId("nav-link-cards");
+		expect(cardsLink).toHaveAttribute("href", "/cards");
+		expect(cardsLink).not.toBeDisabled();
+
 		// Future links disabled
-		expect(screen.getByTestId("nav-link-cards")).toBeDisabled();
 		expect(screen.getByTestId("nav-link-people")).toBeDisabled();
 		expect(screen.getByTestId("nav-link-budget")).toBeDisabled();
 		expect(screen.getByTestId("nav-link-goals")).toBeDisabled();
