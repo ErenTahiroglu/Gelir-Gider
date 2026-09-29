@@ -100,6 +100,146 @@ describe("F5 Card Statements & Payment Lifecycle", () => {
 		expect(screen.getByTestId("reserve-satisfied-status")).toHaveTextContent(
 			"Eksik",
 		);
+
+		// R2: Pay button MUST be disabled when MIDAS_FUND reserve is unsatisfied
+		expect(screen.getByTestId("confirm-statement-pay-button")).toBeDisabled();
+		expect(screen.getByTestId("reserve-shortfall-warning")).toHaveTextContent(
+			"Kart Rezervi tutarı ekstre için eksik kalmaktadır.",
+		);
+
+		// Attempted submit must not call payCreditCardStatement
+		const mockPay = vi.spyOn(creditCardsApi, "payCreditCardStatement");
+		fireEvent.click(screen.getByTestId("confirm-statement-pay-button"));
+		expect(mockPay).not.toHaveBeenCalled();
+	});
+
+	it("fails closed when readiness query errors, presents natural unavailable copy and allows retry (R1)", async () => {
+		const statement: creditCardsApi.CreditCardStatementItem = {
+			statementId: "stmt-1",
+			cardId: "card-1",
+			cycleYear: 2026,
+			cycleMonth: 3,
+			status: "OPEN",
+			revisionNo: 1,
+			statementAmount: "3000.00",
+			statementDate: "2026-03-15",
+			dueDate: "2026-03-25",
+			reservePlacement: "MIDAS_FUND",
+			reserveAmount: "3000.00",
+			reserveSatisfied: true,
+			note: null,
+		};
+
+		const mockPay = vi.spyOn(creditCardsApi, "payCreditCardStatement");
+		const readinessSpy = vi
+			.spyOn(creditCardsApi, "fetchStatementReadiness")
+			.mockRejectedValueOnce(new Error("API network failure"))
+			.mockResolvedValueOnce({
+				readiness: {
+					statementId: "stmt-1",
+					cardId: "card-1",
+					statementAmount: "3000.00",
+					cardLiabilityBalance: "4000.00",
+					reservePlacement: "MIDAS_FUND",
+					reserveAmount: "3000.00",
+					liabilityCoverage: "READY",
+					liabilityAfterPayment: "1000.00",
+				},
+			});
+
+		render(
+			<StatementPayModal
+				cardId="card-1"
+				statement={statement}
+				isOpen={true}
+				onClose={vi.fn()}
+				onSuccess={vi.fn()}
+			/>,
+			{ wrapper: createWrapper() },
+		);
+
+		// Must show unavailable state and retry button
+		await waitFor(() => {
+			expect(
+				screen.getByTestId("readiness-unavailable-state"),
+			).toBeInTheDocument();
+		});
+
+		expect(screen.getByTestId("readiness-error-message")).toHaveTextContent(
+			"Ödeme hazırlık durumu alınamadı.",
+		);
+		// Must not falsely claim Yetersiz or Hazır for liabilityCoverage
+		expect(
+			screen.queryByTestId("liability-coverage-status"),
+		).not.toBeInTheDocument();
+
+		// Pay button must remain disabled
+		const payBtn = screen.getByTestId("confirm-statement-pay-button");
+		expect(payBtn).toBeDisabled();
+
+		// Submit must not issue financial POST
+		fireEvent.click(payBtn);
+		expect(mockPay).not.toHaveBeenCalled();
+
+		// Click retry readiness button
+		fireEvent.click(screen.getByTestId("retry-readiness-button"));
+
+		// Readiness recovers to READY
+		await waitFor(() => {
+			expect(screen.getByTestId("liability-coverage-status")).toHaveTextContent(
+				"Hazır",
+			);
+		});
+
+		// Now payment is eligible
+		expect(readinessSpy).toHaveBeenCalledTimes(2);
+		expect(
+			screen.getByTestId("confirm-statement-pay-button"),
+		).not.toBeDisabled();
+	});
+
+	it("fails closed when readiness payload is missing or undefined (R1)", async () => {
+		const statement: creditCardsApi.CreditCardStatementItem = {
+			statementId: "stmt-1",
+			cardId: "card-1",
+			cycleYear: 2026,
+			cycleMonth: 3,
+			status: "OPEN",
+			revisionNo: 1,
+			statementAmount: "2500.00",
+			statementDate: "2026-03-15",
+			dueDate: "2026-03-25",
+			reservePlacement: "MIDAS_FUND",
+			reserveAmount: "2500.00",
+			reserveSatisfied: true,
+			note: null,
+		};
+
+		const mockPay = vi.spyOn(creditCardsApi, "payCreditCardStatement");
+		vi.spyOn(creditCardsApi, "fetchStatementReadiness").mockResolvedValue({
+			readiness: null as any,
+		});
+
+		render(
+			<StatementPayModal
+				cardId="card-1"
+				statement={statement}
+				isOpen={true}
+				onClose={vi.fn()}
+				onSuccess={vi.fn()}
+			/>,
+			{ wrapper: createWrapper() },
+		);
+
+		await waitFor(() => {
+			expect(
+				screen.getByTestId("readiness-unavailable-state"),
+			).toBeInTheDocument();
+		});
+
+		expect(screen.getByTestId("confirm-statement-pay-button")).toBeDisabled();
+		fireEvent.click(screen.getByTestId("confirm-statement-pay-button"));
+		expect(mockPay).not.toHaveBeenCalled();
 	});
 
 	it("blocks payment when liabilityCoverage is SHORTFALL", async () => {

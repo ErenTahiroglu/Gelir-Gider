@@ -51,10 +51,17 @@ export function StatementPayModal({
 	const queryClient = useQueryClient();
 
 	// Fetch readiness
-	const { data: readinessData, isLoading: readinessLoading } = useQuery({
+	const {
+		data: readinessData,
+		isLoading: readinessLoading,
+		isError: readinessIsError,
+		isSuccess: readinessIsSuccess,
+		refetch: refetchReadiness,
+	} = useQuery({
 		queryKey: ["statement-readiness", cardId, statement.statementId],
 		queryFn: () => fetchStatementReadiness(cardId, statement.statementId),
 		enabled: isOpen && statement.status === "OPEN",
+		retry: false,
 	});
 
 	// Fetch Midas liquidity (for excluding Midas ledger asset on OUTSIDE_MIDAS)
@@ -114,9 +121,29 @@ export function StatementPayModal({
 	}, [statement.reservePlacement, eligibleAccounts, selectedAssetId]);
 
 	const readiness = readinessData?.readiness;
-	const isLiabilityShortfall = readiness?.liabilityCoverage === "SHORTFALL";
 	const isMidasFund = statement.reservePlacement === "MIDAS_FUND";
-	const isReserveSatisfied = statement.reserveSatisfied;
+	const isReserveSatisfied = statement.reserveSatisfied === true;
+
+	// R1: Explicit readiness state model (fail-closed)
+	const readinessConfirmed =
+		readinessIsSuccess && readiness !== undefined && readiness !== null;
+	const liabilityReady =
+		readinessConfirmed && readiness.liabilityCoverage === "READY";
+	const isLiabilityShortfall =
+		readinessConfirmed && readiness.liabilityCoverage === "SHORTFALL";
+	const readinessUnavailable =
+		readinessIsError || (readinessIsSuccess && !readinessConfirmed);
+
+	// R2: Midas reserve gate (fail-closed)
+	const reserveReady = !isMidasFund || isReserveSatisfied;
+
+	// Payment eligibility: must be OPEN, readiness confirmed & READY, reserve ready, and asset ready
+	const canPay =
+		statement.status === "OPEN" &&
+		readinessConfirmed &&
+		liabilityReady &&
+		reserveReady &&
+		(isMidasFund || Boolean(selectedAssetId));
 
 	const executePayment = async (payload: PayStatementPayload, key: string) => {
 		setIsSubmitting(true);
@@ -179,8 +206,17 @@ export function StatementPayModal({
 	const handlePaySubmit = async (e: React.FormEvent) => {
 		e.preventDefault();
 
-		if (isLiabilityShortfall) {
-			setErrorMessage("Kart yükümlülüğü ekstre tutarını karşılamıyor.");
+		if (!readinessConfirmed || !liabilityReady) {
+			if (isLiabilityShortfall) {
+				setErrorMessage("Kart yükümlülüğü ekstre tutarını karşılamıyor.");
+			} else {
+				setErrorMessage("Ödeme hazırlık durumu doğrulanamadı.");
+			}
+			return;
+		}
+
+		if (isMidasFund && !isReserveSatisfied) {
+			setErrorMessage("Kart Rezervi ekstre ödemesi için yeterli değil.");
 			return;
 		}
 
@@ -344,6 +380,32 @@ export function StatementPayModal({
 						<p style={{ color: "var(--color-text-muted, #64748b)" }}>
 							Hazırlık durumu denetleniyor...
 						</p>
+					) : readinessUnavailable ? (
+						<div
+							style={{
+								display: "flex",
+								flexDirection: "column",
+								gap: "0.5rem",
+							}}
+							data-testid="readiness-unavailable-state"
+						>
+							<p
+								style={{ margin: 0, color: "#dc2626", fontSize: "0.9rem" }}
+								data-testid="readiness-error-message"
+							>
+								Ödeme hazırlık durumu alınamadı.
+							</p>
+							<div>
+								<button
+									type="button"
+									className="btn btn-secondary btn-sm"
+									onClick={() => refetchReadiness()}
+									data-testid="retry-readiness-button"
+								>
+									Tekrar Kontrol Et
+								</button>
+							</div>
+						</div>
 					) : (
 						<div
 							style={{
@@ -513,12 +575,7 @@ export function StatementPayModal({
 					<button
 						type="submit"
 						className="btn btn-primary"
-						disabled={
-							isSubmitting ||
-							readinessLoading ||
-							isLiabilityShortfall ||
-							(!isMidasFund && !selectedAssetId)
-						}
+						disabled={!canPay || isSubmitting}
 						data-testid="confirm-statement-pay-button"
 					>
 						{isSubmitting ? "Ödeniyor..." : "Ekstreyi Öde"}
