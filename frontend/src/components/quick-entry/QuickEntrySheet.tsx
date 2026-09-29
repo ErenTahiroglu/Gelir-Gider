@@ -11,12 +11,13 @@ import { useNavigate } from "@tanstack/react-router";
 import {
 	ArrowLeft,
 	Bookmark,
+	Coins,
 	CreditCard,
 	DollarSign,
-	PlusCircle,
 	Settings,
 } from "lucide-react";
 import { useState } from "react";
+import { fetchAllActivePeople } from "../../api/people-api";
 import { fetchQuickEntryTemplates } from "../../api/quick-entry-api";
 import type {
 	CreditCardExpenseTemplateConfig,
@@ -28,6 +29,7 @@ import {
 	ManualExpenseForm,
 	type ManualExpenseInitialValues,
 } from "../manual-expenses/ManualExpenseForm";
+import { ObligationForm } from "../people/obligations/ObligationForm";
 import { CreditCardQuickPurchaseForm } from "./CreditCardQuickPurchaseForm";
 
 export function QuickEntrySheet() {
@@ -44,6 +46,7 @@ function QuickEntryModalContent() {
 	const [directType, setDirectType] = useState<
 		"NONE" | "MANUAL_EXPENSE" | "CREDIT_CARD_EXPENSE"
 	>("NONE");
+	const [overridePersonId, setOverridePersonId] = useState<string>("");
 	const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
 	// Load templates using shared query key ["quick-entry-templates"]
@@ -53,14 +56,24 @@ function QuickEntryModalContent() {
 		enabled: isOpen,
 	});
 
-	const allTemplates = templatesData?.templates ?? [];
+	// Load active people for obligation templates
+	const { data: peopleData } = useQuery({
+		queryKey: ["active-people"],
+		queryFn: () => fetchAllActivePeople(100),
+		enabled: isOpen,
+	});
 
-	// Filter only ACTIVE and supported execution types for the sheet
+	const allTemplates = templatesData?.templates ?? [];
+	const activePeople = peopleData ?? [];
+
+	// Filter only ACTIVE and supported execution types for the sheet (Section 65)
 	const activeExecutableTemplates = allTemplates.filter(
 		(t) =>
 			t.status === "ACTIVE" &&
 			(t.templateType === "MANUAL_EXPENSE" ||
-				t.templateType === "CREDIT_CARD_EXPENSE"),
+				t.templateType === "CREDIT_CARD_EXPENSE" ||
+				t.templateType === "RECEIVABLE" ||
+				t.templateType === "PAYABLE"),
 	);
 
 	const selectedTemplate = selectedTemplateId
@@ -69,6 +82,7 @@ function QuickEntryModalContent() {
 
 	const handleClose = () => {
 		setDirectType("NONE");
+		setOverridePersonId("");
 		setSuccessMessage(null);
 		closeQuickEntry();
 	};
@@ -76,11 +90,12 @@ function QuickEntryModalContent() {
 	const handleBack = () => {
 		selectTemplate(null);
 		setDirectType("NONE");
+		setOverridePersonId("");
 		setSuccessMessage(null);
 	};
 
 	const handleSuccess = () => {
-		setSuccessMessage("Harcama kaydedildi");
+		setSuccessMessage("İşlem kaydedildi");
 		setTimeout(() => {
 			handleClose();
 		}, 800);
@@ -176,6 +191,71 @@ function QuickEntryModalContent() {
 								onCancel={handleClose}
 							/>
 						)}
+
+						{(selectedTemplate.templateType === "RECEIVABLE" ||
+							selectedTemplate.templateType === "PAYABLE") &&
+							(() => {
+								const cfg = selectedTemplate.config as Record<string, unknown>;
+								const targetPersonId =
+									overridePersonId || (cfg.personId as string | undefined);
+								const matchedPerson = activePeople.find(
+									(p) => p.personId === targetPersonId,
+								);
+
+								if (!matchedPerson) {
+									return (
+										<div className="stale-person-box card">
+											<div
+												className="alert alert-warning"
+												role="alert"
+												data-testid="stale-person-warning"
+											>
+												<span>
+													Şablondaki kişi artık kullanılamıyor. Lütfen başka bir
+													kişi seçin.
+												</span>
+											</div>
+											<div className="form-group mt-3">
+												<label
+													htmlFor="quick-override-person"
+													className="form-label"
+												>
+													Geçerli Kişi Seçin
+												</label>
+												<select
+													id="quick-override-person"
+													className="form-control"
+													value={overridePersonId}
+													onChange={(e) => setOverridePersonId(e.target.value)}
+													data-testid="quick-override-person-select"
+												>
+													<option value="">Kişi Seçin...</option>
+													{activePeople.map((p) => (
+														<option key={p.personId} value={p.personId}>
+															{p.displayName}
+														</option>
+													))}
+												</select>
+											</div>
+										</div>
+									);
+								}
+
+								return (
+									<ObligationForm
+										mode="create"
+										personId={matchedPerson.personId}
+										initialDirection={selectedTemplate.templateType}
+										initialValues={{
+											amount: cfg.defaultAmount as string | undefined,
+											description: cfg.description as string | undefined,
+											dueDate: cfg.dueDate as string | undefined,
+										}}
+										onSuccess={handleSuccess}
+										onCancel={handleClose}
+									/>
+								);
+							})()}
 					</div>
 				)}
 
@@ -236,6 +316,9 @@ function QuickEntryModalContent() {
 												<div className="template-btn-icon">
 													{template.templateType === "CREDIT_CARD_EXPENSE" ? (
 														<CreditCard size={18} aria-hidden="true" />
+													) : template.templateType === "RECEIVABLE" ||
+														template.templateType === "PAYABLE" ? (
+														<Coins size={18} aria-hidden="true" />
 													) : (
 														<Bookmark size={18} aria-hidden="true" />
 													)}

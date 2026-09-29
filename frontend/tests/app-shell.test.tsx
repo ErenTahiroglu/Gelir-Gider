@@ -57,10 +57,10 @@ describe("App Shell — Responsive Desktop Sidebar & Mobile Nav Invariants", () 
 		expect(cardsBtn).toHaveAttribute("href", "/cards");
 		expect(cardsBtn).not.toHaveAttribute("aria-disabled", "true");
 
-		// 5. Daha Fazla is disabled
+		// 5. Daha Fazla is activated in F6 (opens More Hub)
 		const moreBtn = screen.getByTestId("mobile-nav-more");
-		expect(moreBtn).toBeDisabled();
-		expect(moreBtn).toHaveAttribute("aria-disabled", "true");
+		expect(moreBtn).not.toBeDisabled();
+		expect(moreBtn).not.toHaveAttribute("aria-disabled", "true");
 	});
 
 	it("renders desktop sidebar with collapsible state and disabled future modules", async () => {
@@ -99,8 +99,12 @@ describe("App Shell — Responsive Desktop Sidebar & Mobile Nav Invariants", () 
 		expect(cardsLink).toHaveAttribute("href", "/cards");
 		expect(cardsLink).not.toBeDisabled();
 
-		// Future links disabled
-		expect(screen.getByTestId("nav-link-people")).toBeDisabled();
+		// Kişiler active in F6
+		const peopleLink = screen.getByTestId("nav-link-people");
+		expect(peopleLink).toHaveAttribute("href", "/people");
+		expect(peopleLink).not.toBeDisabled();
+
+		// Future links disabled (F7+)
 		expect(screen.getByTestId("nav-link-budget")).toBeDisabled();
 		expect(screen.getByTestId("nav-link-goals")).toBeDisabled();
 		expect(screen.getByTestId("nav-link-investments")).toBeDisabled();

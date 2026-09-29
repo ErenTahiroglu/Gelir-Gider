@@ -29,6 +29,7 @@ export function DesktopSidebar({
 		currentPath.startsWith("/transactions") ||
 		currentPath.startsWith("/manual-expenses");
 	const isCardsActive = currentPath.startsWith("/cards");
+	const isPeopleActive = currentPath.startsWith("/people");
 	// Keyboard shortcut: Cmd/Ctrl + B to toggle sidebar
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -127,17 +128,16 @@ export function DesktopSidebar({
 					</li>
 
 					<li className="nav-item">
-						<button
-							type="button"
-							className="nav-link disabled"
-							disabled
-							aria-disabled="true"
-							title={collapsed ? "Kişiler (F6)" : "F6 aşamasında eklenecek"}
+						<Link
+							to="/people"
+							className={`nav-link ${isPeopleActive ? "active" : ""}`}
+							aria-current={isPeopleActive ? "page" : undefined}
+							title={collapsed ? "Kişiler" : undefined}
 							data-testid="nav-link-people"
 						>
 							<Users size={20} aria-hidden="true" />
 							{!collapsed && <span className="nav-label">Kişiler</span>}
-						</button>
+						</Link>
 					</li>
 
 					<li className="nav-item">

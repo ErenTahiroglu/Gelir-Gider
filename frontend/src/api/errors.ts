@@ -85,6 +85,38 @@ export function mapErrorCodeToUserMessage(
 			return "Bu cihaz veya tarayıcı Passkey doğrulamasını desteklemiyor.";
 		case "WEBAUTHN_CANCELLED":
 			return "Passkey doğrulaması tamamlanmadı. Tekrar deneyebilirsiniz.";
+		case "PEOPLE_INVALID_INPUT":
+			return "Girilen bilgiler geçersiz. Lütfen alanları kontrol edin.";
+		case "PEOPLE_LEDGER_ACCOUNT_INVALID":
+			return "Seçilen hesap geçerli değil veya bu işlem için uygun değil.";
+		case "PEOPLE_NOT_FOUND":
+			return "Kişi kaydı bulunamadı.";
+		case "PEOPLE_NOT_ACTIVE":
+			return "Bu kişi kaydı aktif değil veya arşivlenmiş.";
+		case "PEOPLE_REVISION_CONFLICT":
+			return "Kişi bilgileri başka bir işlem tarafından güncellendi. Lütfen sayfayı yenileyip tekrar deneyin.";
+		case "PEOPLE_OBLIGATION_NOT_FOUND":
+			return "Borç/alacak kaydı bulunamadı.";
+		case "PEOPLE_OBLIGATION_NOT_ACTIVE":
+			return "Bu borç/alacak kaydı aktif değil veya kapatılmış.";
+		case "PEOPLE_OBLIGATION_REVISION_CONFLICT":
+			return "Borç/alacak kaydı başka bir işlem tarafından güncellendi. Lütfen sayfayı yenileyip tekrar deneyin.";
+		case "PEOPLE_OBLIGATION_SETTLEMENT_CONFLICT":
+			return "Bu borç/alacak için daha önce ödeme kaydı bulunduğu için bu değişiklik yapılamıyor.";
+		case "PEOPLE_OBLIGATION_OVERSETTLEMENT":
+			return "Ödeme tutarı kalan borç/alacak tutarından fazla olamaz.";
+		case "PEOPLE_OBLIGATION_SPLIT_MANAGED":
+			return "Bu alacak kart harcaması bölüşümünden oluşturuldu. Tutarı değiştirmek için ilgili ortak harcamayı düzenleyin.";
+		case "PEOPLE_PERSON_HAS_OUTSTANDING_BALANCE":
+			return "Bu kişide açık borç/alacak bulunduğu için arşivlenemiyor.";
+		case "PEOPLE_SETTLEMENT_NOT_FOUND":
+			return "Ödeme kaydı bulunamadı.";
+		case "PEOPLE_SETTLEMENT_NOT_ACTIVE":
+			return "Bu ödeme kaydı aktif değil veya iptal edilmiş.";
+		case "PEOPLE_IDEMPOTENCY_CONFLICT":
+			return "Bu işlem daha önce farklı bilgilerle gönderilmiş. Lütfen işlemi yenileyin.";
+		case "PEOPLE_NO_OPEN_RECEIVABLES":
+			return "Bu kişinin tahsil edilecek açık alacağı bulunmuyor.";
 		default:
 			return fallback && fallback.trim() !== ""
 				? fallback

@@ -29,12 +29,14 @@ export function QuickTemplatesStrip({ isUnlocked }: QuickTemplatesStripProps) {
 
 	const allTemplates = templatesQuery.data?.templates ?? [];
 
-	// Filter only ACTIVE executable templates (MANUAL_EXPENSE and CREDIT_CARD_EXPENSE)
+	// Filter only ACTIVE executable templates (MANUAL_EXPENSE, CREDIT_CARD_EXPENSE, RECEIVABLE, PAYABLE)
 	const executableTemplates = allTemplates.filter(
 		(t) =>
 			t.status === "ACTIVE" &&
 			(t.templateType === "MANUAL_EXPENSE" ||
-				t.templateType === "CREDIT_CARD_EXPENSE"),
+				t.templateType === "CREDIT_CARD_EXPENSE" ||
+				t.templateType === "RECEIVABLE" ||
+				t.templateType === "PAYABLE"),
 	);
 	const topTemplates = executableTemplates.slice(0, 5);
 

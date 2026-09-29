@@ -8,6 +8,7 @@ import {
 	useNavigate,
 } from "@tanstack/react-router";
 import { useEffect } from "react";
+import type { PersonObligationDirection } from "./api/people-types";
 import { AuthProvider, useAuth } from "./auth/auth-context";
 import { AuthGate } from "./components/auth/AuthGate";
 import { UnlockScreen } from "./components/auth/UnlockScreen";
@@ -22,6 +23,12 @@ import { StatementForm } from "./components/cards/statements/StatementForm";
 import { DashboardPage } from "./components/dashboard/DashboardPage";
 import { AppShell } from "./components/layout/AppShell";
 import { ManualExpenseForm } from "./components/manual-expenses/ManualExpenseForm";
+import { ObligationDetailPage } from "./components/people/obligations/ObligationDetailPage";
+import { ObligationForm } from "./components/people/obligations/ObligationForm";
+import { PeoplePage } from "./components/people/PeoplePage";
+import { PersonDetailPage } from "./components/people/PersonDetailPage";
+import { PersonForm } from "./components/people/PersonForm";
+import { PersonSettleReceivablesPage } from "./components/people/settlements/PersonSettleReceivablesPage";
 import { TemplateManagement } from "./components/quick-entry/TemplateManagement";
 import { TransactionTimeline } from "./components/transactions/TransactionTimeline";
 import { QuerySecurityBoundary } from "./query/QuerySecurityBoundary";
@@ -370,6 +377,188 @@ const splitDetailRoute = createRoute({
 	component: AuthenticatedSplitDetail,
 });
 
+function AuthenticatedPeople() {
+	return (
+		<AppShell>
+			<PeoplePage />
+		</AppShell>
+	);
+}
+
+function AuthenticatedPersonNew() {
+	const navigate = useNavigate();
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Yeni Kişi Ekle</h1>
+					<PersonForm
+						mode="create"
+						onSuccess={(p) =>
+							void navigate({
+								to: "/people/$personId",
+								params: { personId: p.personId },
+							})
+						}
+						onCancel={() => void navigate({ to: "/people" })}
+					/>
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedPersonDetail() {
+	const params = personDetailRoute.useParams();
+	return (
+		<AppShell>
+			<PersonDetailPage personId={params.personId} />
+		</AppShell>
+	);
+}
+
+function AuthenticatedPersonEdit() {
+	const params = personEditRoute.useParams();
+	const navigate = useNavigate();
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Kişiyi Düzenle</h1>
+					<PersonForm
+						mode="edit"
+						personId={params.personId}
+						onSuccess={() =>
+							void navigate({
+								to: "/people/$personId",
+								params: { personId: params.personId },
+							})
+						}
+						onCancel={() =>
+							void navigate({
+								to: "/people/$personId",
+								params: { personId: params.personId },
+							})
+						}
+					/>
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedObligationNew() {
+	const params = obligationNewRoute.useParams();
+	const search = obligationNewRoute.useSearch();
+	const navigate = useNavigate();
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">
+						{search?.direction === "PAYABLE"
+							? "Yeni Borçlanma Kaydı"
+							: "Yeni Borç Verme Kaydı"}
+					</h1>
+					<ObligationForm
+						mode="create"
+						personId={params.personId}
+						initialDirection={search?.direction ?? "RECEIVABLE"}
+						onSuccess={(ob) =>
+							void navigate({
+								to: "/people/$personId/obligations/$obligationId",
+								params: {
+									personId: params.personId,
+									obligationId: ob.obligationId,
+								},
+							})
+						}
+						onCancel={() =>
+							void navigate({
+								to: "/people/$personId",
+								params: { personId: params.personId },
+							})
+						}
+					/>
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedObligationDetail() {
+	const params = obligationDetailRoute.useParams();
+	return (
+		<AppShell>
+			<ObligationDetailPage
+				personId={params.personId}
+				obligationId={params.obligationId}
+			/>
+		</AppShell>
+	);
+}
+
+function AuthenticatedPersonSettle() {
+	const params = personSettleRoute.useParams();
+	return (
+		<AppShell>
+			<PersonSettleReceivablesPage personId={params.personId} />
+		</AppShell>
+	);
+}
+
+const peopleRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/people",
+	component: AuthenticatedPeople,
+});
+
+const personNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/people/new",
+	component: AuthenticatedPersonNew,
+});
+
+const personDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/people/$personId",
+	component: AuthenticatedPersonDetail,
+});
+
+const personEditRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/people/$personId/edit",
+	component: AuthenticatedPersonEdit,
+});
+
+const obligationNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/people/$personId/obligations/new",
+	validateSearch: (
+		search: Record<string, unknown>,
+	): { direction?: PersonObligationDirection | undefined } => {
+		return {
+			direction:
+				search.direction === "PAYABLE" || search.direction === "RECEIVABLE"
+					? search.direction
+					: undefined,
+		};
+	},
+	component: AuthenticatedObligationNew,
+});
+
+const obligationDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/people/$personId/obligations/$obligationId",
+	component: AuthenticatedObligationDetail,
+});
+
+const personSettleRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/people/$personId/settle",
+	component: AuthenticatedPersonSettle,
+});
+
 const routeTree = rootRoute.addChildren([
 	indexRoute,
 	unlockRoute,
@@ -387,6 +576,13 @@ const routeTree = rootRoute.addChildren([
 	purchaseNewRoute,
 	purchaseDetailRoute,
 	splitDetailRoute,
+	peopleRoute,
+	personNewRoute,
+	personDetailRoute,
+	personEditRoute,
+	obligationNewRoute,
+	obligationDetailRoute,
+	personSettleRoute,
 ]);
 
 export const router = createRouter({ routeTree });

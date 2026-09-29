@@ -77,7 +77,11 @@ export interface QuickEntryTemplateResponse {
 
 export interface CreateTemplatePayload {
 	name: string;
-	templateType: "MANUAL_EXPENSE" | "CREDIT_CARD_EXPENSE";
+	templateType:
+		| "MANUAL_EXPENSE"
+		| "CREDIT_CARD_EXPENSE"
+		| "RECEIVABLE"
+		| "PAYABLE";
 	config: Record<string, unknown>;
 	sortOrder?: number | undefined;
 }

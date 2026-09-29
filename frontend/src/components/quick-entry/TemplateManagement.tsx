@@ -27,6 +27,7 @@ import {
 	fetchAllLedgerAccounts,
 	fetchSpendingCategories,
 } from "../../api/manual-expenses-api";
+import { fetchAllActivePeople } from "../../api/people-api";
 import {
 	archiveQuickEntryTemplate,
 	createQuickEntryTemplate,
@@ -77,6 +78,12 @@ export function TemplateManagement() {
 		staleTime: 60_000,
 	});
 
+	const { data: peopleData } = useQuery({
+		queryKey: ["active-people"],
+		queryFn: () => fetchAllActivePeople(100),
+		staleTime: 60_000,
+	});
+
 	const selectableAccounts = useMemo(
 		() =>
 			(accounts ?? []).filter(
@@ -95,6 +102,7 @@ export function TemplateManagement() {
 	);
 
 	const activeCards = cards ?? [];
+	const activePeople = peopleData ?? [];
 
 	// Local State
 	const [isModalOpen, setIsModalOpen] = useState(false);
@@ -107,7 +115,7 @@ export function TemplateManagement() {
 	// createTemplateType: only used when modalMode === "create".
 	// For edit mode, authority is editingTemplate.templateType.
 	const [createTemplateType, setCreateTemplateType] = useState<
-		"MANUAL_EXPENSE" | "CREDIT_CARD_EXPENSE"
+		"MANUAL_EXPENSE" | "CREDIT_CARD_EXPENSE" | "RECEIVABLE" | "PAYABLE"
 	>("MANUAL_EXPENSE");
 	const [sortOrder, setSortOrder] = useState<number>(0);
 	const [sourceAssetAccountId, setSourceAssetAccountId] = useState("");
@@ -115,6 +123,8 @@ export function TemplateManagement() {
 	const [spendingCategoryId, setSpendingCategoryId] = useState("");
 	const [budgetCategoryOverride, setBudgetCategoryOverride] =
 		useState<BudgetCategorySelection>("MANDATORY_EXPENSE");
+	const [personId, setPersonId] = useState("");
+	const [dueDate, setDueDate] = useState("");
 	const [defaultAmountCanonical, setDefaultAmountCanonical] = useState("");
 	const [defaultAmountDisplay, setDefaultAmountDisplay] = useState("");
 	const [defaultAmountValid, setDefaultAmountValid] = useState(true);
@@ -143,6 +153,8 @@ export function TemplateManagement() {
 		setCardId(activeCards[0]?.cardId ?? "");
 		setSpendingCategoryId("");
 		setBudgetCategoryOverride("MANDATORY_EXPENSE");
+		setPersonId(activePeople[0]?.personId ?? "");
+		setDueDate("");
 		setDefaultAmountCanonical("");
 		setDefaultAmountDisplay("");
 		setDefaultAmountValid(true);
@@ -203,8 +215,27 @@ export function TemplateManagement() {
 				setDefaultAmountDisplay("");
 			}
 			setDefaultAmountValid(true);
+		} else if (
+			t.templateType === "RECEIVABLE" ||
+			t.templateType === "PAYABLE"
+		) {
+			setPersonId((cfg.personId as string) ?? "");
+			setDescription((cfg.description as string) ?? "");
+			setDueDate((cfg.dueDate as string) ?? "");
+
+			const amt = (cfg.defaultAmount as string) ?? "";
+			setDefaultAmountCanonical(amt);
+			if (amt) {
+				const parts = amt.split(".");
+				setDefaultAmountDisplay(
+					parts[1] !== undefined ? `${parts[0]},${parts[1]}` : (parts[0] ?? ""),
+				);
+			} else {
+				setDefaultAmountDisplay("");
+			}
+			setDefaultAmountValid(true);
 		}
-		// Unsupported types (INCOME, RECEIVABLE, PAYABLE): authority is editingTemplate.templateType;
+		// Unsupported type (INCOME): authority is editingTemplate.templateType;
 		// no local form state to populate — config preserved on submit.
 
 		setFormError(null);
@@ -250,8 +281,7 @@ export function TemplateManagement() {
 		const isUnsupportedEditSubmit =
 			modalMode === "edit" &&
 			editingTemplate !== null &&
-			editingTemplate.templateType !== "MANUAL_EXPENSE" &&
-			editingTemplate.templateType !== "CREDIT_CARD_EXPENSE";
+			editingTemplate.templateType === "INCOME";
 		if (!defaultAmountValid && !isUnsupportedEditSubmit) {
 			setFormError("Lütfen geçerli bir varsayılan tutar girin.");
 			return;
@@ -292,6 +322,28 @@ export function TemplateManagement() {
 						merchant: merchant.trim() || undefined,
 						description: description.trim() || undefined,
 						defaultAmount: defaultAmountCanonical || undefined,
+					};
+				} else if (
+					createTemplateType === "RECEIVABLE" ||
+					createTemplateType === "PAYABLE"
+				) {
+					if (!personId) {
+						setFormError("Lütfen bir kişi seçin.");
+						setFormSubmitting(false);
+						return;
+					}
+					if (!activePeople.some((p) => p.personId === personId)) {
+						setFormError(
+							"Şablondaki kişi artık kullanılamıyor. Lütfen başka bir kişi seçin.",
+						);
+						setFormSubmitting(false);
+						return;
+					}
+					config = {
+						personId,
+						description: description.trim() || undefined,
+						defaultAmount: defaultAmountCanonical || undefined,
+						dueDate: dueDate || undefined,
 					};
 				}
 
@@ -342,6 +394,28 @@ export function TemplateManagement() {
 						defaultAmount: defaultAmountCanonical || undefined,
 						// Section 36: Preserve existing shortTermGoalId!
 						shortTermGoalId: existingCfg.shortTermGoalId as string | undefined,
+					};
+				} else if (
+					editingTemplate.templateType === "RECEIVABLE" ||
+					editingTemplate.templateType === "PAYABLE"
+				) {
+					if (!personId) {
+						setFormError("Lütfen bir kişi seçin.");
+						setFormSubmitting(false);
+						return;
+					}
+					if (!activePeople.some((p) => p.personId === personId)) {
+						setFormError(
+							"Şablondaki kişi artık kullanılamıyor. Lütfen başka bir kişi seçin.",
+						);
+						setFormSubmitting(false);
+						return;
+					}
+					config = {
+						personId,
+						description: description.trim() || undefined,
+						defaultAmount: defaultAmountCanonical || undefined,
+						dueDate: dueDate || undefined,
 					};
 				} else {
 					// Unsupported future domain template: preserve its existing config entirely!
@@ -416,12 +490,11 @@ export function TemplateManagement() {
 			? createTemplateType
 			: (editingTemplate?.templateType ?? "MANUAL_EXPENSE");
 
-	// isUnsupportedEdit: true when editing a template whose type F4 does not own (INCOME / RECEIVABLE / PAYABLE).
+	// isUnsupportedEdit: true when editing a template whose type F6 does not own (INCOME).
 	const isUnsupportedEdit =
 		modalMode === "edit" &&
 		editingTemplate !== null &&
-		editingTemplate.templateType !== "MANUAL_EXPENSE" &&
-		editingTemplate.templateType !== "CREDIT_CARD_EXPENSE";
+		editingTemplate.templateType === "INCOME";
 
 	return (
 		<div
@@ -497,7 +570,9 @@ export function TemplateManagement() {
 								{activeTemplates.map((t) => {
 									const isSupported =
 										t.templateType === "MANUAL_EXPENSE" ||
-										t.templateType === "CREDIT_CARD_EXPENSE";
+										t.templateType === "CREDIT_CARD_EXPENSE" ||
+										t.templateType === "RECEIVABLE" ||
+										t.templateType === "PAYABLE";
 									const cfg = t.config as Record<string, unknown>;
 
 									return (
@@ -529,10 +604,23 @@ export function TemplateManagement() {
 
 											{/* Config details */}
 											<div className="template-card-body">
+												{Boolean(cfg.personId) && (
+													<p className="template-detail-item">
+														<strong>Kişi:</strong>{" "}
+														{activePeople.find(
+															(p) => p.personId === cfg.personId,
+														)?.displayName ?? "Kayıtlı Kişi"}
+													</p>
+												)}
 												{Boolean(cfg.defaultAmount) && (
 													<p className="template-detail-item">
 														<strong>Tutar:</strong> {String(cfg.defaultAmount)}{" "}
 														₺
+													</p>
+												)}
+												{Boolean(cfg.dueDate) && (
+													<p className="template-detail-item">
+														<strong>Vade:</strong> {String(cfg.dueDate)}
 													</p>
 												)}
 												{Boolean(cfg.merchant) && (
@@ -701,6 +789,28 @@ export function TemplateManagement() {
 									/>
 									<span>Kredi Kartı Harcaması</span>
 								</label>
+								<label className="radio-option">
+									<input
+										type="radio"
+										name="createTemplateType"
+										value="RECEIVABLE"
+										checked={createTemplateType === "RECEIVABLE"}
+										onChange={() => setCreateTemplateType("RECEIVABLE")}
+										data-testid="tpl-type-receivable"
+									/>
+									<span>Alacak</span>
+								</label>
+								<label className="radio-option">
+									<input
+										type="radio"
+										name="createTemplateType"
+										value="PAYABLE"
+										checked={createTemplateType === "PAYABLE"}
+										onChange={() => setCreateTemplateType("PAYABLE")}
+										data-testid="tpl-type-payable"
+									/>
+									<span>Borç</span>
+								</label>
 							</div>
 						) : (
 							<p
@@ -725,7 +835,7 @@ export function TemplateManagement() {
 						)}
 					</div>
 
-					{/* Future-domain notice for unsupported edit types */}
+					{/* Future-domain notice for unsupported edit types (INCOME) */}
 					{isUnsupportedEdit && (
 						<div
 							className="form-info-banner"
@@ -735,6 +845,107 @@ export function TemplateManagement() {
 							açıldığında düzenlenebilecek. Mevcut ayarlar korunacaktır.
 						</div>
 					)}
+
+					{/* RECEIVABLE & PAYABLE Specific: Kişi * */}
+					{!isUnsupportedEdit &&
+						(effectiveType === "RECEIVABLE" || effectiveType === "PAYABLE") && (
+							<div className="form-group">
+								<label htmlFor="tpl-person" className="form-label required">
+									Kişi *
+								</label>
+								{personId &&
+									!activePeople.some((p) => p.personId === personId) && (
+										<div
+											className="alert alert-warning"
+											data-testid="stale-person-warning"
+										>
+											Şablondaki kişi artık kullanılamıyor. Lütfen başka bir
+											kişi seçin.
+										</div>
+									)}
+								<select
+									id="tpl-person"
+									value={personId}
+									onChange={(e) => setPersonId(e.target.value)}
+									required
+									className="form-select"
+									data-testid="tpl-person-select"
+								>
+									<option value="">Kişi Seçin...</option>
+									{activePeople.map((p) => (
+										<option key={p.personId} value={p.personId}>
+											{p.displayName} (
+											{p.relationship === "FAMILY"
+												? "Aile"
+												: p.relationship === "FRIEND"
+													? "Arkadaş"
+													: "Diğer"}
+											)
+										</option>
+									))}
+								</select>
+							</div>
+						)}
+
+					{/* Varsayılan Tutar for RECEIVABLE / PAYABLE */}
+					{!isUnsupportedEdit &&
+						(effectiveType === "RECEIVABLE" || effectiveType === "PAYABLE") && (
+							<div className="form-group">
+								<label
+									htmlFor="tpl-default-amount-person"
+									className="form-label"
+								>
+									Varsayılan Tutar (İsteğe bağlı)
+								</label>
+								<MoneyInput
+									id="tpl-default-amount-person"
+									value={defaultAmountDisplay}
+									onChange={(canonical, raw, isValid) => {
+										setDefaultAmountCanonical(canonical);
+										setDefaultAmountDisplay(raw);
+										setDefaultAmountValid(isValid);
+									}}
+								/>
+							</div>
+						)}
+
+					{/* Vade Tarihi for RECEIVABLE / PAYABLE */}
+					{!isUnsupportedEdit &&
+						(effectiveType === "RECEIVABLE" || effectiveType === "PAYABLE") && (
+							<div className="form-group">
+								<label htmlFor="tpl-duedate" className="form-label">
+									Vade Tarihi (İsteğe bağlı)
+								</label>
+								<input
+									type="date"
+									id="tpl-duedate"
+									value={dueDate}
+									onChange={(e) => setDueDate(e.target.value)}
+									className="form-input"
+									data-testid="tpl-duedate-input"
+								/>
+							</div>
+						)}
+
+					{/* Açıklama for RECEIVABLE / PAYABLE */}
+					{!isUnsupportedEdit &&
+						(effectiveType === "RECEIVABLE" || effectiveType === "PAYABLE") && (
+							<div className="form-group">
+								<label htmlFor="tpl-person-description" className="form-label">
+									Açıklama (İsteğe bağlı)
+								</label>
+								<input
+									type="text"
+									id="tpl-person-description"
+									value={description}
+									onChange={(e) => setDescription(e.target.value)}
+									maxLength={255}
+									placeholder="Örn: Yemek ortaklığı"
+									className="form-input"
+									data-testid="tpl-person-description-input"
+								/>
+							</div>
+						)}
 
 					{/* MANUAL_EXPENSE Specific: Ödeme Kaynağı * */}
 					{!isUnsupportedEdit && effectiveType === "MANUAL_EXPENSE" && (
