@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, ArrowLeft, RefreshCw, Save } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { ApiError } from "../../api/errors";
+import { ApiError, isNetworkUncertainError } from "../../api/errors";
 import { createPerson, fetchPerson, updatePerson } from "../../api/people-api";
 import type {
 	PersonProductDto,
@@ -13,6 +13,19 @@ interface PersonFormProps {
 	personId?: string;
 	onSuccess?: (person: PersonProductDto) => void;
 	onCancel?: () => void;
+}
+
+interface FrozenPersonAttempt {
+	mode: "create" | "edit";
+	personId?: string | undefined;
+	payload: {
+		displayName: string;
+		relationship: PersonRelationship;
+		note?: string | undefined;
+		occurredAt: string;
+		expectedRevisionNo?: number | undefined;
+	};
+	idempotencyKey: string;
 }
 
 export function PersonForm({
@@ -45,16 +58,10 @@ export function PersonForm({
 	const [validationError, setValidationError] = useState<string | null>(null);
 	const [apiError, setApiError] = useState<string | null>(null);
 	const [revisionConflict, setRevisionConflict] = useState(false);
+	const [isNetworkUncertain, setIsNetworkUncertain] = useState(false);
 
-	// Stable idempotency key for network retry
-	const currentKeyRef = useRef<string>(crypto.randomUUID());
-	const lastSubmittedPayloadRef = useRef<{
-		displayName: string;
-		relationship: PersonRelationship;
-		note?: string | undefined;
-		occurredAt: string;
-		expectedRevisionNo?: number | undefined;
-	} | null>(null);
+	// Frozen attempt for network retry
+	const frozenAttemptRef = useRef<FrozenPersonAttempt | null>(null);
 
 	// Synchronize edit fields when fresh person data is loaded
 	useEffect(() => {
@@ -67,37 +74,29 @@ export function PersonForm({
 	}, [mode, initialPerson]);
 
 	const mutation = useMutation({
-		mutationFn: async () => {
-			const trimmedName = displayName.trim();
-			if (!trimmedName || trimmedName.length > 120) {
-				throw new Error("İsim 1 ile 120 karakter arasında olmalıdır.");
-			}
-			if (note.trim().length > 500) {
-				throw new Error("Not en fazla 500 karakter olabilir.");
+		mutationFn: async (attempt: FrozenPersonAttempt) => {
+			if (attempt.mode === "create") {
+				return createPerson(attempt.payload, attempt.idempotencyKey);
 			}
 
-			const payload = {
-				displayName: trimmedName,
-				relationship,
-				note: note.trim() !== "" ? note.trim() : undefined,
-				occurredAt: new Date().toISOString(),
-			};
-
-			if (mode === "create") {
-				lastSubmittedPayloadRef.current = payload;
-				return createPerson(payload, currentKeyRef.current);
-			}
-
-			if (!personId || !initialPerson) {
+			if (
+				!attempt.personId ||
+				attempt.payload.expectedRevisionNo === undefined
+			) {
 				throw new Error("Kişi verisi bulunamadı.");
 			}
 
-			const updatePayload = {
-				...payload,
-				expectedRevisionNo: initialPerson.revisionNo,
-			};
-			lastSubmittedPayloadRef.current = updatePayload;
-			return updatePerson(personId, updatePayload, currentKeyRef.current);
+			return updatePerson(
+				attempt.personId,
+				{
+					displayName: attempt.payload.displayName,
+					relationship: attempt.payload.relationship,
+					note: attempt.payload.note,
+					occurredAt: attempt.payload.occurredAt,
+					expectedRevisionNo: attempt.payload.expectedRevisionNo,
+				},
+				attempt.idempotencyKey,
+			);
 		},
 		retry: false,
 		onSuccess: (data) => {
@@ -111,14 +110,20 @@ export function PersonForm({
 				});
 			}
 
-			// Reset key on success
-			currentKeyRef.current = crypto.randomUUID();
-			lastSubmittedPayloadRef.current = null;
+			// Clear frozen attempt
+			frozenAttemptRef.current = null;
+			setIsNetworkUncertain(false);
 			setRevisionConflict(false);
 
 			onSuccess?.(data.person);
 		},
 		onError: (err) => {
+			if (isNetworkUncertainError(err)) {
+				setIsNetworkUncertain(true);
+				setApiError(null);
+				return;
+			}
+			setIsNetworkUncertain(false);
 			if (err instanceof ApiError) {
 				if (err.code === "PEOPLE_REVISION_CONFLICT") {
 					setRevisionConflict(true);
@@ -138,6 +143,7 @@ export function PersonForm({
 
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
+		if (isNetworkUncertain) return;
 		setValidationError(null);
 		setApiError(null);
 
@@ -155,11 +161,40 @@ export function PersonForm({
 			return;
 		}
 
-		mutation.mutate();
+		if (mode === "edit" && (!personId || !initialPerson)) {
+			setValidationError("Kişi verisi bulunamadı.");
+			return;
+		}
+
+		const key = crypto.randomUUID();
+		const occurredAt = new Date().toISOString();
+		const attempt: FrozenPersonAttempt = {
+			mode,
+			personId,
+			payload: {
+				displayName: trimmedName,
+				relationship,
+				note: note.trim() !== "" ? note.trim() : undefined,
+				occurredAt,
+				...(mode === "edit" && initialPerson
+					? { expectedRevisionNo: initialPerson.revisionNo }
+					: {}),
+			},
+			idempotencyKey: key,
+		};
+		frozenAttemptRef.current = attempt;
+		mutation.mutate(attempt);
+	};
+
+	const handleRetryUncertain = () => {
+		if (!frozenAttemptRef.current) return;
+		setApiError(null);
+		mutation.mutate(frozenAttemptRef.current);
 	};
 
 	const handleReloadConflict = async () => {
-		currentKeyRef.current = crypto.randomUUID();
+		frozenAttemptRef.current = null;
+		setIsNetworkUncertain(false);
 		setRevisionConflict(false);
 		setApiError(null);
 		await refetchPerson();
@@ -211,6 +246,28 @@ export function PersonForm({
 				</div>
 			)}
 
+			{isNetworkUncertain && (
+				<div
+					className="alert alert-warning"
+					role="alert"
+					data-testid="person-uncertain-alert"
+				>
+					<AlertCircle size={18} aria-hidden="true" />
+					<div>
+						<p>İşlemin kaydedilip kaydedilmediği doğrulanamadı.</p>
+						<button
+							type="button"
+							className="btn btn-secondary btn-sm mt-2"
+							onClick={handleRetryUncertain}
+							disabled={mutation.isPending}
+							data-testid="retry-uncertain-btn"
+						>
+							Aynı İşlemi Tekrar Dene
+						</button>
+					</div>
+				</div>
+			)}
+
 			{revisionConflict && (
 				<div
 					className="person-conflict-box alert alert-warning"
@@ -247,7 +304,9 @@ export function PersonForm({
 					onChange={(e) => setDisplayName(e.target.value)}
 					maxLength={120}
 					placeholder="Örn: Ali Yılmaz"
-					disabled={mutation.isPending || revisionConflict}
+					disabled={
+						mutation.isPending || revisionConflict || isNetworkUncertain
+					}
 					data-testid="person-name-input"
 					required
 				/>
@@ -270,7 +329,9 @@ export function PersonForm({
 							value="FRIEND"
 							checked={relationship === "FRIEND"}
 							onChange={() => setRelationship("FRIEND")}
-							disabled={mutation.isPending || revisionConflict}
+							disabled={
+								mutation.isPending || revisionConflict || isNetworkUncertain
+							}
 							data-testid="relationship-friend"
 						/>
 						<span className="relationship-title">Arkadaş</span>
@@ -286,7 +347,9 @@ export function PersonForm({
 							value="FAMILY"
 							checked={relationship === "FAMILY"}
 							onChange={() => setRelationship("FAMILY")}
-							disabled={mutation.isPending || revisionConflict}
+							disabled={
+								mutation.isPending || revisionConflict || isNetworkUncertain
+							}
 							data-testid="relationship-family"
 						/>
 						<span className="relationship-title">Aile</span>
@@ -302,7 +365,9 @@ export function PersonForm({
 							value="OTHER"
 							checked={relationship === "OTHER"}
 							onChange={() => setRelationship("OTHER")}
-							disabled={mutation.isPending || revisionConflict}
+							disabled={
+								mutation.isPending || revisionConflict || isNetworkUncertain
+							}
 							data-testid="relationship-other"
 						/>
 						<span className="relationship-title">Diğer</span>
@@ -323,7 +388,9 @@ export function PersonForm({
 					maxLength={500}
 					rows={3}
 					placeholder="Kişi hakkında hatırlatıcı bir not..."
-					disabled={mutation.isPending || revisionConflict}
+					disabled={
+						mutation.isPending || revisionConflict || isNetworkUncertain
+					}
 					data-testid="person-note-input"
 				/>
 				<span className="form-hint">{note.length}/500 karakter</span>
@@ -346,7 +413,9 @@ export function PersonForm({
 				<button
 					type="submit"
 					className="btn btn-primary"
-					disabled={mutation.isPending || revisionConflict}
+					disabled={
+						mutation.isPending || revisionConflict || isNetworkUncertain
+					}
 					data-testid="person-submit-btn"
 				>
 					<Save size={16} aria-hidden="true" />

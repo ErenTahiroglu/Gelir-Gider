@@ -263,4 +263,206 @@ describe("F6 People CRUD — Identity, OCC, Archive & Balance Distinction", () =
 		// Verify NO fake net amount (500 - 120 = 380) is rendered
 		expect(screen.queryByText(/₺380,00/i)).not.toBeInTheDocument();
 	});
+
+	it("R2: person create uncertain retry reuses exact same Idempotency-Key, payload, and occurredAt", async () => {
+		const networkError = new ApiError({
+			status: 0,
+			code: "NETWORK_ERROR",
+			message: "Failed to fetch",
+		});
+
+		const mockCreate = vi
+			.spyOn(peopleApi, "createPerson")
+			.mockRejectedValueOnce(networkError)
+			.mockResolvedValueOnce({
+				person: {
+					personId: "person-unc",
+					status: "ACTIVE",
+					displayName: "Zeynep Arslan",
+					relationship: "FRIEND",
+					note: "Ortak hesap",
+					revisionNo: 1,
+					receivableBalance: "0.00",
+					payableBalance: "0.00",
+				},
+			});
+
+		render(<PersonForm mode="create" />, {
+			wrapper: createWrapper(),
+		});
+
+		fireEvent.change(screen.getByTestId("person-name-input"), {
+			target: { value: "Zeynep Arslan" },
+		});
+		fireEvent.click(screen.getByTestId("relationship-friend"));
+		fireEvent.change(screen.getByLabelText(/Not/i), {
+			target: { value: "Ortak hesap" },
+		});
+
+		fireEvent.click(screen.getByTestId("person-submit-btn"));
+
+		await waitFor(() => {
+			expect(mockCreate).toHaveBeenCalledTimes(1);
+		});
+
+		expect(
+			await screen.findByTestId("person-uncertain-alert"),
+		).toBeInTheDocument();
+		expect(
+			screen.getByText("İşlemin kaydedilip kaydedilmediği doğrulanamadı."),
+		).toBeInTheDocument();
+
+		fireEvent.click(screen.getByTestId("retry-uncertain-btn"));
+
+		await waitFor(() => {
+			expect(mockCreate).toHaveBeenCalledTimes(2);
+		});
+
+		const [call1Payload, call1Key] = mockCreate.mock.calls[0]!;
+		const [call2Payload, call2Key] = mockCreate.mock.calls[1]!;
+
+		expect(call2Key).toBe(call1Key);
+		expect(call2Payload).toEqual(call1Payload);
+		expect(call2Payload.occurredAt).toBe(call1Payload.occurredAt);
+	});
+
+	it("R2: person edit uncertain retry reuses exact same Idempotency-Key, payload, and occurredAt", async () => {
+		const initialPerson: PersonProductDto = {
+			personId: "person-edit-unc",
+			status: "ACTIVE",
+			displayName: "Burak Yılmaz",
+			relationship: "FRIEND",
+			note: "Eski not",
+			revisionNo: 5,
+			receivableBalance: "0.00",
+			payableBalance: "0.00",
+		};
+
+		vi.spyOn(peopleApi, "fetchPerson").mockResolvedValue({
+			person: initialPerson,
+		});
+
+		const networkError = new ApiError({
+			status: 0,
+			code: "NETWORK_ERROR",
+			message: "Connection abort",
+		});
+
+		const mockUpdate = vi
+			.spyOn(peopleApi, "updatePerson")
+			.mockRejectedValueOnce(networkError)
+			.mockResolvedValueOnce({
+				person: {
+					...initialPerson,
+					displayName: "Burak Yılmaz Güncel",
+					revisionNo: 6,
+				},
+			});
+
+		render(<PersonForm mode="edit" personId="person-edit-unc" />, {
+			wrapper: createWrapper(),
+		});
+
+		await waitFor(() => {
+			expect(screen.getByDisplayValue("Burak Yılmaz")).toBeInTheDocument();
+		});
+
+		fireEvent.change(screen.getByDisplayValue("Burak Yılmaz"), {
+			target: { value: "Burak Yılmaz Güncel" },
+		});
+
+		fireEvent.click(screen.getByTestId("person-submit-btn"));
+
+		await waitFor(() => {
+			expect(mockUpdate).toHaveBeenCalledTimes(1);
+		});
+
+		expect(
+			await screen.findByTestId("person-uncertain-alert"),
+		).toBeInTheDocument();
+
+		fireEvent.click(screen.getByTestId("retry-uncertain-btn"));
+
+		await waitFor(() => {
+			expect(mockUpdate).toHaveBeenCalledTimes(2);
+		});
+
+		const [call1Id, call1Payload, call1Key] = mockUpdate.mock.calls[0]!;
+		const [call2Id, call2Payload, call2Key] = mockUpdate.mock.calls[1]!;
+
+		expect(call1Id).toBe("person-edit-unc");
+		expect(call2Id).toBe("person-edit-unc");
+		expect(call2Key).toBe(call1Key);
+		expect(call2Payload).toEqual(call1Payload);
+		expect(call2Payload.expectedRevisionNo).toBe(5);
+		expect(call2Payload.occurredAt).toBe(call1Payload.occurredAt);
+	});
+
+	it("R2: person archive uncertain retry reuses exact same Idempotency-Key, payload, and occurredAt", async () => {
+		const personToArchive: PersonProductDto = {
+			personId: "person-arch-unc",
+			status: "ACTIVE",
+			displayName: "Fatma Şen",
+			relationship: "OTHER",
+			note: null,
+			revisionNo: 4,
+			receivableBalance: "0.00",
+			payableBalance: "0.00",
+		};
+
+		const networkError = new ApiError({
+			status: 0,
+			code: "NETWORK_ERROR",
+			message: "Timeout archiving",
+		});
+
+		const mockArchive = vi
+			.spyOn(peopleApi, "archivePerson")
+			.mockRejectedValueOnce(networkError)
+			.mockResolvedValueOnce({
+				person: {
+					...personToArchive,
+					status: "ARCHIVED",
+					revisionNo: 5,
+				},
+			});
+
+		render(
+			<PersonArchiveModal
+				isOpen={true}
+				onClose={vi.fn()}
+				person={personToArchive}
+			/>,
+			{ wrapper: createWrapper() },
+		);
+
+		fireEvent.click(screen.getByTestId("confirm-archive-btn"));
+
+		await waitFor(() => {
+			expect(mockArchive).toHaveBeenCalledTimes(1);
+		});
+
+		expect(
+			await screen.findByTestId("archive-uncertain-alert"),
+		).toBeInTheDocument();
+		expect(
+			screen.getByText("İşlemin kaydedilip kaydedilmediği doğrulanamadı."),
+		).toBeInTheDocument();
+
+		fireEvent.click(screen.getByTestId("retry-uncertain-btn"));
+
+		await waitFor(() => {
+			expect(mockArchive).toHaveBeenCalledTimes(2);
+		});
+
+		const [call1Id, call1Payload, call1Key] = mockArchive.mock.calls[0]!;
+		const [call2Id, call2Payload, call2Key] = mockArchive.mock.calls[1]!;
+
+		expect(call1Id).toBe("person-arch-unc");
+		expect(call2Id).toBe("person-arch-unc");
+		expect(call2Key).toBe(call1Key);
+		expect(call2Payload).toEqual(call1Payload);
+		expect(call2Payload.expectedRevisionNo).toBe(4);
+		expect(call2Payload.occurredAt).toBe(call1Payload.occurredAt);
+	});
 });

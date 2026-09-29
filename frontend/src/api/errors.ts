@@ -123,3 +123,16 @@ export function mapErrorCodeToUserMessage(
 				: "Bir hata oluştu. Lütfen tekrar deneyin.";
 	}
 }
+
+export function isNetworkUncertainError(err: unknown): boolean {
+	if (err instanceof ApiError) {
+		return err.status === 0 || err.code === "NETWORK_ERROR";
+	}
+	if (err instanceof Error) {
+		const msg = err.message.toLowerCase();
+		return (
+			msg.includes("network") || msg.includes("fetch") || msg.includes("abort")
+		);
+	}
+	return false;
+}

@@ -13,13 +13,14 @@ import {
 	History,
 	Info,
 } from "lucide-react";
-import { useState } from "react";
-import { ApiError } from "../../../api/errors";
+import { useRef, useState } from "react";
+import { ApiError, isNetworkUncertainError } from "../../../api/errors";
 import {
 	fetchObligationSettlements,
 	fetchPersonObligation,
 	voidPersonObligation,
 } from "../../../api/people-api";
+import { formatIstanbulDateTimeTurkish } from "../../../lib/istanbul-date";
 import { formatMoneyToTry } from "../../../lib/money";
 import { PayableSettlementModal } from "./PayableSettlementModal";
 
@@ -36,6 +37,11 @@ export function ObligationDetailPage({
 
 	const [isPayModalOpen, setIsPayModalOpen] = useState(false);
 	const [voidError, setVoidError] = useState<string | null>(null);
+	const [isVoidUncertain, setIsVoidUncertain] = useState(false);
+	const frozenVoidAttemptRef = useRef<{
+		key: string;
+		expectedRevisionNo: number;
+	} | null>(null);
 
 	// 1. Fetch obligation
 	const {
@@ -72,17 +78,22 @@ export function ObligationDetailPage({
 
 	// 3. Void mutation
 	const voidMutation = useMutation({
-		mutationFn: async (expectedRevisionNo: number) => {
-			const idempotencyKey = crypto.randomUUID();
+		mutationFn: async (attempt: {
+			key: string;
+			expectedRevisionNo: number;
+		}) => {
 			return voidPersonObligation(
 				personId,
 				obligationId,
-				{ expectedRevisionNo },
-				idempotencyKey,
+				{ expectedRevisionNo: attempt.expectedRevisionNo },
+				attempt.key,
 			);
 		},
 		retry: false,
 		onSuccess: () => {
+			setIsVoidUncertain(false);
+			frozenVoidAttemptRef.current = null;
+			setVoidError(null);
 			void queryClient.invalidateQueries({ queryKey: ["people"] });
 			void queryClient.invalidateQueries({ queryKey: ["active-people"] });
 			void queryClient.invalidateQueries({ queryKey: ["person", personId] });
@@ -100,6 +111,12 @@ export function ObligationDetailPage({
 			void queryClient.invalidateQueries({ queryKey: ["spending-summary"] });
 		},
 		onError: (err) => {
+			if (isNetworkUncertainError(err)) {
+				setIsVoidUncertain(true);
+				setVoidError(null);
+				return;
+			}
+			setIsVoidUncertain(false);
 			if (err instanceof ApiError) {
 				setVoidError(err.userMessage);
 			} else if (err instanceof Error) {
@@ -118,8 +135,20 @@ export function ObligationDetailPage({
 			)
 		) {
 			setVoidError(null);
-			voidMutation.mutate(obligation.revisionNo);
+			setIsVoidUncertain(false);
+			const attempt = {
+				key: crypto.randomUUID(),
+				expectedRevisionNo: obligation.revisionNo,
+			};
+			frozenVoidAttemptRef.current = attempt;
+			voidMutation.mutate(attempt);
 		}
+	};
+
+	const handleRetryVoidUncertain = () => {
+		if (!frozenVoidAttemptRef.current) return;
+		setVoidError(null);
+		voidMutation.mutate(frozenVoidAttemptRef.current);
 	};
 
 	if (isObligationLoading) {
@@ -181,6 +210,28 @@ export function ObligationDetailPage({
 				>
 					<AlertCircle size={18} aria-hidden="true" />
 					<span>{voidError}</span>
+				</div>
+			)}
+
+			{isVoidUncertain && (
+				<div
+					className="alert alert-warning"
+					role="alert"
+					data-testid="obligation-void-uncertain-alert"
+				>
+					<AlertCircle size={18} aria-hidden="true" />
+					<div>
+						<p>İptal işleminin tamamlanıp tamamlanmadığı doğrulanamadı.</p>
+						<button
+							type="button"
+							className="btn btn-secondary btn-sm mt-2"
+							onClick={handleRetryVoidUncertain}
+							disabled={voidMutation.isPending}
+							data-testid="retry-uncertain-void-btn"
+						>
+							Aynı İptal İşlemini Tekrar Dene
+						</button>
+					</div>
 				</div>
 			)}
 
@@ -296,7 +347,7 @@ export function ObligationDetailPage({
 								type="button"
 								className="btn btn-outline-danger"
 								onClick={handleVoid}
-								disabled={voidMutation.isPending}
+								disabled={voidMutation.isPending || isVoidUncertain}
 								data-testid="void-obligation-btn"
 							>
 								<Ban size={16} aria-hidden="true" />
@@ -349,7 +400,7 @@ export function ObligationDetailPage({
 										key={s.settlementId}
 										data-testid={`settlement-row-${s.settlementId}`}
 									>
-										<td>{s.occurredAt.slice(0, 10)}</td>
+										<td>{formatIstanbulDateTimeTurkish(s.occurredAt)}</td>
 										<td>{formatMoneyToTry(s.cashAmount)}</td>
 										<td>{formatMoneyToTry(s.appliedAmount)}</td>
 										<td>{formatMoneyToTry(s.excessAmount)}</td>

@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, ArrowLeft, RefreshCw, Save } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ApiError } from "../../../api/errors";
+import { ApiError, isNetworkUncertainError } from "../../../api/errors";
 import { fetchAllLedgerAccounts } from "../../../api/manual-expenses-api";
 import {
 	createPersonPayable,
@@ -10,9 +10,12 @@ import {
 	updatePersonObligation,
 } from "../../../api/people-api";
 import type {
+	CreatePayablePayload,
+	CreateReceivablePayload,
 	ObligationBudgetCategory,
 	ObligationProductDto,
 	PersonObligationDirection,
+	UpdateObligationPayload,
 } from "../../../api/people-types";
 import { normalizeTurkishMoneyInput } from "../../../lib/money";
 import { MoneyInput } from "../../common/MoneyInput";
@@ -92,8 +95,15 @@ export function ObligationForm({
 	const [validationError, setValidationError] = useState<string | null>(null);
 	const [apiError, setApiError] = useState<string | null>(null);
 	const [revisionConflict, setRevisionConflict] = useState(false);
+	const [isNetworkUncertain, setIsNetworkUncertain] = useState(false);
 
-	const currentKeyRef = useRef<string>(crypto.randomUUID());
+	const frozenAttemptRef = useRef<{
+		key: string;
+		payload:
+			| CreateReceivablePayload
+			| CreatePayablePayload
+			| UpdateObligationPayload;
+	} | null>(null);
 
 	// If selectableAccounts loaded and no funding account selected yet, pick first
 	useEffect(() => {
@@ -107,9 +117,7 @@ export function ObligationForm({
 	useEffect(() => {
 		if (mode === "edit" && initialObligation) {
 			setDirection(initialObligation.direction);
-			setAmount(
-				initialObligation.remainingAmount || initialObligation.principalAmount,
-			);
+			setAmount(initialObligation.principalAmount);
 			if (initialObligation.fundingAssetAccountId) {
 				setFundingAssetAccountId(initialObligation.fundingAssetAccountId);
 			}
@@ -130,53 +138,26 @@ export function ObligationForm({
 	}, [mode, initialObligation]);
 
 	const mutation = useMutation({
-		mutationFn: async () => {
-			const norm = normalizeTurkishMoneyInput(amount);
-			if (!norm.valid || !norm.canonical || norm.cents === undefined) {
-				throw new Error(norm.error ?? "Geçerli bir tutar girin.");
-			}
-			if (norm.cents <= 0n) {
-				throw new Error("Tutar sıfırdan büyük olmalıdır.");
-			}
-
-			if (description.trim().length > 500) {
-				throw new Error("Açıklama en fazla 500 karakter olabilir.");
-			}
-
-			const occurredAt = new Date().toISOString();
-			const trimmedDueDate = dueDate.trim() !== "" ? dueDate.trim() : undefined;
-			const trimmedDesc =
-				description.trim() !== "" ? description.trim() : undefined;
-
+		mutationFn: async (attempt: {
+			key: string;
+			payload:
+				| CreateReceivablePayload
+				| CreatePayablePayload
+				| UpdateObligationPayload;
+		}) => {
 			if (mode === "create") {
 				if (direction === "RECEIVABLE") {
-					if (!fundingAssetAccountId) {
-						throw new Error("Lütfen paranın verildiği hesabı seçin.");
-					}
 					return createPersonReceivable(
 						personId,
-						{
-							amount: norm.canonical,
-							fundingAssetAccountId,
-							dueDate: trimmedDueDate,
-							description: trimmedDesc,
-							occurredAt,
-						},
-						currentKeyRef.current,
-					);
-				} else {
-					return createPersonPayable(
-						personId,
-						{
-							amount: norm.canonical,
-							budgetCategory,
-							dueDate: trimmedDueDate,
-							description: trimmedDesc,
-							occurredAt,
-						},
-						currentKeyRef.current,
+						attempt.payload as CreateReceivablePayload,
+						attempt.key,
 					);
 				}
+				return createPersonPayable(
+					personId,
+					attempt.payload as CreatePayablePayload,
+					attempt.key,
+				);
 			}
 
 			// Edit mode
@@ -193,17 +174,8 @@ export function ObligationForm({
 			return updatePersonObligation(
 				personId,
 				obligationId,
-				{
-					expectedRevisionNo: initialObligation.revisionNo,
-					amount: norm.canonical,
-					fundingAssetAccountId:
-						direction === "RECEIVABLE" ? fundingAssetAccountId : undefined,
-					budgetCategory: direction === "PAYABLE" ? budgetCategory : undefined,
-					dueDate: trimmedDueDate,
-					description: trimmedDesc,
-					occurredAt,
-				},
-				currentKeyRef.current,
+				attempt.payload as UpdateObligationPayload,
+				attempt.key,
 			);
 		},
 		retry: false,
@@ -227,12 +199,20 @@ export function ObligationForm({
 			void queryClient.invalidateQueries({ queryKey: ["ledger-accounts"] });
 			void queryClient.invalidateQueries({ queryKey: ["spending-summary"] });
 
-			currentKeyRef.current = crypto.randomUUID();
+			frozenAttemptRef.current = null;
+			setIsNetworkUncertain(false);
 			setRevisionConflict(false);
 			onSuccess?.(data.obligation);
 		},
 		onError: (err) => {
-			if (err instanceof ApiError) {
+			if (isNetworkUncertainError(err)) {
+				setIsNetworkUncertain(true);
+				setApiError(
+					"Kaydın tamamlanıp tamamlanmadığı doğrulanamadı. Aynı işlemi güvenli şekilde tekrar kontrol edebilirsiniz.",
+				);
+			} else if (err instanceof ApiError) {
+				frozenAttemptRef.current = null;
+				setIsNetworkUncertain(false);
 				if (err.code === "PEOPLE_OBLIGATION_REVISION_CONFLICT") {
 					setRevisionConflict(true);
 					setApiError(
@@ -242,8 +222,12 @@ export function ObligationForm({
 					setApiError(err.userMessage);
 				}
 			} else if (err instanceof Error) {
+				frozenAttemptRef.current = null;
+				setIsNetworkUncertain(false);
 				setApiError(err.message);
 			} else {
+				frozenAttemptRef.current = null;
+				setIsNetworkUncertain(false);
 				setApiError("İşlem sırasında bir hata oluştu.");
 			}
 		},
@@ -251,12 +235,23 @@ export function ObligationForm({
 
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
+		if (isNetworkUncertain) return;
+
 		setValidationError(null);
 		setApiError(null);
 
 		const norm = normalizeTurkishMoneyInput(amount);
 		if (!norm.valid || !norm.canonical || norm.cents === undefined) {
-			setValidationError(norm.error ?? "Lütfen geçerli bir tutar girin.");
+			setValidationError(norm.error ?? "Geçerli bir tutar girin.");
+			return;
+		}
+		if (norm.cents <= 0n) {
+			setValidationError("Tutar sıfırdan büyük olmalıdır.");
+			return;
+		}
+
+		if (description.trim().length > 500) {
+			setValidationError("Açıklama en fazla 500 karakter olabilir.");
 			return;
 		}
 
@@ -265,11 +260,74 @@ export function ObligationForm({
 			return;
 		}
 
-		mutation.mutate();
+		if (mode === "edit" && initialObligation?.isSplitManaged) {
+			setValidationError(
+				"Bu alacak kart harcaması bölüşümünden oluşturuldu. Tutarı değiştirmek için ilgili ortak harcamayı düzenleyin.",
+			);
+			return;
+		}
+
+		const key = crypto.randomUUID();
+		const occurredAt = new Date().toISOString();
+		const trimmedDueDate = dueDate.trim() !== "" ? dueDate.trim() : undefined;
+		const trimmedDesc =
+			description.trim() !== "" ? description.trim() : undefined;
+
+		let payload:
+			| CreateReceivablePayload
+			| CreatePayablePayload
+			| UpdateObligationPayload;
+
+		if (mode === "create") {
+			if (direction === "RECEIVABLE") {
+				payload = {
+					amount: norm.canonical,
+					fundingAssetAccountId,
+					dueDate: trimmedDueDate,
+					description: trimmedDesc,
+					occurredAt,
+				};
+			} else {
+				payload = {
+					amount: norm.canonical,
+					budgetCategory,
+					dueDate: trimmedDueDate,
+					description: trimmedDesc,
+					occurredAt,
+				};
+			}
+		} else {
+			if (!obligationId || !initialObligation) {
+				setValidationError("Kayıt bilgisi bulunamadı.");
+				return;
+			}
+
+			payload = {
+				expectedRevisionNo: initialObligation.revisionNo,
+				amount: norm.canonical,
+				fundingAssetAccountId:
+					direction === "RECEIVABLE" ? fundingAssetAccountId : undefined,
+				budgetCategory: direction === "PAYABLE" ? budgetCategory : undefined,
+				dueDate: trimmedDueDate,
+				description: trimmedDesc,
+				occurredAt,
+			};
+		}
+
+		frozenAttemptRef.current = { key, payload };
+		mutation.mutate(frozenAttemptRef.current);
+	};
+
+	const handleRetryUncertain = () => {
+		if (frozenAttemptRef.current) {
+			setApiError(null);
+			mutation.mutate(frozenAttemptRef.current);
+		}
 	};
 
 	const handleReloadConflict = async () => {
-		currentKeyRef.current = crypto.randomUUID();
+		frozenAttemptRef.current = null;
+		setIsNetworkUncertain(false);
 		setRevisionConflict(false);
 		setApiError(null);
 		await refetchObligation();
@@ -369,6 +427,33 @@ export function ObligationForm({
 				</div>
 			)}
 
+			{isNetworkUncertain && (
+				<div
+					className="obligation-uncertain-box alert alert-warning"
+					role="alert"
+					data-testid="obligation-uncertain-alert"
+				>
+					<AlertCircle size={18} aria-hidden="true" />
+					<div className="uncertain-message">
+						<strong>Doğrulanamayan İşlem Durumu</strong>
+						<p>
+							Kaydın tamamlanıp tamamlanmadığı doğrulanamadı. Aynı işlemi
+							güvenli şekilde tekrar kontrol edebilirsiniz.
+						</p>
+						<button
+							type="button"
+							className="btn btn-secondary btn-sm mt-2"
+							onClick={handleRetryUncertain}
+							disabled={mutation.isPending}
+							data-testid="retry-uncertain-btn"
+						>
+							<RefreshCw size={14} aria-hidden="true" />
+							<span>Aynı İşlemi Tekrar Dene</span>
+						</button>
+					</div>
+				</div>
+			)}
+
 			{/* Direction toggle only in create mode */}
 			{mode === "create" && (
 				<div className="form-group">
@@ -382,6 +467,7 @@ export function ObligationForm({
 							type="button"
 							className={`direction-btn ${direction === "RECEIVABLE" ? "selected receivable" : ""}`}
 							onClick={() => setDirection("RECEIVABLE")}
+							disabled={mutation.isPending || isNetworkUncertain}
 							data-testid="direction-receivable-btn"
 						>
 							<span className="direction-title">Borç Verdim</span>
@@ -392,6 +478,7 @@ export function ObligationForm({
 							type="button"
 							className={`direction-btn ${direction === "PAYABLE" ? "selected payable" : ""}`}
 							onClick={() => setDirection("PAYABLE")}
+							disabled={mutation.isPending || isNetworkUncertain}
 							data-testid="direction-payable-btn"
 						>
 							<span className="direction-title">Borçlandım</span>
@@ -410,7 +497,9 @@ export function ObligationForm({
 					id="obligation-amount"
 					value={amount}
 					onChange={(val) => setAmount(val)}
-					disabled={mutation.isPending || revisionConflict}
+					disabled={
+						mutation.isPending || revisionConflict || isNetworkUncertain
+					}
 					data-testid="obligation-amount-input"
 					required
 				/>
@@ -430,7 +519,9 @@ export function ObligationForm({
 							className="form-control"
 							value={fundingAssetAccountId}
 							onChange={(e) => setFundingAssetAccountId(e.target.value)}
-							disabled={mutation.isPending || revisionConflict}
+							disabled={
+								mutation.isPending || revisionConflict || isNetworkUncertain
+							}
 							data-testid="obligation-funding-account-select"
 							required
 						>
@@ -467,7 +558,9 @@ export function ObligationForm({
 								value="MANDATORY_EXPENSE"
 								checked={budgetCategory === "MANDATORY_EXPENSE"}
 								onChange={() => setBudgetCategory("MANDATORY_EXPENSE")}
-								disabled={mutation.isPending || revisionConflict}
+								disabled={
+									mutation.isPending || revisionConflict || isNetworkUncertain
+								}
 								data-testid="budget-mandatory"
 							/>
 							<span className="category-title">Zorunlu Temel İhtiyaç</span>
@@ -482,7 +575,9 @@ export function ObligationForm({
 								value="DISCRETIONARY_SPEND"
 								checked={budgetCategory === "DISCRETIONARY_SPEND"}
 								onChange={() => setBudgetCategory("DISCRETIONARY_SPEND")}
-								disabled={mutation.isPending || revisionConflict}
+								disabled={
+									mutation.isPending || revisionConflict || isNetworkUncertain
+								}
 								data-testid="budget-discretionary"
 							/>
 							<span className="category-title">Keyfi / Esnek Harcama</span>
@@ -497,7 +592,9 @@ export function ObligationForm({
 								value="SHORT_TERM_PURCHASE"
 								checked={budgetCategory === "SHORT_TERM_PURCHASE"}
 								onChange={() => setBudgetCategory("SHORT_TERM_PURCHASE")}
-								disabled={mutation.isPending || revisionConflict}
+								disabled={
+									mutation.isPending || revisionConflict || isNetworkUncertain
+								}
 								data-testid="budget-short-term"
 							/>
 							<span className="category-title">Planlı Kısa Vadeli Alım</span>
@@ -517,7 +614,9 @@ export function ObligationForm({
 					className="form-control"
 					value={dueDate}
 					onChange={(e) => setDueDate(e.target.value)}
-					disabled={mutation.isPending || revisionConflict}
+					disabled={
+						mutation.isPending || revisionConflict || isNetworkUncertain
+					}
 					data-testid="obligation-duedate-input"
 				/>
 			</div>
@@ -535,7 +634,9 @@ export function ObligationForm({
 					onChange={(e) => setDescription(e.target.value)}
 					maxLength={500}
 					placeholder="Örn: Yemek masrafı ortaklığı"
-					disabled={mutation.isPending || revisionConflict}
+					disabled={
+						mutation.isPending || revisionConflict || isNetworkUncertain
+					}
 					data-testid="obligation-description-input"
 				/>
 				<span className="form-hint">{description.length}/500 karakter</span>
@@ -559,7 +660,9 @@ export function ObligationForm({
 				<button
 					type="submit"
 					className="btn btn-primary"
-					disabled={mutation.isPending || revisionConflict}
+					disabled={
+						mutation.isPending || revisionConflict || isNetworkUncertain
+					}
 					data-testid="obligation-submit-btn"
 				>
 					<Save size={16} aria-hidden="true" />

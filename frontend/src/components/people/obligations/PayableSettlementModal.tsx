@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, CheckCircle2 } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
-import { ApiError } from "../../../api/errors";
+import { ApiError, isNetworkUncertainError } from "../../../api/errors";
 import { fetchAllLedgerAccounts } from "../../../api/manual-expenses-api";
 import { settlePersonPayable } from "../../../api/people-api";
 import type { ObligationProductDto } from "../../../api/people-types";
@@ -22,6 +22,16 @@ interface PayableSettlementModalProps {
 	onSuccess?: (() => void) | undefined;
 }
 
+interface FrozenPayableSettlementAttempt {
+	key: string;
+	payload: {
+		amount: string;
+		sourceAssetAccountId: string;
+		note?: string | undefined;
+		occurredAt: string;
+	};
+}
+
 export function PayableSettlementModal({
 	isOpen,
 	onClose,
@@ -37,8 +47,16 @@ export function PayableSettlementModal({
 	const [sourceAssetAccountId, setSourceAssetAccountId] = useState("");
 	const [note, setNote] = useState("");
 	const [error, setError] = useState<string | null>(null);
+	const [isNetworkUncertain, setIsNetworkUncertain] = useState(false);
 
-	const currentKeyRef = useRef<string>(crypto.randomUUID());
+	const frozenAttemptRef = useRef<FrozenPayableSettlementAttempt | null>(null);
+
+	const handleClose = () => {
+		frozenAttemptRef.current = null;
+		setIsNetworkUncertain(false);
+		setError(null);
+		onClose();
+	};
 
 	// Fetch user's eligible ledger accounts
 	const { data: accounts, isLoading: accountsLoading } = useQuery({
@@ -63,41 +81,20 @@ export function PayableSettlementModal({
 		sourceAssetAccountId || (selectableAccounts[0]?.accountId ?? "");
 
 	const mutation = useMutation({
-		mutationFn: async () => {
-			const norm = normalizeTurkishMoneyInput(amount);
-			if (!norm.valid || !norm.canonical || norm.cents === undefined) {
-				throw new Error(norm.error ?? "Geçerli bir ödeme tutarı girin.");
-			}
-
-			if (norm.cents <= 0n) {
-				throw new Error("Ödeme tutarı sıfırdan büyük olmalıdır.");
-			}
-
-			// BigInt oversettlement guard (Section 51)
-			if (norm.cents > remainingCents) {
-				throw new Error(
-					`Ödeme tutarı kalan borç tutarından (${formatCentsToTry(remainingCents)}) fazla olamaz.`,
-				);
-			}
-
-			if (!activeAccountId) {
-				throw new Error("Lütfen ödemenin yapılacağı hesabı seçin.");
-			}
-
+		mutationFn: async (attempt: FrozenPayableSettlementAttempt) => {
 			return settlePersonPayable(
 				personId,
 				obligation.obligationId,
-				{
-					amount: norm.canonical,
-					sourceAssetAccountId: activeAccountId,
-					note: note.trim() !== "" ? note.trim() : undefined,
-					occurredAt: new Date().toISOString(),
-				},
-				currentKeyRef.current,
+				attempt.payload,
+				attempt.key,
 			);
 		},
 		retry: false,
 		onSuccess: () => {
+			frozenAttemptRef.current = null;
+			setIsNetworkUncertain(false);
+			setError(null);
+
 			// Query invalidation per Section 57
 			void queryClient.invalidateQueries({ queryKey: ["people"] });
 			void queryClient.invalidateQueries({ queryKey: ["active-people"] });
@@ -121,11 +118,16 @@ export function PayableSettlementModal({
 			void queryClient.invalidateQueries({ queryKey: ["card-statements"] });
 			void queryClient.invalidateQueries({ queryKey: ["spending-summary"] });
 
-			currentKeyRef.current = crypto.randomUUID();
 			onClose();
 			onSuccess?.();
 		},
 		onError: (err) => {
+			if (isNetworkUncertainError(err)) {
+				setIsNetworkUncertain(true);
+				setError(null);
+				return;
+			}
+			setIsNetworkUncertain(false);
 			if (err instanceof ApiError) {
 				setError(err.userMessage);
 			} else if (err instanceof Error) {
@@ -138,14 +140,56 @@ export function PayableSettlementModal({
 
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
+		if (isNetworkUncertain) return;
 		setError(null);
-		mutation.mutate();
+
+		const norm = normalizeTurkishMoneyInput(amount);
+		if (!norm.valid || !norm.canonical || norm.cents === undefined) {
+			setError(norm.error ?? "Geçerli bir ödeme tutarı girin.");
+			return;
+		}
+
+		if (norm.cents <= 0n) {
+			setError("Ödeme tutarı sıfırdan büyük olmalıdır.");
+			return;
+		}
+
+		// BigInt oversettlement guard (Section 51)
+		if (norm.cents > remainingCents) {
+			setError(
+				`Ödeme tutarı kalan borç tutarından (${formatCentsToTry(remainingCents)}) fazla olamaz.`,
+			);
+			return;
+		}
+
+		if (!activeAccountId) {
+			setError("Lütfen ödemenin yapılacağı hesabı seçin.");
+			return;
+		}
+
+		const attempt: FrozenPayableSettlementAttempt = {
+			key: crypto.randomUUID(),
+			payload: {
+				amount: norm.canonical,
+				sourceAssetAccountId: activeAccountId,
+				note: note.trim() !== "" ? note.trim() : undefined,
+				occurredAt: new Date().toISOString(),
+			},
+		};
+		frozenAttemptRef.current = attempt;
+		mutation.mutate(attempt);
+	};
+
+	const handleRetryUncertain = () => {
+		if (!frozenAttemptRef.current) return;
+		setError(null);
+		mutation.mutate(frozenAttemptRef.current);
 	};
 
 	return (
 		<AccessibleModal
 			isOpen={isOpen}
-			onClose={onClose}
+			onClose={handleClose}
 			title="Borcu Öde"
 			className="payable-settlement-modal"
 		>
@@ -162,6 +206,28 @@ export function PayableSettlementModal({
 					>
 						<AlertCircle size={18} aria-hidden="true" />
 						<span>{error}</span>
+					</div>
+				)}
+
+				{isNetworkUncertain && (
+					<div
+						className="alert alert-warning"
+						role="alert"
+						data-testid="settle-payable-uncertain-alert"
+					>
+						<AlertCircle size={18} aria-hidden="true" />
+						<div>
+							<p>Ödemenin kaydedilip kaydedilmediği doğrulanamadı.</p>
+							<button
+								type="button"
+								className="btn btn-secondary btn-sm mt-2"
+								onClick={handleRetryUncertain}
+								disabled={mutation.isPending}
+								data-testid="retry-uncertain-btn"
+							>
+								Tekrar Dene
+							</button>
+						</div>
 					</div>
 				)}
 
@@ -188,7 +254,7 @@ export function PayableSettlementModal({
 						id="payable-amount"
 						value={amount}
 						onChange={(val) => setAmount(val)}
-						disabled={mutation.isPending}
+						disabled={mutation.isPending || isNetworkUncertain}
 						data-testid="payable-amount-input"
 						required
 					/>
@@ -209,7 +275,7 @@ export function PayableSettlementModal({
 							className="form-control"
 							value={activeAccountId}
 							onChange={(e) => setSourceAssetAccountId(e.target.value)}
-							disabled={mutation.isPending}
+							disabled={mutation.isPending || isNetworkUncertain}
 							data-testid="payable-source-account-select"
 							required
 						>
@@ -234,7 +300,7 @@ export function PayableSettlementModal({
 						onChange={(e) => setNote(e.target.value)}
 						maxLength={500}
 						placeholder="Örn: Havale ile ödendi"
-						disabled={mutation.isPending}
+						disabled={mutation.isPending || isNetworkUncertain}
 						data-testid="payable-note-input"
 					/>
 				</div>
@@ -243,7 +309,7 @@ export function PayableSettlementModal({
 					<button
 						type="button"
 						className="btn btn-secondary"
-						onClick={onClose}
+						onClick={handleClose}
 						disabled={mutation.isPending}
 					>
 						Vazgeç
@@ -251,7 +317,7 @@ export function PayableSettlementModal({
 					<button
 						type="submit"
 						className="btn btn-primary"
-						disabled={mutation.isPending}
+						disabled={mutation.isPending || isNetworkUncertain}
 						data-testid="confirm-settle-payable-btn"
 					>
 						<CheckCircle2 size={16} aria-hidden="true" />

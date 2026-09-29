@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, AlertTriangle } from "lucide-react";
-import { useState } from "react";
-import { ApiError } from "../../api/errors";
+import { useRef, useState } from "react";
+import { ApiError, isNetworkUncertainError } from "../../api/errors";
 import { archivePerson } from "../../api/people-api";
 import type { PersonProductDto } from "../../api/people-types";
 import { parseMoneyToCents } from "../../lib/money";
@@ -14,6 +14,14 @@ interface PersonArchiveModalProps {
 	onSuccess?: () => void;
 }
 
+interface FrozenArchiveAttempt {
+	key: string;
+	payload: {
+		expectedRevisionNo: number;
+		occurredAt: string;
+	};
+}
+
 export function PersonArchiveModal({
 	isOpen,
 	onClose,
@@ -22,28 +30,30 @@ export function PersonArchiveModal({
 }: PersonArchiveModalProps) {
 	const queryClient = useQueryClient();
 	const [error, setError] = useState<string | null>(null);
+	const [isNetworkUncertain, setIsNetworkUncertain] = useState(false);
+	const frozenAttemptRef = useRef<FrozenArchiveAttempt | null>(null);
 
 	const hasReceivableBalance = parseMoneyToCents(person.receivableBalance) > 0n;
 	const hasPayableBalance = parseMoneyToCents(person.payableBalance) > 0n;
 	const hasOutstandingBalance = hasReceivableBalance || hasPayableBalance;
 
-	const archiveMutation = useMutation({
-		mutationFn: async () => {
-			const idempotencyKey = crypto.randomUUID();
-			const now = new Date();
-			const occurredAt = now.toISOString();
+	const handleClose = () => {
+		frozenAttemptRef.current = null;
+		setIsNetworkUncertain(false);
+		setError(null);
+		onClose();
+	};
 
-			return archivePerson(
-				person.personId,
-				{
-					expectedRevisionNo: person.revisionNo,
-					occurredAt,
-				},
-				idempotencyKey,
-			);
+	const archiveMutation = useMutation({
+		mutationFn: async (attempt: FrozenArchiveAttempt) => {
+			return archivePerson(person.personId, attempt.payload, attempt.key);
 		},
 		retry: false,
 		onSuccess: () => {
+			frozenAttemptRef.current = null;
+			setIsNetworkUncertain(false);
+			setError(null);
+
 			// Query invalidations
 			void queryClient.invalidateQueries({ queryKey: ["people"] });
 			void queryClient.invalidateQueries({ queryKey: ["active-people"] });
@@ -58,6 +68,12 @@ export function PersonArchiveModal({
 			onSuccess?.();
 		},
 		onError: (err) => {
+			if (isNetworkUncertainError(err)) {
+				setIsNetworkUncertain(true);
+				setError(null);
+				return;
+			}
+			setIsNetworkUncertain(false);
 			if (err instanceof ApiError) {
 				setError(err.userMessage);
 			} else {
@@ -68,13 +84,28 @@ export function PersonArchiveModal({
 
 	const handleArchive = () => {
 		setError(null);
-		archiveMutation.mutate();
+		setIsNetworkUncertain(false);
+		const attempt: FrozenArchiveAttempt = {
+			key: crypto.randomUUID(),
+			payload: {
+				expectedRevisionNo: person.revisionNo,
+				occurredAt: new Date().toISOString(),
+			},
+		};
+		frozenAttemptRef.current = attempt;
+		archiveMutation.mutate(attempt);
+	};
+
+	const handleRetryUncertain = () => {
+		if (!frozenAttemptRef.current) return;
+		setError(null);
+		archiveMutation.mutate(frozenAttemptRef.current);
 	};
 
 	return (
 		<AccessibleModal
 			isOpen={isOpen}
-			onClose={onClose}
+			onClose={handleClose}
 			title="Kişiyi Arşivle"
 			className="person-archive-modal"
 		>
@@ -90,6 +121,28 @@ export function PersonArchiveModal({
 					>
 						<AlertCircle size={18} aria-hidden="true" />
 						<span>{error}</span>
+					</div>
+				)}
+
+				{isNetworkUncertain && (
+					<div
+						className="person-uncertain-alert alert alert-warning"
+						role="alert"
+						data-testid="archive-uncertain-alert"
+					>
+						<AlertCircle size={18} aria-hidden="true" />
+						<div>
+							<p>İşlemin kaydedilip kaydedilmediği doğrulanamadı.</p>
+							<button
+								type="button"
+								className="btn btn-secondary btn-sm mt-2"
+								onClick={handleRetryUncertain}
+								disabled={archiveMutation.isPending}
+								data-testid="retry-uncertain-btn"
+							>
+								Aynı İşlemi Tekrar Dene
+							</button>
+						</div>
 					</div>
 				)}
 
@@ -121,7 +174,7 @@ export function PersonArchiveModal({
 					<button
 						type="button"
 						className="btn btn-secondary"
-						onClick={onClose}
+						onClick={handleClose}
 						disabled={archiveMutation.isPending}
 					>
 						Vazgeç
@@ -130,7 +183,7 @@ export function PersonArchiveModal({
 						type="button"
 						className="btn btn-danger"
 						onClick={handleArchive}
-						disabled={archiveMutation.isPending}
+						disabled={archiveMutation.isPending || isNetworkUncertain}
 						data-testid="confirm-archive-btn"
 					>
 						{archiveMutation.isPending ? "Arşivleniyor..." : "Arşivle"}

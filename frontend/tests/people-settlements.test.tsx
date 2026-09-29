@@ -411,4 +411,98 @@ describe("F6 Settlements — Root Orchestrator, Waterfall, Cash vs Midas & Payab
 		expect(payablePayload.amount).toBe("100.00");
 		expect(typeof idempotencyKey).toBe("string");
 	});
+
+	it("R2: payable settlement uncertain retry uses exact same Idempotency-Key, payload, and occurredAt", async () => {
+		const openPayable: ObligationProductDto = {
+			obligationId: "ob-pay-unc",
+			personId: "p1",
+			direction: "PAYABLE",
+			status: "OPEN",
+			principalAmount: "500.00",
+			settledAmount: "100.00",
+			remainingAmount: "400.00",
+			dueDate: null,
+			description: "Payable test",
+			budgetCategory: "MANDATORY_EXPENSE",
+			revisionNo: 3,
+			isSplitManaged: false,
+		};
+
+		const networkError = new ApiError({
+			status: 0,
+			code: "NETWORK_ERROR",
+			message: "Network dropped",
+		});
+
+		const mockSettlePayable = vi
+			.spyOn(peopleApi, "settlePersonPayable")
+			.mockRejectedValueOnce(networkError)
+			.mockResolvedValueOnce({
+				settlement: {
+					settlementId: "set-p-unc",
+					obligationId: "ob-pay-unc",
+					personId: "p1",
+					direction: "PAYABLE",
+					status: "ACTIVE",
+					cashAmount: "200.00",
+					appliedAmount: "200.00",
+					excessAmount: "0.00",
+					note: "Taksit",
+					occurredAt: "2026-03-29T12:00:00Z",
+					revisionNo: 1,
+				},
+			});
+
+		render(
+			<PayableSettlementModal
+				isOpen={true}
+				onClose={vi.fn()}
+				personId="p1"
+				obligation={openPayable}
+			/>,
+			{ wrapper: createWrapper() },
+		);
+
+		await waitFor(() => {
+			expect(screen.getByTestId("payable-settlement-form")).toBeInTheDocument();
+		});
+
+		fireEvent.change(screen.getByTestId("money-input"), {
+			target: { value: "200.00" },
+		});
+		fireEvent.change(screen.getByTestId("payable-note-input"), {
+			target: { value: "Taksit" },
+		});
+
+		fireEvent.click(screen.getByTestId("confirm-settle-payable-btn"));
+
+		await waitFor(() => {
+			expect(mockSettlePayable).toHaveBeenCalledTimes(1);
+		});
+
+		expect(
+			await screen.findByTestId("settle-payable-uncertain-alert"),
+		).toBeInTheDocument();
+		expect(
+			screen.getByText("Ödemenin kaydedilip kaydedilmediği doğrulanamadı."),
+		).toBeInTheDocument();
+
+		fireEvent.click(screen.getByTestId("retry-uncertain-btn"));
+
+		await waitFor(() => {
+			expect(mockSettlePayable).toHaveBeenCalledTimes(2);
+		});
+
+		const [, , call1Payload, call1Key] = mockSettlePayable.mock.calls[0]!;
+		const [, , call2Payload, call2Key] = mockSettlePayable.mock.calls[1]!;
+
+		expect(call2Key).toBe(call1Key);
+		expect(call2Payload).toEqual(call1Payload);
+		expect(call2Payload.amount).toBe("200.00");
+		expect(call2Payload.note).toBe("Taksit");
+		expect(call2Payload.sourceAssetAccountId).toBe(
+			call1Payload.sourceAssetAccountId,
+		);
+		expect(call2Payload.occurredAt).toBe(call1Payload.occurredAt);
+	});
 });

@@ -472,4 +472,499 @@ describe("F6 Obligations — Standalone Receivable/Payable, Split-Managed Guard,
 			expect(screen.getByText("2. taksit")).toBeInTheDocument();
 		});
 	});
+
+	it("R1: partial RECEIVABLE edit pre-fills principalAmount and preserves full principal on description edit", async () => {
+		const initialObligation: ObligationProductDto = {
+			obligationId: "ob-r1-rec",
+			personId: "p1",
+			direction: "RECEIVABLE",
+			status: "OPEN",
+			principalAmount: "500.00",
+			settledAmount: "200.00",
+			remainingAmount: "300.00",
+			dueDate: "2026-05-01",
+			description: "Eski açıklama",
+			budgetCategory: null,
+			revisionNo: 4,
+			isSplitManaged: false,
+		};
+
+		vi.spyOn(peopleApi, "fetchPersonObligation").mockResolvedValue({
+			obligation: initialObligation,
+		});
+
+		const mockUpdate = vi
+			.spyOn(peopleApi, "updatePersonObligation")
+			.mockResolvedValue({
+				obligation: {
+					...initialObligation,
+					description: "Yeni açıklama",
+					revisionNo: 5,
+				},
+			});
+
+		render(
+			<ObligationForm mode="edit" personId="p1" obligationId="ob-r1-rec" />,
+			{ wrapper: createWrapper() },
+		);
+
+		await waitFor(() => {
+			expect(screen.getByLabelText(/Tutar/i)).toHaveValue("500.00");
+		});
+
+		const amountInput = screen.getByLabelText(/Tutar/i) as HTMLInputElement;
+		// Must prefill principalAmount (500.00), NEVER remainingAmount (300.00)
+		expect(amountInput.value).toBe("500.00");
+		expect(amountInput.value).not.toBe("300.00");
+
+		// Change only description
+		const descInput = screen.getByTestId("obligation-description-input");
+		fireEvent.change(descInput, { target: { value: "Yeni açıklama" } });
+
+		fireEvent.click(screen.getByTestId("obligation-submit-btn"));
+
+		await waitFor(() => {
+			expect(mockUpdate).toHaveBeenCalledTimes(1);
+		});
+
+		const [personIdArg, obligationIdArg, payload] = mockUpdate.mock.calls[0]!;
+		expect(personIdArg).toBe("p1");
+		expect(obligationIdArg).toBe("ob-r1-rec");
+		expect(payload).toEqual(
+			expect.objectContaining({
+				expectedRevisionNo: 4,
+				amount: "500.00",
+				description: "Yeni açıklama",
+				dueDate: "2026-05-01",
+			}),
+		);
+	});
+
+	it("R1: partial PAYABLE edit pre-fills principalAmount and preserves full principal", async () => {
+		const initialObligation: ObligationProductDto = {
+			obligationId: "ob-r1-pay",
+			personId: "p1",
+			direction: "PAYABLE",
+			status: "OPEN",
+			principalAmount: "750.00",
+			settledAmount: "250.00",
+			remainingAmount: "500.00",
+			dueDate: null,
+			description: "Kira ortaklığı",
+			budgetCategory: "MANDATORY_EXPENSE",
+			revisionNo: 2,
+			isSplitManaged: false,
+		};
+
+		vi.spyOn(peopleApi, "fetchPersonObligation").mockResolvedValue({
+			obligation: initialObligation,
+		});
+
+		const mockUpdate = vi
+			.spyOn(peopleApi, "updatePersonObligation")
+			.mockResolvedValue({
+				obligation: {
+					...initialObligation,
+					description: "Kira ortaklığı revize",
+					revisionNo: 3,
+				},
+			});
+
+		render(
+			<ObligationForm mode="edit" personId="p1" obligationId="ob-r1-pay" />,
+			{ wrapper: createWrapper() },
+		);
+
+		await waitFor(() => {
+			expect(screen.getByLabelText(/Tutar/i)).toHaveValue("750.00");
+		});
+
+		const amountInput = screen.getByLabelText(/Tutar/i) as HTMLInputElement;
+		// Must prefill 750.00, not 500.00
+		expect(amountInput.value).toBe("750.00");
+		expect(amountInput.value).not.toBe("500.00");
+
+		const descInput = screen.getByTestId("obligation-description-input");
+		fireEvent.change(descInput, { target: { value: "Kira ortaklığı revize" } });
+
+		fireEvent.click(screen.getByTestId("obligation-submit-btn"));
+
+		await waitFor(() => {
+			expect(mockUpdate).toHaveBeenCalledTimes(1);
+		});
+
+		const [, , payload] = mockUpdate.mock.calls[0]!;
+		expect(payload.amount).toBe("750.00");
+		expect(payload.expectedRevisionNo).toBe(2);
+		expect(payload.budgetCategory).toBe("MANDATORY_EXPENSE");
+	});
+
+	it("R2: receivable create uncertain retry uses exact same Idempotency-Key, payload, and occurredAt", async () => {
+		const networkError = new ApiError({
+			status: 0,
+			code: "NETWORK_ERROR",
+			message: "Network failure during POST",
+		});
+
+		const mockCreate = vi
+			.spyOn(peopleApi, "createPersonReceivable")
+			.mockRejectedValueOnce(networkError)
+			.mockResolvedValueOnce({
+				obligation: {
+					obligationId: "ob-created",
+					personId: "p1",
+					direction: "RECEIVABLE",
+					status: "OPEN",
+					principalAmount: "100.00",
+					settledAmount: "0.00",
+					remainingAmount: "100.00",
+					dueDate: null,
+					description: "Uncertain test",
+					budgetCategory: null,
+					revisionNo: 1,
+					isSplitManaged: false,
+				},
+			});
+
+		render(
+			<ObligationForm
+				mode="create"
+				personId="p1"
+				initialDirection="RECEIVABLE"
+			/>,
+			{ wrapper: createWrapper() },
+		);
+
+		await waitFor(() => {
+			expect(
+				screen.getByTestId("obligation-funding-account-select"),
+			).toBeInTheDocument();
+		});
+
+		// Fill form
+		fireEvent.change(screen.getByLabelText(/Tutar/i), {
+			target: { value: "100.00" },
+		});
+		fireEvent.change(screen.getByTestId("obligation-funding-account-select"), {
+			target: { value: "acc-bank" },
+		});
+		fireEvent.change(screen.getByLabelText(/Açıklama/i), {
+			target: { value: "Uncertain test" },
+		});
+
+		// Submit 1
+		fireEvent.click(screen.getByTestId("obligation-submit-btn"));
+
+		await waitFor(() => {
+			expect(mockCreate).toHaveBeenCalledTimes(1);
+		});
+
+		// Uncertain alert is displayed
+		expect(
+			await screen.findByTestId("obligation-uncertain-alert"),
+		).toBeInTheDocument();
+		expect(screen.getByTestId("obligation-uncertain-alert")).toHaveTextContent(
+			"Kaydın tamamlanıp tamamlanmadığı doğrulanamadı. Aynı işlemi güvenli şekilde tekrar kontrol edebilirsiniz.",
+		);
+
+		// Retry
+		fireEvent.click(screen.getByTestId("retry-uncertain-btn"));
+
+		await waitFor(() => {
+			expect(mockCreate).toHaveBeenCalledTimes(2);
+		});
+
+		const [call1Person, call1Payload, call1Key] = mockCreate.mock.calls[0]!;
+		const [call2Person, call2Payload, call2Key] = mockCreate.mock.calls[1]!;
+
+		expect(call1Person).toBe("p1");
+		expect(call2Person).toBe("p1");
+		expect(call2Key).toBe(call1Key);
+		expect(call2Payload).toEqual(call1Payload);
+		expect(call2Payload.occurredAt).toBe(call1Payload.occurredAt);
+	});
+
+	it("R2: payable create uncertain retry uses exact same Idempotency-Key, payload, and occurredAt", async () => {
+		const networkError = new ApiError({
+			status: 0,
+			code: "NETWORK_ERROR",
+			message: "Network timeout",
+		});
+
+		const mockCreate = vi
+			.spyOn(peopleApi, "createPersonPayable")
+			.mockRejectedValueOnce(networkError)
+			.mockResolvedValueOnce({
+				obligation: {
+					obligationId: "ob-pay-unc",
+					personId: "p1",
+					direction: "PAYABLE",
+					status: "OPEN",
+					principalAmount: "250.00",
+					settledAmount: "0.00",
+					remainingAmount: "250.00",
+					dueDate: null,
+					description: "Payable uncertain",
+					budgetCategory: "MANDATORY_EXPENSE",
+					revisionNo: 1,
+					isSplitManaged: false,
+				},
+			});
+
+		render(
+			<ObligationForm mode="create" personId="p1" initialDirection="PAYABLE" />,
+			{ wrapper: createWrapper() },
+		);
+
+		fireEvent.change(screen.getByLabelText(/Tutar/i), {
+			target: { value: "250.00" },
+		});
+		fireEvent.click(screen.getByTestId("budget-mandatory"));
+		fireEvent.change(screen.getByLabelText(/Açıklama/i), {
+			target: { value: "Payable uncertain" },
+		});
+
+		fireEvent.click(screen.getByTestId("obligation-submit-btn"));
+
+		await waitFor(() => {
+			expect(mockCreate).toHaveBeenCalledTimes(1);
+		});
+
+		expect(
+			await screen.findByTestId("retry-uncertain-btn"),
+		).toBeInTheDocument();
+
+		fireEvent.click(screen.getByTestId("retry-uncertain-btn"));
+
+		await waitFor(() => {
+			expect(mockCreate).toHaveBeenCalledTimes(2);
+		});
+
+		const [, call1Payload, call1Key] = mockCreate.mock.calls[0]!;
+		const [, call2Payload, call2Key] = mockCreate.mock.calls[1]!;
+
+		expect(call2Key).toBe(call1Key);
+		expect(call2Payload).toEqual(call1Payload);
+		expect(call2Payload.occurredAt).toBe(call1Payload.occurredAt);
+	});
+
+	it("R2: obligation edit uncertain retry uses exact same Idempotency-Key, payload, and occurredAt", async () => {
+		const initialObligation: ObligationProductDto = {
+			obligationId: "ob-edit-unc",
+			personId: "p1",
+			direction: "RECEIVABLE",
+			status: "OPEN",
+			principalAmount: "400.00",
+			settledAmount: "0.00",
+			remainingAmount: "400.00",
+			dueDate: null,
+			description: "Edit uncertain",
+			budgetCategory: null,
+			revisionNo: 2,
+			isSplitManaged: false,
+		};
+
+		const networkError = new ApiError({
+			status: 0,
+			code: "NETWORK_ERROR",
+			message: "Failed to fetch",
+		});
+
+		vi.spyOn(peopleApi, "fetchPersonObligation").mockResolvedValue({
+			obligation: initialObligation,
+		});
+
+		const mockUpdate = vi
+			.spyOn(peopleApi, "updatePersonObligation")
+			.mockRejectedValueOnce(networkError)
+			.mockResolvedValueOnce({
+				obligation: {
+					...initialObligation,
+					description: "Edit uncertain updated",
+					revisionNo: 3,
+				},
+			});
+
+		render(
+			<ObligationForm mode="edit" personId="p1" obligationId="ob-edit-unc" />,
+			{ wrapper: createWrapper() },
+		);
+
+		await waitFor(() => {
+			expect(screen.getByLabelText(/Tutar/i)).toHaveValue("400.00");
+		});
+
+		fireEvent.change(screen.getByTestId("obligation-description-input"), {
+			target: { value: "Edit uncertain updated" },
+		});
+
+		fireEvent.click(screen.getByTestId("obligation-submit-btn"));
+
+		await waitFor(() => {
+			expect(mockUpdate).toHaveBeenCalledTimes(1);
+		});
+
+		expect(
+			await screen.findByTestId("retry-uncertain-btn"),
+		).toBeInTheDocument();
+
+		fireEvent.click(screen.getByTestId("retry-uncertain-btn"));
+
+		await waitFor(() => {
+			expect(mockUpdate).toHaveBeenCalledTimes(2);
+		});
+
+		const [, , call1Payload, call1Key] = mockUpdate.mock.calls[0]!;
+		const [, , call2Payload, call2Key] = mockUpdate.mock.calls[1]!;
+
+		expect(call2Key).toBe(call1Key);
+		expect(call2Payload).toEqual(call1Payload);
+		expect(call2Payload.occurredAt).toBe(call1Payload.occurredAt);
+		expect(call2Payload.expectedRevisionNo).toBe(2);
+		expect(call2Payload.amount).toBe("400.00");
+	});
+
+	it("R2: obligation void uncertain retry resends same key and revision without prompting window.confirm again", async () => {
+		const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+		const obligation: ObligationProductDto = {
+			obligationId: "ob-void-unc",
+			personId: "p1",
+			direction: "RECEIVABLE",
+			status: "OPEN",
+			principalAmount: "300.00",
+			settledAmount: "0.00",
+			remainingAmount: "300.00",
+			dueDate: null,
+			description: "Void uncertain",
+			budgetCategory: null,
+			revisionNo: 5,
+			isSplitManaged: false,
+		};
+
+		vi.spyOn(peopleApi, "fetchPersonObligation").mockResolvedValue({
+			obligation,
+		});
+		vi.spyOn(peopleApi, "fetchObligationSettlements").mockResolvedValue({
+			settlements: [],
+			limit: 50,
+			hasMore: false,
+			nextCursor: null,
+		});
+
+		const networkError = new ApiError({
+			status: 0,
+			code: "NETWORK_ERROR",
+			message: "Connection dropped",
+		});
+
+		const mockVoid = vi
+			.spyOn(peopleApi, "voidPersonObligation")
+			.mockRejectedValueOnce(networkError)
+			.mockResolvedValueOnce({
+				obligation: { ...obligation, status: "VOID", revisionNo: 6 },
+			});
+
+		await renderWithRouter(
+			<ObligationDetailPage personId="p1" obligationId="ob-void-unc" />,
+		);
+
+		await waitFor(() => {
+			expect(screen.getByTestId("void-obligation-btn")).toBeInTheDocument();
+		});
+
+		fireEvent.click(screen.getByTestId("void-obligation-btn"));
+
+		await waitFor(() => {
+			expect(mockVoid).toHaveBeenCalledTimes(1);
+		});
+
+		expect(confirmSpy).toHaveBeenCalledTimes(1);
+		expect(
+			await screen.findByTestId("retry-uncertain-void-btn"),
+		).toBeInTheDocument();
+		expect(
+			screen.getByText(
+				"İptal işleminin tamamlanıp tamamlanmadığı doğrulanamadı.",
+			),
+		).toBeInTheDocument();
+
+		// Retry void without confirming again
+		fireEvent.click(screen.getByTestId("retry-uncertain-void-btn"));
+
+		await waitFor(() => {
+			expect(mockVoid).toHaveBeenCalledTimes(2);
+		});
+
+		// confirm must NOT have been called a second time
+		expect(confirmSpy).toHaveBeenCalledTimes(1);
+
+		const [, , call1Payload, call1Key] = mockVoid.mock.calls[0]!;
+		const [, , call2Payload, call2Key] = mockVoid.mock.calls[1]!;
+
+		expect(call2Key).toBe(call1Key);
+		expect(call2Payload).toEqual(call1Payload);
+		expect(call2Payload.expectedRevisionNo).toBe(5);
+	});
+
+	it("R3: settlement history displays Istanbul timezone representation instead of UTC date slice", async () => {
+		const obligation: ObligationProductDto = {
+			obligationId: "ob-r3",
+			personId: "p1",
+			direction: "RECEIVABLE",
+			status: "OPEN",
+			principalAmount: "500.00",
+			settledAmount: "100.00",
+			remainingAmount: "400.00",
+			dueDate: null,
+			description: "R3 test",
+			budgetCategory: null,
+			revisionNo: 1,
+			isSplitManaged: false,
+		};
+
+		vi.spyOn(peopleApi, "fetchPersonObligation").mockResolvedValue({
+			obligation,
+		});
+		vi.spyOn(peopleApi, "fetchObligationSettlements").mockResolvedValue({
+			settlements: [
+				{
+					settlementId: "set-boundary",
+					obligationId: "ob-r3",
+					personId: "p1",
+					direction: "RECEIVABLE",
+					status: "ACTIVE",
+					cashAmount: "100.00",
+					appliedAmount: "100.00",
+					excessAmount: "0.00",
+					note: "Boundary settlement",
+					// UTC: 2026-09-30 21:30:00 -> Istanbul: 2026-10-01 00:30:00
+					occurredAt: "2026-09-30T21:30:00.000Z",
+					revisionNo: 1,
+				},
+			],
+			limit: 50,
+			hasMore: false,
+			nextCursor: null,
+		});
+
+		await renderWithRouter(
+			<ObligationDetailPage personId="p1" obligationId="ob-r3" />,
+		);
+
+		await waitFor(() => {
+			expect(
+				screen.getByTestId("settlement-row-set-boundary"),
+			).toBeInTheDocument();
+		});
+
+		const row = screen.getByTestId("settlement-row-set-boundary");
+
+		// Must display Istanbul date representation "1 Ekim 2026"
+		expect(row).toHaveTextContent("1 Ekim 2026");
+		expect(row).toHaveTextContent("00:30");
+
+		// Must NOT display UTC calendar date slice "2026-09-30"
+		expect(row).not.toHaveTextContent("2026-09-30");
+	});
 });
