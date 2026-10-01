@@ -16,6 +16,7 @@ import {
 	formatIstanbulDateTimeLocal,
 	parseIstanbulDateTimeLocalToIso,
 } from "../../lib/istanbul-date";
+import { parseMoneyToCents } from "../../lib/money";
 import { MoneyInput } from "../common/MoneyInput";
 import { LedgerAccountProvisionModal } from "./LedgerAccountProvisionModal";
 
@@ -102,7 +103,15 @@ export function IncomeReceiptForm({
 			return;
 		}
 
-		if (!amount || Number.parseFloat(amount) <= 0) {
+		let amountCents: bigint;
+		try {
+			amountCents = parseMoneyToCents(amount);
+		} catch {
+			setFormError("Geçerli bir tutar girin.");
+			return;
+		}
+
+		if (amountCents <= 0n) {
 			setFormError("Lütfen sıfırdan büyük geçerli bir tahsilat tutarı girin.");
 			return;
 		}

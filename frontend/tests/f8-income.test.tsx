@@ -18,6 +18,7 @@ import type {
 	ProductIncomeSourceItem,
 } from "../src/api/income-types";
 import * as manualExpensesApi from "../src/api/manual-expenses-api";
+import { EntitlementDetail } from "../src/components/income/EntitlementDetail";
 import { EntitlementForm } from "../src/components/income/EntitlementForm";
 import { IncomeReceiptDetail } from "../src/components/income/IncomeReceiptDetail";
 import { IncomeSettlementEditor } from "../src/components/income/IncomeSettlementEditor";
@@ -552,6 +553,388 @@ describe("F8 Income Tests", () => {
 				const totalEl = screen.getByTestId("reference-income-total");
 				expect(totalEl.textContent).toContain("13.000,00");
 			});
+		});
+	});
+
+	// =========================================================================
+	// Section R1 & R2: RED-TEAM STRENGTHENING — EXACT MONEY & FROZEN RETRIES
+	// =========================================================================
+	describe("Red-Team Strengthening: Exact Money Validation & Frozen Retries", () => {
+		it("R1: validates precise valid money (0.01) and submits exact amount", async () => {
+			const { wrapper } = createWrapper();
+			vi.mocked(incomeApi.fetchAllActiveIncomeSources).mockResolvedValue([
+				mockRegularSource,
+			]);
+
+			render(<EntitlementForm />, { wrapper });
+
+			await waitFor(() => {
+				expect(screen.getByRole("combobox")).toBeDefined();
+			});
+
+			const selectEl = screen.getByRole("combobox");
+			fireEvent.change(selectEl, {
+				target: { value: "src-1" },
+			});
+
+			// Set 0.01 (valid minimal precise cent)
+			fireEvent.change(screen.getByLabelText(/Beklenen Tutar/i), {
+				target: { value: "0.01" },
+			});
+
+			vi.mocked(incomeApi.createIncomeEntitlement).mockResolvedValue({
+				entitlementId: "ent-new",
+			} as any);
+
+			const submitBtn = screen.getByRole("button", {
+				name: /Beklenen Geliri Kaydet/i,
+			});
+			fireEvent.click(submitBtn);
+			await waitFor(() => {
+				expect(incomeApi.createIncomeEntitlement).toHaveBeenCalledWith(
+					expect.objectContaining({
+						amount: "0.01",
+					}),
+					expect.any(String),
+				);
+			});
+		});
+
+		it("R2: Entitlement Edit preserves identical Idempotency-Key and payload on uncertain retry", async () => {
+			const { wrapper } = createWrapper();
+			const mockEnt: IncomeEntitlementItem = {
+				entitlementId: "ent-1",
+				sourceId: "src-1",
+				sourceCode: "KYK",
+				sourceName: "KYK Bursu",
+				periodMonth: "2026-09-01",
+				revisionNo: 3,
+				status: "ACTIVE",
+				amount: "2000.00",
+				allocatedAmount: "0.00",
+				outstandingAmount: "2000.00",
+				settlementStatus: "OPEN",
+				expectedReceiptOn: "2026-09-10",
+				overdue: false,
+				note: "Orijinal Not",
+			};
+
+			vi.mocked(incomeApi.fetchIncomeEntitlement).mockResolvedValue(mockEnt);
+
+			// First call: Network error (uncertain)
+			const networkErr = new TypeError("Failed to fetch");
+			vi.mocked(incomeApi.reviseIncomeEntitlement)
+				.mockRejectedValueOnce(networkErr)
+				.mockResolvedValueOnce({
+					...mockEnt,
+					revisionNo: 4,
+					amount: "2500.00",
+				});
+
+			render(<EntitlementDetail entitlementId="ent-1" />, { wrapper });
+
+			await waitFor(() => {
+				expect(screen.getByTestId("btn-edit-entitlement")).toBeDefined();
+			});
+
+			fireEvent.click(screen.getByTestId("btn-edit-entitlement"));
+
+			await waitFor(() => {
+				expect(screen.getByLabelText(/Yeni Beklenen Tutar/i)).toBeDefined();
+			});
+
+			fireEvent.change(screen.getByLabelText(/Yeni Beklenen Tutar/i), {
+				target: { value: "2500.00" },
+			});
+			fireEvent.change(screen.getByLabelText(/Değişiklik Gerekçesi/i), {
+				target: { value: "Artış" },
+			});
+
+			// First submit
+			fireEvent.click(
+				screen.getByRole("button", { name: /Değişiklikleri Kaydet/i }),
+			);
+
+			await waitFor(() => {
+				expect(screen.getByTestId("edit-uncertain-warning")).toBeDefined();
+			});
+
+			expect(incomeApi.reviseIncomeEntitlement).toHaveBeenCalledTimes(1);
+			const firstCallKey = vi.mocked(incomeApi.reviseIncomeEntitlement).mock
+				.calls[0]![2];
+			const firstCallPayload = vi.mocked(incomeApi.reviseIncomeEntitlement).mock
+				.calls[0]![1];
+
+			// Click retry button
+			fireEvent.click(screen.getByTestId("btn-retry-edit-entitlement"));
+
+			await waitFor(() => {
+				expect(incomeApi.reviseIncomeEntitlement).toHaveBeenCalledTimes(2);
+			});
+
+			const secondCallKey = vi.mocked(incomeApi.reviseIncomeEntitlement).mock
+				.calls[1]![2];
+			const secondCallPayload = vi.mocked(incomeApi.reviseIncomeEntitlement)
+				.mock.calls[1]![1];
+
+			expect(secondCallKey).toBe(firstCallKey);
+			expect(secondCallPayload).toEqual(firstCallPayload);
+			expect(secondCallPayload.expectedRevisionNo).toBe(3);
+			expect(secondCallPayload.amount).toBe("2500.00");
+			expect(secondCallPayload.reasonNote).toBe("Artış");
+		});
+
+		it("R2: Entitlement Void preserves identical Idempotency-Key and payload on uncertain retry", async () => {
+			const { wrapper } = createWrapper();
+			const mockEnt: IncomeEntitlementItem = {
+				entitlementId: "ent-1",
+				sourceId: "src-1",
+				sourceCode: "KYK",
+				sourceName: "KYK Bursu",
+				periodMonth: "2026-09-01",
+				revisionNo: 2,
+				status: "ACTIVE",
+				amount: "2000.00",
+				allocatedAmount: "0.00",
+				outstandingAmount: "2000.00",
+				settlementStatus: "OPEN",
+				expectedReceiptOn: null,
+				overdue: false,
+				note: null,
+			};
+
+			vi.mocked(incomeApi.fetchIncomeEntitlement).mockResolvedValue(mockEnt);
+
+			const networkErr = new TypeError("Failed to fetch");
+			vi.mocked(incomeApi.voidIncomeEntitlement)
+				.mockRejectedValueOnce(networkErr)
+				.mockResolvedValueOnce({ ...mockEnt, status: "VOIDED" });
+
+			render(<EntitlementDetail entitlementId="ent-1" />, { wrapper });
+
+			await waitFor(() => {
+				expect(screen.getByTestId("btn-void-entitlement")).toBeDefined();
+			});
+
+			fireEvent.click(screen.getByTestId("btn-void-entitlement"));
+
+			await waitFor(() => {
+				expect(screen.getByLabelText(/İptal Gerekçesi/i)).toBeDefined();
+			});
+
+			fireEvent.change(screen.getByLabelText(/İptal Gerekçesi/i), {
+				target: { value: "Burs kesildi" },
+			});
+
+			// Submit void
+			fireEvent.click(
+				screen.getByRole("button", { name: /^Beklenen Geliri İptal Et$/i }),
+			);
+
+			await waitFor(() => {
+				expect(screen.getByTestId("void-uncertain-warning")).toBeDefined();
+			});
+
+			expect(incomeApi.voidIncomeEntitlement).toHaveBeenCalledTimes(1);
+			const firstKey = vi.mocked(incomeApi.voidIncomeEntitlement).mock
+				.calls[0]![2];
+			const firstPayload = vi.mocked(incomeApi.voidIncomeEntitlement).mock
+				.calls[0]![1];
+
+			// Retry void
+			fireEvent.click(screen.getByTestId("btn-retry-void-entitlement"));
+
+			await waitFor(() => {
+				expect(incomeApi.voidIncomeEntitlement).toHaveBeenCalledTimes(2);
+			});
+
+			const secondKey = vi.mocked(incomeApi.voidIncomeEntitlement).mock
+				.calls[1]![2];
+			const secondPayload = vi.mocked(incomeApi.voidIncomeEntitlement).mock
+				.calls[1]![1];
+
+			expect(secondKey).toBe(firstKey);
+			expect(secondPayload).toEqual(firstPayload);
+			expect(secondPayload.expectedRevisionNo).toBe(2);
+			expect(secondPayload.reasonNote).toBe("Burs kesildi");
+		});
+
+		it("R2: Receipt Edit preserves exact receivedAt ISO and Idempotency-Key on uncertain retry", async () => {
+			const { wrapper } = createWrapper();
+			const mockReceipt: IncomeReceiptItem = {
+				incomeReceiptId: "rec-1",
+				sourceId: "src-1",
+				sourceCode: "KYK",
+				sourceName: "KYK Bursu",
+				status: "ACTIVE",
+				revisionNo: 4,
+				receivedAt: "2026-09-05T10:00:00.000Z",
+				amount: "2000.00",
+				destinationAccountId: "acc-1",
+				note: "Maaş",
+			};
+
+			vi.mocked(incomeApi.fetchIncomeReceipt).mockResolvedValue(mockReceipt);
+			vi.mocked(incomeApi.fetchIncomeReceiptSettlement).mockResolvedValue(
+				null as any,
+			);
+			vi.mocked(manualExpensesApi.fetchAllLedgerAccounts).mockResolvedValue([
+				{
+					id: "acc-1",
+					accountId: "acc-1",
+					code: "USR_BANKA",
+					name: "Ana Banka",
+					accountType: "ASSET",
+					normalBalance: "DEBIT",
+					currency: "TRY",
+					archived: false,
+				} as any,
+			]);
+
+			const networkErr = new TypeError("Network down");
+			vi.mocked(incomeApi.reviseIncomeReceipt)
+				.mockRejectedValueOnce(networkErr)
+				.mockResolvedValueOnce({
+					...mockReceipt,
+					revisionNo: 5,
+					amount: "2200.00",
+				});
+
+			render(<IncomeReceiptDetail incomeReceiptId="rec-1" />, { wrapper });
+
+			await waitFor(() => {
+				expect(screen.getByTestId("btn-edit-receipt")).toBeDefined();
+			});
+
+			fireEvent.click(screen.getByTestId("btn-edit-receipt"));
+
+			await waitFor(() => {
+				expect(screen.getByLabelText(/Yeni Tutar/i)).toBeDefined();
+			});
+
+			fireEvent.change(screen.getByLabelText(/Yeni Tutar/i), {
+				target: { value: "2200.00" },
+			});
+
+			fireEvent.click(screen.getByTestId("btn-save-receipt-revision"));
+
+			await waitFor(() => {
+				expect(
+					screen.getByTestId("receipt-edit-uncertain-warning"),
+				).toBeDefined();
+			});
+
+			expect(incomeApi.reviseIncomeReceipt).toHaveBeenCalledTimes(1);
+			const firstKey = vi.mocked(incomeApi.reviseIncomeReceipt).mock
+				.calls[0]![2];
+			const firstPayload = vi.mocked(incomeApi.reviseIncomeReceipt).mock
+				.calls[0]![1];
+
+			// Retry edit
+			fireEvent.click(screen.getByTestId("btn-retry-edit-receipt"));
+
+			await waitFor(() => {
+				expect(incomeApi.reviseIncomeReceipt).toHaveBeenCalledTimes(2);
+			});
+
+			const secondKey = vi.mocked(incomeApi.reviseIncomeReceipt).mock
+				.calls[1]![2];
+			const secondPayload = vi.mocked(incomeApi.reviseIncomeReceipt).mock
+				.calls[1]![1];
+
+			expect(secondKey).toBe(firstKey);
+			expect(secondPayload.receivedAt).toBe(firstPayload.receivedAt);
+			expect(secondPayload.expectedRevisionNo).toBe(4);
+			expect(secondPayload.amount).toBe("2200.00");
+		});
+
+		it("R2: Settlement Clear reuses frozen key without calling window.confirm again on retry", async () => {
+			const { wrapper } = createWrapper();
+			const existingSettlement: IncomeReceiptSettlementResponse = {
+				incomeReceiptId: "rec-1",
+				receiptAmount: "1000.00",
+				allocatedAmount: "1000.00",
+				unallocatedAmount: "0.00",
+				revisionNo: 3,
+				allocations: [
+					{
+						entitlementId: "ent-1",
+						periodMonth: "2026-09-01",
+						entitlementAmount: "1000.00",
+						allocatedAmount: "1000.00",
+						entitlementOutstandingAfterAllReceipts: "0.00",
+					},
+				],
+			};
+
+			vi.mocked(incomeApi.fetchIncomeEntitlements).mockResolvedValue({
+				entitlements: [],
+				hasMore: false,
+				limit: 100,
+				nextCursor: null,
+			});
+
+			const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+			const networkErr = new TypeError("Failed to fetch");
+			vi.mocked(incomeApi.reviseIncomeSettlement)
+				.mockRejectedValueOnce(networkErr)
+				.mockResolvedValueOnce({
+					...existingSettlement,
+					allocations: [],
+					revisionNo: 4,
+				});
+
+			render(
+				<IncomeSettlementEditor
+					incomeReceiptId="rec-1"
+					sourceId="src-1"
+					receiptAmount="1000.00"
+					existingSettlement={existingSettlement}
+					onSuccess={vi.fn()}
+					onCancel={vi.fn()}
+				/>,
+				{ wrapper },
+			);
+
+			await waitFor(() => {
+				expect(screen.getByTestId("btn-clear-settlement")).toBeDefined();
+			});
+
+			// First clear attempt -> prompts confirm
+			fireEvent.click(screen.getByTestId("btn-clear-settlement"));
+			expect(confirmSpy).toHaveBeenCalledTimes(1);
+
+			await waitFor(() => {
+				expect(
+					screen.getByTestId("settlement-uncertain-warning"),
+				).toBeDefined();
+			});
+
+			expect(incomeApi.reviseIncomeSettlement).toHaveBeenCalledTimes(1);
+			const firstKey = vi.mocked(incomeApi.reviseIncomeSettlement).mock
+				.calls[0]![2];
+			const firstPayload = vi.mocked(incomeApi.reviseIncomeSettlement).mock
+				.calls[0]![1];
+
+			// Retry clear -> should NOT prompt confirm again
+			fireEvent.click(screen.getByTestId("btn-retry-settlement"));
+
+			await waitFor(() => {
+				expect(incomeApi.reviseIncomeSettlement).toHaveBeenCalledTimes(2);
+			});
+
+			expect(confirmSpy).toHaveBeenCalledTimes(1); // Still exactly 1!
+			const secondKey = vi.mocked(incomeApi.reviseIncomeSettlement).mock
+				.calls[1]![2];
+			const secondPayload = vi.mocked(incomeApi.reviseIncomeSettlement).mock
+				.calls[1]![1];
+
+			expect(secondKey).toBe(firstKey);
+			expect(secondPayload.expectedRevisionNo).toBe(3);
+			expect(secondPayload.allocations).toEqual([]);
+
+			confirmSpy.mockRestore();
 		});
 	});
 });

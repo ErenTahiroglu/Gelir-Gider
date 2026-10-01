@@ -1,8 +1,8 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { ArrowLeft, Edit, Trash2 } from "lucide-react";
-import { useState } from "react";
-import { ApiError } from "../../api/errors";
+import { AlertTriangle, ArrowLeft, Edit, Trash2 } from "lucide-react";
+import { useRef, useState } from "react";
+import { ApiError, isNetworkUncertainError } from "../../api/errors";
 import {
 	fetchIncomeEntitlement,
 	reviseIncomeEntitlement,
@@ -17,7 +17,7 @@ import {
 	formatPeriodMonthTurkish,
 	fromEntitlementPeriodMonth,
 } from "../../lib/istanbul-date";
-import { formatMoneyToTry } from "../../lib/money";
+import { formatMoneyToTry, parseMoneyToCents } from "../../lib/money";
 import { AccessibleModal } from "../common/AccessibleModal";
 import { MoneyInput } from "../common/MoneyInput";
 
@@ -55,10 +55,26 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 	const [editNote, setEditNote] = useState("");
 	const [editReasonNote, setEditReasonNote] = useState("");
 	const [editError, setEditError] = useState<string | null>(null);
+	const [editUncertainWarning, setEditUncertainWarning] = useState<
+		string | null
+	>(null);
+	const [isEditSubmitting, setIsEditSubmitting] = useState(false);
+	const frozenEditAttemptRef = useRef<{
+		key: string;
+		payload: ReviseIncomeEntitlementPayload;
+	} | null>(null);
 
 	// Void form state
 	const [voidReasonNote, setVoidReasonNote] = useState("");
 	const [voidError, setVoidError] = useState<string | null>(null);
+	const [voidUncertainWarning, setVoidUncertainWarning] = useState<
+		string | null
+	>(null);
+	const [isVoidSubmitting, setIsVoidSubmitting] = useState(false);
+	const frozenVoidAttemptRef = useRef<{
+		key: string;
+		payload: VoidIncomeEntitlementPayload;
+	} | null>(null);
 
 	const {
 		data: entitlement,
@@ -78,39 +94,60 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 		setEditNote(entitlement.note ?? "");
 		setEditReasonNote("");
 		setEditError(null);
+		setEditUncertainWarning(null);
+		frozenEditAttemptRef.current = null;
 		setIsEditModalOpen(true);
 	};
 
 	const openVoid = () => {
 		setVoidReasonNote("");
 		setVoidError(null);
+		setVoidUncertainWarning(null);
+		frozenVoidAttemptRef.current = null;
 		setIsVoidModalOpen(true);
 	};
 
-	const handleEditSubmit = async (e: React.FormEvent) => {
-		e.preventDefault();
+	const executeEditSubmit = async (isRetry: boolean) => {
 		if (!entitlement) return;
 		setEditError(null);
+		setEditUncertainWarning(null);
 
-		if (!editAmount || Number.parseFloat(editAmount) <= 0) {
-			setEditError("Geçerli ve pozitif bir tutar girin.");
-			return;
+		let key: string;
+		let payload: ReviseIncomeEntitlementPayload;
+
+		if (isRetry && frozenEditAttemptRef.current) {
+			key = frozenEditAttemptRef.current.key;
+			payload = frozenEditAttemptRef.current.payload;
+		} else {
+			let amountCents: bigint;
+			try {
+				amountCents = parseMoneyToCents(editAmount);
+			} catch {
+				setEditError("Geçerli bir tutar girin.");
+				return;
+			}
+
+			if (amountCents <= 0n) {
+				setEditError("Geçerli ve pozitif bir tutar girin.");
+				return;
+			}
+
+			key = crypto.randomUUID();
+			payload = {
+				expectedRevisionNo: entitlement.revisionNo,
+				amount: editAmount,
+				expectedReceiptOn: editExpectedReceiptOn ? editExpectedReceiptOn : null,
+				note: editNote.trim() ? editNote.trim() : null,
+				reasonNote: editReasonNote.trim() ? editReasonNote.trim() : null,
+			};
+			frozenEditAttemptRef.current = { key, payload };
 		}
 
-		const payload: ReviseIncomeEntitlementPayload = {
-			expectedRevisionNo: entitlement.revisionNo,
-			amount: editAmount,
-			expectedReceiptOn: editExpectedReceiptOn ? editExpectedReceiptOn : null,
-			note: editNote.trim() ? editNote.trim() : null,
-			reasonNote: editReasonNote.trim() ? editReasonNote.trim() : null,
-		};
-
+		setIsEditSubmitting(true);
 		try {
-			await reviseIncomeEntitlement(
-				entitlement.entitlementId,
-				payload,
-				crypto.randomUUID(),
-			);
+			await reviseIncomeEntitlement(entitlement.entitlementId, payload, key);
+			frozenEditAttemptRef.current = null;
+			setEditUncertainWarning(null);
 			await queryClient.invalidateQueries({
 				queryKey: ["income-entitlements"],
 			});
@@ -119,33 +156,56 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 			});
 			setIsEditModalOpen(false);
 		} catch (err) {
-			if (err instanceof ApiError) {
-				if (err.code === "INCOME_ENTITLEMENT_REVISION_CONFLICT") {
-					await refetch();
-				}
-				setEditError(err.userMessage);
+			if (isNetworkUncertainError(err)) {
+				setEditUncertainWarning(
+					"Güncellemenin tamamlanıp tamamlanmadığı doğrulanamadı.",
+				);
 			} else {
-				setEditError("Beklenen gelir güncellenirken bir hata oluştu.");
+				frozenEditAttemptRef.current = null;
+				if (err instanceof ApiError) {
+					if (err.code === "INCOME_ENTITLEMENT_REVISION_CONFLICT") {
+						await refetch();
+					}
+					setEditError(err.userMessage);
+				} else {
+					setEditError("Beklenen gelir güncellenirken bir hata oluştu.");
+				}
 			}
+		} finally {
+			setIsEditSubmitting(false);
 		}
 	};
 
-	const handleVoidSubmit = async (e: React.FormEvent) => {
+	const handleEditSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
+		void executeEditSubmit(false);
+	};
+
+	const executeVoidSubmit = async (isRetry: boolean) => {
 		if (!entitlement) return;
 		setVoidError(null);
+		setVoidUncertainWarning(null);
 
-		const payload: VoidIncomeEntitlementPayload = {
-			expectedRevisionNo: entitlement.revisionNo,
-			reasonNote: voidReasonNote.trim() ? voidReasonNote.trim() : null,
-		};
+		let key: string;
+		let payload: VoidIncomeEntitlementPayload;
 
+		if (isRetry && frozenVoidAttemptRef.current) {
+			key = frozenVoidAttemptRef.current.key;
+			payload = frozenVoidAttemptRef.current.payload;
+		} else {
+			key = crypto.randomUUID();
+			payload = {
+				expectedRevisionNo: entitlement.revisionNo,
+				reasonNote: voidReasonNote.trim() ? voidReasonNote.trim() : null,
+			};
+			frozenVoidAttemptRef.current = { key, payload };
+		}
+
+		setIsVoidSubmitting(true);
 		try {
-			await voidIncomeEntitlement(
-				entitlement.entitlementId,
-				payload,
-				crypto.randomUUID(),
-			);
+			await voidIncomeEntitlement(entitlement.entitlementId, payload, key);
+			frozenVoidAttemptRef.current = null;
+			setVoidUncertainWarning(null);
 			await queryClient.invalidateQueries({
 				queryKey: ["income-entitlements"],
 			});
@@ -154,15 +214,29 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 			});
 			setIsVoidModalOpen(false);
 		} catch (err) {
-			if (err instanceof ApiError) {
-				if (err.code === "INCOME_ENTITLEMENT_REVISION_CONFLICT") {
-					await refetch();
-				}
-				setVoidError(err.userMessage);
+			if (isNetworkUncertainError(err)) {
+				setVoidUncertainWarning(
+					"İptal işleminin tamamlanıp tamamlanmadığı doğrulanamadı.",
+				);
 			} else {
-				setVoidError("Beklenen gelir iptal edilirken bir hata oluştu.");
+				frozenVoidAttemptRef.current = null;
+				if (err instanceof ApiError) {
+					if (err.code === "INCOME_ENTITLEMENT_REVISION_CONFLICT") {
+						await refetch();
+					}
+					setVoidError(err.userMessage);
+				} else {
+					setVoidError("Beklenen gelir iptal edilirken bir hata oluştu.");
+				}
 			}
+		} finally {
+			setIsVoidSubmitting(false);
 		}
+	};
+
+	const handleVoidSubmit = (e: React.FormEvent) => {
+		e.preventDefault();
+		void executeVoidSubmit(false);
 	};
 
 	if (isLoading) {
@@ -346,11 +420,41 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 			{/* Edit Modal */}
 			<AccessibleModal
 				isOpen={isEditModalOpen}
-				onClose={() => setIsEditModalOpen(false)}
+				onClose={() => {
+					if (!isEditSubmitting) {
+						frozenEditAttemptRef.current = null;
+						setEditUncertainWarning(null);
+						setIsEditModalOpen(false);
+					}
+				}}
 				title="Beklenen Geliri Düzenle"
 				variant="center-dialog"
 			>
 				<form onSubmit={handleEditSubmit}>
+					{editUncertainWarning && (
+						<div
+							className="alert alert-warning mb-4 flex items-center justify-between gap-2"
+							role="alert"
+							data-testid="edit-uncertain-warning"
+						>
+							<div className="flex items-center gap-2">
+								<AlertTriangle size={18} className="text-warning shrink-0" />
+								<span className="text-sm">{editUncertainWarning}</span>
+							</div>
+							<button
+								type="button"
+								className="btn btn-sm btn-primary"
+								onClick={() => void executeEditSubmit(true)}
+								disabled={isEditSubmitting}
+								data-testid="btn-retry-edit-entitlement"
+							>
+								{isEditSubmitting
+									? "Deneniyor..."
+									: "Aynı Güncellemeyi Tekrar Dene"}
+							</button>
+						</div>
+					)}
+
 					{editError && (
 						<div className="alert alert-danger mb-4" role="alert">
 							{editError}
@@ -365,6 +469,7 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 							id="edit-entitlement-amount"
 							value={editAmount}
 							onChange={setEditAmount}
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
 							required
 						/>
 					</div>
@@ -382,6 +487,7 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 							className="form-control"
 							value={editExpectedReceiptOn}
 							onChange={(e) => setEditExpectedReceiptOn(e.target.value)}
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
 						/>
 					</div>
 
@@ -395,6 +501,7 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 							className="form-control"
 							value={editNote}
 							onChange={(e) => setEditNote(e.target.value)}
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
 							maxLength={255}
 						/>
 					</div>
@@ -409,6 +516,7 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 							className="form-control"
 							value={editReasonNote}
 							onChange={(e) => setEditReasonNote(e.target.value)}
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
 							placeholder="Örn: Enflasyon artışı güncellendi"
 							maxLength={255}
 						/>
@@ -418,12 +526,21 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 						<button
 							type="button"
 							className="btn btn-secondary"
-							onClick={() => setIsEditModalOpen(false)}
+							onClick={() => {
+								frozenEditAttemptRef.current = null;
+								setEditUncertainWarning(null);
+								setIsEditModalOpen(false);
+							}}
+							disabled={isEditSubmitting}
 						>
 							Vazgeç
 						</button>
-						<button type="submit" className="btn btn-primary">
-							Değişiklikleri Kaydet
+						<button
+							type="submit"
+							className="btn btn-primary"
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
+						>
+							{isEditSubmitting ? "Kaydediliyor..." : "Değişiklikleri Kaydet"}
 						</button>
 					</div>
 				</form>
@@ -432,7 +549,13 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 			{/* Void Modal */}
 			<AccessibleModal
 				isOpen={isVoidModalOpen}
-				onClose={() => setIsVoidModalOpen(false)}
+				onClose={() => {
+					if (!isVoidSubmitting) {
+						frozenVoidAttemptRef.current = null;
+						setVoidUncertainWarning(null);
+						setIsVoidModalOpen(false);
+					}
+				}}
 				title="Beklenen Geliri İptal Et"
 				variant="center-dialog"
 			>
@@ -441,6 +564,30 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 						Bu beklenen geliri iptal etmek istediğinize emin misiniz? Bir
 						tahsilatla eşleştirilmiş beklenen gelirler doğrudan iptal edilemez.
 					</p>
+
+					{voidUncertainWarning && (
+						<div
+							className="alert alert-warning mb-4 flex items-center justify-between gap-2"
+							role="alert"
+							data-testid="void-uncertain-warning"
+						>
+							<div className="flex items-center gap-2">
+								<AlertTriangle size={18} className="text-warning shrink-0" />
+								<span className="text-sm">{voidUncertainWarning}</span>
+							</div>
+							<button
+								type="button"
+								className="btn btn-sm btn-primary"
+								onClick={() => void executeVoidSubmit(true)}
+								disabled={isVoidSubmitting}
+								data-testid="btn-retry-void-entitlement"
+							>
+								{isVoidSubmitting
+									? "Deneniyor..."
+									: "Aynı İptal İşlemini Tekrar Dene"}
+							</button>
+						</div>
+					)}
 
 					{voidError && (
 						<div className="alert alert-danger mb-4" role="alert">
@@ -458,6 +605,7 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 							className="form-control"
 							value={voidReasonNote}
 							onChange={(e) => setVoidReasonNote(e.target.value)}
+							disabled={isVoidSubmitting || Boolean(voidUncertainWarning)}
 							placeholder="Örn: Bu ay burs yatmayacak"
 							maxLength={255}
 						/>
@@ -467,12 +615,23 @@ export function EntitlementDetail({ entitlementId }: EntitlementDetailProps) {
 						<button
 							type="button"
 							className="btn btn-secondary"
-							onClick={() => setIsVoidModalOpen(false)}
+							onClick={() => {
+								frozenVoidAttemptRef.current = null;
+								setVoidUncertainWarning(null);
+								setIsVoidModalOpen(false);
+							}}
+							disabled={isVoidSubmitting}
 						>
 							Vazgeç
 						</button>
-						<button type="submit" className="btn btn-danger">
-							Beklenen Geliri İptal Et
+						<button
+							type="submit"
+							className="btn btn-danger"
+							disabled={isVoidSubmitting || Boolean(voidUncertainWarning)}
+						>
+							{isVoidSubmitting
+								? "İptal Ediliyor..."
+								: "Beklenen Geliri İptal Et"}
 						</button>
 					</div>
 				</form>

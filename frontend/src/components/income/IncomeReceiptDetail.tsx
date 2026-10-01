@@ -1,8 +1,8 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { ArrowLeft, Edit, Layers, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
-import { ApiError } from "../../api/errors";
+import { AlertTriangle, ArrowLeft, Edit, Layers, Trash2 } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import { ApiError, isNetworkUncertainError } from "../../api/errors";
 import {
 	fetchIncomeReceipt,
 	fetchIncomeReceiptSettlement,
@@ -21,7 +21,7 @@ import {
 	fromEntitlementPeriodMonth,
 	parseIstanbulDateTimeLocalToIso,
 } from "../../lib/istanbul-date";
-import { formatMoneyToTry } from "../../lib/money";
+import { formatMoneyToTry, parseMoneyToCents } from "../../lib/money";
 import { AccessibleModal } from "../common/AccessibleModal";
 import { MoneyInput } from "../common/MoneyInput";
 import { IncomeSettlementEditor } from "./IncomeSettlementEditor";
@@ -47,10 +47,26 @@ export function IncomeReceiptDetail({
 	const [editNote, setEditNote] = useState("");
 	const [editReasonNote, setEditReasonNote] = useState("");
 	const [editError, setEditError] = useState<string | null>(null);
+	const [editUncertainWarning, setEditUncertainWarning] = useState<
+		string | null
+	>(null);
+	const [isEditSubmitting, setIsEditSubmitting] = useState(false);
+	const frozenEditAttemptRef = useRef<{
+		key: string;
+		payload: ReviseIncomeReceiptPayload;
+	} | null>(null);
 
 	// Void form state
 	const [voidReasonNote, setVoidReasonNote] = useState("");
 	const [voidError, setVoidError] = useState<string | null>(null);
+	const [voidUncertainWarning, setVoidUncertainWarning] = useState<
+		string | null
+	>(null);
+	const [isVoidSubmitting, setIsVoidSubmitting] = useState(false);
+	const frozenVoidAttemptRef = useRef<{
+		key: string;
+		payload: VoidIncomeReceiptPayload;
+	} | null>(null);
 
 	// Fetch receipt
 	const {
@@ -65,11 +81,7 @@ export function IncomeReceiptDetail({
 	});
 
 	// Fetch settlement
-	const {
-		data: settlement,
-		isLoading: settlementLoading,
-		refetch: refetchSettlement,
-	} = useQuery({
+	const { data: settlement, refetch: refetchSettlement } = useQuery({
 		queryKey: ["income-settlement", incomeReceiptId],
 		queryFn: () => fetchIncomeReceiptSettlement(incomeReceiptId),
 		staleTime: 10_000,
@@ -109,53 +121,74 @@ export function IncomeReceiptDetail({
 		setEditNote(receipt.note ?? "");
 		setEditReasonNote("");
 		setEditError(null);
+		setEditUncertainWarning(null);
+		frozenEditAttemptRef.current = null;
 		setIsEditModalOpen(true);
 	};
 
 	const openVoid = () => {
 		setVoidReasonNote("");
 		setVoidError(null);
+		setVoidUncertainWarning(null);
+		frozenVoidAttemptRef.current = null;
 		setIsVoidModalOpen(true);
 	};
 
-	const handleEditSubmit = async (e: React.FormEvent) => {
-		e.preventDefault();
+	const executeEditSubmit = async (isRetry: boolean) => {
 		if (!receipt) return;
 		setEditError(null);
+		setEditUncertainWarning(null);
 
-		if (!editAmount || Number.parseFloat(editAmount) <= 0) {
-			setEditError("Geçerli ve pozitif bir tutar girin.");
-			return;
+		let key: string;
+		let payload: ReviseIncomeReceiptPayload;
+
+		if (isRetry && frozenEditAttemptRef.current) {
+			key = frozenEditAttemptRef.current.key;
+			payload = frozenEditAttemptRef.current.payload;
+		} else {
+			let amountCents: bigint;
+			try {
+				amountCents = parseMoneyToCents(editAmount);
+			} catch {
+				setEditError("Geçerli bir tutar girin.");
+				return;
+			}
+
+			if (amountCents <= 0n) {
+				setEditError("Geçerli ve pozitif bir tutar girin.");
+				return;
+			}
+
+			if (!editDestinationAccountId) {
+				setEditError("Yatan kasa/banka hesabını seçin.");
+				return;
+			}
+
+			let canonicalIso: string;
+			try {
+				canonicalIso = parseIstanbulDateTimeLocalToIso(editReceivedAtLocal);
+			} catch {
+				setEditError("Geçerli bir tarih ve saat girin.");
+				return;
+			}
+
+			key = crypto.randomUUID();
+			payload = {
+				expectedRevisionNo: receipt.revisionNo,
+				amount: editAmount,
+				receivedAt: canonicalIso,
+				destinationAccountId: editDestinationAccountId,
+				note: editNote.trim() ? editNote.trim() : null,
+				reasonNote: editReasonNote.trim() ? editReasonNote.trim() : null,
+			};
+			frozenEditAttemptRef.current = { key, payload };
 		}
 
-		if (!editDestinationAccountId) {
-			setEditError("Yatan kasa/banka hesabını seçin.");
-			return;
-		}
-
-		let canonicalIso: string;
+		setIsEditSubmitting(true);
 		try {
-			canonicalIso = parseIstanbulDateTimeLocalToIso(editReceivedAtLocal);
-		} catch {
-			setEditError("Geçerli bir tarih ve saat girin.");
-			return;
-		}
-
-		const payload: ReviseIncomeReceiptPayload = {
-			expectedRevisionNo: receipt.revisionNo,
-			amount: editAmount,
-			receivedAt: canonicalIso,
-			destinationAccountId: editDestinationAccountId,
-			note: editNote.trim() ? editNote.trim() : null,
-			reasonNote: editReasonNote.trim() ? editReasonNote.trim() : null,
-		};
-
-		try {
-			await reviseIncomeReceipt(
-				receipt.incomeReceiptId,
-				payload,
-				crypto.randomUUID(),
-			);
+			await reviseIncomeReceipt(receipt.incomeReceiptId, payload, key);
+			frozenEditAttemptRef.current = null;
+			setEditUncertainWarning(null);
 			await queryClient.invalidateQueries({ queryKey: ["income-receipts"] });
 			await queryClient.invalidateQueries({
 				queryKey: ["income-receipt", incomeReceiptId],
@@ -165,33 +198,56 @@ export function IncomeReceiptDetail({
 			await queryClient.invalidateQueries({ queryKey: ["income-reference"] });
 			setIsEditModalOpen(false);
 		} catch (err) {
-			if (err instanceof ApiError) {
-				if (err.code === "INCOME_RECEIPT_REVISION_CONFLICT") {
-					await refetchReceipt();
-				}
-				setEditError(err.userMessage);
+			if (isNetworkUncertainError(err)) {
+				setEditUncertainWarning(
+					"Güncellemenin tamamlanıp tamamlanmadığı doğrulanamadı.",
+				);
 			} else {
-				setEditError("Tahsilat kaydı güncellenirken bir hata oluştu.");
+				frozenEditAttemptRef.current = null;
+				if (err instanceof ApiError) {
+					if (err.code === "INCOME_RECEIPT_REVISION_CONFLICT") {
+						await refetchReceipt();
+					}
+					setEditError(err.userMessage);
+				} else {
+					setEditError("Tahsilat kaydı güncellenirken bir hata oluştu.");
+				}
 			}
+		} finally {
+			setIsEditSubmitting(false);
 		}
 	};
 
-	const handleVoidSubmit = async (e: React.FormEvent) => {
+	const handleEditSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
+		void executeEditSubmit(false);
+	};
+
+	const executeVoidSubmit = async (isRetry: boolean) => {
 		if (!receipt) return;
 		setVoidError(null);
+		setVoidUncertainWarning(null);
 
-		const payload: VoidIncomeReceiptPayload = {
-			expectedRevisionNo: receipt.revisionNo,
-			reasonNote: voidReasonNote.trim() ? voidReasonNote.trim() : null,
-		};
+		let key: string;
+		let payload: VoidIncomeReceiptPayload;
 
+		if (isRetry && frozenVoidAttemptRef.current) {
+			key = frozenVoidAttemptRef.current.key;
+			payload = frozenVoidAttemptRef.current.payload;
+		} else {
+			key = crypto.randomUUID();
+			payload = {
+				expectedRevisionNo: receipt.revisionNo,
+				reasonNote: voidReasonNote.trim() ? voidReasonNote.trim() : null,
+			};
+			frozenVoidAttemptRef.current = { key, payload };
+		}
+
+		setIsVoidSubmitting(true);
 		try {
-			await voidIncomeReceipt(
-				receipt.incomeReceiptId,
-				payload,
-				crypto.randomUUID(),
-			);
+			await voidIncomeReceipt(receipt.incomeReceiptId, payload, key);
+			frozenVoidAttemptRef.current = null;
+			setVoidUncertainWarning(null);
 			await queryClient.invalidateQueries({ queryKey: ["income-receipts"] });
 			await queryClient.invalidateQueries({
 				queryKey: ["income-receipt", incomeReceiptId],
@@ -201,15 +257,29 @@ export function IncomeReceiptDetail({
 			await queryClient.invalidateQueries({ queryKey: ["income-reference"] });
 			setIsVoidModalOpen(false);
 		} catch (err) {
-			if (err instanceof ApiError) {
-				if (err.code === "INCOME_RECEIPT_REVISION_CONFLICT") {
-					await refetchReceipt();
-				}
-				setVoidError(err.userMessage);
+			if (isNetworkUncertainError(err)) {
+				setVoidUncertainWarning(
+					"İptal işleminin tamamlanıp tamamlanmadığı doğrulanamadı.",
+				);
 			} else {
-				setVoidError("Tahsilat kaydı iptal edilirken bir hata oluştu.");
+				frozenVoidAttemptRef.current = null;
+				if (err instanceof ApiError) {
+					if (err.code === "INCOME_RECEIPT_REVISION_CONFLICT") {
+						await refetchReceipt();
+					}
+					setVoidError(err.userMessage);
+				} else {
+					setVoidError("Tahsilat kaydı iptal edilirken bir hata oluştu.");
+				}
 			}
+		} finally {
+			setIsVoidSubmitting(false);
 		}
+	};
+
+	const handleVoidSubmit = (e: React.FormEvent) => {
+		e.preventDefault();
+		void executeVoidSubmit(false);
 	};
 
 	if (receiptLoading) {
@@ -452,11 +522,41 @@ export function IncomeReceiptDetail({
 			{/* Edit Modal */}
 			<AccessibleModal
 				isOpen={isEditModalOpen}
-				onClose={() => setIsEditModalOpen(false)}
+				onClose={() => {
+					if (!isEditSubmitting) {
+						frozenEditAttemptRef.current = null;
+						setEditUncertainWarning(null);
+						setIsEditModalOpen(false);
+					}
+				}}
 				title="Tahsilatı Düzenle"
 				variant="center-dialog"
 			>
 				<form onSubmit={handleEditSubmit}>
+					{editUncertainWarning && (
+						<div
+							className="alert alert-warning mb-4 flex items-center justify-between gap-2"
+							role="alert"
+							data-testid="receipt-edit-uncertain-warning"
+						>
+							<div className="flex items-center gap-2">
+								<AlertTriangle size={18} className="text-warning shrink-0" />
+								<span className="text-sm">{editUncertainWarning}</span>
+							</div>
+							<button
+								type="button"
+								className="btn btn-sm btn-primary"
+								onClick={() => void executeEditSubmit(true)}
+								disabled={isEditSubmitting}
+								data-testid="btn-retry-edit-receipt"
+							>
+								{isEditSubmitting
+									? "Deneniyor..."
+									: "Aynı Güncellemeyi Tekrar Dene"}
+							</button>
+						</div>
+					)}
+
 					{editError && (
 						<div className="alert alert-danger mb-4" role="alert">
 							{editError}
@@ -471,6 +571,7 @@ export function IncomeReceiptDetail({
 							id="edit-receipt-amount"
 							value={editAmount}
 							onChange={setEditAmount}
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
 							required
 						/>
 					</div>
@@ -484,6 +585,7 @@ export function IncomeReceiptDetail({
 							className="form-control"
 							value={editDestinationAccountId}
 							onChange={(e) => setEditDestinationAccountId(e.target.value)}
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
 							required
 						>
 							<option value="">Hesap Seçin...</option>
@@ -505,6 +607,7 @@ export function IncomeReceiptDetail({
 							className="form-control"
 							value={editReceivedAtLocal}
 							onChange={(e) => setEditReceivedAtLocal(e.target.value)}
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
 							required
 						/>
 					</div>
@@ -519,6 +622,7 @@ export function IncomeReceiptDetail({
 							className="form-control"
 							value={editNote}
 							onChange={(e) => setEditNote(e.target.value)}
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
 							maxLength={255}
 						/>
 					</div>
@@ -533,6 +637,7 @@ export function IncomeReceiptDetail({
 							className="form-control"
 							value={editReasonNote}
 							onChange={(e) => setEditReasonNote(e.target.value)}
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
 							placeholder="Örn: Yanlış hesap seçilmişti"
 							maxLength={255}
 						/>
@@ -542,16 +647,22 @@ export function IncomeReceiptDetail({
 						<button
 							type="button"
 							className="btn btn-secondary"
-							onClick={() => setIsEditModalOpen(false)}
+							onClick={() => {
+								frozenEditAttemptRef.current = null;
+								setEditUncertainWarning(null);
+								setIsEditModalOpen(false);
+							}}
+							disabled={isEditSubmitting}
 						>
 							Vazgeç
 						</button>
 						<button
 							type="submit"
 							className="btn btn-primary"
+							disabled={isEditSubmitting || Boolean(editUncertainWarning)}
 							data-testid="btn-save-receipt-revision"
 						>
-							Değişiklikleri Kaydet
+							{isEditSubmitting ? "Kaydediliyor..." : "Değişiklikleri Kaydet"}
 						</button>
 					</div>
 				</form>
@@ -560,7 +671,13 @@ export function IncomeReceiptDetail({
 			{/* Void Modal */}
 			<AccessibleModal
 				isOpen={isVoidModalOpen}
-				onClose={() => setIsVoidModalOpen(false)}
+				onClose={() => {
+					if (!isVoidSubmitting) {
+						frozenVoidAttemptRef.current = null;
+						setVoidUncertainWarning(null);
+						setIsVoidModalOpen(false);
+					}
+				}}
 				title="Tahsilatı İptal Et"
 				variant="center-dialog"
 			>
@@ -571,6 +688,30 @@ export function IncomeReceiptDetail({
 						tersine çevrilecektir. Eşleştirilmiş beklenen gelir kaydı varsa önce
 						eşleştirmeyi temizlemeniz gerekir.
 					</p>
+
+					{voidUncertainWarning && (
+						<div
+							className="alert alert-warning mb-4 flex items-center justify-between gap-2"
+							role="alert"
+							data-testid="receipt-void-uncertain-warning"
+						>
+							<div className="flex items-center gap-2">
+								<AlertTriangle size={18} className="text-warning shrink-0" />
+								<span className="text-sm">{voidUncertainWarning}</span>
+							</div>
+							<button
+								type="button"
+								className="btn btn-sm btn-primary"
+								onClick={() => void executeVoidSubmit(true)}
+								disabled={isVoidSubmitting}
+								data-testid="btn-retry-void-receipt"
+							>
+								{isVoidSubmitting
+									? "Deneniyor..."
+									: "Aynı İptal İşlemini Tekrar Dene"}
+							</button>
+						</div>
+					)}
 
 					{voidError && (
 						<div className="alert alert-danger mb-4" role="alert">
@@ -588,6 +729,7 @@ export function IncomeReceiptDetail({
 							className="form-control"
 							value={voidReasonNote}
 							onChange={(e) => setVoidReasonNote(e.target.value)}
+							disabled={isVoidSubmitting || Boolean(voidUncertainWarning)}
 							placeholder="Örn: Hatalı mükerrer kayıt"
 							maxLength={255}
 						/>
@@ -597,12 +739,21 @@ export function IncomeReceiptDetail({
 						<button
 							type="button"
 							className="btn btn-secondary"
-							onClick={() => setIsVoidModalOpen(false)}
+							onClick={() => {
+								frozenVoidAttemptRef.current = null;
+								setVoidUncertainWarning(null);
+								setIsVoidModalOpen(false);
+							}}
+							disabled={isVoidSubmitting}
 						>
 							Vazgeç
 						</button>
-						<button type="submit" className="btn btn-danger">
-							Tahsilatı İptal Et
+						<button
+							type="submit"
+							className="btn btn-danger"
+							disabled={isVoidSubmitting || Boolean(voidUncertainWarning)}
+						>
+							{isVoidSubmitting ? "İptal Ediliyor..." : "Tahsilatı İptal Et"}
 						</button>
 					</div>
 				</form>

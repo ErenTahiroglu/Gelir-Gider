@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
-import { ApiError } from "../../api/errors";
+import { AlertTriangle, Plus, Trash2 } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import { ApiError, isNetworkUncertainError } from "../../api/errors";
 import {
 	createIncomeSettlement,
 	fetchIncomeEntitlements,
@@ -38,6 +38,23 @@ interface AllocationRow {
 	amount: string;
 }
 
+type FrozenSettlementAttempt =
+	| {
+			type: "CREATE";
+			key: string;
+			payload: CreateIncomeSettlementPayload;
+	  }
+	| {
+			type: "REVISE";
+			key: string;
+			payload: ReviseIncomeSettlementPayload;
+	  }
+	| {
+			type: "CLEAR";
+			key: string;
+			payload: ReviseIncomeSettlementPayload;
+	  };
+
 export function IncomeSettlementEditor({
 	incomeReceiptId,
 	sourceId,
@@ -68,6 +85,9 @@ export function IncomeSettlementEditor({
 	const [reasonNote, setReasonNote] = useState("");
 	const [submitting, setSubmitting] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const [uncertainWarning, setUncertainWarning] = useState<string | null>(null);
+
+	const frozenAttemptRef = useRef<FrozenSettlementAttempt | null>(null);
 
 	// Load entitlements for the same source
 	const { data: entitlementsData, isLoading: entitlementsLoading } = useQuery({
@@ -158,30 +178,40 @@ export function IncomeSettlementEditor({
 		);
 	};
 
-	const handleClearSettlement = async () => {
+	const executeClearSettlement = async (isRetry: boolean) => {
 		if (!existingSettlement) return;
-		if (
-			!window.confirm(
-				"Bu tahsilatın tüm beklenen gelir eşleştirmesini temizlemek istediğinize emin misiniz?",
-			)
-		) {
-			return;
-		}
-
 		setError(null);
-		setSubmitting(true);
-		try {
-			const payload: ReviseIncomeSettlementPayload = {
+		setUncertainWarning(null);
+
+		let key: string;
+		let payload: ReviseIncomeSettlementPayload;
+
+		if (isRetry && frozenAttemptRef.current?.type === "CLEAR") {
+			key = frozenAttemptRef.current.key;
+			payload = frozenAttemptRef.current.payload;
+		} else {
+			if (
+				!window.confirm(
+					"Bu tahsilatın tüm beklenen gelir eşleştirmesini temizlemek istediğinize emin misiniz?",
+				)
+			) {
+				return;
+			}
+
+			key = crypto.randomUUID();
+			payload = {
 				expectedRevisionNo: existingSettlement.revisionNo,
 				allocations: [],
 				reasonNote: "Eşleştirme kullanıcı tarafından temizlendi",
 			};
+			frozenAttemptRef.current = { type: "CLEAR", key, payload };
+		}
 
-			await reviseIncomeSettlement(
-				incomeReceiptId,
-				payload,
-				crypto.randomUUID(),
-			);
+		setSubmitting(true);
+		try {
+			await reviseIncomeSettlement(incomeReceiptId, payload, key);
+			frozenAttemptRef.current = null;
+			setUncertainWarning(null);
 			await queryClient.invalidateQueries({
 				queryKey: ["income-settlement", incomeReceiptId],
 			});
@@ -191,59 +221,100 @@ export function IncomeSettlementEditor({
 			await queryClient.invalidateQueries({ queryKey: ["income-receipts"] });
 			onSuccess();
 		} catch (err) {
-			if (err instanceof ApiError) {
-				setError(err.userMessage);
+			if (isNetworkUncertainError(err)) {
+				setUncertainWarning(
+					"Eşleştirmenin temizlenip temizlenmediği doğrulanamadı.",
+				);
 			} else {
-				setError("Eşleştirme temizlenirken hata oluştu.");
+				frozenAttemptRef.current = null;
+				if (err instanceof ApiError) {
+					if (err.code === "INCOME_SETTLEMENT_REVISION_CONFLICT") {
+						await queryClient.invalidateQueries({
+							queryKey: ["income-settlement", incomeReceiptId],
+						});
+						await queryClient.invalidateQueries({
+							queryKey: ["income-entitlements"],
+						});
+					}
+					setError(err.userMessage);
+				} else {
+					setError("Eşleştirme temizlenirken hata oluştu.");
+				}
 			}
 		} finally {
 			setSubmitting(false);
 		}
 	};
 
-	const handleSubmit = async (e: React.FormEvent) => {
-		e.preventDefault();
+	const executeSubmit = async (isRetry: boolean) => {
 		setError(null);
+		setUncertainWarning(null);
 
-		const validRows = allocations.filter(
-			(r) => r.entitlementId && r.amount?.trim(),
-		);
+		let key: string;
+		let attemptType: "CREATE" | "REVISE";
+		let createPayload: CreateIncomeSettlementPayload | null = null;
+		let revisePayload: ReviseIncomeSettlementPayload | null = null;
 
-		if (validRows.length === 0) {
-			setError(
-				"En az bir beklenen gelir eşleştirmesi seçmeli ve tutar girmelisiniz.",
+		if (
+			isRetry &&
+			frozenAttemptRef.current &&
+			(frozenAttemptRef.current.type === "CREATE" ||
+				frozenAttemptRef.current.type === "REVISE")
+		) {
+			key = frozenAttemptRef.current.key;
+			attemptType = frozenAttemptRef.current.type;
+			if (frozenAttemptRef.current.type === "CREATE") {
+				createPayload = frozenAttemptRef.current.payload;
+			} else {
+				revisePayload = frozenAttemptRef.current.payload;
+			}
+		} else {
+			const validRows = allocations.filter(
+				(r) => r.entitlementId && r.amount?.trim(),
 			);
-			return;
-		}
 
-		// Check for duplicate entitlement selections
-		const seenEntitlements = new Set<string>();
-		for (const row of validRows) {
-			if (seenEntitlements.has(row.entitlementId)) {
-				setError("Aynı beklenen gelir birden fazla satırda seçilemez.");
+			if (validRows.length === 0) {
+				setError(
+					"En az bir beklenen gelir eşleştirmesi seçmeli ve tutar girmelisiniz.",
+				);
 				return;
 			}
-			seenEntitlements.add(row.entitlementId);
 
-			const cents = parseMoneyToCents(row.amount);
-			if (cents <= 0n) {
-				setError("Tüm eşleştirme tutarları sıfırdan büyük olmalıdır.");
+			// Check for duplicate entitlement selections
+			const seenEntitlements = new Set<string>();
+			for (const row of validRows) {
+				if (seenEntitlements.has(row.entitlementId)) {
+					setError("Aynı beklenen gelir birden fazla satırda seçilemez.");
+					return;
+				}
+				seenEntitlements.add(row.entitlementId);
+
+				let cents: bigint;
+				try {
+					cents = parseMoneyToCents(row.amount);
+				} catch {
+					setError("Geçerli bir eşleştirme tutarı girin.");
+					return;
+				}
+
+				if (cents <= 0n) {
+					setError("Tüm eşleştirme tutarları sıfırdan büyük olmalıdır.");
+					return;
+				}
+			}
+
+			// Guard: sum <= receiptAmount
+			if (totalAllocatedCents > receiptCents) {
+				setError(
+					`Eşleştirilen toplam tutar (${formatCentsToCanonical(totalAllocatedCents)} ₺), tahsilat tutarından (${receiptAmount} ₺) fazla olamaz.`,
+				);
 				return;
 			}
-		}
 
-		// Guard: sum <= receiptAmount
-		if (totalAllocatedCents > receiptCents) {
-			setError(
-				`Eşleştirilen toplam tutar (${formatCentsToCanonical(totalAllocatedCents)} ₺), tahsilat tutarından (${receiptAmount} ₺) fazla olamaz.`,
-			);
-			return;
-		}
-
-		setSubmitting(true);
-		try {
+			key = crypto.randomUUID();
 			if (isEditing && existingSettlement) {
-				const payload: ReviseIncomeSettlementPayload = {
+				attemptType = "REVISE";
+				revisePayload = {
 					expectedRevisionNo: existingSettlement.revisionNo,
 					allocations: validRows.map((r) => ({
 						entitlementId: r.entitlementId,
@@ -252,28 +323,38 @@ export function IncomeSettlementEditor({
 					note: note.trim() ? note.trim() : null,
 					reasonNote: reasonNote.trim() ? reasonNote.trim() : null,
 				};
-
-				await reviseIncomeSettlement(
-					incomeReceiptId,
-					payload,
-					crypto.randomUUID(),
-				);
+				frozenAttemptRef.current = {
+					type: "REVISE",
+					key,
+					payload: revisePayload,
+				};
 			} else {
-				const payload: CreateIncomeSettlementPayload = {
+				attemptType = "CREATE";
+				createPayload = {
 					allocations: validRows.map((r) => ({
 						entitlementId: r.entitlementId,
 						amount: r.amount,
 					})),
 					note: note.trim() ? note.trim() : null,
 				};
+				frozenAttemptRef.current = {
+					type: "CREATE",
+					key,
+					payload: createPayload,
+				};
+			}
+		}
 
-				await createIncomeSettlement(
-					incomeReceiptId,
-					payload,
-					crypto.randomUUID(),
-				);
+		setSubmitting(true);
+		try {
+			if (attemptType === "REVISE" && revisePayload) {
+				await reviseIncomeSettlement(incomeReceiptId, revisePayload, key);
+			} else if (attemptType === "CREATE" && createPayload) {
+				await createIncomeSettlement(incomeReceiptId, createPayload, key);
 			}
 
+			frozenAttemptRef.current = null;
+			setUncertainWarning(null);
 			await queryClient.invalidateQueries({
 				queryKey: ["income-settlement", incomeReceiptId],
 			});
@@ -283,14 +364,36 @@ export function IncomeSettlementEditor({
 			await queryClient.invalidateQueries({ queryKey: ["income-receipts"] });
 			onSuccess();
 		} catch (err) {
-			if (err instanceof ApiError) {
-				setError(err.userMessage);
+			if (isNetworkUncertainError(err)) {
+				setUncertainWarning(
+					attemptType === "CREATE"
+						? "Eşleştirmenin oluşturulup oluşturulmadığı doğrulanamadı."
+						: "Eşleştirme güncellemesinin tamamlanıp tamamlanmadığı doğrulanamadı.",
+				);
 			} else {
-				setError("Eşleştirme kaydedilirken hata oluştu.");
+				frozenAttemptRef.current = null;
+				if (err instanceof ApiError) {
+					if (err.code === "INCOME_SETTLEMENT_REVISION_CONFLICT") {
+						await queryClient.invalidateQueries({
+							queryKey: ["income-settlement", incomeReceiptId],
+						});
+						await queryClient.invalidateQueries({
+							queryKey: ["income-entitlements"],
+						});
+					}
+					setError(err.userMessage);
+				} else {
+					setError("Eşleştirme kaydedilirken hata oluştu.");
+				}
 			}
 		} finally {
 			setSubmitting(false);
 		}
+	};
+
+	const handleSubmit = (e: React.FormEvent) => {
+		e.preventDefault();
+		void executeSubmit(false);
 	};
 
 	return (
@@ -305,8 +408,8 @@ export function IncomeSettlementEditor({
 					<button
 						type="button"
 						className="btn btn-sm btn-outline-danger"
-						onClick={handleClearSettlement}
-						disabled={submitting}
+						onClick={() => void executeClearSettlement(false)}
+						disabled={submitting || Boolean(uncertainWarning)}
 						data-testid="btn-clear-settlement"
 					>
 						Eşleştirmeyi Temizle
@@ -319,6 +422,47 @@ export function IncomeSettlementEditor({
 				eşleştirin. Eşleştirme yalnızca ilişkilendirme amaçlıdır; hesap
 				bakiyelerini tekrar değiştirmez.
 			</p>
+
+			{uncertainWarning && (
+				<div
+					className="alert alert-warning mb-4 flex items-center justify-between gap-2"
+					role="alert"
+					data-testid="settlement-uncertain-warning"
+				>
+					<div className="flex items-center gap-2">
+						<AlertTriangle size={18} className="text-warning shrink-0" />
+						<span className="text-sm">{uncertainWarning}</span>
+					</div>
+					<div className="flex items-center gap-2">
+						<button
+							type="button"
+							className="btn btn-sm btn-secondary"
+							onClick={() => {
+								frozenAttemptRef.current = null;
+								setUncertainWarning(null);
+							}}
+							disabled={submitting}
+						>
+							Yeni Deneme
+						</button>
+						<button
+							type="button"
+							className="btn btn-sm btn-primary"
+							onClick={() => {
+								if (frozenAttemptRef.current?.type === "CLEAR") {
+									void executeClearSettlement(true);
+								} else {
+									void executeSubmit(true);
+								}
+							}}
+							disabled={submitting}
+							data-testid="btn-retry-settlement"
+						>
+							{submitting ? "Deneniyor..." : "Aynı İşlemi Tekrar Dene"}
+						</button>
+					</div>
+				</div>
+			)}
 
 			{error && (
 				<div className="alert alert-danger mb-4" role="alert">
@@ -375,6 +519,7 @@ export function IncomeSettlementEditor({
 											onChange={(e) =>
 												handleRowChange(idx, "entitlementId", e.target.value)
 											}
+											disabled={submitting || Boolean(uncertainWarning)}
 											required
 										>
 											<option value="">Beklenen Gelir Seçin...</option>
@@ -406,6 +551,7 @@ export function IncomeSettlementEditor({
 										value={row.amount}
 										onChange={(val) => handleRowChange(idx, "amount", val)}
 										placeholder="0,00"
+										disabled={submitting || Boolean(uncertainWarning)}
 										required
 									/>
 								</div>
@@ -415,6 +561,7 @@ export function IncomeSettlementEditor({
 										type="button"
 										className="btn btn-icon btn-ghost text-danger mb-1"
 										onClick={() => handleRemoveRow(idx)}
+										disabled={submitting || Boolean(uncertainWarning)}
 										aria-label="Satırı Sil"
 									>
 										<Trash2 size={16} aria-hidden="true" />
@@ -430,6 +577,7 @@ export function IncomeSettlementEditor({
 						type="button"
 						className="btn btn-sm btn-outline-secondary inline-flex items-center gap-1"
 						onClick={handleAddRow}
+						disabled={submitting || Boolean(uncertainWarning)}
 					>
 						<Plus size={14} aria-hidden="true" />
 						<span>Satır Ekle</span>
@@ -447,6 +595,7 @@ export function IncomeSettlementEditor({
 							className="form-control"
 							value={reasonNote}
 							onChange={(e) => setReasonNote(e.target.value)}
+							disabled={submitting || Boolean(uncertainWarning)}
 							placeholder="Örn: Yanlış aya eşleştirilmişti"
 							maxLength={255}
 						/>
@@ -465,7 +614,9 @@ export function IncomeSettlementEditor({
 					<button
 						type="submit"
 						className="btn btn-primary"
-						disabled={submitting || isOverallocated}
+						disabled={
+							submitting || isOverallocated || Boolean(uncertainWarning)
+						}
 						data-testid="btn-save-settlement"
 					>
 						{submitting ? "Kaydediliyor..." : "Eşleştirmeyi Kaydet"}

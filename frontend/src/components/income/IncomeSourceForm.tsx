@@ -12,6 +12,7 @@ import type {
 } from "../../api/income-types";
 import { fetchAllLedgerAccounts } from "../../api/manual-expenses-api";
 import { getIstanbulCalendarDate } from "../../lib/istanbul-date";
+import { parseMoneyToCents } from "../../lib/money";
 import { MoneyInput } from "../common/MoneyInput";
 import { LedgerAccountProvisionModal } from "./LedgerAccountProvisionModal";
 
@@ -126,19 +127,35 @@ export function IncomeSourceForm() {
 		};
 
 		if (effectiveRefMethod === "FIXED_MONTHLY") {
-			if (
-				!expectedMonthlyAmount ||
-				Number.parseFloat(expectedMonthlyAmount) <= 0
-			) {
+			if (!expectedMonthlyAmount) {
+				setFormError("Sabit aylık gelir için pozitif bir tutar girilmelidir.");
+				return;
+			}
+			let cents: bigint;
+			try {
+				cents = parseMoneyToCents(expectedMonthlyAmount);
+			} catch {
+				setFormError("Geçerli bir tutar girin.");
+				return;
+			}
+			if (cents <= 0n) {
 				setFormError("Sabit aylık gelir için pozitif bir tutar girilmelidir.");
 				return;
 			}
 			payload.expectedMonthlyAmount = expectedMonthlyAmount;
 		} else if (effectiveRefMethod === "SEASONAL_ANNUALIZED") {
-			if (
-				!expectedMonthlyAmount ||
-				Number.parseFloat(expectedMonthlyAmount) <= 0
-			) {
+			if (!expectedMonthlyAmount) {
+				setFormError("Dönemsel gelir için pozitif bir tutar girilmelidir.");
+				return;
+			}
+			let cents: bigint;
+			try {
+				cents = parseMoneyToCents(expectedMonthlyAmount);
+			} catch {
+				setFormError("Geçerli bir tutar girin.");
+				return;
+			}
+			if (cents <= 0n) {
 				setFormError("Dönemsel gelir için pozitif bir tutar girilmelidir.");
 				return;
 			}
@@ -157,11 +174,15 @@ export function IncomeSourceForm() {
 			}
 			payload.rollingMedianMonths = rollingMedianMonths;
 		} else if (effectiveRefMethod === "EXCLUDED") {
-			if (
-				expectedMonthlyAmount &&
-				Number.parseFloat(expectedMonthlyAmount) > 0
-			) {
-				payload.expectedMonthlyAmount = expectedMonthlyAmount;
+			if (expectedMonthlyAmount?.trim()) {
+				try {
+					const cents = parseMoneyToCents(expectedMonthlyAmount);
+					if (cents > 0n) {
+						payload.expectedMonthlyAmount = expectedMonthlyAmount;
+					}
+				} catch {
+					// Invalid optional amount not included
+				}
 			}
 		}
 
