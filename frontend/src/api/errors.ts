@@ -254,6 +254,55 @@ export function mapErrorCodeToUserMessage(
 		case "MONTH_CLOSE_NOT_FOUND":
 			return "Bu döneme ait tamamlanmış bir kapanış kaydı bulunamadı.";
 
+		// Imports (F9)
+		case "IMPORT_INVALID_INPUT":
+			return "İçe aktarma verileri veya parametreleri geçersiz.";
+		case "IMPORT_BATCH_NOT_FOUND":
+			return "İçe aktarma grubu bulunamadı.";
+		case "IMPORT_ROW_NOT_FOUND":
+			return "İçe aktarılan satır kaydı bulunamadı.";
+		case "IMPORT_REVISION_CONFLICT":
+			return "Satır durumu başka bir işlem tarafından güncellendi. Lütfen güncel durumu kontrol edin.";
+		case "IMPORT_IDEMPOTENCY_CONFLICT":
+			return "Bu işlem daha önce farklı bilgilerle gönderilmiş. Lütfen işlemi yenileyin.";
+		case "IMPORT_NEEDS_REVIEW":
+			return "Bu satırın uygulanabilmesi için kart veya gelir eşleştirmelerinin tamamlanması gerekiyor.";
+		case "IMPORT_POSSIBLE_DUPLICATE":
+			return "Bu satır mevcut bir kayıtla benzer görünüyor. Lütfen inceleyip karar verin.";
+		case "IMPORT_EXACT_DUPLICATE":
+			return "Bu kayıt daha önce içe aktarılmış aynı işlemle eşleşiyor.";
+		case "IMPORT_UNSUPPORTED_RECORD":
+			return "Bu işlem türü henüz sistem tarafından desteklenmiyor.";
+		case "IMPORT_TARGET_NOT_FOUND":
+			return "Eşleştirilmek istenen hedef işlem kaydı bulunamadı.";
+		case "IMPORT_TARGET_MISMATCH":
+			return "Seçilen hedef işlem bilgileri bu satırla uyuşmuyor.";
+		case "IMPORT_MISSING_CARD_MAPPING":
+			return "Bu kart harcaması için geçerli bir kredi kartı seçilmelidir.";
+		case "IMPORT_MISSING_INCOME_MAPPING":
+			return "Bu gelir tahsilatı için gelir kaynağı ve tahsilat hesabı seçilmelidir.";
+		case "IMPORT_MISSING_EXPENSE_MAPPING":
+			return "Bu harcama için gerekli kategori veya hesap eşleştirmesi eksik.";
+		case "IMPORT_INVALID_STATE":
+			return "Satırın mevcut durumu bu işlem için uygun değil.";
+
+		// Notifications (F9)
+		case "NOTIFICATION_INVALID_INPUT":
+			return "Bildirim parametreleri veya abonelik bilgileri geçersiz.";
+		case "NOTIFICATION_SUBSCRIPTION_NOT_FOUND":
+			return "Bildirim aboneliği bulunamadı.";
+		case "NOTIFICATION_SUBSCRIPTION_DISABLED":
+			return "Bu bildirim aboneliği zaten devre dışı bırakılmış.";
+		case "NOTIFICATION_REVISION_CONFLICT":
+			return "Abonelik durumu güncellendi. Lütfen sayfayı yenileyip tekrar deneyin.";
+		case "NOTIFICATION_IDEMPOTENCY_CONFLICT":
+			return "Bu abonelik işlemi daha önce farklı bilgilerle gönderilmiş. Lütfen işlemi yenileyin.";
+		case "NOTIFICATION_EVENT_NOT_FOUND":
+			return "Bildirim kaydı bulunamadı.";
+		case "NOTIFICATION_PUSH_CONFIG_INVALID":
+		case "NOTIFICATION_PUSH_DELIVERY_FAILED":
+			return "Bildirim servisiyle iletişim kurulamadı. Lütfen daha sonra tekrar deneyin.";
+
 		// Ledger
 		case "LEDGER_ACCOUNT_CODE_CONFLICT":
 			return "Bu kodla bir hesap zaten mevcut.";
@@ -277,4 +326,14 @@ export function isNetworkUncertainError(err: unknown): boolean {
 		);
 	}
 	return false;
+}
+
+export function getApiErrorMessage(err: unknown): string {
+	if (err instanceof ApiError) {
+		return err.userMessage;
+	}
+	if (err instanceof Error) {
+		return err.message;
+	}
+	return "Beklenmeyen bir hata oluştu.";
 }

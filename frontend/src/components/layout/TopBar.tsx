@@ -1,3 +1,4 @@
+import { Link } from "@tanstack/react-router";
 import { Bell, Calendar, Lock, LogOut } from "lucide-react";
 import { useAuth } from "../../auth/auth-context";
 import {
@@ -31,16 +32,15 @@ export function TopBar() {
 					</span>
 				)}
 
-				<button
-					type="button"
+				<Link
+					to="/notifications"
 					className="topbar-btn icon-btn"
-					aria-label="Bildirimler (Henüz aktif değil)"
+					aria-label="Bildirimler"
 					title="Bildirimler"
-					disabled
-					aria-disabled="true"
+					data-testid="topbar-notifications-btn"
 				>
 					<Bell size={18} aria-hidden="true" />
-				</button>
+				</Link>
 
 				<button
 					type="button"

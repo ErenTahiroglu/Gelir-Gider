@@ -6,6 +6,17 @@ import * as webauthnClient from "../src/auth/webauthn-client";
 import { AuthGate } from "../src/components/auth/AuthGate";
 import { TopBar } from "../src/components/layout/TopBar";
 
+vi.mock("@tanstack/react-router", () => ({
+	Link: ({ children, to, ...props }: any) => (
+		<a href={to} {...props}>
+			{children}
+		</a>
+	),
+	useNavigate: () => vi.fn(),
+	useParams: () => ({}),
+	useSearch: () => ({}),
+}));
+
 function TestApp() {
 	const { state } = useAuth();
 

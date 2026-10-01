@@ -22,7 +22,9 @@ export function MobileNav() {
 		currentPath.startsWith("/midas") ||
 		currentPath.startsWith("/long-term") ||
 		currentPath.startsWith("/income") ||
-		currentPath.startsWith("/month-close");
+		currentPath.startsWith("/month-close") ||
+		currentPath.startsWith("/imports") ||
+		currentPath.startsWith("/notifications");
 
 	return (
 		<>

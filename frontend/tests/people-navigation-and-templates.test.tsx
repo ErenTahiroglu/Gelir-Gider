@@ -129,10 +129,11 @@ describe("F6 Navigation & Quick Entry Templates — More Hub, Desktop & Obligati
 			"/month-close",
 		);
 
-		// Future domain links disabled (F9, etc.)
-		expect(screen.getByTestId("more-hub-link-statement-import")).toHaveClass(
-			"disabled",
-		);
+		// Active F9 import link
+		expect(
+			screen.getByTestId("more-hub-link-statement-import"),
+		).toHaveAttribute("href", "/imports");
+		// Future domain links disabled
 		expect(screen.getByTestId("more-hub-link-campaigns")).toHaveClass(
 			"disabled",
 		);

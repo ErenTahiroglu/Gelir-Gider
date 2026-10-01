@@ -271,6 +271,8 @@ export function formatIstanbulDateTimeTurkish(instant: string | Date): string {
 	return `${cal.day} ${monthName} ${cal.year}, ${timePart}`;
 }
 
+export const formatIstanbulDateTime = formatIstanbulDateTimeTurkish;
+
 /**
  * Returns previous completed calendar month in Europe/Istanbul (YYYY-MM).
  * For example: if current Istanbul date is 2026-09-29, returns "2026-08".

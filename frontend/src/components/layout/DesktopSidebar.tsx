@@ -1,9 +1,11 @@
 import { Link, useRouterState } from "@tanstack/react-router";
 import {
+	Bell,
 	CalendarCheck,
 	ChevronLeft,
 	ChevronRight,
 	CreditCard,
+	FileSpreadsheet,
 	Home,
 	PieChart,
 	Repeat,
@@ -37,6 +39,8 @@ export function DesktopSidebar({
 	const isGoalsActive = currentPath.startsWith("/goals");
 	const isLongTermActive = currentPath.startsWith("/long-term");
 	const isMonthCloseActive = currentPath.startsWith("/month-close");
+	const isImportsActive = currentPath.startsWith("/imports");
+	const isNotificationsActive = currentPath.startsWith("/notifications");
 	// Keyboard shortcut: Cmd/Ctrl + B to toggle sidebar
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -209,6 +213,32 @@ export function DesktopSidebar({
 						>
 							<CalendarCheck size={20} aria-hidden="true" />
 							{!collapsed && <span className="nav-label">Ayı Tamamla</span>}
+						</Link>
+					</li>
+
+					<li className="nav-item">
+						<Link
+							to="/imports"
+							className={`nav-link ${isImportsActive ? "active" : ""}`}
+							aria-current={isImportsActive ? "page" : undefined}
+							title={collapsed ? "İçe Aktar" : undefined}
+							data-testid="nav-link-imports"
+						>
+							<FileSpreadsheet size={20} aria-hidden="true" />
+							{!collapsed && <span className="nav-label">İçe Aktar</span>}
+						</Link>
+					</li>
+
+					<li className="nav-item">
+						<Link
+							to="/notifications"
+							className={`nav-link ${isNotificationsActive ? "active" : ""}`}
+							aria-current={isNotificationsActive ? "page" : undefined}
+							title={collapsed ? "Bildirimler" : undefined}
+							data-testid="nav-link-notifications"
+						>
+							<Bell size={20} aria-hidden="true" />
+							{!collapsed && <span className="nav-label">Bildirimler</span>}
 						</Link>
 					</li>
 				</ul>

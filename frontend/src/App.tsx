@@ -24,6 +24,9 @@ import { DashboardPage } from "./components/dashboard/DashboardPage";
 import { GoalDetailPage } from "./components/goals/GoalDetailPage";
 import { GoalForm } from "./components/goals/GoalForm";
 import { GoalsPage } from "./components/goals/GoalsPage";
+import { ImportBatchPage } from "./components/imports/ImportBatchPage";
+import { ImportRowsReview } from "./components/imports/ImportRowsReview";
+import { ImportsPage } from "./components/imports/ImportsPage";
 import { EntitlementDetail } from "./components/income/EntitlementDetail";
 import { EntitlementForm } from "./components/income/EntitlementForm";
 import { IncomePage } from "./components/income/IncomePage";
@@ -39,6 +42,7 @@ import { MidasPage } from "./components/midas/MidasPage";
 import { MonthCloseDetailPage } from "./components/month-close/MonthCloseDetailPage";
 import { MonthClosePage } from "./components/month-close/MonthClosePage";
 import { MonthCloseWizard } from "./components/month-close/MonthCloseWizard";
+import { NotificationsPage } from "./components/notifications/NotificationsPage";
 import { ObligationDetailPage } from "./components/people/obligations/ObligationDetailPage";
 import { ObligationForm } from "./components/people/obligations/ObligationForm";
 import { PeoplePage } from "./components/people/PeoplePage";
@@ -841,16 +845,72 @@ const monthCloseRoute = createRoute({
 	component: AuthenticatedMonthClose,
 });
 
+const monthCloseWizardRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/month-close/wizard",
+	component: AuthenticatedMonthCloseWizard,
+});
+
 const monthCloseDetailRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/month-close/$periodMonth",
 	component: AuthenticatedMonthCloseDetail,
 });
 
-const monthCloseWizardRoute = createRoute({
+function AuthenticatedImports() {
+	return (
+		<AppShell>
+			<ImportsPage />
+		</AppShell>
+	);
+}
+
+function AuthenticatedImportBatch() {
+	return (
+		<AppShell>
+			<ImportBatchPage />
+		</AppShell>
+	);
+}
+
+function AuthenticatedImportReview() {
+	return (
+		<AppShell>
+			<ImportRowsReview />
+		</AppShell>
+	);
+}
+
+function AuthenticatedNotifications() {
+	return (
+		<AppShell>
+			<NotificationsPage />
+		</AppShell>
+	);
+}
+
+const importsRoute = createRoute({
 	getParentRoute: () => rootRoute,
-	path: "/month-close/wizard",
-	component: AuthenticatedMonthCloseWizard,
+	path: "/imports",
+	component: AuthenticatedImports,
+});
+
+const importBatchRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/imports/$batchId",
+	component: AuthenticatedImportBatch,
+});
+
+const importReviewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/imports/$batchId/review",
+	component: AuthenticatedImportReview,
+});
+
+const notificationsRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/notifications",
+	component: AuthenticatedNotifications,
 });
 
 const routeTree = rootRoute.addChildren([
@@ -896,6 +956,11 @@ const routeTree = rootRoute.addChildren([
 	monthCloseRoute,
 	monthCloseWizardRoute,
 	monthCloseDetailRoute,
+	// F9: Imports & Notifications routes
+	importsRoute,
+	importBatchRoute,
+	importReviewRoute,
+	notificationsRoute,
 ]);
 
 export const router = createRouter({ routeTree });

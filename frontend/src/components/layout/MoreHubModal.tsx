@@ -1,8 +1,9 @@
 import { Link, useRouterState } from "@tanstack/react-router";
 import {
 	Award,
+	Bell,
 	Calendar,
-	FileText,
+	FileSpreadsheet,
 	PieChart,
 	Sliders,
 	Target,
@@ -28,6 +29,8 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 	const isLongTermActive = currentPath.startsWith("/long-term");
 	const isIncomeActive = currentPath.startsWith("/income");
 	const isMonthCloseActive = currentPath.startsWith("/month-close");
+	const isImportsActive = currentPath.startsWith("/imports");
+	const isNotificationsActive = currentPath.startsWith("/notifications");
 
 	return (
 		<AccessibleModal
@@ -41,6 +44,48 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 				<div className="more-hub-section">
 					<h3 className="more-hub-section-title">Hizmetler & Yönetim</h3>
 					<ul className="more-hub-list">
+						{/* Active item: Ekstre İçe Aktar (F9) */}
+						<li className="more-hub-item">
+							<Link
+								to="/imports"
+								className={`more-hub-link ${isImportsActive ? "active" : ""}`}
+								onClick={onClose}
+								aria-current={isImportsActive ? "page" : undefined}
+								data-testid="more-hub-link-statement-import"
+							>
+								<div className="more-hub-icon-wrapper">
+									<FileSpreadsheet size={20} aria-hidden="true" />
+								</div>
+								<div className="more-hub-item-info">
+									<span className="more-hub-item-name">Ekstre İçe Aktar</span>
+									<span className="more-hub-item-desc">
+										CSV ekstre yükleme ve işlem eşleme
+									</span>
+								</div>
+							</Link>
+						</li>
+
+						{/* Active item: Bildirimler (F9) */}
+						<li className="more-hub-item">
+							<Link
+								to="/notifications"
+								className={`more-hub-link ${isNotificationsActive ? "active" : ""}`}
+								onClick={onClose}
+								aria-current={isNotificationsActive ? "page" : undefined}
+								data-testid="more-hub-link-notifications"
+							>
+								<div className="more-hub-icon-wrapper">
+									<Bell size={20} aria-hidden="true" />
+								</div>
+								<div className="more-hub-item-info">
+									<span className="more-hub-item-name">Bildirimler</span>
+									<span className="more-hub-item-desc">
+										Bildirim geçmişi ve Web Push ayarları
+									</span>
+								</div>
+							</Link>
+						</li>
+
 						{/* Active item: Gelirler */}
 						<li className="more-hub-item">
 							<Link
@@ -195,30 +240,6 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 				<div className="more-hub-section">
 					<h3 className="more-hub-section-title">Gelecek Özellikler</h3>
 					<ul className="more-hub-list">
-						{/* Disabled F9: Ekstre İçe Aktar */}
-						<li className="more-hub-item">
-							<button
-								type="button"
-								className="more-hub-link disabled"
-								disabled
-								aria-disabled="true"
-								data-testid="more-hub-link-statement-import"
-							>
-								<div className="more-hub-icon-wrapper">
-									<FileText size={20} aria-hidden="true" />
-								</div>
-								<div className="more-hub-item-info">
-									<div className="more-hub-item-header">
-										<span className="more-hub-item-name">Ekstre İçe Aktar</span>
-										<span className="more-hub-badge">F9</span>
-									</div>
-									<span className="more-hub-item-desc">
-										PDF ve CSV ekstre yükleme
-									</span>
-								</div>
-							</button>
-						</li>
-
 						{/* Disabled Future: Kampanyalar & Ödüller */}
 						<li className="more-hub-item">
 							<button
