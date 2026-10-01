@@ -475,10 +475,10 @@ describe("F5 Card Statements & Payment Lifecycle", () => {
 		});
 
 		// Both calls must have the EXACT SAME Idempotency-Key!
-		const firstKey = mockPay.mock.calls[0]![3];
-		const secondKey = mockPay.mock.calls[1]![3];
+		const firstKey = mockPay.mock.calls[0]?.[3];
+		const secondKey = mockPay.mock.calls[1]?.[3];
 		expect(firstKey).toBe(secondKey);
-		expect(mockPay.mock.calls[1]![2]).toEqual(mockPay.mock.calls[0]![2]);
+		expect(mockPay.mock.calls[1]?.[2]).toEqual(mockPay.mock.calls[0]?.[2]);
 	});
 
 	it("reopens a paid statement with reversal lifecycle and natural copy", async () => {

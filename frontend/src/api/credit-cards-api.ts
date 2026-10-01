@@ -12,7 +12,6 @@ import type {
 	CreateSharedPurchasePayload,
 	CreateStatementPayload,
 	CreditCardItem,
-	CreditCardPurchaseItem,
 	CreditCardPurchaseResponse,
 	CreditCardPurchaseSplitResponse,
 	CreditCardPurchasesResponse,

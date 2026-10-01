@@ -8,12 +8,9 @@ import {
 } from "@testing-library/react";
 import type React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiError } from "../../frontend/src/api/errors";
 import * as f7Api from "../src/api/f7-api";
 import type { LongTermTaskProductDto } from "../src/api/f7-types";
 import { LongTermLifecycleModal } from "../src/components/long-term/LongTermLifecycleModal";
-import { LongTermPage } from "../src/components/long-term/LongTermPage";
-import { LongTermTaskDetailPage } from "../src/components/long-term/LongTermTaskDetailPage";
 import { LongTermTaskForm } from "../src/components/long-term/LongTermTaskForm";
 
 vi.mock("../src/api/f7-api");

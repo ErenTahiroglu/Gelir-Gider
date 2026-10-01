@@ -573,8 +573,8 @@ The monthly accounting close is presented as an anxiety-free, **5-Step Wizard**:
 
 ### Wizard Step Sequence
 1. **Adım 1: Dönem Kontrolü (Period Check):** Reads `GET /month-close/preview?periodMonth=YYYY-MM`. Verifies if period has ended in Europe/Istanbul.
-2. **Adım 2: Eksik ve Sınıflandırma (Unclassified Check):** If blocked by `MONTH_CLOSE_UNCLASSIFIED_EXPENSES`, lists unclassified transactions with inline category selectors.
-3. **Adım 3: Kart ve Yükümlülük Doğrulama (Obligation Check):** Confirms all credit card statement payments are reconciled.
+2. **Adım 2: Eksik ve Sınıflandırma (Unclassified Check):** When `MONTH_CLOSE_UNCLASSIFIED_EXPENSES` is returned, displays authoritative aggregate `unclassifiedExpense` amount, blocks Month Close progression, directs the user to existing transaction/card correction surfaces (`/transactions`, `/cards`), and provides “Tekrar Kontrol Et” to refetch the Month Close preview. (No fabricated transaction list).
+3. **Adım 3: Kartlar & Yükümlülükler Bilgilendirme Kontrolü (Obligation Check):** Informational review of active cards, liabilities, and statements using existing read models. This is informational only and not a Month Close backend gate; closing is not blocked solely due to open credit card balances unless preview/POST authority itself blocks.
 4. **Adım 4: Fazlalık Dağıtım Kararı (Surplus Routing):** If surplus exists, displays backend proposed goal allocation:
    - Option A: **Tamamını Aktar (FULL)** (Recommended).
    - Option B: **Kısmi Aktar (PARTIAL)** (Custom amount input).

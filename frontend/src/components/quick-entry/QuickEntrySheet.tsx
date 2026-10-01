@@ -15,16 +15,19 @@ import {
 	CreditCard,
 	DollarSign,
 	Settings,
+	Wallet,
 } from "lucide-react";
 import { useState } from "react";
 import { fetchAllActivePeople } from "../../api/people-api";
 import { fetchQuickEntryTemplates } from "../../api/quick-entry-api";
 import type {
 	CreditCardExpenseTemplateConfig,
+	IncomeTemplateConfig,
 	QuickEntryTemplateItem,
 } from "../../api/quick-entry-types";
 import { useQuickEntry } from "../../context/QuickEntryContext";
 import { AccessibleModal } from "../common/AccessibleModal";
+import { IncomeReceiptForm } from "../income/IncomeReceiptForm";
 import {
 	ManualExpenseForm,
 	type ManualExpenseInitialValues,
@@ -44,7 +47,7 @@ function QuickEntryModalContent() {
 	const navigate = useNavigate();
 
 	const [directType, setDirectType] = useState<
-		"NONE" | "MANUAL_EXPENSE" | "CREDIT_CARD_EXPENSE"
+		"NONE" | "MANUAL_EXPENSE" | "CREDIT_CARD_EXPENSE" | "INCOME"
 	>("NONE");
 	const [overridePersonId, setOverridePersonId] = useState<string>("");
 	const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -66,14 +69,15 @@ function QuickEntryModalContent() {
 	const allTemplates = templatesData?.templates ?? [];
 	const activePeople = peopleData ?? [];
 
-	// Filter only ACTIVE and supported execution types for the sheet (Section 65)
+	// Filter only ACTIVE and supported execution types for the sheet (Section 65 + F8 INCOME)
 	const activeExecutableTemplates = allTemplates.filter(
 		(t) =>
 			t.status === "ACTIVE" &&
 			(t.templateType === "MANUAL_EXPENSE" ||
 				t.templateType === "CREDIT_CARD_EXPENSE" ||
 				t.templateType === "RECEIVABLE" ||
-				t.templateType === "PAYABLE"),
+				t.templateType === "PAYABLE" ||
+				t.templateType === "INCOME"),
 	);
 
 	const selectedTemplate = selectedTemplateId
@@ -114,6 +118,8 @@ function QuickEntryModalContent() {
 		title = "Nakit / Banka Harcaması";
 	} else if (directType === "CREDIT_CARD_EXPENSE") {
 		title = "Kart Harcaması";
+	} else if (directType === "INCOME") {
+		title = "Gelir Gir";
 	}
 
 	return (
@@ -256,6 +262,15 @@ function QuickEntryModalContent() {
 									/>
 								);
 							})()}
+
+						{/* F8: INCOME template execution */}
+						{selectedTemplate.templateType === "INCOME" && (
+							<IncomeTemplateExecution
+								cfg={selectedTemplate.config as IncomeTemplateConfig}
+								onSuccess={handleSuccess}
+								onClose={handleClose}
+							/>
+						)}
 					</div>
 				)}
 
@@ -277,6 +292,16 @@ function QuickEntryModalContent() {
 						<CreditCardQuickPurchaseForm
 							onSuccess={handleSuccess}
 							onCancel={handleClose}
+						/>
+					</div>
+				)}
+
+				{/* 4. Form view: Direct income entry */}
+				{!selectedTemplate && directType === "INCOME" && (
+					<div className="quick-entry-form-container">
+						<DirectIncomeEntry
+							onSuccess={handleSuccess}
+							onClose={handleClose}
 						/>
 					</div>
 				)}
@@ -319,6 +344,8 @@ function QuickEntryModalContent() {
 													) : template.templateType === "RECEIVABLE" ||
 														template.templateType === "PAYABLE" ? (
 														<Coins size={18} aria-hidden="true" />
+													) : template.templateType === "INCOME" ? (
+														<Wallet size={18} aria-hidden="true" />
 													) : (
 														<Bookmark size={18} aria-hidden="true" />
 													)}
@@ -369,6 +396,15 @@ function QuickEntryModalContent() {
 									<CreditCard size={20} aria-hidden="true" />
 									<span>Kart Harcaması</span>
 								</button>
+								<button
+									type="button"
+									className="quick-entry-action-card"
+									onClick={() => setDirectType("INCOME")}
+									data-testid="quick-entry-income-btn"
+								>
+									<Wallet size={20} aria-hidden="true" />
+									<span>Gelir Gir</span>
+								</button>
 							</div>
 						</div>
 
@@ -388,5 +424,58 @@ function QuickEntryModalContent() {
 				)}
 			</div>
 		</AccessibleModal>
+	);
+}
+
+// =============================================================================
+// F8: Income Template Execution
+// Executes INCOME templates through POST /income/receipts.
+// Prompts for destinationAccountId and receivedAt (not stored in template config).
+// =============================================================================
+interface IncomeTemplateExecutionProps {
+	cfg: IncomeTemplateConfig;
+	onSuccess: () => void;
+	onClose: () => void;
+}
+
+function IncomeTemplateExecution({
+	cfg,
+	onSuccess,
+	onClose,
+}: IncomeTemplateExecutionProps) {
+	return (
+		<IncomeReceiptForm
+			initialValues={{
+				...(cfg.incomeSourceId !== undefined
+					? { sourceId: cfg.incomeSourceId }
+					: {}),
+				...(cfg.defaultAmount !== undefined
+					? { amount: cfg.defaultAmount }
+					: {}),
+				...(cfg.description !== undefined ? { note: cfg.description } : {}),
+			}}
+			onSuccess={onSuccess}
+			onCancel={onClose}
+			isQuickEntry={true}
+		/>
+	);
+}
+
+// =============================================================================
+// F8: Direct Income Entry
+// Opens IncomeReceiptForm without any template prefill.
+// =============================================================================
+interface DirectIncomeEntryProps {
+	onSuccess: () => void;
+	onClose: () => void;
+}
+
+function DirectIncomeEntry({ onSuccess, onClose }: DirectIncomeEntryProps) {
+	return (
+		<IncomeReceiptForm
+			onSuccess={onSuccess}
+			onCancel={onClose}
+			isQuickEntry={true}
+		/>
 	);
 }

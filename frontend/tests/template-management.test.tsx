@@ -9,6 +9,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as client from "../src/api/client";
 import { ApiError } from "../src/api/errors";
+import * as incomeApi from "../src/api/income-api";
 import * as manualExpensesApi from "../src/api/manual-expenses-api";
 import * as quickEntryApi from "../src/api/quick-entry-api";
 import type { QuickEntryTemplateItem } from "../src/api/quick-entry-types";
@@ -402,7 +403,23 @@ describe("Template Management & Server Synchronization (Section 71-73)", () => {
 		});
 	});
 
-	describe("R2 — Unsupported template edit safety", () => {
+	describe("R2 — INCOME template edit and save", () => {
+		const mockIncomeSource = {
+			sourceId: "src-abc",
+			code: "BURS",
+			name: "KYK Bursu",
+			nature: "REGULAR" as const,
+			referenceMethod: "FIXED_MONTHLY" as const,
+			expectedMonthlyAmount: "5000.00",
+			seasonalMonthsPerYear: null,
+			rollingMedianMonths: null,
+			incomeLedgerAccountId: "acc-inc-1",
+			activeFrom: "2026-01-01",
+			activeUntil: null,
+			createdAt: "2026-01-01T00:00:00Z",
+			archivedAt: null,
+		};
+
 		const incomeTemplate: QuickEntryTemplateItem = {
 			id: "income-template",
 			userId: "usr-1",
@@ -432,9 +449,12 @@ describe("Template Management & Server Synchronization (Section 71-73)", () => {
 			vi.spyOn(quickEntryApi, "fetchAllActiveCreditCards").mockResolvedValue(
 				mockCards,
 			);
+			vi.spyOn(incomeApi, "fetchAllActiveIncomeSources").mockResolvedValue([
+				mockIncomeSource,
+			]);
 		}
 
-		it("R2: editing INCOME template shows immutable type, name, sortOrder, future-domain notice; hides config fields", async () => {
+		it("R2: editing INCOME template shows immutable type, name, sortOrder, and income config fields", async () => {
 			setupMocksR2([incomeTemplate]);
 			await renderWithProviders(<TemplateManagement />);
 
@@ -452,8 +472,13 @@ describe("Template Management & Server Synchronization (Section 71-73)", () => {
 			expect(screen.getByTestId("tpl-name-input")).toBeInTheDocument();
 			expect(screen.getByTestId("tpl-sort-order-input")).toBeInTheDocument();
 
-			// future-domain notice visible
-			expect(screen.getByTestId("future-domain-notice")).toBeInTheDocument();
+			// income config fields MUST be rendered
+			expect(
+				screen.getByTestId("tpl-income-source-select"),
+			).toBeInTheDocument();
+			expect(
+				screen.getByTestId("tpl-income-description-input"),
+			).toBeInTheDocument();
 
 			// manual / card config fields MUST NOT be rendered
 			expect(
@@ -466,12 +491,9 @@ describe("Template Management & Server Synchronization (Section 71-73)", () => {
 			expect(
 				screen.queryByTestId("tpl-merchant-input"),
 			).not.toBeInTheDocument();
-			expect(
-				screen.queryByTestId("tpl-description-input"),
-			).not.toBeInTheDocument();
 		});
 
-		it("R2: saving INCOME template sends exact existing config and does NOT send templateType", async () => {
+		it("R2: saving INCOME template sends exact config and does NOT send templateType", async () => {
 			setupMocksR2([incomeTemplate]);
 			const apiPostSpy = vi.spyOn(client, "apiPost").mockResolvedValue({
 				template: incomeTemplate,

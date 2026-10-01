@@ -191,6 +191,74 @@ export function mapErrorCodeToUserMessage(
 			return "Bu görev işlemi daha önce farklı bilgilerle gönderilmiş. Lütfen işlemi yenileyin.";
 		case "LONG_TERM_INSUFFICIENT_UNALLOCATED":
 			return "Midas serbest bakiyesi bu görev tutarını karşılamak için yetersiz.";
+
+		// Income (F8)
+		case "INCOME_INVALID_INPUT":
+			return "Girilen gelir bilgileri geçersiz. Lütfen alanları kontrol edin.";
+		case "INCOME_SOURCE_NOT_FOUND":
+			return "Gelir kaynağı bulunamadı.";
+		case "INCOME_SOURCE_ARCHIVED":
+			return "Bu gelir kaynağı arşivlenmiş ve üzerinde işlem yapılamaz.";
+		case "INCOME_SOURCE_CODE_CONFLICT":
+			return "Bu kaynak koduyla tanımlı bir gelir kaynağı zaten mevcut.";
+		case "INCOME_LEDGER_ACCOUNT_INVALID":
+			return "Seçilen muhasebe hesabı gelir kaynağı için uygun değil.";
+		case "INCOME_DESTINATION_ACCOUNT_INVALID":
+			return "Seçilen kasa/banka hesabı tahsilat için uygun değil.";
+		case "INCOME_ENTITLEMENT_NOT_FOUND":
+			return "Beklenen gelir kaydı bulunamadı.";
+		case "INCOME_ENTITLEMENT_PERIOD_CONFLICT":
+			return "Bu gelir kaynağı için bu döneme ait beklenen gelir zaten mevcut.";
+		case "INCOME_ENTITLEMENT_REVISION_CONFLICT":
+			return "Beklenen gelir bilgileri başka bir işlem tarafından güncellendi. Lütfen sayfayı yenileyip tekrar deneyin.";
+		case "INCOME_ENTITLEMENT_ALREADY_VOIDED":
+			return "Bu beklenen gelir zaten iptal edilmiş.";
+		case "INCOME_RECEIPT_NOT_FOUND":
+			return "Gerçekleşen gelir tahsilat kaydı bulunamadı.";
+		case "INCOME_RECEIPT_REVISION_CONFLICT":
+			return "Tahsilat bilgileri başka bir işlem tarafından güncellendi. Lütfen sayfayı yenileyip tekrar deneyin.";
+		case "INCOME_RECEIPT_ALREADY_VOIDED":
+			return "Bu tahsilat kaydı zaten iptal edilmiş.";
+		case "INCOME_SETTLEMENT_NOT_FOUND":
+			return "Henüz beklenen gelir eşleştirmesi yapılmadı.";
+		case "INCOME_SETTLEMENT_CONFLICT":
+			return "Bu beklenen gelir bir tahsilatla eşleştirildiği için doğrudan iptal edilemiyor. Önce tahsilat eşleştirmesini düzeltin.";
+		case "INCOME_SETTLEMENT_ALREADY_EXISTS":
+			return "Bu tahsilat için zaten bir eşleştirme kaydı mevcut.";
+		case "INCOME_SETTLEMENT_REVISION_CONFLICT":
+			return "Eşleştirme bilgileri başka bir işlem tarafından güncellendi. Lütfen güncel durumu kontrol edin.";
+		case "INCOME_IDEMPOTENCY_CONFLICT":
+			return "Bu işlem daha önce farklı bilgilerle gönderilmiş. Lütfen işlemi yenileyin.";
+
+		// Month Close (F8)
+		case "MONTH_CLOSE_INVALID_INPUT":
+			return "Dönem kapatma parametreleri geçersiz.";
+		case "MONTH_CLOSE_PERIOD_NOT_ENDED":
+			return "Bu dönem henüz tamamlanmadığı için kapatılamaz.";
+		case "MONTH_CLOSE_BUDGET_PLAN_NOT_FOUND":
+			return "Bu dönem için bütçe planı bulunamadı. Dönem kapatılamaz.";
+		case "MONTH_CLOSE_BUDGET_PLAN_NOT_ACTIVE":
+			return "Bu döneme ait bütçe planı aktif değil.";
+		case "MONTH_CLOSE_UNCLASSIFIED_EXPENSES":
+			return "Bu dönemde sınıflandırılmamış harcamalar var. Lütfen önce hareketleri kategorize edin.";
+		case "MONTH_CLOSE_MIDAS_NOT_FOUND":
+			return "Midas likidite hesabı bulunamadı. Lütfen Midas hesabınızı bağlayın.";
+		case "MONTH_CLOSE_INSUFFICIENT_LIQUIDITY":
+			return "Midas serbest bakiye kapanış aktarımı için yeterli değil.";
+		case "MONTH_CLOSE_STALE_PROPOSAL":
+			return "Kapanış verileri siz incelerken değişti. Güncel öneri yeniden yüklendi; lütfen tekrar kontrol edin.";
+		case "MONTH_CLOSE_ALREADY_CLOSED":
+			return "Bu dönem daha önce tamamlandı.";
+		case "MONTH_CLOSE_IDEMPOTENCY_CONFLICT":
+			return "Bu kapanış işlemi daha önce farklı bilgilerle gönderilmiş. Lütfen işlemi yenileyin.";
+		case "MONTH_CLOSE_NOT_FOUND":
+			return "Bu döneme ait tamamlanmış bir kapanış kaydı bulunamadı.";
+
+		// Ledger
+		case "LEDGER_ACCOUNT_CODE_CONFLICT":
+			return "Bu kodla bir hesap zaten mevcut.";
+		case "LEDGER_INVALID_INPUT":
+			return "Girilen hesap bilgileri geçersiz.";
 		default:
 			return fallback && fallback.trim() !== ""
 				? fallback

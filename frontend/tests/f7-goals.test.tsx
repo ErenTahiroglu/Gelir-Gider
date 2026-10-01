@@ -378,12 +378,12 @@ describe("Phase F7 — Short-Term Goals", () => {
 		});
 
 		// Verify frozen key, payload, and occurredAt are strictly reused on retry
-		const secondCallPayload = mockReorder.mock.calls[1]![0];
-		const secondCallKey = mockReorder.mock.calls[1]![1];
+		const secondCallPayload = mockReorder.mock.calls[1]?.[0];
+		const secondCallKey = mockReorder.mock.calls[1]?.[1];
 
 		expect(secondCallKey).toBe(capturedKey);
-		expect(secondCallPayload.occurredAt).toBe(capturedOccurredAt);
-		expect(secondCallPayload.orderedGoalIds).toEqual([
+		expect(secondCallPayload?.occurredAt).toBe(capturedOccurredAt);
+		expect(secondCallPayload?.orderedGoalIds).toEqual([
 			"goal-B",
 			"goal-A",
 			"goal-C",
@@ -499,7 +499,7 @@ describe("Phase F7 — Short-Term Goals", () => {
 
 	it("R2 regression: reorder, funding, and release responses match exact backend source DTO contract", async () => {
 		// Mock reorder response exactly matching backend
-		const mockReorder = vi
+		const _mockReorder = vi
 			.spyOn(f7Api, "reorderShortTermGoals")
 			.mockResolvedValue({
 				reorder: {
@@ -529,7 +529,7 @@ describe("Phase F7 — Short-Term Goals", () => {
 		expect((reorderRes.reorder as any).occurredAt).toBeUndefined();
 
 		// Mock fund response exactly matching backend
-		const mockFund = vi.spyOn(f7Api, "fundShortTermGoal").mockResolvedValue({
+		const _mockFund = vi.spyOn(f7Api, "fundShortTermGoal").mockResolvedValue({
 			funding: {
 				goalId: "goal-1",
 				transferId: "tr-1",
@@ -555,7 +555,7 @@ describe("Phase F7 — Short-Term Goals", () => {
 		expect((fundRes.funding as any).occurredAt).toBeUndefined();
 
 		// Mock release response exactly matching backend
-		const mockRelease = vi
+		const _mockRelease = vi
 			.spyOn(f7Api, "releaseShortTermGoal")
 			.mockResolvedValue({
 				release: {

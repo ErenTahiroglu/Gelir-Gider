@@ -1,5 +1,6 @@
 import { Link, useRouterState } from "@tanstack/react-router";
 import {
+	CalendarCheck,
 	ChevronLeft,
 	ChevronRight,
 	CreditCard,
@@ -9,6 +10,7 @@ import {
 	Target,
 	TrendingUp,
 	Users,
+	Wallet,
 } from "lucide-react";
 import { useEffect } from "react";
 
@@ -29,10 +31,12 @@ export function DesktopSidebar({
 		currentPath.startsWith("/transactions") ||
 		currentPath.startsWith("/manual-expenses");
 	const isCardsActive = currentPath.startsWith("/cards");
+	const isIncomeActive = currentPath.startsWith("/income");
 	const isPeopleActive = currentPath.startsWith("/people");
 	const isMidasActive = currentPath.startsWith("/midas");
 	const isGoalsActive = currentPath.startsWith("/goals");
 	const isLongTermActive = currentPath.startsWith("/long-term");
+	const isMonthCloseActive = currentPath.startsWith("/month-close");
 	// Keyboard shortcut: Cmd/Ctrl + B to toggle sidebar
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -132,6 +136,19 @@ export function DesktopSidebar({
 
 					<li className="nav-item">
 						<Link
+							to="/income"
+							className={`nav-link ${isIncomeActive ? "active" : ""}`}
+							aria-current={isIncomeActive ? "page" : undefined}
+							title={collapsed ? "Gelirler" : undefined}
+							data-testid="nav-link-income"
+						>
+							<Wallet size={20} aria-hidden="true" />
+							{!collapsed && <span className="nav-label">Gelirler</span>}
+						</Link>
+					</li>
+
+					<li className="nav-item">
+						<Link
 							to="/people"
 							className={`nav-link ${isPeopleActive ? "active" : ""}`}
 							aria-current={isPeopleActive ? "page" : undefined}
@@ -179,6 +196,19 @@ export function DesktopSidebar({
 						>
 							<TrendingUp size={20} aria-hidden="true" />
 							{!collapsed && <span className="nav-label">Uzun Vadeli</span>}
+						</Link>
+					</li>
+
+					<li className="nav-item">
+						<Link
+							to="/month-close"
+							className={`nav-link ${isMonthCloseActive ? "active" : ""}`}
+							aria-current={isMonthCloseActive ? "page" : undefined}
+							title={collapsed ? "Ayı Tamamla" : undefined}
+							data-testid="nav-link-month-close"
+						>
+							<CalendarCheck size={20} aria-hidden="true" />
+							{!collapsed && <span className="nav-label">Ayı Tamamla</span>}
 						</Link>
 					</li>
 				</ul>

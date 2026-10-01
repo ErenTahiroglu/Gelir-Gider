@@ -97,7 +97,7 @@ describe("F6 People CRUD — Identity, OCC, Archive & Balance Distinction", () =
 		expect(payload.relationship).toBe("FRIEND");
 		expect(payload.note).toBe("İş arkadaşı");
 		expect(typeof idempotencyKey).toBe("string");
-		expect(idempotencyKey!.length).toBeGreaterThan(10);
+		expect(idempotencyKey?.length).toBeGreaterThan(10);
 	});
 
 	it("validates displayName length and note length before submission", async () => {

@@ -80,6 +80,7 @@ export interface CreateTemplatePayload {
 	templateType:
 		| "MANUAL_EXPENSE"
 		| "CREDIT_CARD_EXPENSE"
+		| "INCOME"
 		| "RECEIVABLE"
 		| "PAYABLE";
 	config: Record<string, unknown>;

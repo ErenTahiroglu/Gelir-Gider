@@ -270,3 +270,65 @@ export function formatIstanbulDateTimeTurkish(instant: string | Date): string {
 	const timePart = timeFormatter.format(date);
 	return `${cal.day} ${monthName} ${cal.year}, ${timePart}`;
 }
+
+/**
+ * Returns previous completed calendar month in Europe/Istanbul (YYYY-MM).
+ * For example: if current Istanbul date is 2026-09-29, returns "2026-08".
+ * If current Istanbul date is 2026-01-15, returns "2025-12".
+ */
+export function getPreviousIstanbulPeriodMonth(now: Date = new Date()): string {
+	const current = getIstanbulCalendarDate(now);
+	let prevYear = current.year;
+	let prevMonth = current.month - 1;
+	if (prevMonth === 0) {
+		prevMonth = 12;
+		prevYear -= 1;
+	}
+	return `${prevYear}-${String(prevMonth).padStart(2, "0")}`;
+}
+
+/**
+ * Checks whether a given period (YYYY-MM) has completed in Europe/Istanbul calendar.
+ * Returns true if periodMonth is strictly before current Istanbul periodMonth.
+ */
+export function isIstanbulPeriodEnded(
+	periodMonth: string,
+	now: Date = new Date(),
+): boolean {
+	const currentPeriod = getIstanbulPeriodMonth(now);
+	return periodMonth < currentPeriod;
+}
+
+/**
+ * Converts a UI period month (YYYY-MM) to an entitlement period month (YYYY-MM-01).
+ */
+export function toEntitlementPeriodMonth(periodMonth: string): string {
+	const trimmed = periodMonth.trim();
+	if (/^\d{4}-\d{2}$/.test(trimmed)) {
+		return `${trimmed}-01`;
+	}
+	if (/^\d{4}-\d{2}-01$/.test(trimmed)) {
+		return trimmed;
+	}
+	throw new Error(
+		`Invalid period month format: "${periodMonth}". Expected YYYY-MM`,
+	);
+}
+
+/**
+ * Converts an entitlement period month (YYYY-MM-01) to a UI period month (YYYY-MM).
+ */
+export function fromEntitlementPeriodMonth(
+	entitlementPeriodMonth: string,
+): string {
+	const trimmed = entitlementPeriodMonth.trim();
+	if (/^\d{4}-\d{2}-01$/.test(trimmed)) {
+		return trimmed.slice(0, 7);
+	}
+	if (/^\d{4}-\d{2}$/.test(trimmed)) {
+		return trimmed;
+	}
+	throw new Error(
+		`Invalid entitlement period month: "${entitlementPeriodMonth}"`,
+	);
+}

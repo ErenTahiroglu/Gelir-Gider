@@ -119,10 +119,17 @@ describe("F6 Navigation & Quick Entry Templates — More Hub, Desktop & Obligati
 			"/long-term",
 		);
 
-		// Future domain links disabled (F8, F9, etc.)
-		expect(screen.getByTestId("more-hub-link-month-close")).toHaveClass(
-			"disabled",
+		// F8 activated domains: Income & Month Close
+		expect(screen.getByTestId("more-hub-link-income")).toHaveAttribute(
+			"href",
+			"/income",
 		);
+		expect(screen.getByTestId("more-hub-link-month-close")).toHaveAttribute(
+			"href",
+			"/month-close",
+		);
+
+		// Future domain links disabled (F9, etc.)
 		expect(screen.getByTestId("more-hub-link-statement-import")).toHaveClass(
 			"disabled",
 		);

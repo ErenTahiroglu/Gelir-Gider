@@ -65,10 +65,10 @@ export function AttachSplitModal({
 	const activePeople = useMemo(() => people ?? [], [people]);
 
 	const [splitMethod, setSplitMethod] = useState<SplitMethod>("EQUAL");
-	const [userWeight, setUserWeight] = useState<number>(1);
+	const [userWeight, _setUserWeight] = useState<number>(1);
 	const [participants, setParticipants] = useState<FormParticipant[]>([]);
 	const [candidatePersonId, setCandidatePersonId] = useState<string>("");
-	const [occurredAtLocal, setOccurredAtLocal] = useState<string>(() =>
+	const [occurredAtLocal, _setOccurredAtLocal] = useState<string>(() =>
 		formatIstanbulDateTimeLocal(new Date()),
 	);
 
@@ -363,7 +363,7 @@ export function AttachSplitModal({
 				})}
 
 				{/* Preview */}
-				{previewResult && previewResult.isValid && (
+				{previewResult?.isValid && (
 					<div
 						style={{
 							padding: "0.5rem",

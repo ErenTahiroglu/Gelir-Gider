@@ -9,10 +9,7 @@ import {
 import type React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as f7Api from "../src/api/f7-api";
-import type {
-	LongTermTaskProductDto,
-	ShortTermGoalProductDto,
-} from "../src/api/f7-types";
+import type { ShortTermGoalProductDto } from "../src/api/f7-types";
 import { GoalFundingModal } from "../src/components/goals/GoalFundingModal";
 import { LongTermTaskForm } from "../src/components/long-term/LongTermTaskForm";
 import { MidasPage } from "../src/components/midas/MidasPage";

@@ -325,8 +325,8 @@ describe("F5 Shared Purchases & Splits Lifecycle", () => {
 		const [, payload] = mockSharedCreate.mock.calls[0]!;
 		expect(payload.splitMethod).toBe("MANUAL");
 		expect(payload.userWeight).toBeUndefined();
-		expect(payload.participants[0]!.shareAmount).toBe("80.00");
-		expect(payload.participants[0]!.weight).toBeUndefined();
+		expect(payload.participants[0]?.shareAmount).toBe("80.00");
+		expect(payload.participants[0]?.weight).toBeUndefined();
 	});
 
 	it("uses coordinated shared-void for active shared purchase instead of unshared void", async () => {

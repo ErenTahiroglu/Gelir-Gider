@@ -84,8 +84,12 @@ describe("F5 Split Math — Zero Float BigInt Cent Allocation", () => {
 		expect(res.isValid).toBe(true);
 		// Sum of userShare + externalShares must exactly equal 100.00
 		const userCents = BigInt(res.userShareAmount.replace(".", ""));
-		const p1Cents = BigInt(res.participants[0]!.shareAmount.replace(".", ""));
-		const p2Cents = BigInt(res.participants[1]!.shareAmount.replace(".", ""));
+		const p1Cents = BigInt(
+			(res.participants[0]?.shareAmount ?? "0").replace(".", ""),
+		);
+		const p2Cents = BigInt(
+			(res.participants[1]?.shareAmount ?? "0").replace(".", ""),
+		);
 		expect(userCents + p1Cents + p2Cents).toBe(10000n);
 	});
 });

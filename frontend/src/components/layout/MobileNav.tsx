@@ -20,7 +20,9 @@ export function MobileNav() {
 		currentPath.startsWith("/settings/quick-templates") ||
 		currentPath.startsWith("/goals") ||
 		currentPath.startsWith("/midas") ||
-		currentPath.startsWith("/long-term");
+		currentPath.startsWith("/long-term") ||
+		currentPath.startsWith("/income") ||
+		currentPath.startsWith("/month-close");
 
 	return (
 		<>

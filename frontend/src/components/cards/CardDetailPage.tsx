@@ -9,7 +9,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { Archive, ArrowLeft, Edit3, Plus } from "lucide-react";
+import { Archive, ArrowLeft, Edit3 } from "lucide-react";
 import { useState } from "react";
 import { fetchCreditCard } from "../../api/credit-cards-api";
 import { formatMoneyToTry } from "../../lib/money";

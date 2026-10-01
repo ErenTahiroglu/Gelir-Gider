@@ -152,7 +152,7 @@ describe("F6 Obligations — Standalone Receivable/Payable, Split-Managed Guard,
 		expect(payload.description).toBe("Ödünç para");
 		expect(payload.dueDate).toBe("2026-04-15");
 		expect(typeof idempotencyKey).toBe("string");
-		expect(idempotencyKey!.length).toBeGreaterThan(10);
+		expect(idempotencyKey?.length).toBeGreaterThan(10);
 	});
 
 	it("creates a standalone PAYABLE with financial classification and no funding asset", async () => {

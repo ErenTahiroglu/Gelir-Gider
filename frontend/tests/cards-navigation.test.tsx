@@ -5,8 +5,7 @@ import {
 	createRouter,
 	RouterProvider,
 } from "@tanstack/react-router";
-import { fireEvent, render, screen } from "@testing-library/react";
-import type React from "react";
+import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { DesktopSidebar } from "../src/components/layout/DesktopSidebar";
 import { MobileNav } from "../src/components/layout/MobileNav";

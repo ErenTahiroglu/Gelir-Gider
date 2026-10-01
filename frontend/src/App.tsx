@@ -24,12 +24,21 @@ import { DashboardPage } from "./components/dashboard/DashboardPage";
 import { GoalDetailPage } from "./components/goals/GoalDetailPage";
 import { GoalForm } from "./components/goals/GoalForm";
 import { GoalsPage } from "./components/goals/GoalsPage";
+import { EntitlementDetail } from "./components/income/EntitlementDetail";
+import { EntitlementForm } from "./components/income/EntitlementForm";
+import { IncomePage } from "./components/income/IncomePage";
+import { IncomeReceiptDetail } from "./components/income/IncomeReceiptDetail";
+import { IncomeReceiptForm } from "./components/income/IncomeReceiptForm";
+import { IncomeSourceForm } from "./components/income/IncomeSourceForm";
 import { AppShell } from "./components/layout/AppShell";
 import { LongTermPage } from "./components/long-term/LongTermPage";
 import { LongTermTaskDetailPage } from "./components/long-term/LongTermTaskDetailPage";
 import { LongTermTaskForm } from "./components/long-term/LongTermTaskForm";
 import { ManualExpenseForm } from "./components/manual-expenses/ManualExpenseForm";
 import { MidasPage } from "./components/midas/MidasPage";
+import { MonthCloseDetailPage } from "./components/month-close/MonthCloseDetailPage";
+import { MonthClosePage } from "./components/month-close/MonthClosePage";
+import { MonthCloseWizard } from "./components/month-close/MonthCloseWizard";
 import { ObligationDetailPage } from "./components/people/obligations/ObligationDetailPage";
 import { ObligationForm } from "./components/people/obligations/ObligationForm";
 import { PeoplePage } from "./components/people/PeoplePage";
@@ -697,6 +706,153 @@ const longTermDetailRoute = createRoute({
 	component: AuthenticatedLongTermDetail,
 });
 
+// ============================================================================
+// Phase F8: Income Routes
+// ============================================================================
+
+function AuthenticatedIncome() {
+	return (
+		<AppShell>
+			<IncomePage />
+		</AppShell>
+	);
+}
+
+function AuthenticatedIncomeSourceNew() {
+	return (
+		<AppShell>
+			<IncomeSourceForm />
+		</AppShell>
+	);
+}
+
+function AuthenticatedEntitlementNew() {
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Yeni Beklenen Gelir</h1>
+					<EntitlementForm />
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedEntitlementDetail() {
+	const params = entitlementDetailRoute.useParams();
+	return (
+		<AppShell>
+			<EntitlementDetail entitlementId={params.entitlementId} />
+		</AppShell>
+	);
+}
+
+function AuthenticatedReceiptNew() {
+	return (
+		<AppShell>
+			<div className="form-page-container">
+				<div className="form-page-card card">
+					<h1 className="page-title">Yeni Gelir Tahsilatı</h1>
+					<IncomeReceiptForm />
+				</div>
+			</div>
+		</AppShell>
+	);
+}
+
+function AuthenticatedReceiptDetail() {
+	const params = receiptDetailRoute.useParams();
+	return (
+		<AppShell>
+			<IncomeReceiptDetail incomeReceiptId={params.incomeReceiptId} />
+		</AppShell>
+	);
+}
+
+// ============================================================================
+// Phase F8: Month Close Routes
+// ============================================================================
+
+function AuthenticatedMonthClose() {
+	return (
+		<AppShell>
+			<MonthClosePage />
+		</AppShell>
+	);
+}
+
+function AuthenticatedMonthCloseDetail() {
+	const params = monthCloseDetailRoute.useParams();
+	return (
+		<AppShell>
+			<MonthCloseDetailPage periodMonth={params.periodMonth} />
+		</AppShell>
+	);
+}
+
+function AuthenticatedMonthCloseWizard() {
+	return (
+		<AppShell>
+			<MonthCloseWizard />
+		</AppShell>
+	);
+}
+
+const incomeRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/income",
+	component: AuthenticatedIncome,
+});
+
+const incomeSourceNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/income/sources/new",
+	component: AuthenticatedIncomeSourceNew,
+});
+
+const entitlementNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/income/entitlements/new",
+	component: AuthenticatedEntitlementNew,
+});
+
+const entitlementDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/income/entitlements/$entitlementId",
+	component: AuthenticatedEntitlementDetail,
+});
+
+const receiptNewRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/income/receipts/new",
+	component: AuthenticatedReceiptNew,
+});
+
+const receiptDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/income/receipts/$incomeReceiptId",
+	component: AuthenticatedReceiptDetail,
+});
+
+const monthCloseRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/month-close",
+	component: AuthenticatedMonthClose,
+});
+
+const monthCloseDetailRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/month-close/$periodMonth",
+	component: AuthenticatedMonthCloseDetail,
+});
+
+const monthCloseWizardRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/month-close/wizard",
+	component: AuthenticatedMonthCloseWizard,
+});
+
 const routeTree = rootRoute.addChildren([
 	indexRoute,
 	unlockRoute,
@@ -729,6 +885,17 @@ const routeTree = rootRoute.addChildren([
 	longTermRoute,
 	longTermNewRoute,
 	longTermDetailRoute,
+	// F8: Income routes
+	incomeRoute,
+	incomeSourceNewRoute,
+	entitlementNewRoute,
+	entitlementDetailRoute,
+	receiptNewRoute,
+	receiptDetailRoute,
+	// F8: Month Close routes (wizard before detail to avoid param match)
+	monthCloseRoute,
+	monthCloseWizardRoute,
+	monthCloseDetailRoute,
 ]);
 
 export const router = createRouter({ routeTree });

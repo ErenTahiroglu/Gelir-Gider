@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { Bookmark, CreditCard, Sparkles } from "lucide-react";
+import { Bookmark, CreditCard, Sparkles, Wallet } from "lucide-react";
 import { fetchQuickEntryTemplates } from "../../api/dashboard-api";
 import type { QuickEntryTemplatesResponse } from "../../api/dashboard-types";
 import { useQuickEntry } from "../../context/QuickEntryContext";
@@ -29,14 +29,15 @@ export function QuickTemplatesStrip({ isUnlocked }: QuickTemplatesStripProps) {
 
 	const allTemplates = templatesQuery.data?.templates ?? [];
 
-	// Filter only ACTIVE executable templates (MANUAL_EXPENSE, CREDIT_CARD_EXPENSE, RECEIVABLE, PAYABLE)
+	// Filter only ACTIVE executable templates (MANUAL_EXPENSE, CREDIT_CARD_EXPENSE, RECEIVABLE, PAYABLE, INCOME)
 	const executableTemplates = allTemplates.filter(
 		(t) =>
 			t.status === "ACTIVE" &&
 			(t.templateType === "MANUAL_EXPENSE" ||
 				t.templateType === "CREDIT_CARD_EXPENSE" ||
 				t.templateType === "RECEIVABLE" ||
-				t.templateType === "PAYABLE"),
+				t.templateType === "PAYABLE" ||
+				t.templateType === "INCOME"),
 	);
 	const topTemplates = executableTemplates.slice(0, 5);
 
@@ -126,6 +127,8 @@ export function QuickTemplatesStrip({ isUnlocked }: QuickTemplatesStripProps) {
 									className="chip-icon"
 									aria-hidden="true"
 								/>
+							) : template.templateType === "INCOME" ? (
+								<Wallet size={14} className="chip-icon" aria-hidden="true" />
 							) : (
 								<Bookmark size={14} className="chip-icon" aria-hidden="true" />
 							)}

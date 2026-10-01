@@ -20,7 +20,6 @@ import {
 	fetchAllActivePeople,
 } from "../../../api/credit-cards-api";
 import type {
-	PersonItem,
 	SharedPurchaseResponse,
 	SplitMethod,
 	SplitParticipantInput,
@@ -775,7 +774,7 @@ export function SharedPurchaseForm({
 				)}
 
 				{/* Preview Section (Section 47 & 48) */}
-				{previewResult && previewResult.isValid && (
+				{previewResult?.isValid && (
 					<div
 						className="split-preview-box"
 						style={{

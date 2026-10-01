@@ -20,9 +20,11 @@ import {
 	CreditCard,
 	Edit2,
 	Plus,
+	Wallet,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { ApiError } from "../../api/errors";
+import { fetchAllActiveIncomeSources } from "../../api/income-api";
 import {
 	fetchAllLedgerAccounts,
 	fetchSpendingCategories,
@@ -84,6 +86,12 @@ export function TemplateManagement() {
 		staleTime: 60_000,
 	});
 
+	const { data: incomeSourcesData } = useQuery({
+		queryKey: ["income-sources", { activeOnly: true }],
+		queryFn: () => fetchAllActiveIncomeSources(100),
+		staleTime: 60_000,
+	});
+
 	const selectableAccounts = useMemo(
 		() =>
 			(accounts ?? []).filter(
@@ -103,6 +111,10 @@ export function TemplateManagement() {
 
 	const activeCards = cards ?? [];
 	const activePeople = peopleData ?? [];
+	const activeIncomeSources = useMemo(
+		() => (incomeSourcesData ?? []).filter((s) => !s.archivedAt),
+		[incomeSourcesData],
+	);
 
 	// Local State
 	const [isModalOpen, setIsModalOpen] = useState(false);
@@ -115,7 +127,11 @@ export function TemplateManagement() {
 	// createTemplateType: only used when modalMode === "create".
 	// For edit mode, authority is editingTemplate.templateType.
 	const [createTemplateType, setCreateTemplateType] = useState<
-		"MANUAL_EXPENSE" | "CREDIT_CARD_EXPENSE" | "RECEIVABLE" | "PAYABLE"
+		| "MANUAL_EXPENSE"
+		| "CREDIT_CARD_EXPENSE"
+		| "INCOME"
+		| "RECEIVABLE"
+		| "PAYABLE"
 	>("MANUAL_EXPENSE");
 	const [sortOrder, setSortOrder] = useState<number>(0);
 	const [sourceAssetAccountId, setSourceAssetAccountId] = useState("");
@@ -124,6 +140,7 @@ export function TemplateManagement() {
 	const [budgetCategoryOverride, setBudgetCategoryOverride] =
 		useState<BudgetCategorySelection>("MANDATORY_EXPENSE");
 	const [personId, setPersonId] = useState("");
+	const [incomeSourceId, setIncomeSourceId] = useState("");
 	const [dueDate, setDueDate] = useState("");
 	const [defaultAmountCanonical, setDefaultAmountCanonical] = useState("");
 	const [defaultAmountDisplay, setDefaultAmountDisplay] = useState("");
@@ -154,6 +171,7 @@ export function TemplateManagement() {
 		setSpendingCategoryId("");
 		setBudgetCategoryOverride("MANDATORY_EXPENSE");
 		setPersonId(activePeople[0]?.personId ?? "");
+		setIncomeSourceId(activeIncomeSources[0]?.sourceId ?? "");
 		setDueDate("");
 		setDefaultAmountCanonical("");
 		setDefaultAmountDisplay("");
@@ -234,9 +252,22 @@ export function TemplateManagement() {
 				setDefaultAmountDisplay("");
 			}
 			setDefaultAmountValid(true);
+		} else if (t.templateType === "INCOME") {
+			setIncomeSourceId((cfg.incomeSourceId as string) ?? "");
+			setDescription((cfg.description as string) ?? "");
+
+			const amt = (cfg.defaultAmount as string) ?? "";
+			setDefaultAmountCanonical(amt);
+			if (amt) {
+				const parts = amt.split(".");
+				setDefaultAmountDisplay(
+					parts[1] !== undefined ? `${parts[0]},${parts[1]}` : (parts[0] ?? ""),
+				);
+			} else {
+				setDefaultAmountDisplay("");
+			}
+			setDefaultAmountValid(true);
 		}
-		// Unsupported type (INCOME): authority is editingTemplate.templateType;
-		// no local form state to populate — config preserved on submit.
 
 		setFormError(null);
 		setNetworkUncertaintyWarning(null);
@@ -277,12 +308,7 @@ export function TemplateManagement() {
 			return;
 		}
 
-		// Skip amount validation for unsupported-type edits (no amount field shown)
-		const isUnsupportedEditSubmit =
-			modalMode === "edit" &&
-			editingTemplate !== null &&
-			editingTemplate.templateType === "INCOME";
-		if (!defaultAmountValid && !isUnsupportedEditSubmit) {
+		if (!defaultAmountValid) {
 			setFormError("Lütfen geçerli bir varsayılan tutar girin.");
 			return;
 		}
@@ -320,6 +346,24 @@ export function TemplateManagement() {
 						spendingCategoryId: spendingCategoryId || undefined,
 						budgetCategoryOverride,
 						merchant: merchant.trim() || undefined,
+						description: description.trim() || undefined,
+						defaultAmount: defaultAmountCanonical || undefined,
+					};
+				} else if (createTemplateType === "INCOME") {
+					if (!incomeSourceId) {
+						setFormError("Lütfen bir gelir kaynağı seçin.");
+						setFormSubmitting(false);
+						return;
+					}
+					if (!activeIncomeSources.some((s) => s.sourceId === incomeSourceId)) {
+						setFormError(
+							"Şablondaki gelir kaynağı artık kullanılamıyor. Lütfen başka bir gelir kaynağı seçin.",
+						);
+						setFormSubmitting(false);
+						return;
+					}
+					config = {
+						incomeSourceId,
 						description: description.trim() || undefined,
 						defaultAmount: defaultAmountCanonical || undefined,
 					};
@@ -394,6 +438,24 @@ export function TemplateManagement() {
 						defaultAmount: defaultAmountCanonical || undefined,
 						// Section 36: Preserve existing shortTermGoalId!
 						shortTermGoalId: existingCfg.shortTermGoalId as string | undefined,
+					};
+				} else if (editingTemplate.templateType === "INCOME") {
+					if (!incomeSourceId) {
+						setFormError("Lütfen bir gelir kaynağı seçin.");
+						setFormSubmitting(false);
+						return;
+					}
+					if (!activeIncomeSources.some((s) => s.sourceId === incomeSourceId)) {
+						setFormError(
+							"Şablondaki gelir kaynağı artık kullanılamıyor. Lütfen başka bir gelir kaynağı seçin.",
+						);
+						setFormSubmitting(false);
+						return;
+					}
+					config = {
+						incomeSourceId,
+						description: description.trim() || undefined,
+						defaultAmount: defaultAmountCanonical || undefined,
 					};
 				} else if (
 					editingTemplate.templateType === "RECEIVABLE" ||
@@ -490,11 +552,8 @@ export function TemplateManagement() {
 			? createTemplateType
 			: (editingTemplate?.templateType ?? "MANUAL_EXPENSE");
 
-	// isUnsupportedEdit: true when editing a template whose type F6 does not own (INCOME).
-	const isUnsupportedEdit =
-		modalMode === "edit" &&
-		editingTemplate !== null &&
-		editingTemplate.templateType === "INCOME";
+	// isUnsupportedEdit: F8 now fully supports INCOME. Only truly unknown future types.
+	const isUnsupportedEdit = false;
 
 	return (
 		<div
@@ -568,11 +627,13 @@ export function TemplateManagement() {
 								data-testid="active-templates-list"
 							>
 								{activeTemplates.map((t) => {
+									// F8: INCOME is now fully supported
 									const isSupported =
 										t.templateType === "MANUAL_EXPENSE" ||
 										t.templateType === "CREDIT_CARD_EXPENSE" ||
 										t.templateType === "RECEIVABLE" ||
-										t.templateType === "PAYABLE";
+										t.templateType === "PAYABLE" ||
+										t.templateType === "INCOME";
 									const cfg = t.config as Record<string, unknown>;
 
 									return (
@@ -586,6 +647,8 @@ export function TemplateManagement() {
 													<div className="template-card-icon">
 														{t.templateType === "CREDIT_CARD_EXPENSE" ? (
 															<CreditCard size={18} aria-hidden="true" />
+														) : t.templateType === "INCOME" ? (
+															<Wallet size={18} aria-hidden="true" />
 														) : (
 															<Bookmark size={18} aria-hidden="true" />
 														)}
@@ -604,6 +667,23 @@ export function TemplateManagement() {
 
 											{/* Config details */}
 											<div className="template-card-body">
+												{/* INCOME template: show source name */}
+												{t.templateType === "INCOME" &&
+													Boolean(cfg.incomeSourceId) && (
+														<p className="template-detail-item">
+															<strong>Gelir Kaynağı:</strong>{" "}
+															{activeIncomeSources.find(
+																(s) => s.sourceId === cfg.incomeSourceId,
+															)?.name ?? (
+																<span
+																	className="text-warning"
+																	data-testid={`stale-source-warn-${t.id}`}
+																>
+																	Şablondaki gelir kaynağı artık kullanılamıyor
+																</span>
+															)}
+														</p>
+													)}
 												{Boolean(cfg.personId) && (
 													<p className="template-detail-item">
 														<strong>Kişi:</strong>{" "}
@@ -642,6 +722,19 @@ export function TemplateManagement() {
 														Henüz bu hızlı kayıt türü kullanıma açılmadı.
 													</p>
 												)}
+												{/* Stale INCOME source warning on card */}
+												{t.templateType === "INCOME" &&
+													Boolean(cfg.incomeSourceId) &&
+													!activeIncomeSources.some(
+														(s) => s.sourceId === cfg.incomeSourceId,
+													) && (
+														<p
+															className="alert alert-warning"
+															data-testid={`stale-income-source-${t.id}`}
+														>
+															Gelir kaynağı arşivlenmiş — şablonu düzenleyin.
+														</p>
+													)}
 											</div>
 
 											{/* Actions */}
@@ -811,6 +904,18 @@ export function TemplateManagement() {
 									/>
 									<span>Borç</span>
 								</label>
+								{/* F8: INCOME is now a supported type */}
+								<label className="radio-option">
+									<input
+										type="radio"
+										name="createTemplateType"
+										value="INCOME"
+										checked={createTemplateType === "INCOME"}
+										onChange={() => setCreateTemplateType("INCOME")}
+										data-testid="tpl-type-income"
+									/>
+									<span>Gelir</span>
+								</label>
 							</div>
 						) : (
 							<p
@@ -835,14 +940,81 @@ export function TemplateManagement() {
 						)}
 					</div>
 
-					{/* Future-domain notice for unsupported edit types (INCOME) */}
-					{isUnsupportedEdit && (
-						<div
-							className="form-info-banner"
-							data-testid="future-domain-notice"
-						>
-							Bu şablon türünün ayrıntılı ayarları ilgili özellik kullanıma
-							açıldığında düzenlenebilecek. Mevcut ayarlar korunacaktır.
+					{/* isUnsupportedEdit is false in F8 — INCOME is fully supported */}
+
+					{/* INCOME Specific: Gelir Kaynağı * */}
+					{effectiveType === "INCOME" && (
+						<div className="form-group">
+							<label
+								htmlFor="tpl-income-source"
+								className="form-label required"
+							>
+								Gelir Kaynağı *
+							</label>
+							{incomeSourceId &&
+								!activeIncomeSources.some(
+									(s) => s.sourceId === incomeSourceId,
+								) && (
+									<div
+										className="alert alert-warning"
+										data-testid="stale-income-source-warning"
+									>
+										Şablondaki gelir kaynağı artık kullanılamıyor. Lütfen başka
+										bir gelir kaynağı seçin.
+									</div>
+								)}
+							<select
+								id="tpl-income-source"
+								value={incomeSourceId}
+								onChange={(e) => setIncomeSourceId(e.target.value)}
+								required
+								className="form-select"
+								data-testid="tpl-income-source-select"
+							>
+								<option value="">Gelir Kaynağı Seçin...</option>
+								{activeIncomeSources.map((s) => (
+									<option key={s.sourceId} value={s.sourceId}>
+										{s.name} ({s.code})
+									</option>
+								))}
+							</select>
+						</div>
+					)}
+
+					{/* INCOME Specific: Varsayılan Tutar */}
+					{effectiveType === "INCOME" && (
+						<div className="form-group">
+							<label htmlFor="tpl-income-amount" className="form-label">
+								Varsayılan Tutar (İsteğe bağlı)
+							</label>
+							<MoneyInput
+								id="tpl-income-amount"
+								value={defaultAmountDisplay}
+								onChange={(canonical, raw, isValid) => {
+									setDefaultAmountCanonical(canonical);
+									setDefaultAmountDisplay(raw);
+									setDefaultAmountValid(isValid);
+								}}
+							/>
+						</div>
+					)}
+
+					{/* INCOME Specific: Açıklama */}
+					{effectiveType === "INCOME" && (
+						<div className="form-group">
+							<label htmlFor="tpl-income-description" className="form-label">
+								Açıklama (İsteğe bağlı)
+							</label>
+							<input
+								type="text"
+								id="tpl-income-description"
+								value={description}
+								onChange={(e) => setDescription(e.target.value)}
+								maxLength={255}
+								placeholder="Örn: KYK Bursu"
+								className="form-input"
+								data-testid="tpl-income-description-input"
+							/>
 						</div>
 					)}
 

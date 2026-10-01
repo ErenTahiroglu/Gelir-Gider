@@ -18,7 +18,6 @@ import type {
 	CreateShortTermGoalPayload,
 	FundShortTermGoalPayload,
 	FundShortTermGoalResponse,
-	LongTermTaskProductDto,
 	LongTermTaskResponse,
 	LongTermTaskStatus,
 	LongTermTasksListResponse,

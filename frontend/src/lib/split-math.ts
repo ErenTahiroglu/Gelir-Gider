@@ -400,7 +400,7 @@ export function calculateRatioSplitPreview(
 
 	const finalShares = new Map<number, bigint>();
 	for (let i = 0; i < parties.length; i++) {
-		finalShares.set(i, parties[i]!.baseShare);
+		finalShares.set(i, parties[i]?.baseShare ?? 0n);
 	}
 
 	for (let i = 0; i < remainingCents; i++) {

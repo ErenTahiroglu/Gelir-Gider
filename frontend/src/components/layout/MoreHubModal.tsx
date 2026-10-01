@@ -8,6 +8,7 @@ import {
 	Target,
 	TrendingUp,
 	Users,
+	Wallet,
 } from "lucide-react";
 import { AccessibleModal } from "../common/AccessibleModal";
 
@@ -25,6 +26,8 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 	const isGoalsActive = currentPath.startsWith("/goals");
 	const isMidasActive = currentPath.startsWith("/midas");
 	const isLongTermActive = currentPath.startsWith("/long-term");
+	const isIncomeActive = currentPath.startsWith("/income");
+	const isMonthCloseActive = currentPath.startsWith("/month-close");
 
 	return (
 		<AccessibleModal
@@ -38,6 +41,48 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 				<div className="more-hub-section">
 					<h3 className="more-hub-section-title">Hizmetler & Yönetim</h3>
 					<ul className="more-hub-list">
+						{/* Active item: Gelirler */}
+						<li className="more-hub-item">
+							<Link
+								to="/income"
+								className={`more-hub-link ${isIncomeActive ? "active" : ""}`}
+								onClick={onClose}
+								aria-current={isIncomeActive ? "page" : undefined}
+								data-testid="more-hub-link-income"
+							>
+								<div className="more-hub-icon-wrapper">
+									<Wallet size={20} aria-hidden="true" />
+								</div>
+								<div className="more-hub-item-info">
+									<span className="more-hub-item-name">Gelirler</span>
+									<span className="more-hub-item-desc">
+										Kaynaklar, beklenen gelir ve tahsilatlar
+									</span>
+								</div>
+							</Link>
+						</li>
+
+						{/* Active item: Ayı Tamamla */}
+						<li className="more-hub-item">
+							<Link
+								to="/month-close"
+								className={`more-hub-link ${isMonthCloseActive ? "active" : ""}`}
+								onClick={onClose}
+								aria-current={isMonthCloseActive ? "page" : undefined}
+								data-testid="more-hub-link-month-close"
+							>
+								<div className="more-hub-icon-wrapper">
+									<Calendar size={20} aria-hidden="true" />
+								</div>
+								<div className="more-hub-item-info">
+									<span className="more-hub-item-name">Ayı Tamamla</span>
+									<span className="more-hub-item-desc">
+										Dönem sonu mutabakatı ve kapanış
+									</span>
+								</div>
+							</Link>
+						</li>
+
 						{/* Active item: Kişiler */}
 						<li className="more-hub-item">
 							<Link
@@ -150,30 +195,6 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 				<div className="more-hub-section">
 					<h3 className="more-hub-section-title">Gelecek Özellikler</h3>
 					<ul className="more-hub-list">
-						{/* Disabled F8: Ayı Tamamla */}
-						<li className="more-hub-item">
-							<button
-								type="button"
-								className="more-hub-link disabled"
-								disabled
-								aria-disabled="true"
-								data-testid="more-hub-link-month-close"
-							>
-								<div className="more-hub-icon-wrapper">
-									<Calendar size={20} aria-hidden="true" />
-								</div>
-								<div className="more-hub-item-info">
-									<div className="more-hub-item-header">
-										<span className="more-hub-item-name">Ayı Tamamla</span>
-										<span className="more-hub-badge">F8</span>
-									</div>
-									<span className="more-hub-item-desc">
-										Dönem sonu mutabakatı ve kapanış
-									</span>
-								</div>
-							</button>
-						</li>
-
 						{/* Disabled F9: Ekstre İçe Aktar */}
 						<li className="more-hub-item">
 							<button

@@ -11,21 +11,17 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { ArrowLeft, Edit3, Trash2, Users } from "lucide-react";
+import { ArrowLeft, Trash2, Users } from "lucide-react";
 import { useRef, useState } from "react";
 import { mapCreditCardError } from "../../../api/credit-card-errors";
 import {
 	fetchCreditCard,
 	fetchCreditCardPurchase,
 	fetchPurchaseSplit,
-	updateCreditCardPurchase,
 	voidCreditCardPurchase,
 	voidSharedCreditCardPurchase,
 } from "../../../api/credit-cards-api";
-import {
-	formatIstanbulDateTimeLocal,
-	parseIstanbulDateTimeLocalToIso,
-} from "../../../lib/istanbul-date";
+import { parseIstanbulDateTimeLocalToIso } from "../../../lib/istanbul-date";
 import { formatMoneyToTry } from "../../../lib/money";
 import { AccessibleModal } from "../../common/AccessibleModal";
 import { AttachSplitModal } from "./AttachSplitModal";
@@ -39,7 +35,7 @@ export function PurchaseDetailPage({
 	cardId,
 	purchaseId,
 }: PurchaseDetailPageProps) {
-	const navigate = useNavigate();
+	const _navigate = useNavigate();
 	const queryClient = useQueryClient();
 
 	const [isAttachSplitOpen, setIsAttachSplitOpen] = useState<boolean>(false);

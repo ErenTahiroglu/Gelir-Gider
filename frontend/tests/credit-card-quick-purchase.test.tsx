@@ -85,7 +85,7 @@ describe("Credit Card Quick Purchase Execution (Section 67-70)", () => {
 					},
 				});
 			}
-			return Promise.reject(new Error("Unexpected url: " + url));
+			return Promise.reject(new Error(`Unexpected url: ${url}`));
 		});
 
 		const queryClient = createTestQueryClient();
@@ -138,7 +138,7 @@ describe("Credit Card Quick Purchase Execution (Section 67-70)", () => {
 			(call[0] as string).includes("/purchases"),
 		);
 		expect(purchaseCall).toBeDefined();
-		const purchaseBody = purchaseCall![1] as Record<string, unknown>;
+		const purchaseBody = purchaseCall?.[1] as Record<string, unknown>;
 		expect(purchaseBody.defaultAmount).toBeUndefined();
 		expect(purchaseBody.spendingCategoryId).toBeUndefined();
 		expect(purchaseBody.budgetCategoryOverride).toBeUndefined();
@@ -175,7 +175,7 @@ describe("Credit Card Quick Purchase Execution (Section 67-70)", () => {
 					},
 				});
 			}
-			return Promise.reject(new Error("Unexpected url: " + url));
+			return Promise.reject(new Error(`Unexpected url: ${url}`));
 		});
 
 		const queryClient = createTestQueryClient();
@@ -238,7 +238,7 @@ describe("Credit Card Quick Purchase Execution (Section 67-70)", () => {
 			if (url.includes("/category-assignments")) {
 				return Promise.reject(new Error("Category service down"));
 			}
-			return Promise.reject(new Error("Unexpected url: " + url));
+			return Promise.reject(new Error(`Unexpected url: ${url}`));
 		});
 
 		const queryClient = createTestQueryClient();
@@ -294,9 +294,9 @@ describe("Credit Card Quick Purchase Execution (Section 67-70)", () => {
 		let attempt = 0;
 		const capturedKeys: string[] = [];
 
-		const apiPostSpy = vi
+		const _apiPostSpy = vi
 			.spyOn(client, "apiPost")
-			.mockImplementation((url, payload, options) => {
+			.mockImplementation((url, _payload, options) => {
 				if (url.includes("/purchases")) {
 					attempt++;
 					const headers = options?.headers as
