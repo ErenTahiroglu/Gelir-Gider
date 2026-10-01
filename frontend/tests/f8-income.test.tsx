@@ -387,6 +387,88 @@ describe("F8 Income Tests", () => {
 				);
 			});
 		});
+
+		it("replays exact Idempotency-Key and payload on receipt void network uncertainty", async () => {
+			const { wrapper } = createWrapper();
+			const mockReceipt: IncomeReceiptItem = {
+				incomeReceiptId: "rec-1",
+				sourceId: "src-1",
+				sourceCode: "KYK_BURSU",
+				sourceName: "KYK Bursu",
+				status: "ACTIVE",
+				revisionNo: 2,
+				receivedAt: "2026-09-10T10:00:00.000Z",
+				amount: "2000.00",
+				destinationAccountId: "acc-asset-1",
+				note: "KYK Eylül",
+			};
+
+			vi.mocked(incomeApi.fetchIncomeReceipt).mockResolvedValue(mockReceipt);
+			vi.mocked(incomeApi.fetchIncomeReceiptSettlement).mockResolvedValue({
+				incomeReceiptId: "rec-1",
+				receiptAmount: "2000.00",
+				allocatedAmount: "0.00",
+				unallocatedAmount: "2000.00",
+				revisionNo: 1,
+				allocations: [],
+			});
+
+			mockParams = { incomeReceiptId: "rec-1" };
+
+			const networkErr = new TypeError("Failed to fetch");
+			vi.mocked(incomeApi.voidIncomeReceipt)
+				.mockRejectedValueOnce(networkErr)
+				.mockResolvedValueOnce({
+					...mockReceipt,
+					status: "VOIDED",
+					revisionNo: 3,
+				});
+
+			render(<IncomeReceiptDetail incomeReceiptId="rec-1" />, { wrapper });
+
+			await waitFor(() => {
+				expect(screen.getByTestId("btn-void-receipt")).toBeDefined();
+			});
+
+			fireEvent.click(screen.getByTestId("btn-void-receipt"));
+
+			await waitFor(() => {
+				expect(
+					screen.getByRole("button", { name: /Tahsilatı İptal Et/i }),
+				).toBeDefined();
+			});
+
+			fireEvent.click(
+				screen.getByRole("button", { name: /Tahsilatı İptal Et/i }),
+			);
+
+			await waitFor(() => {
+				expect(
+					screen.getByTestId("receipt-void-uncertain-warning"),
+				).toBeDefined();
+			});
+
+			expect(incomeApi.voidIncomeReceipt).toHaveBeenCalledTimes(1);
+			const firstKey = vi.mocked(incomeApi.voidIncomeReceipt).mock.calls[0]![2];
+			const firstPayload = vi.mocked(incomeApi.voidIncomeReceipt).mock
+				.calls[0]![1];
+
+			// Explicit retry
+			fireEvent.click(screen.getByTestId("btn-retry-void-receipt"));
+
+			await waitFor(() => {
+				expect(incomeApi.voidIncomeReceipt).toHaveBeenCalledTimes(2);
+			});
+
+			const secondKey = vi.mocked(incomeApi.voidIncomeReceipt).mock
+				.calls[1]![2];
+			const secondPayload = vi.mocked(incomeApi.voidIncomeReceipt).mock
+				.calls[1]![1];
+
+			expect(secondKey).toBe(firstKey);
+			expect(secondPayload).toEqual(firstPayload);
+			expect(secondPayload.expectedRevisionNo).toBe(2);
+		});
 	});
 
 	// =========================================================================
@@ -935,6 +1017,322 @@ describe("F8 Income Tests", () => {
 			expect(secondPayload.allocations).toEqual([]);
 
 			confirmSpy.mockRestore();
+		});
+
+		it("replays exact Idempotency-Key and allocations on settlement create network uncertainty", async () => {
+			const { wrapper } = createWrapper();
+			const mockEntitlement: IncomeEntitlementItem = {
+				entitlementId: "ent-1",
+				sourceId: "src-1",
+				sourceCode: "KYK_BURSU",
+				sourceName: "KYK Bursu",
+				periodMonth: "2026-09-01",
+				revisionNo: 1,
+				status: "ACTIVE",
+				amount: "2000.00",
+				allocatedAmount: "0.00",
+				outstandingAmount: "2000.00",
+				settlementStatus: "OPEN",
+				expectedReceiptOn: "2026-09-10",
+				overdue: false,
+				note: null,
+			};
+
+			vi.mocked(incomeApi.fetchIncomeEntitlements).mockResolvedValue({
+				entitlements: [mockEntitlement],
+				hasMore: false,
+				limit: 100,
+				nextCursor: null,
+			});
+
+			const networkErr = new TypeError("Failed to fetch");
+			vi.mocked(incomeApi.createIncomeSettlement)
+				.mockRejectedValueOnce(networkErr)
+				.mockResolvedValueOnce({
+					incomeReceiptId: "rec-1",
+					receiptAmount: "1000.00",
+					allocatedAmount: "1000.00",
+					unallocatedAmount: "0.00",
+					revisionNo: 1,
+					allocations: [
+						{
+							entitlementId: "ent-1",
+							periodMonth: "2026-09-01",
+							entitlementAmount: "2000.00",
+							allocatedAmount: "1000.00",
+							entitlementOutstandingAfterAllReceipts: "1000.00",
+						},
+					],
+				});
+
+			render(
+				<IncomeSettlementEditor
+					incomeReceiptId="rec-1"
+					sourceId="src-1"
+					receiptAmount="1000.00"
+					existingSettlement={null}
+					onSuccess={vi.fn()}
+					onCancel={vi.fn()}
+				/>,
+				{ wrapper },
+			);
+
+			await waitFor(() => {
+				expect(screen.getByTestId("btn-save-settlement")).toBeDefined();
+				expect(screen.queryByText(/Yükleniyor/i)).toBeNull();
+			});
+
+			// Select entitlement
+			const select = screen.getByLabelText(/Beklenen Gelir Dönemi/i);
+			fireEvent.change(select, { target: { value: "ent-1" } });
+
+			// Enter 1000.00
+			const amountInput = screen.getByLabelText(/Aktarılan Tutar/i);
+			fireEvent.change(amountInput, { target: { value: "1000.00" } });
+
+			// Submit create
+			fireEvent.click(screen.getByTestId("btn-save-settlement"));
+
+			await waitFor(() => {
+				expect(
+					screen.getByTestId("settlement-uncertain-warning"),
+				).toBeDefined();
+			});
+
+			expect(incomeApi.createIncomeSettlement).toHaveBeenCalledTimes(1);
+			const firstKey = vi.mocked(incomeApi.createIncomeSettlement).mock
+				.calls[0]![2];
+			const firstReceiptId = vi.mocked(incomeApi.createIncomeSettlement).mock
+				.calls[0]![0];
+			const firstPayload = vi.mocked(incomeApi.createIncomeSettlement).mock
+				.calls[0]![1];
+
+			// Explicit retry
+			fireEvent.click(screen.getByTestId("btn-retry-settlement"));
+
+			await waitFor(() => {
+				expect(incomeApi.createIncomeSettlement).toHaveBeenCalledTimes(2);
+			});
+
+			const secondKey = vi.mocked(incomeApi.createIncomeSettlement).mock
+				.calls[1]![2];
+			const secondReceiptId = vi.mocked(incomeApi.createIncomeSettlement).mock
+				.calls[1]![0];
+			const secondPayload = vi.mocked(incomeApi.createIncomeSettlement).mock
+				.calls[1]![1];
+
+			expect(secondKey).toBe(firstKey);
+			expect(secondReceiptId).toBe("rec-1");
+			expect(secondPayload).toEqual(firstPayload);
+			expect(secondPayload.allocations).toEqual([
+				{
+					entitlementId: "ent-1",
+					amount: "1000.00",
+				},
+			]);
+		});
+
+		it("replays exact Idempotency-Key and payload on settlement revise network uncertainty", async () => {
+			const { wrapper } = createWrapper();
+			const existingSettlement: IncomeReceiptSettlementResponse = {
+				incomeReceiptId: "rec-1",
+				receiptAmount: "2000.00",
+				allocatedAmount: "1000.00",
+				unallocatedAmount: "1000.00",
+				revisionNo: 2,
+				allocations: [
+					{
+						entitlementId: "ent-1",
+						periodMonth: "2026-09-01",
+						entitlementAmount: "2000.00",
+						allocatedAmount: "1000.00",
+						entitlementOutstandingAfterAllReceipts: "1000.00",
+					},
+				],
+			};
+
+			const mockEntitlement: IncomeEntitlementItem = {
+				entitlementId: "ent-1",
+				sourceId: "src-1",
+				sourceCode: "KYK_BURSU",
+				sourceName: "KYK Bursu",
+				periodMonth: "2026-09-01",
+				revisionNo: 1,
+				status: "ACTIVE",
+				amount: "2000.00",
+				allocatedAmount: "1000.00",
+				outstandingAmount: "1000.00",
+				settlementStatus: "PARTIAL",
+				expectedReceiptOn: "2026-09-10",
+				overdue: false,
+				note: null,
+			};
+
+			vi.mocked(incomeApi.fetchIncomeEntitlements).mockResolvedValue({
+				entitlements: [mockEntitlement],
+				hasMore: false,
+				limit: 100,
+				nextCursor: null,
+			});
+
+			const networkErr = new TypeError("Failed to fetch");
+			vi.mocked(incomeApi.reviseIncomeSettlement)
+				.mockRejectedValueOnce(networkErr)
+				.mockResolvedValueOnce({
+					...existingSettlement,
+					allocatedAmount: "2000.00",
+					unallocatedAmount: "0.00",
+					revisionNo: 3,
+					allocations: [
+						{
+							...existingSettlement.allocations[0]!,
+							allocatedAmount: "2000.00",
+							entitlementOutstandingAfterAllReceipts: "0.00",
+						},
+					],
+				});
+
+			render(
+				<IncomeSettlementEditor
+					incomeReceiptId="rec-1"
+					sourceId="src-1"
+					receiptAmount="2000.00"
+					existingSettlement={existingSettlement}
+					onSuccess={vi.fn()}
+					onCancel={vi.fn()}
+				/>,
+				{ wrapper },
+			);
+
+			await waitFor(() => {
+				expect(screen.getByTestId("btn-save-settlement")).toBeDefined();
+			});
+
+			// Change allocation from 1000 to 2000
+			const amountInputs = screen.getAllByRole("textbox");
+			if (amountInputs[0]) {
+				fireEvent.change(amountInputs[0], { target: { value: "2000.00" } });
+			}
+
+			fireEvent.click(screen.getByTestId("btn-save-settlement"));
+
+			await waitFor(() => {
+				expect(
+					screen.getByTestId("settlement-uncertain-warning"),
+				).toBeDefined();
+			});
+
+			expect(incomeApi.reviseIncomeSettlement).toHaveBeenCalledTimes(1);
+			const firstKey = vi.mocked(incomeApi.reviseIncomeSettlement).mock
+				.calls[0]![2];
+			const firstPayload = vi.mocked(incomeApi.reviseIncomeSettlement).mock
+				.calls[0]![1];
+
+			// Explicit retry
+			fireEvent.click(screen.getByTestId("btn-retry-settlement"));
+
+			await waitFor(() => {
+				expect(incomeApi.reviseIncomeSettlement).toHaveBeenCalledTimes(2);
+			});
+
+			const secondKey = vi.mocked(incomeApi.reviseIncomeSettlement).mock
+				.calls[1]![2];
+			const secondPayload = vi.mocked(incomeApi.reviseIncomeSettlement).mock
+				.calls[1]![1];
+
+			expect(secondKey).toBe(firstKey);
+			expect(secondPayload).toEqual(firstPayload);
+			expect(secondPayload.expectedRevisionNo).toBe(2);
+			expect(secondPayload.allocations).toEqual([
+				{
+					entitlementId: "ent-1",
+					amount: "2000.00",
+				},
+			]);
+		});
+
+		it("clears frozen attempt and refetches on INCOME_SETTLEMENT_REVISION_CONFLICT", async () => {
+			const { wrapper, queryClient } = createWrapper();
+			const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+			const existingSettlement: IncomeReceiptSettlementResponse = {
+				incomeReceiptId: "rec-1",
+				receiptAmount: "2000.00",
+				allocatedAmount: "1000.00",
+				unallocatedAmount: "1000.00",
+				revisionNo: 2,
+				allocations: [
+					{
+						entitlementId: "ent-1",
+						periodMonth: "2026-09-01",
+						entitlementAmount: "2000.00",
+						allocatedAmount: "1000.00",
+						entitlementOutstandingAfterAllReceipts: "1000.00",
+					},
+				],
+			};
+
+			const mockEntitlement: IncomeEntitlementItem = {
+				entitlementId: "ent-1",
+				sourceId: "src-1",
+				sourceCode: "KYK_BURSU",
+				sourceName: "KYK Bursu",
+				periodMonth: "2026-09-01",
+				revisionNo: 1,
+				status: "ACTIVE",
+				amount: "2000.00",
+				allocatedAmount: "1000.00",
+				outstandingAmount: "1000.00",
+				settlementStatus: "PARTIAL",
+				expectedReceiptOn: "2026-09-10",
+				overdue: false,
+				note: null,
+			};
+
+			vi.mocked(incomeApi.fetchIncomeEntitlements).mockResolvedValue({
+				entitlements: [mockEntitlement],
+				hasMore: false,
+				limit: 100,
+				nextCursor: null,
+			});
+
+			vi.mocked(incomeApi.reviseIncomeSettlement).mockRejectedValueOnce(
+				new ApiError({
+					status: 409,
+					code: "INCOME_SETTLEMENT_REVISION_CONFLICT",
+					message: "Settlement was modified by another session",
+				}),
+			);
+
+			render(
+				<IncomeSettlementEditor
+					incomeReceiptId="rec-1"
+					sourceId="src-1"
+					receiptAmount="2000.00"
+					existingSettlement={existingSettlement}
+					onSuccess={vi.fn()}
+					onCancel={vi.fn()}
+				/>,
+				{ wrapper },
+			);
+
+			await waitFor(() => {
+				expect(screen.getByTestId("btn-save-settlement")).toBeDefined();
+			});
+
+			fireEvent.click(screen.getByTestId("btn-save-settlement"));
+
+			await waitFor(() => {
+				expect(incomeApi.reviseIncomeSettlement).toHaveBeenCalledTimes(1);
+			});
+
+			// Should show error and invalidate queries
+			await waitFor(() => {
+				expect(invalidateSpy).toHaveBeenCalled();
+			});
+
+			// Should NOT show uncertain retry warning (since it's a conflict, not network uncertainty)
+			expect(screen.queryByTestId("settlement-uncertain-warning")).toBeNull();
 		});
 	});
 });

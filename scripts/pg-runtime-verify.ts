@@ -914,7 +914,7 @@ async function runtime() {
 		[U1, "f".repeat(64)] as never[],
 	);
 	await db.query(
-		`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ('80000000-0000-4000-8000-0000000000e1',$1,'80000000-0000-4000-8000-000000000001','PURCHASE','80000000-0000-4000-8000-0000000000c1')`,
+		`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id,created_at) values ('80000000-0000-4000-8000-0000000000e1',$1,'80000000-0000-4000-8000-000000000001','PURCHASE','80000000-0000-4000-8000-0000000000c1','2026-09-01 00:00:00 Europe/Istanbul')`,
 		[U1] as never[],
 	);
 	await db.query(
@@ -1177,7 +1177,7 @@ async function resolverRuntime() {
 		[U1, F] as never[],
 	);
 	await pg.query(
-		`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ('80000000-0000-4000-8000-0000000000e1',$1,'80000000-0000-4000-8000-000000000001','PURCHASE','80000000-0000-4000-8000-0000000000c1')`,
+		`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id,created_at) values ('80000000-0000-4000-8000-0000000000e1',$1,'80000000-0000-4000-8000-000000000001','PURCHASE','80000000-0000-4000-8000-0000000000c1','2026-09-02 00:00:00 Europe/Istanbul')`,
 		[U1] as never[],
 	);
 	await pg.query(
@@ -1609,7 +1609,7 @@ async function resolverRuntime4A() {
 			[trid, U1, ctid, F, `cptr-${eid.slice(-6)}`] as never[],
 		);
 		await pg.query(
-			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ($1,$2,'80000000-0000-4000-8000-000000000001','PURCHASE',$3)`,
+			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id,created_at) values ($1,$2,'80000000-0000-4000-8000-000000000001','PURCHASE',$3,'2026-09-02 00:00:00+00')`,
 			[eid, U1, ctid] as never[],
 		);
 		await pg.query(
@@ -2082,8 +2082,8 @@ async function resolverRuntime4A1() {
 			[tr, U1, ct, occurredAt, F, `cptr-${seq}`] as never[],
 		);
 		await pg.query(
-			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ($1,$2,'80000000-0000-4000-8000-000000000001','PURCHASE',$3)`,
-			[eid, U1, ct] as never[],
+			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id,created_at) values ($1,$2,'80000000-0000-4000-8000-000000000001','PURCHASE',$3,$4)`,
+			[eid, U1, ct, occurredAt] as never[],
 		);
 		await pg.query(
 			`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,canonical_revision_id,operation,amount,budget_category,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8,$9)`,
@@ -2311,8 +2311,8 @@ async function make4bScenario() {
 		const eid = gid();
 		const er = gid();
 		await q(
-			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id) values ($1,$2,$3,'PURCHASE',$4)`,
-			[eid, U1, CARD, ct],
+			`insert into credit_card_liability_events (id,user_id,credit_card_id,event_type,canonical_transaction_id,created_at) values ($1,$2,$3,'PURCHASE',$4,$5)`,
+			[eid, U1, CARD, ct, occ],
 		);
 		await q(
 			`insert into credit_card_liability_event_revisions (id,user_id,event_id,revision_no,canonical_revision_id,operation,amount,budget_category,merchant,installment_count,occurred_at,idempotency_key,revision_fingerprint) values ($1,$2,$3,1,$4,'CREATE',$5,$6,$7,$8,$9,$10,$11)`,
@@ -2795,6 +2795,15 @@ async function resolverRuntime4B() {
 			"600.00",
 			"MANDATORY_EXPENSE",
 			"2026-09-03 00:00:00+00",
+		);
+		const checkEvent = await s.pg.query<{ created_at: Date }>(
+			"select created_at from credit_card_liability_events where id=$1",
+			[purA.eid],
+		);
+		const createdAtIso = new Date(checkEvent.rows[0]!.created_at).toISOString();
+		chkB(
+			createdAtIso === "2026-09-03T00:00:00.000Z",
+			"4B/ROOT-ANCHOR: mkPur liability event created_at is pinned to historical fixture instant (2026-09-03)",
 		);
 		const purI = await s.mkPur(
 			"1200.00",
@@ -12883,6 +12892,9 @@ async function resolverRuntime7B2() {
 		activeFrom: "2026-01-01",
 	});
 	await archiveIncomeSource({ db, userId: U1, sourceId: sArchReg.incomeSource.id });
+	await s.replica();
+	await s.q("update income_sources set archived_at = '2026-01-02 00:00:00+00' where id = $1", [sArchReg.incomeSource.id]);
+	await s.origin();
 
 	let archEntThrew = "";
 	try {
