@@ -16,6 +16,7 @@ import type {
 	ImportRowDetail,
 	StageImportBatchResponse,
 } from "../src/api/imports-types";
+import * as manualExpensesApi from "../src/api/manual-expenses-api";
 import { CsvImportForm } from "../src/components/imports/CsvImportForm";
 import { ImportApplyProgress } from "../src/components/imports/ImportApplyProgress";
 import { ImportBatchPage } from "../src/components/imports/ImportBatchPage";
@@ -58,9 +59,12 @@ vi.mock("../src/api/manual-expenses-api", () => ({
 		{
 			accountId: "acc-1",
 			accountType: "ASSET",
+			normalBalance: "DEBIT",
 			name: "Vadesiz TL",
 			currency: "TRY",
 			archived: false,
+			balance: "1000.00",
+			code: "102.01",
 		},
 	]),
 }));
@@ -159,7 +163,6 @@ describe("F9 — CSV Imports & Resolution Unit & Integration Suite", () => {
 		expect(callArg.sourceFileName).toBe("ekstre.csv");
 		expect(callArg.sourceContent).toBe(csvContent);
 		expect(callArg.observedAt).toBeDefined();
-		// Staging accepts no idempotency key argument
 		expect(stageMock.mock.calls[0]!.length).toBe(1);
 	});
 
@@ -168,7 +171,6 @@ describe("F9 — CSV Imports & Resolution Unit & Integration Suite", () => {
 		const { wrapper } = createWrapper();
 		render(<CsvImportForm />, { wrapper });
 
-		// 11 MiB file
 		const largeContent = "a".repeat(11 * 1024 * 1024);
 		const file = new File([largeContent], "huge.csv", { type: "text/csv" });
 
@@ -383,20 +385,268 @@ describe("F9 — CSV Imports & Resolution Unit & Integration Suite", () => {
 		});
 	});
 
-	it("sends fresh latestRevisionNo as expectedRevisionNo in resolveImportRow", async () => {
+	it("integrates ImportBatchPage with readyCount = 3, enables modal start button, and triggers applyReadyImportRows", async () => {
+		mockParams = { batchId: "batch-real-1" };
+		vi.mocked(importsApi.getImportBatch).mockResolvedValue({
+			id: "batch-real-1",
+			userId: "user-1",
+			provider: "HTTP_UPLOAD",
+			sourceKind: "GENERIC_CSV_V1",
+			sourceContentHash: "hash",
+			sourceFileName: "test.csv",
+			parserType: "GENERIC_CSV_V1",
+			parserVersion: "1",
+			observedAt: "2026-10-01T10:00:00.000Z",
+			createdAt: "2026-10-01T10:00:00.000Z",
+			totalRows: 3,
+			readyCount: 3,
+			needsReviewCount: 0,
+			possibleDuplicateCount: 0,
+			exactDuplicateCount: 0,
+			appliedCount: 0,
+			linkedCount: 0,
+			skippedCount: 0,
+			unsupportedCount: 0,
+		});
+
+		vi.mocked(importsApi.getImportBatchPreview).mockResolvedValue({
+			batch: {
+				id: "batch-real-1",
+				userId: "user-1",
+				provider: "HTTP_UPLOAD",
+				sourceKind: "GENERIC_CSV_V1",
+				sourceContentHash: "hash",
+				sourceFileName: "test.csv",
+				parserType: "GENERIC_CSV_V1",
+				parserVersion: "1",
+				observedAt: "2026-10-01T10:00:00.000Z",
+				createdAt: "2026-10-01T10:00:00.000Z",
+				totalRows: 3,
+				readyCount: 3,
+				needsReviewCount: 0,
+				possibleDuplicateCount: 0,
+				exactDuplicateCount: 0,
+				appliedCount: 0,
+				linkedCount: 0,
+				skippedCount: 0,
+				unsupportedCount: 0,
+			},
+			rowSample: [],
+			rowSampleLimit: 25,
+		});
+
+		const applyMock = vi
+			.mocked(importsApi.applyReadyImportRows)
+			.mockResolvedValueOnce({
+				appliedCount: 3,
+				failedCount: 0,
+				remainingReadyCount: 0,
+				hasMore: false,
+				results: [],
+			});
+
+		const { wrapper } = createWrapper();
+		render(<ImportBatchPage />, { wrapper });
+
+		await waitFor(() => {
+			expect(screen.getByTestId("btn-apply-ready")).toBeInTheDocument();
+		});
+
+		fireEvent.click(screen.getByTestId("btn-apply-ready"));
+
+		await waitFor(() => {
+			expect(screen.getByTestId("metric-remaining-count")).toHaveTextContent(
+				"3",
+			);
+		});
+
+		const startBtn = screen.getByTestId("btn-start-apply");
+		expect(startBtn).toBeEnabled();
+
+		fireEvent.click(startBtn);
+
+		await waitFor(() => {
+			expect(applyMock).toHaveBeenCalledWith("batch-real-1", 50);
+		});
+	});
+
+	it("integrates ImportRowsReview with readyCount = 3 and initializes apply modal correctly", async () => {
+		mockParams = { batchId: "batch-review-1" };
+		vi.mocked(importsApi.getImportBatch).mockResolvedValue({
+			id: "batch-review-1",
+			userId: "user-1",
+			provider: "HTTP_UPLOAD",
+			sourceKind: "GENERIC_CSV_V1",
+			sourceContentHash: "hash",
+			sourceFileName: "test.csv",
+			parserType: "GENERIC_CSV_V1",
+			parserVersion: "1",
+			observedAt: "2026-10-01T10:00:00.000Z",
+			createdAt: "2026-10-01T10:00:00.000Z",
+			totalRows: 3,
+			readyCount: 3,
+			needsReviewCount: 0,
+			possibleDuplicateCount: 0,
+			exactDuplicateCount: 0,
+			appliedCount: 0,
+			linkedCount: 0,
+			skippedCount: 0,
+			unsupportedCount: 0,
+		});
+
+		vi.mocked(importsApi.getImportRows).mockResolvedValue({
+			items: [],
+			nextCursor: null,
+		});
+
+		const { wrapper } = createWrapper();
+		render(<ImportRowsReview />, { wrapper });
+
+		await waitFor(() => {
+			expect(
+				screen.getByTestId("btn-apply-ready-from-review"),
+			).toBeInTheDocument();
+		});
+
+		fireEvent.click(screen.getByTestId("btn-apply-ready-from-review"));
+
+		await waitFor(() => {
+			expect(screen.getByTestId("metric-remaining-count")).toHaveTextContent(
+				"3",
+			);
+			expect(screen.getByTestId("btn-start-apply")).toBeEnabled();
+		});
+	});
+
+	it("enters REVIEW_REQUIRED state on failed apply and disables/hides normal start button", async () => {
+		const applyMock = vi
+			.mocked(importsApi.applyReadyImportRows)
+			.mockResolvedValueOnce({
+				appliedCount: 1,
+				failedCount: 1,
+				remainingReadyCount: 1,
+				hasMore: true,
+				results: [
+					{
+						importRowId: "row-failing",
+						status: "FAILED",
+						errorMessage: "Kart limiti yetersiz",
+					},
+				],
+			});
+
+		const { wrapper } = createWrapper();
+		render(
+			<ImportApplyProgress
+				batchId="batch-fail-gate"
+				readyCount={2}
+				isOpen={true}
+				onClose={() => {}}
+			/>,
+			{ wrapper },
+		);
+
+		fireEvent.click(screen.getByTestId("btn-start-apply"));
+
+		await waitFor(() => {
+			expect(applyMock).toHaveBeenCalledTimes(1);
+		});
+
+		await waitFor(() => {
+			expect(
+				screen.getByText(/Bazı satırlar uygulanamadı/i),
+			).toBeInTheDocument();
+		});
+
+		// Start button must be hidden or disabled to prevent hammering the failing row
+		expect(screen.queryByTestId("btn-start-apply")).not.toBeInTheDocument();
+		expect(screen.getByTestId("btn-close-apply")).toHaveTextContent(
+			/Kapat ve Satırları İncele/i,
+		);
+	});
+
+	it("apply network uncertainty explicitly refreshes batch + READY rows authority", async () => {
+		vi.mocked(importsApi.applyReadyImportRows).mockRejectedValueOnce(
+			new ApiError({
+				status: 0,
+				code: "NETWORK_ERROR",
+				message: "Network failure",
+			}),
+		);
+
+		const batchMock = vi
+			.mocked(importsApi.getImportBatch)
+			.mockResolvedValueOnce({
+				id: "batch-uncertain",
+				userId: "user-1",
+				provider: "HTTP_UPLOAD",
+				sourceKind: "GENERIC_CSV_V1",
+				sourceContentHash: "hash",
+				sourceFileName: "test.csv",
+				parserType: "GENERIC_CSV_V1",
+				parserVersion: "1",
+				observedAt: "2026-10-01T10:00:00.000Z",
+				createdAt: "2026-10-01T10:00:00.000Z",
+				totalRows: 5,
+				readyCount: 3,
+				needsReviewCount: 0,
+				possibleDuplicateCount: 0,
+				exactDuplicateCount: 0,
+				appliedCount: 2,
+				linkedCount: 0,
+				skippedCount: 0,
+				unsupportedCount: 0,
+			});
+
+		const rowsMock = vi.mocked(importsApi.getImportRows).mockResolvedValueOnce({
+			items: [],
+			nextCursor: null,
+		});
+
+		const { wrapper } = createWrapper();
+		render(
+			<ImportApplyProgress
+				batchId="batch-uncertain"
+				readyCount={5}
+				isOpen={true}
+				onClose={() => {}}
+			/>,
+			{ wrapper },
+		);
+
+		fireEvent.click(screen.getByTestId("btn-start-apply"));
+
+		await waitFor(() => {
+			expect(batchMock).toHaveBeenCalledWith("batch-uncertain");
+			expect(rowsMock).toHaveBeenCalledWith({
+				batchId: "batch-uncertain",
+				status: "READY",
+				limit: 50,
+			});
+		});
+
+		await waitFor(() => {
+			expect(screen.getByTestId("metric-remaining-count")).toHaveTextContent(
+				"3",
+			);
+			expect(screen.getByTestId("metric-applied-count")).toHaveTextContent("2");
+		});
+	});
+
+	it("preserves prefilled purchaseCategory when resolving card mapping partially", async () => {
 		const rowDetail: ImportRowDetail = {
-			id: "row-occ",
+			id: "row-card-prefill",
 			userId: "user-1",
 			batchId: "batch-1",
 			rowOrdinal: 1,
 			recordType: "CREDIT_CARD_PURCHASE",
-			latestRevisionNo: 3,
+			latestRevisionNo: 1,
 			status: "NEEDS_REVIEW",
 			payload: {
 				recordType: "CREDIT_CARD_PURCHASE",
 				occurredAt: "2026-10-01T10:00:00.000Z",
-				amount: "250.00",
-				merchant: "Akaryakıt",
+				amount: "150.00",
+				merchant: "Süpermarket",
 				cardId: null,
 				purchaseCategory: "MANDATORY",
 				shortTermGoalId: null,
@@ -413,7 +663,7 @@ describe("F9 — CSV Imports & Resolution Unit & Integration Suite", () => {
 		const resolveMock = vi
 			.mocked(importsApi.resolveImportRow)
 			.mockResolvedValueOnce({
-				row: { ...rowDetail, status: "READY", latestRevisionNo: 4 },
+				row: { ...rowDetail, status: "READY", latestRevisionNo: 2 },
 				idempotentReplay: false,
 			});
 
@@ -421,7 +671,7 @@ describe("F9 — CSV Imports & Resolution Unit & Integration Suite", () => {
 		render(
 			<ImportRowResolver
 				batchId="batch-1"
-				rowId="row-occ"
+				rowId="row-card-prefill"
 				row={rowDetail}
 				isOpen={true}
 				onClose={() => {}}
@@ -429,7 +679,15 @@ describe("F9 — CSV Imports & Resolution Unit & Integration Suite", () => {
 			{ wrapper },
 		);
 
-		await waitFor(() => screen.getByTestId("select-card-id"));
+		// Assert category is already prefilled to MANDATORY and cards are loaded
+		await waitFor(() => {
+			expect(screen.getByTestId("select-purchase-category")).toHaveValue(
+				"MANDATORY",
+			);
+			expect(screen.getByText(/Garanti Bonus/i)).toBeInTheDocument();
+		});
+
+		// User selects ONLY the card
 		fireEvent.change(screen.getByTestId("select-card-id"), {
 			target: { value: "card-1" },
 		});
@@ -440,12 +698,452 @@ describe("F9 — CSV Imports & Resolution Unit & Integration Suite", () => {
 			expect(resolveMock).toHaveBeenCalledTimes(1);
 		});
 
-		const [batchId, rowId, body, key] = resolveMock.mock.calls[0]!;
-		expect(batchId).toBe("batch-1");
-		expect(rowId).toBe("row-occ");
-		expect(body.expectedRevisionNo).toBe(3);
-		expect(key).toBeDefined();
-		expect(key.length).toBeGreaterThan(0);
+		const [_bId, _rId, body] = resolveMock.mock.calls[0]!;
+		expect(body.action).toBe("RESOLVE_MAPPINGS");
+		expect(body.resolvedMappings).toEqual({
+			cardId: "card-1",
+			purchaseCategory: "MANDATORY",
+			shortTermGoalId: null,
+		});
+	});
+
+	it("preserves prefilled incomeSourceId when resolving income mapping partially", async () => {
+		const rowDetail: ImportRowDetail = {
+			id: "row-income-prefill",
+			userId: "user-1",
+			batchId: "batch-1",
+			rowOrdinal: 1,
+			recordType: "INCOME_RECEIPT",
+			latestRevisionNo: 1,
+			status: "NEEDS_REVIEW",
+			payload: {
+				recordType: "INCOME_RECEIPT",
+				receivedAt: "2026-10-01T10:00:00.000Z",
+				amount: "5000.00",
+				note: "Danışmanlık",
+				incomeSourceId: "source-1",
+				destinationAccountId: null,
+			},
+			occurredAt: "2026-10-01T10:00:00.000Z",
+			externalIdentityPresent: false,
+			duplicateCandidates: [],
+			result: null,
+		};
+
+		vi.mocked(importsApi.getImportRow).mockResolvedValue(rowDetail);
+		const resolveMock = vi
+			.mocked(importsApi.resolveImportRow)
+			.mockResolvedValueOnce({
+				row: { ...rowDetail, status: "READY", latestRevisionNo: 2 },
+				idempotentReplay: false,
+			});
+
+		const { wrapper } = createWrapper();
+		render(
+			<ImportRowResolver
+				batchId="batch-1"
+				rowId="row-income-prefill"
+				row={rowDetail}
+				isOpen={true}
+				onClose={() => {}}
+			/>,
+			{ wrapper },
+		);
+
+		// Assert income source is already prefilled to source-1
+		await waitFor(() => {
+			expect(screen.getByTestId("select-income-source-id")).toHaveValue(
+				"source-1",
+			);
+		});
+
+		// User selects ONLY destination account
+		fireEvent.change(screen.getByTestId("select-dest-account-id"), {
+			target: { value: "acc-1" },
+		});
+
+		fireEvent.click(screen.getByTestId("btn-submit-resolve-income"));
+
+		await waitFor(() => {
+			expect(resolveMock).toHaveBeenCalledTimes(1);
+		});
+
+		const [_bId, _rId, body] = resolveMock.mock.calls[0]!;
+		expect(body.action).toBe("RESOLVE_MAPPINGS");
+		expect(body.resolvedMappings).toEqual({
+			incomeSourceId: "source-1",
+			destinationAccountId: "acc-1",
+		});
+	});
+
+	it("strictly filters Income destination accounts to ASSET + DEBIT + TRY + active", async () => {
+		vi.mocked(manualExpensesApi.fetchAllLedgerAccounts).mockResolvedValueOnce([
+			{
+				accountId: "acc-A",
+				accountType: "ASSET",
+				normalBalance: "DEBIT",
+				currency: "TRY",
+				archived: false,
+				name: "Kasa A",
+				code: "100.01",
+				balance: "0.00",
+			},
+			{
+				accountId: "acc-B",
+				accountType: "ASSET",
+				normalBalance: "CREDIT",
+				currency: "TRY",
+				archived: false,
+				name: "Hesap B",
+				code: "100.02",
+				balance: "100.00",
+			},
+			{
+				accountId: "acc-C",
+				accountType: "ASSET",
+				normalBalance: "DEBIT",
+				currency: "USD",
+				archived: false,
+				name: "Hesap C",
+				code: "100.03",
+				balance: "100.00",
+			},
+			{
+				accountId: "acc-D",
+				accountType: "ASSET",
+				normalBalance: "DEBIT",
+				currency: "TRY",
+				archived: true,
+				name: "Hesap D",
+				code: "100.04",
+				balance: "100.00",
+			},
+		]);
+
+		const rowDetail: ImportRowDetail = {
+			id: "row-income-filter",
+			userId: "user-1",
+			batchId: "batch-1",
+			rowOrdinal: 1,
+			recordType: "INCOME_RECEIPT",
+			latestRevisionNo: 1,
+			status: "NEEDS_REVIEW",
+			payload: {
+				recordType: "INCOME_RECEIPT",
+				receivedAt: "2026-10-01T10:00:00.000Z",
+				amount: "1000.00",
+				note: "Gelir",
+				incomeSourceId: "source-1",
+				destinationAccountId: null,
+			},
+			occurredAt: "2026-10-01T10:00:00.000Z",
+			externalIdentityPresent: false,
+			duplicateCandidates: [],
+			result: null,
+		};
+
+		vi.mocked(importsApi.getImportRow).mockResolvedValue(rowDetail);
+
+		const { wrapper } = createWrapper();
+		render(
+			<ImportRowResolver
+				batchId="batch-1"
+				rowId="row-income-filter"
+				row={rowDetail}
+				isOpen={true}
+				onClose={() => {}}
+			/>,
+			{ wrapper },
+		);
+
+		await waitFor(() => {
+			const select = screen.getByTestId("select-dest-account-id");
+			const options = Array.from(select.querySelectorAll("option")).map(
+				(o) => o.value,
+			);
+			expect(options).toContain("acc-A");
+			expect(options).not.toContain("acc-B");
+			expect(options).not.toContain("acc-C");
+			expect(options).not.toContain("acc-D");
+		});
+	});
+
+	it("resolver network-uncertain retry resends SAME key and EXACT payload with locked inputs", async () => {
+		const rowDetail: ImportRowDetail = {
+			id: "row-uncertain-retry",
+			userId: "user-1",
+			batchId: "batch-1",
+			rowOrdinal: 1,
+			recordType: "CREDIT_CARD_PURCHASE",
+			latestRevisionNo: 1,
+			status: "NEEDS_REVIEW",
+			payload: {
+				recordType: "CREDIT_CARD_PURCHASE",
+				occurredAt: "2026-10-01T10:00:00.000Z",
+				amount: "150.00",
+				merchant: "Restoran",
+				cardId: null,
+				purchaseCategory: "DISCRETIONARY",
+				shortTermGoalId: null,
+				description: null,
+				installmentCount: 1,
+			},
+			occurredAt: "2026-10-01T10:00:00.000Z",
+			externalIdentityPresent: false,
+			duplicateCandidates: [],
+			result: null,
+		};
+
+		vi.mocked(importsApi.getImportRow).mockResolvedValue(rowDetail);
+
+		const resolveMock = vi
+			.mocked(importsApi.resolveImportRow)
+			.mockRejectedValueOnce(
+				new ApiError({
+					status: 0,
+					code: "NETWORK_ERROR",
+					message: "Connection lost",
+				}),
+			)
+			.mockResolvedValueOnce({
+				row: { ...rowDetail, status: "READY", latestRevisionNo: 2 },
+				idempotentReplay: false,
+			});
+
+		const { wrapper } = createWrapper();
+		render(
+			<ImportRowResolver
+				batchId="batch-1"
+				rowId="row-uncertain-retry"
+				row={rowDetail}
+				isOpen={true}
+				onClose={() => {}}
+			/>,
+			{ wrapper },
+		);
+
+		await waitFor(() => {
+			expect(screen.getByTestId("select-card-id")).toBeInTheDocument();
+			expect(screen.getByText(/Garanti Bonus/i)).toBeInTheDocument();
+		});
+		fireEvent.change(screen.getByTestId("select-card-id"), {
+			target: { value: "card-1" },
+		});
+
+		fireEvent.click(screen.getByTestId("btn-submit-resolve-card"));
+
+		await waitFor(() => {
+			expect(resolveMock).toHaveBeenCalledTimes(1);
+			expect(screen.getByTestId("btn-retry-resolver")).toBeInTheDocument();
+		});
+
+		const [b1, r1, body1, key1] = resolveMock.mock.calls[0]!;
+
+		// While uncertain, verify controls are locked
+		expect(screen.getByTestId("select-card-id")).toBeDisabled();
+		expect(screen.getByTestId("select-purchase-category")).toBeDisabled();
+		expect(screen.getByTestId("tab-link-existing")).toBeDisabled();
+		expect(screen.getByTestId("tab-skip-row")).toBeDisabled();
+		expect(screen.getByTestId("btn-submit-resolve-card")).toBeDisabled();
+
+		// Click retry
+		fireEvent.click(screen.getByTestId("btn-retry-resolver"));
+
+		await waitFor(() => {
+			expect(resolveMock).toHaveBeenCalledTimes(2);
+		});
+
+		const [b2, r2, body2, key2] = resolveMock.mock.calls[1]!;
+		expect(b2).toBe(b1);
+		expect(r2).toBe(r1);
+		expect(key2).toBe(key1);
+		expect(body2).toEqual(body1);
+	});
+
+	it("deterministic rejection clears frozen state; subsequent corrected submit gets new key", async () => {
+		const rowDetail: ImportRowDetail = {
+			id: "row-determ-error",
+			userId: "user-1",
+			batchId: "batch-1",
+			rowOrdinal: 1,
+			recordType: "CREDIT_CARD_PURCHASE",
+			latestRevisionNo: 1,
+			status: "NEEDS_REVIEW",
+			payload: {
+				recordType: "CREDIT_CARD_PURCHASE",
+				occurredAt: "2026-10-01T10:00:00.000Z",
+				amount: "150.00",
+				merchant: "Restoran",
+				cardId: null,
+				purchaseCategory: "DISCRETIONARY",
+				shortTermGoalId: null,
+				description: null,
+				installmentCount: 1,
+			},
+			occurredAt: "2026-10-01T10:00:00.000Z",
+			externalIdentityPresent: false,
+			duplicateCandidates: [],
+			result: null,
+		};
+
+		vi.mocked(importsApi.getImportRow).mockResolvedValue(rowDetail);
+
+		const resolveMock = vi
+			.mocked(importsApi.resolveImportRow)
+			.mockRejectedValueOnce(
+				new ApiError({
+					status: 400,
+					code: "IMPORT_INVALID_INPUT",
+					message: "Invalid card selection",
+				}),
+			)
+			.mockResolvedValueOnce({
+				row: { ...rowDetail, status: "READY", latestRevisionNo: 2 },
+				idempotentReplay: false,
+			});
+
+		const { wrapper } = createWrapper();
+		render(
+			<ImportRowResolver
+				batchId="batch-1"
+				rowId="row-determ-error"
+				row={rowDetail}
+				isOpen={true}
+				onClose={() => {}}
+			/>,
+			{ wrapper },
+		);
+
+		await waitFor(() => {
+			expect(screen.getByTestId("select-card-id")).toBeInTheDocument();
+			expect(screen.getByText(/Garanti Bonus/i)).toBeInTheDocument();
+		});
+		fireEvent.change(screen.getByTestId("select-card-id"), {
+			target: { value: "card-1" },
+		});
+
+		fireEvent.click(screen.getByTestId("btn-submit-resolve-card"));
+
+		await waitFor(() => {
+			expect(resolveMock).toHaveBeenCalledTimes(1);
+			expect(screen.getByTestId("resolver-error-banner")).toBeInTheDocument();
+		});
+
+		const key1 = resolveMock.mock.calls[0]![3];
+
+		// No uncertain retry button should be present
+		expect(screen.queryByTestId("btn-retry-resolver")).not.toBeInTheDocument();
+
+		// User updates category and submits again
+		fireEvent.change(screen.getByTestId("select-purchase-category"), {
+			target: { value: "MANDATORY" },
+		});
+
+		fireEvent.click(screen.getByTestId("btn-submit-resolve-card"));
+
+		await waitFor(() => {
+			expect(resolveMock).toHaveBeenCalledTimes(2);
+		});
+
+		const key2 = resolveMock.mock.calls[1]![3];
+		expect(key2).not.toBe(key1);
+	});
+
+	it("revision conflict refetches row with new latestRevisionNo and next submit gets new key", async () => {
+		const initialRow: ImportRowDetail = {
+			id: "row-occ-conflict",
+			userId: "user-1",
+			batchId: "batch-1",
+			rowOrdinal: 1,
+			recordType: "CREDIT_CARD_PURCHASE",
+			latestRevisionNo: 1,
+			status: "NEEDS_REVIEW",
+			payload: {
+				recordType: "CREDIT_CARD_PURCHASE",
+				occurredAt: "2026-10-01T10:00:00.000Z",
+				amount: "150.00",
+				merchant: "Restoran",
+				cardId: null,
+				purchaseCategory: "DISCRETIONARY",
+				shortTermGoalId: null,
+				description: null,
+				installmentCount: 1,
+			},
+			occurredAt: "2026-10-01T10:00:00.000Z",
+			externalIdentityPresent: false,
+			duplicateCandidates: [],
+			result: null,
+		};
+
+		const updatedRow: ImportRowDetail = {
+			...initialRow,
+			latestRevisionNo: 2,
+		};
+
+		const getRowMock = vi
+			.mocked(importsApi.getImportRow)
+			.mockResolvedValueOnce(initialRow)
+			.mockResolvedValueOnce(updatedRow);
+
+		const resolveMock = vi
+			.mocked(importsApi.resolveImportRow)
+			.mockRejectedValueOnce(
+				new ApiError({
+					status: 409,
+					code: "IMPORT_REVISION_CONFLICT",
+					message: "Revision conflict occurred",
+				}),
+			)
+			.mockResolvedValueOnce({
+				row: { ...updatedRow, status: "READY", latestRevisionNo: 3 },
+				idempotentReplay: false,
+			});
+
+		const { wrapper } = createWrapper();
+		render(
+			<ImportRowResolver
+				batchId="batch-1"
+				rowId="row-occ-conflict"
+				row={initialRow}
+				isOpen={true}
+				onClose={() => {}}
+			/>,
+			{ wrapper },
+		);
+
+		await waitFor(() => {
+			expect(screen.getByTestId("select-card-id")).toBeInTheDocument();
+			expect(screen.getByText(/Garanti Bonus/i)).toBeInTheDocument();
+		});
+		fireEvent.change(screen.getByTestId("select-card-id"), {
+			target: { value: "card-1" },
+		});
+
+		fireEvent.click(screen.getByTestId("btn-submit-resolve-card"));
+
+		await waitFor(() => {
+			expect(resolveMock).toHaveBeenCalledTimes(1);
+			expect(
+				screen.getByText(/Satır durumu siz incelerken değişti/i),
+			).toBeInTheDocument();
+		});
+
+		const key1 = resolveMock.mock.calls[0]![3];
+		expect(resolveMock.mock.calls[0]![2].expectedRevisionNo).toBe(1);
+
+		// Assert refetch was called
+		expect(getRowMock).toHaveBeenCalled();
+
+		// User submits again
+		fireEvent.click(screen.getByTestId("btn-submit-resolve-card"));
+
+		await waitFor(() => {
+			expect(resolveMock).toHaveBeenCalledTimes(2);
+		});
+
+		const [_b2, _r2, body2, key2] = resolveMock.mock.calls[1]!;
+		expect(key2).not.toBe(key1);
+		expect(body2.expectedRevisionNo).toBe(2);
 	});
 
 	it("disallows direct link to IMPORT_ROW candidate type", async () => {
@@ -552,69 +1250,6 @@ describe("F9 — CSV Imports & Resolution Unit & Integration Suite", () => {
 		});
 	});
 
-	it("chunk apply stops immediately if failedCount > 0 without loop", async () => {
-		const applyMock = vi
-			.mocked(importsApi.applyReadyImportRows)
-			.mockResolvedValueOnce({
-				appliedCount: 49,
-				failedCount: 1,
-				remainingReadyCount: 1,
-				hasMore: true,
-				results: [
-					{
-						importRowId: "row-failing",
-						status: "FAILED",
-						errorMessage: "Kart limiti yetersiz",
-					},
-				],
-			});
-
-		vi.mocked(importsApi.getImportBatch).mockResolvedValueOnce({
-			id: "batch-failing",
-			userId: "user-1",
-			provider: "HTTP_UPLOAD",
-			sourceKind: "GENERIC_CSV_V1",
-			sourceContentHash: "hash",
-			sourceFileName: "test.csv",
-			parserType: "GENERIC_CSV_V1",
-			parserVersion: "1",
-			observedAt: "2026-10-01T10:00:00.000Z",
-			createdAt: "2026-10-01T10:00:00.000Z",
-			totalRows: 50,
-			readyCount: 1,
-			needsReviewCount: 0,
-			possibleDuplicateCount: 0,
-			exactDuplicateCount: 0,
-			appliedCount: 49,
-			linkedCount: 0,
-			skippedCount: 0,
-			unsupportedCount: 0,
-		});
-
-		const { wrapper } = createWrapper();
-		render(
-			<ImportApplyProgress
-				batchId="batch-failing"
-				readyCount={50}
-				isOpen={true}
-				onClose={() => {}}
-			/>,
-			{ wrapper },
-		);
-
-		fireEvent.click(screen.getByTestId("btn-start-apply"));
-
-		await waitFor(() => {
-			expect(applyMock).toHaveBeenCalledTimes(1);
-		});
-
-		await waitFor(() => {
-			expect(
-				screen.getByText(/Bazı satırlar uygulanamadı/i),
-			).toBeInTheDocument();
-		});
-	});
-
 	it("chunk apply stops if zero progress (appliedCount === 0 && hasMore === true)", async () => {
 		const applyMock = vi
 			.mocked(importsApi.applyReadyImportRows)
@@ -625,28 +1260,6 @@ describe("F9 — CSV Imports & Resolution Unit & Integration Suite", () => {
 				hasMore: true,
 				results: [],
 			});
-
-		vi.mocked(importsApi.getImportBatch).mockResolvedValueOnce({
-			id: "batch-zero-prog",
-			userId: "user-1",
-			provider: "HTTP_UPLOAD",
-			sourceKind: "GENERIC_CSV_V1",
-			sourceContentHash: "hash",
-			sourceFileName: "test.csv",
-			parserType: "GENERIC_CSV_V1",
-			parserVersion: "1",
-			observedAt: "2026-10-01T10:00:00.000Z",
-			createdAt: "2026-10-01T10:00:00.000Z",
-			totalRows: 10,
-			readyCount: 10,
-			needsReviewCount: 0,
-			possibleDuplicateCount: 0,
-			exactDuplicateCount: 0,
-			appliedCount: 0,
-			linkedCount: 0,
-			skippedCount: 0,
-			unsupportedCount: 0,
-		});
 
 		const { wrapper } = createWrapper();
 		render(

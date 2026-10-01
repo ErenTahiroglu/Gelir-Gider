@@ -12,6 +12,28 @@
  * MUST NOT implement offline caching.
  */
 
+function sanitizeDeepLink(raw) {
+	if (typeof raw !== "string") return "/";
+	const trimmed = raw.trim();
+	if (
+		!trimmed.startsWith("/") ||
+		trimmed.startsWith("//") ||
+		trimmed.includes("\\")
+	) {
+		return "/";
+	}
+	try {
+		const origin = self.location.origin;
+		const resolved = new URL(trimmed, origin);
+		if (resolved.origin !== origin) {
+			return "/";
+		}
+		return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+	} catch {
+		return "/";
+	}
+}
+
 self.addEventListener("push", (event) => {
 	let payload = {};
 	if (event.data) {
@@ -36,16 +58,8 @@ self.addEventListener("push", (event) => {
 			? payload.body.trim()
 			: "Yeni bir bildiriminiz var.";
 
-	// DeepLink is extracted safely — only relative paths allowed
-	let deepLink = "/";
-	if (
-		payload.data &&
-		typeof payload.data === "object" &&
-		typeof payload.data.deepLink === "string" &&
-		payload.data.deepLink.startsWith("/")
-	) {
-		deepLink = payload.data.deepLink;
-	}
+	// DeepLink is extracted safely — only relative same-origin paths allowed
+	const deepLink = sanitizeDeepLink(payload.data?.deepLink);
 
 	const notificationOptions = {
 		body,
@@ -63,11 +77,7 @@ self.addEventListener("push", (event) => {
 self.addEventListener("notificationclick", (event) => {
 	event.notification.close();
 
-	const rawDeepLink = event.notification.data?.deepLink;
-	const deepLink =
-		typeof rawDeepLink === "string" && rawDeepLink.startsWith("/")
-			? rawDeepLink
-			: "/";
+	const deepLink = sanitizeDeepLink(event.notification.data?.deepLink);
 
 	event.waitUntil(
 		self.clients

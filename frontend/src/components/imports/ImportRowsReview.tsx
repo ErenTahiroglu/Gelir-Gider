@@ -304,6 +304,7 @@ export function ImportRowsReview() {
 			{isApplying && batch && (
 				<ImportApplyProgress
 					batchId={batch.id}
+					readyCount={batch.readyCount}
 					isOpen={isApplying}
 					onClose={() => setIsApplying(false)}
 				/>

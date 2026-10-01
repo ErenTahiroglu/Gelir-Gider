@@ -1,8 +1,12 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, CheckCircle2, Loader2, RefreshCw } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { isNetworkUncertainError } from "../../api/errors";
-import { applyReadyImportRows, getImportBatch } from "../../api/imports-api";
+import {
+	applyReadyImportRows,
+	getImportBatch,
+	getImportRows,
+} from "../../api/imports-api";
 import { AccessibleModal } from "../common/AccessibleModal";
 
 interface ImportApplyProgressProps {
@@ -30,6 +34,14 @@ export function ImportApplyProgress({
 	const [hasFailedRows, setHasFailedRows] = useState(false);
 	const [isDone, setIsDone] = useState(false);
 	const [isNetworkUncertain, setIsNetworkUncertain] = useState(false);
+
+	const prevReadyCountRef = useRef(readyCount);
+	useEffect(() => {
+		if (prevReadyCountRef.current !== readyCount) {
+			prevReadyCountRef.current = readyCount;
+			setRemainingReady(readyCount);
+		}
+	}, [readyCount]);
 
 	const invalidateFinancialQueries = async () => {
 		await Promise.all([
@@ -70,20 +82,24 @@ export function ImportApplyProgress({
 				setTotalAppliedSoFar(currentAppliedTotal);
 				setRemainingReady(response.remainingReadyCount);
 
-				// If any row failed, stop loop immediately (Section 48)
+				// If any row failed, stop loop immediately (Section 5 review gate)
 				if (response.failedCount > 0) {
 					localHasFailed = true;
 					setHasFailedRows(true);
-					setStatusMessage("Bazı satırlar uygulanamadı. İnceleme gerekiyor.");
+					setStatusMessage(
+						"Bazı satırlar uygulanamadı. İnceleme gerekiyor; lütfen satırları inceleyiniz.",
+					);
 					hasMore = false;
 					break;
 				}
 
-				// Zero-progress safety guard (Section 48)
+				// Zero-progress safety guard (Section 5 review gate)
 				if (response.hasMore && response.appliedCount === 0) {
 					localHasFailed = true;
 					setHasFailedRows(true);
-					setStatusMessage("İlerleme sağlanamadı. Lütfen satırları inceleyin.");
+					setStatusMessage(
+						"İlerleme sağlanamadı. İnceleme gerekiyor; lütfen satırları inceleyiniz.",
+					);
 					hasMore = false;
 					break;
 				}
@@ -104,9 +120,12 @@ export function ImportApplyProgress({
 				setStatusMessage(
 					"Ağ bağlantısı kesildi. Güncel durum sunucudan kontrol ediliyor...",
 				);
-				// Section 49: Immediately refetch batch from server authority
+				// Explicit authority recovery: fetch both batch authority and READY rows
 				try {
-					const freshBatch = await getImportBatch(batchId);
+					const [freshBatch] = await Promise.all([
+						getImportBatch(batchId),
+						getImportRows({ batchId, status: "READY", limit: 50 }),
+					]);
 					setRemainingReady(freshBatch.readyCount);
 					setTotalAppliedSoFar(freshBatch.appliedCount);
 					await invalidateFinancialQueries();
@@ -202,7 +221,7 @@ export function ImportApplyProgress({
 				)}
 
 				<div className="modal-actions">
-					{!isApplying && !isDone && (
+					{!isApplying && !isDone && !hasFailedRows && (
 						<button
 							type="button"
 							className="btn btn-primary"
@@ -223,7 +242,11 @@ export function ImportApplyProgress({
 							onClick={onClose}
 							data-testid="btn-close-apply"
 						>
-							{isDone ? "Kapat" : "Vazgeç"}
+							{isDone
+								? "Kapat"
+								: hasFailedRows
+									? "Kapat ve Satırları İncele"
+									: "Vazgeç"}
 						</button>
 					)}
 				</div>

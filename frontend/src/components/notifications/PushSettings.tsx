@@ -1,6 +1,7 @@
 import {
 	useInfiniteQuery,
 	useMutation,
+	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
 import {
@@ -17,9 +18,10 @@ import {
 	XCircle,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { getApiErrorMessage } from "../../api/errors";
+import { getApiErrorMessage, isNetworkUncertainError } from "../../api/errors";
 import {
 	disablePushSubscription,
+	getPushSubscription,
 	getPushSubscriptions,
 	registerPushSubscription,
 } from "../../api/notifications-api";
@@ -62,6 +64,9 @@ export function PushSettings() {
 	const [localSubscription, setLocalSubscription] =
 		useState<PushSubscription | null>(null);
 	const [checkingLocalSub, setCheckingLocalSub] = useState(true);
+	const [storedId, setStoredId] = useState<string | null>(() =>
+		getStoredPushSubscriptionId(),
+	);
 
 	const [frozenRegister, setFrozenRegister] =
 		useState<FrozenRegisterAttempt | null>(null);
@@ -100,7 +105,18 @@ export function PushSettings() {
 		};
 	}, [isSupported]);
 
-	// Device subscriptions query
+	// Server authority query for exact stored subscription ID
+	const serverSubQuery = useQuery({
+		queryKey: ["push-subscription", storedId],
+		queryFn: () => {
+			if (!storedId) throw new Error("No stored subscription ID");
+			return getPushSubscription(storedId);
+		},
+		enabled: !!storedId,
+		retry: false,
+	});
+
+	// Device subscriptions list query
 	const subscriptionsQuery = useInfiniteQuery({
 		queryKey: ["push-subscriptions"],
 		queryFn: ({ pageParam }) =>
@@ -133,18 +149,30 @@ export function PushSettings() {
 		retry: false,
 		onSuccess: (res) => {
 			setStoredPushSubscriptionId(res.subscriptionId);
+			setStoredId(res.subscriptionId);
 			setFrozenRegister(null);
 			setStatusMessage({
 				type: "success",
 				text: "Web Push bildirimleri bu cihaz için başarıyla etkinleştirildi.",
 			});
 			void queryClient.invalidateQueries({ queryKey: ["push-subscriptions"] });
+			void queryClient.invalidateQueries({
+				queryKey: ["push-subscription", res.subscriptionId],
+			});
 		},
 		onError: (err) => {
-			setStatusMessage({
-				type: "error",
-				text: `Bildirim aboneliğinin sunucuya kaydedilip kaydedilmediği doğrulanamadı: ${getApiErrorMessage(err)}`,
-			});
+			if (isNetworkUncertainError(err)) {
+				setStatusMessage({
+					type: "error",
+					text: `Bildirim aboneliğinin sunucuya kaydedilip kaydedilmediği doğrulanamadı: ${getApiErrorMessage(err)}`,
+				});
+			} else {
+				setFrozenRegister(null);
+				setStatusMessage({
+					type: "error",
+					text: `Bildirim aboneliği oluşturulamadı: ${getApiErrorMessage(err)}`,
+				});
+			}
 		},
 	});
 
@@ -165,14 +193,18 @@ export function PushSettings() {
 		onSuccess: async (_res, attempt) => {
 			setFrozenDisable(null);
 			void queryClient.invalidateQueries({ queryKey: ["push-subscriptions"] });
+			void queryClient.invalidateQueries({
+				queryKey: ["push-subscription", attempt.subscriptionId],
+			});
 
 			// Backend confirmed success -> now perform local browser unsubscribe
-			const storedId = getStoredPushSubscriptionId();
-			if (storedId === attempt.subscriptionId && localSubscription) {
+			const currentStored = getStoredPushSubscriptionId();
+			if (currentStored === attempt.subscriptionId && localSubscription) {
 				try {
 					await localSubscription.unsubscribe();
 					setLocalSubscription(null);
 					removeStoredPushSubscriptionId();
+					setStoredId(null);
 					setStatusMessage({
 						type: "success",
 						text: "Bildirim aboneliği başarıyla devre dışı bırakıldı.",
@@ -192,10 +224,18 @@ export function PushSettings() {
 			}
 		},
 		onError: (err) => {
-			setStatusMessage({
-				type: "error",
-				text: `Bildirim aboneliğinin devre dışı bırakıldığı doğrulanamadı: ${getApiErrorMessage(err)}`,
-			});
+			if (isNetworkUncertainError(err)) {
+				setStatusMessage({
+					type: "error",
+					text: `Bildirim aboneliğinin devre dışı bırakıldığı doğrulanamadı: ${getApiErrorMessage(err)}`,
+				});
+			} else {
+				setFrozenDisable(null);
+				setStatusMessage({
+					type: "error",
+					text: `Bildirim aboneliği devre dışı bırakılamadı: ${getApiErrorMessage(err)}`,
+				});
+			}
 		},
 	});
 
@@ -262,30 +302,29 @@ export function PushSettings() {
 		}
 	};
 
-	const handleDisableCurrentDevice = async () => {
-		const storedId = getStoredPushSubscriptionId();
-		if (!storedId) {
-			// If not stored in local storage, attempt to match against server active list
-			const activeMatch = allSubscriptions.find(
-				(s) => s.status === "ACTIVE" && s.userAgent === navigator.userAgent,
-			);
-			if (!activeMatch) {
-				// No server match known, just clean up local subscription if any
-				if (localSubscription) {
-					await localSubscription.unsubscribe();
-					setLocalSubscription(null);
-				}
-				setStatusMessage({
-					type: "success",
-					text: "Yerel tarayıcı aboneliği temizlendi.",
-				});
-				return;
-			}
-			initiateDisable(activeMatch.subscriptionId);
-			return;
-		}
+	const handleRecoverServerBinding = () => {
+		if (!localSubscription) return;
+		setStatusMessage(null);
+		const serialized = serializeBrowserPushSubscription(localSubscription);
 
-		initiateDisable(storedId);
+		const attempt: FrozenRegisterAttempt = {
+			idempotencyKey: crypto.randomUUID(),
+			endpoint: serialized.endpoint,
+			p256dh: serialized.p256dh,
+			auth: serialized.auth,
+			expirationTime: serialized.expirationTime,
+			userAgent: navigator.userAgent,
+			occurredAt: new Date().toISOString(),
+		};
+
+		setFrozenRegister(attempt);
+		registerMutation.mutate(attempt);
+	};
+
+	const handleDisableCurrentDevice = () => {
+		if (storedId) {
+			initiateDisable(storedId);
+		}
 	};
 
 	const initiateDisable = (subscriptionId: string) => {
@@ -306,6 +345,7 @@ export function PushSettings() {
 				await localSubscription.unsubscribe();
 				setLocalSubscription(null);
 				removeStoredPushSubscriptionId();
+				setStoredId(null);
 				setStatusMessage({
 					type: "success",
 					text: "Tarayıcı aboneliği başarıyla temizlendi.",
@@ -319,8 +359,24 @@ export function PushSettings() {
 		}
 	};
 
-	const isCurrentlyActive =
-		!!localSubscription && permissionState === "granted";
+	// Determine authoritative server state for current device
+	const isServerActive =
+		Boolean(storedId) &&
+		serverSubQuery.data?.status === "ACTIVE" &&
+		Boolean(localSubscription);
+
+	const isServerDisabled =
+		Boolean(storedId) &&
+		serverSubQuery.data?.status === "DISABLED" &&
+		Boolean(localSubscription);
+
+	const isLocalUnverified =
+		Boolean(localSubscription) &&
+		(!storedId ||
+			serverSubQuery.isError ||
+			(serverSubQuery.data &&
+				serverSubQuery.data.status !== "ACTIVE" &&
+				serverSubQuery.data.status !== "DISABLED"));
 
 	return (
 		<div className="push-settings-section" data-testid="push-settings-section">
@@ -353,7 +409,7 @@ export function PushSettings() {
 				</div>
 			)}
 
-			{/* Frozen Retry Actions */}
+			{/* Frozen Retry Actions (Network Uncertainty Only) */}
 			{frozenRegister && registerMutation.isError && (
 				<div
 					className="uncertain-retry-card card"
@@ -422,10 +478,18 @@ export function PushSettings() {
 							<XCircle size={28} className="text-muted" aria-hidden="true" />
 						) : permissionState === "denied" ? (
 							<BellOff size={28} className="text-danger" aria-hidden="true" />
-						) : isCurrentlyActive ? (
+						) : isServerActive ? (
 							<ShieldCheck
 								size={28}
 								className="text-success"
+								aria-hidden="true"
+							/>
+						) : isServerDisabled ? (
+							<BellOff size={28} className="text-warning" aria-hidden="true" />
+						) : isLocalUnverified ? (
+							<AlertTriangle
+								size={28}
+								className="text-warning"
 								aria-hidden="true"
 							/>
 						) : (
@@ -442,9 +506,13 @@ export function PushSettings() {
 									? "Push bildirimleri bu ortamda yapılandırılmamış."
 									: permissionState === "denied"
 										? "Bildirim izni engellenmiş. Tarayıcı ayarlarından bildirimlere izin vermeniz gerekiyor."
-										: isCurrentlyActive
+										: isServerActive
 											? "Bildirimler açık. Ödeme hatırlatmaları ve limit uyarıları bu cihaza gönderilecek."
-											: "Bildirimler kapalı. İstediğiniz zaman etkinleştirebilirsiniz."}
+											: isServerDisabled
+												? "Bildirimler sunucuda devre dışı bırakılmış. Tekrar etkinleştirebilirsiniz."
+												: isLocalUnverified
+													? "Tarayıcı aboneliği var ancak sunucu bağlantısı doğrulanmadı."
+													: "Bildirimler kapalı. İstediğiniz zaman etkinleştirebilirsiniz."}
 						</p>
 					</div>
 				</div>
@@ -452,7 +520,7 @@ export function PushSettings() {
 				<div className="push-status-actions">
 					{isSupported && vapidPublicKey && permissionState !== "denied" && (
 						<>
-							{isCurrentlyActive ? (
+							{isServerActive ? (
 								<button
 									type="button"
 									className="btn btn-outline-danger"
@@ -465,6 +533,29 @@ export function PushSettings() {
 										? "Kapatılıyor..."
 										: "Bildirimleri Kapat"}
 								</button>
+							) : isLocalUnverified ? (
+								<div className="unverified-actions">
+									<button
+										type="button"
+										className="btn btn-primary"
+										onClick={handleRecoverServerBinding}
+										disabled={registerMutation.isPending || checkingLocalSub}
+										data-testid="btn-match-server"
+									>
+										<RefreshCw size={16} aria-hidden="true" />
+										{registerMutation.isPending
+											? "Eşleştiriliyor..."
+											: "Sunucuyla Eşleştir"}
+									</button>
+									<button
+										type="button"
+										className="btn btn-secondary btn-sm"
+										onClick={handleCleanupLocalSubscription}
+										data-testid="btn-cleanup-local-sub"
+									>
+										Yerel Aboneliği Temizle
+									</button>
+								</div>
 							) : (
 								<button
 									type="button"
@@ -482,16 +573,18 @@ export function PushSettings() {
 						</>
 					)}
 
-					{statusMessage?.type === "warning" && localSubscription && (
-						<button
-							type="button"
-							className="btn btn-secondary btn-sm"
-							onClick={handleCleanupLocalSubscription}
-							data-testid="btn-cleanup-local-sub"
-						>
-							Yerel Aboneliği Temizle
-						</button>
-					)}
+					{statusMessage?.type === "warning" &&
+						localSubscription &&
+						!isLocalUnverified && (
+							<button
+								type="button"
+								className="btn btn-secondary btn-sm"
+								onClick={handleCleanupLocalSubscription}
+								data-testid="btn-cleanup-local-sub"
+							>
+								Yerel Aboneliği Temizle
+							</button>
+						)}
 				</div>
 			</div>
 
@@ -514,9 +607,9 @@ export function PushSettings() {
 					<div className="subscriptions-list" data-testid="subscriptions-list">
 						{allSubscriptions.map((sub) => {
 							const isActive = sub.status === "ACTIVE";
+							// Exact server ID matching ONLY — never guess by userAgent
 							const isCurrentDevice =
-								sub.subscriptionId === getStoredPushSubscriptionId() ||
-								(isActive && sub.userAgent === navigator.userAgent);
+								Boolean(storedId) && sub.subscriptionId === storedId;
 
 							return (
 								<div

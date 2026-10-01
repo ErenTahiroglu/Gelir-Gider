@@ -146,3 +146,34 @@ export function serializeBrowserPushSubscription(
 		occurredAt,
 	};
 }
+
+/**
+ * Validates and sanitizes deep links to ensure strict same-origin relative paths.
+ * Rejects external URLs, protocol-relative '//', and invalid patterns.
+ */
+export function sanitizeDeepLink(raw: unknown): string {
+	if (typeof raw !== "string") return "/";
+	const trimmed = raw.trim();
+	if (
+		!trimmed.startsWith("/") ||
+		trimmed.startsWith("//") ||
+		trimmed.includes("\\")
+	) {
+		return "/";
+	}
+	try {
+		const baseOrigin =
+			typeof window !== "undefined" && window.location?.origin
+				? window.location.origin
+				: typeof self !== "undefined" && self.location?.origin
+					? self.location.origin
+					: "http://localhost";
+		const resolved = new URL(trimmed, baseOrigin);
+		if (resolved.origin !== baseOrigin) {
+			return "/";
+		}
+		return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+	} catch {
+		return "/";
+	}
+}

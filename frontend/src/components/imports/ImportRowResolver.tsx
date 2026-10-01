@@ -9,7 +9,7 @@ import {
 	RefreshCw,
 	XCircle,
 } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchAllActiveCreditCards } from "../../api/credit-cards-api";
 import { isNetworkUncertainError } from "../../api/errors";
 import { fetchShortTermGoals } from "../../api/f7-api";
@@ -123,8 +123,10 @@ export function ImportRowResolver({
 	const [isNetworkUncertain, setIsNetworkUncertain] = useState(false);
 	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-	// Pre-fill fields when row loads
-	const initializeForm = (r: ImportRowDetail) => {
+	const lastInitializedKey = useRef<string | null>(null);
+
+	// Pre-fill fields from authoritative payload
+	const initializeForm = useCallback((r: ImportRowDetail) => {
 		if (r.recordType === "CREDIT_CARD_PURCHASE") {
 			const cp = r.payload as NormalizedCardPurchasePayload;
 			setSelectedCardId(cp.cardId ?? "");
@@ -138,10 +140,23 @@ export function ImportRowResolver({
 
 		if (r.status === "POSSIBLE_DUPLICATE") {
 			setActiveTab("CONFIRM");
-		} else if (r.status === "NEEDS_REVIEW") {
+		} else if (r.status === "NEEDS_REVIEW" || r.status === "READY") {
 			setActiveTab("MAPPINGS");
 		}
-	};
+	}, []);
+
+	// Authoritative revision-aware initial form sync
+	useEffect(() => {
+		if (!row || !isOpen) {
+			lastInitializedKey.current = null;
+			return;
+		}
+		const rowKey = `${row.id}-${row.latestRevisionNo}`;
+		if (lastInitializedKey.current !== rowKey && !isNetworkUncertain) {
+			lastInitializedKey.current = rowKey;
+			initializeForm(row);
+		}
+	}, [row, isOpen, isNetworkUncertain, initializeForm]);
 
 	const resolveMutation = useMutation({
 		mutationFn: ({
@@ -189,18 +204,19 @@ export function ImportRowResolver({
 				);
 			} else {
 				setIsNetworkUncertain(false);
+				setFrozenIdempotencyKey(null);
+				setFrozenPayload(null);
 				const errStr =
 					err instanceof Error ? err.message : "İşlem gerçekleştirilemedi.";
 
-				// On OCC revision conflict, clear frozen attempt and refetch row
+				// On OCC revision conflict, clear frozen attempt, refetch row and re-initialize
 				if (
 					errStr.includes("IMPORT_REVISION_CONFLICT") ||
 					(err instanceof Error &&
 						err.name === "ApiError" &&
 						(err as { code?: string }).code === "IMPORT_REVISION_CONFLICT")
 				) {
-					setFrozenIdempotencyKey(null);
-					setFrozenPayload(null);
+					lastInitializedKey.current = null;
 					await refetchRow();
 					setErrorMessage(
 						"Satır durumu siz incelerken değişti. Güncel durum yüklendi; lütfen tekrar inceleyin.",
@@ -212,14 +228,16 @@ export function ImportRowResolver({
 		},
 	});
 
+	// New logical submit: ALWAYS generate a fresh idempotency key
 	const submitDecision = (request: ResolveImportRowRequest) => {
 		setErrorMessage(null);
-		const key = frozenIdempotencyKey ?? crypto.randomUUID();
+		const key = crypto.randomUUID();
 		setFrozenIdempotencyKey(key);
 		setFrozenPayload(request);
 		resolveMutation.mutate({ request, idempotencyKey: key });
 	};
 
+	// Uncertain retry: ONLY re-sends frozen exact request and key
 	const handleRetryUncertain = () => {
 		if (frozenPayload && frozenIdempotencyKey) {
 			resolveMutation.mutate({
@@ -359,6 +377,7 @@ export function ImportRowResolver({
 											role="tab"
 											aria-selected={activeTab === "CONFIRM"}
 											className={`tab-btn ${activeTab === "CONFIRM" ? "active" : ""}`}
+											disabled={isNetworkUncertain || resolveMutation.isPending}
 											onClick={() => setActiveTab("CONFIRM")}
 											data-testid="tab-confirm-import"
 										>
@@ -371,6 +390,7 @@ export function ImportRowResolver({
 										role="tab"
 										aria-selected={activeTab === "MAPPINGS"}
 										className={`tab-btn ${activeTab === "MAPPINGS" ? "active" : ""}`}
+										disabled={isNetworkUncertain || resolveMutation.isPending}
 										onClick={() => {
 											initializeForm(row);
 											setActiveTab("MAPPINGS");
@@ -385,6 +405,7 @@ export function ImportRowResolver({
 										role="tab"
 										aria-selected={activeTab === "LINK"}
 										className={`tab-btn ${activeTab === "LINK" ? "active" : ""}`}
+										disabled={isNetworkUncertain || resolveMutation.isPending}
 										onClick={() => setActiveTab("LINK")}
 										data-testid="tab-link-existing"
 									>
@@ -396,6 +417,7 @@ export function ImportRowResolver({
 										role="tab"
 										aria-selected={activeTab === "SKIP"}
 										className={`tab-btn ${activeTab === "SKIP" ? "active" : ""}`}
+										disabled={isNetworkUncertain || resolveMutation.isPending}
 										onClick={() => setActiveTab("SKIP")}
 										data-testid="tab-skip-row"
 									>
@@ -415,7 +437,9 @@ export function ImportRowResolver({
 											<button
 												type="button"
 												className="btn btn-primary"
-												disabled={resolveMutation.isPending}
+												disabled={
+													isNetworkUncertain || resolveMutation.isPending
+												}
 												onClick={() =>
 													submitDecision({
 														expectedRevisionNo: row.latestRevisionNo,
@@ -440,6 +464,9 @@ export function ImportRowResolver({
 														id="card-select"
 														className="form-control"
 														value={selectedCardId}
+														disabled={
+															isNetworkUncertain || resolveMutation.isPending
+														}
 														onChange={(e) => setSelectedCardId(e.target.value)}
 														data-testid="select-card-id"
 													>
@@ -469,6 +496,9 @@ export function ImportRowResolver({
 														id="category-select"
 														className="form-control"
 														value={selectedCategory}
+														disabled={
+															isNetworkUncertain || resolveMutation.isPending
+														}
 														onChange={(e) =>
 															setSelectedCategory(e.target.value)
 														}
@@ -495,6 +525,9 @@ export function ImportRowResolver({
 															id="goal-select"
 															className="form-control"
 															value={selectedGoalId}
+															disabled={
+																isNetworkUncertain || resolveMutation.isPending
+															}
 															onChange={(e) =>
 																setSelectedGoalId(e.target.value)
 															}
@@ -522,6 +555,7 @@ export function ImportRowResolver({
 													type="button"
 													className="btn btn-primary"
 													disabled={
+														isNetworkUncertain ||
 														resolveMutation.isPending ||
 														(selectedCategory === "SHORT_TERM_PURCHASE" &&
 															!selectedGoalId)
@@ -557,6 +591,9 @@ export function ImportRowResolver({
 														id="income-source-select"
 														className="form-control"
 														value={selectedIncomeSourceId}
+														disabled={
+															isNetworkUncertain || resolveMutation.isPending
+														}
 														onChange={(e) =>
 															setSelectedIncomeSourceId(e.target.value)
 														}
@@ -587,6 +624,9 @@ export function ImportRowResolver({
 														id="dest-account-select"
 														className="form-control"
 														value={selectedDestAccountId}
+														disabled={
+															isNetworkUncertain || resolveMutation.isPending
+														}
 														onChange={(e) =>
 															setSelectedDestAccountId(e.target.value)
 														}
@@ -595,7 +635,11 @@ export function ImportRowResolver({
 														<option value="">Hesap Seçin...</option>
 														{ledgerAccountsData
 															?.filter(
-																(a) => a.accountType === "ASSET" && !a.archived,
+																(a) =>
+																	a.accountType === "ASSET" &&
+																	a.normalBalance === "DEBIT" &&
+																	a.currency === "TRY" &&
+																	!a.archived,
 															)
 															.map((a) => (
 																<option key={a.accountId} value={a.accountId}>
@@ -608,7 +652,9 @@ export function ImportRowResolver({
 												<button
 													type="button"
 													className="btn btn-primary"
-													disabled={resolveMutation.isPending}
+													disabled={
+														isNetworkUncertain || resolveMutation.isPending
+													}
 													onClick={() =>
 														submitDecision({
 															expectedRevisionNo: row.latestRevisionNo,
@@ -663,7 +709,11 @@ export function ImportRowResolver({
 																	);
 																}
 															}}
-															disabled={isImportRowCandidate}
+															disabled={
+																isNetworkUncertain ||
+																isImportRowCandidate ||
+																resolveMutation.isPending
+															}
 															data-testid={`candidate-${cand.candidateId}`}
 														>
 															<div className="candidate-header">
@@ -704,7 +754,9 @@ export function ImportRowResolver({
 											type="button"
 											className="btn btn-primary"
 											disabled={
-												!selectedCandidateId || resolveMutation.isPending
+												isNetworkUncertain ||
+												!selectedCandidateId ||
+												resolveMutation.isPending
 											}
 											onClick={() =>
 												submitDecision({
@@ -742,6 +794,9 @@ export function ImportRowResolver({
 												className="form-control"
 												placeholder="Örn: Kişisel olmayan işlem"
 												value={skipReasonNote}
+												disabled={
+													isNetworkUncertain || resolveMutation.isPending
+												}
 												onChange={(e) => setSkipReasonNote(e.target.value)}
 												data-testid="input-skip-note"
 											/>
@@ -750,7 +805,7 @@ export function ImportRowResolver({
 										<button
 											type="button"
 											className="btn btn-danger"
-											disabled={resolveMutation.isPending}
+											disabled={isNetworkUncertain || resolveMutation.isPending}
 											onClick={() =>
 												submitDecision({
 													expectedRevisionNo: row.latestRevisionNo,

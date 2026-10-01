@@ -283,6 +283,7 @@ export function ImportBatchPage() {
 			{isApplying && (
 				<ImportApplyProgress
 					batchId={batch.id}
+					readyCount={batch.readyCount}
 					isOpen={isApplying}
 					onClose={() => setIsApplying(false)}
 				/>
