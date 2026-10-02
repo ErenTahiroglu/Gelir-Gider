@@ -1,10 +1,23 @@
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 describe("PWA Manifest & Asset Structure (F10)", () => {
 	const distPath = path.resolve(__dirname, "../../dist");
 	const manifestPath = path.join(distPath, "manifest.webmanifest");
+
+	beforeAll(() => {
+		if (
+			!fs.existsSync(manifestPath) ||
+			!fs.existsSync(path.join(distPath, "sw.js"))
+		) {
+			execSync("npm run build", {
+				cwd: path.resolve(__dirname, "../.."),
+				stdio: "ignore",
+			});
+		}
+	});
 
 	it("manifest file exists and is valid JSON", () => {
 		expect(
