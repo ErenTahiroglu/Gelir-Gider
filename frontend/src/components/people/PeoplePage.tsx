@@ -53,7 +53,7 @@ export function PeoplePage() {
 	};
 
 	return (
-		<div className="people-page" data-testid="people-page">
+		<div className="page-container people-page" data-testid="people-page">
 			{/* Page Header */}
 			<div className="page-header">
 				<div className="header-title-block">
@@ -156,13 +156,17 @@ export function PeoplePage() {
 				</div>
 			) : people.length === 0 ? (
 				<div
-					className="people-empty card text-secondary"
+					className="empty-state-card card"
 					data-testid="empty-people"
 				>
-					<Users size={32} aria-hidden="true" className="empty-icon" />
-					<p>Kayıtlı kişi bulunamadı.</p>
-					<Link to="/people/new" className="btn btn-secondary btn-sm mt-2">
-						İlk Kişiyi Ekle
+					<Users size={36} aria-hidden="true" className="empty-icon" />
+					<h3 className="empty-title">Kayıtlı kişi bulunamadı.</h3>
+					<p className="empty-message">
+						Borç, alacak ve paylaşımlı harcama takibi için ilk kişiyi ekleyin.
+					</p>
+					<Link to="/people/new" className="btn btn-primary btn-sm" style={{ marginTop: "var(--space-2)" }}>
+						<Plus size={16} aria-hidden="true" />
+						<span>İlk Kişiyi Ekle</span>
 					</Link>
 				</div>
 			) : (

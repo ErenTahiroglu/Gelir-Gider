@@ -71,45 +71,45 @@ export function MonthClosePage() {
 		data?.pages.flatMap((p) => p.monthCloses) ?? [];
 
 	return (
-		<div
-			className="month-close-page container mx-auto px-4 py-6"
-			data-testid="month-close-page"
-		>
-			<div className="flex flex-wrap justify-between items-center gap-4 mb-6">
-				<div>
-					<h1 className="page-title text-2xl font-bold flex items-center gap-2">
+		<div className="page-container month-close-page" data-testid="month-close-page">
+			<div className="page-header">
+				<div className="header-title-block">
+					<h1 className="page-title">
 						<CalendarCheck
 							size={26}
-							className="text-primary"
+							style={{ color: "var(--color-primary-600)" }}
 							aria-hidden="true"
 						/>
 						<span>Ayı Tamamla — Kapanış Geçmişi</span>
 					</h1>
-					<p className="text-secondary text-sm">
+					<p className="page-subtitle">
 						Tamamlanan dönemlerin muhasebe kapanış özetleri ve fazlalık
 						dağıtımları.
 					</p>
 				</div>
-				<Link
-					to="/month-close/wizard"
-					className="btn btn-primary flex items-center gap-2"
-					data-testid="btn-open-wizard"
-				>
-					<CalendarCheck size={18} aria-hidden="true" />
-					<span>Ayı Tamamla Sihirbazı</span>
-				</Link>
+				<div className="header-actions">
+					<Link
+						to="/month-close/wizard"
+						className="btn btn-primary"
+						data-testid="btn-open-wizard"
+					>
+						<CalendarCheck size={18} aria-hidden="true" />
+						<span>Ayı Tamamla Sihirbazı</span>
+					</Link>
+				</div>
 			</div>
 
 			{isLoading ? (
-				<div className="card p-8 text-center text-secondary">
+				<div className="card text-center text-secondary" style={{ padding: "var(--space-8)" }}>
 					Kapanış geçmişi yükleniyor...
 				</div>
 			) : isError ? (
-				<div className="card p-8 text-center text-danger">
+				<div className="card text-center" style={{ padding: "var(--space-8)", color: "var(--color-danger-500)" }}>
 					<p>Kapanış kayıtları alınırken bir hata oluştu.</p>
 					<button
 						type="button"
-						className="btn btn-secondary mt-2 inline-flex items-center gap-1"
+						className="btn btn-secondary btn-sm"
+						style={{ marginTop: "var(--space-2)" }}
 						onClick={() => void refetch()}
 					>
 						<RefreshCw size={14} aria-hidden="true" />
@@ -117,12 +117,15 @@ export function MonthClosePage() {
 					</button>
 				</div>
 			) : allCloses.length === 0 ? (
-				<div className="card p-8 text-center text-secondary">
-					<p className="mb-4">
-						Henüz tamamlanmış bir dönem kapanışı bulunmuyor.
+				<div className="empty-state-card card" data-testid="empty-month-closes">
+					<CalendarCheck size={36} aria-hidden="true" className="empty-icon" />
+					<h3 className="empty-title">Henüz Tamamlanmış Dönem Yok</h3>
+					<p className="empty-message">
+						Henüz tamamlanmış bir dönem kapanışı bulunmuyor. Geçmiş ayların fazlalıklarını değerlendirmek için sihirbazı başlatın.
 					</p>
-					<Link to="/month-close/wizard" className="btn btn-outline-primary">
-						Geçmiş Bir Ayı Tamamlayın
+					<Link to="/month-close/wizard" className="btn btn-primary" style={{ marginTop: "var(--space-2)" }}>
+						<CalendarCheck size={16} aria-hidden="true" />
+						<span>Geçmiş Bir Ayı Tamamlayın</span>
 					</Link>
 				</div>
 			) : (

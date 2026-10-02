@@ -5,6 +5,7 @@ import "./styles/tokens.css";
 import "./styles/reset.css";
 import "./styles/global.css";
 import "./styles/app-shell.css";
+import "./styles/product-pages.css";
 
 const rootElement = document.getElementById("root");
 if (rootElement) {

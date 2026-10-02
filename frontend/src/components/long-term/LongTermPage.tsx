@@ -95,18 +95,18 @@ export function LongTermPage() {
 	return (
 		<div className="page-container long-term-page" data-testid="long-term-page">
 			{/* Header */}
-			<div className="page-header flex justify-between items-center">
-				<div>
+			<div className="page-header">
+				<div className="header-title-block">
 					<h1 className="page-title">Uzun Vadeli Yatırım Görevleri</h1>
 					<p className="page-subtitle">
 						Midas'tan harici yatırım hesaplarına varlık transfer takibi
 					</p>
 				</div>
 
-				<div className="flex items-center gap-2">
+				<div className="header-actions">
 					<button
 						type="button"
-						className="btn btn-secondary btn-sm"
+						className="btn btn-secondary btn-icon btn-sm"
 						onClick={() => void refetch()}
 						disabled={isFetching}
 						title="Yenile"
@@ -131,7 +131,7 @@ export function LongTermPage() {
 					) : (
 						<button
 							type="button"
-							className="btn btn-primary btn-sm opacity-50 cursor-not-allowed"
+							className="btn btn-primary btn-sm"
 							disabled
 							title={
 								isMidasNotConfigured
@@ -248,12 +248,12 @@ export function LongTermPage() {
 						<span>Görevler yükleniyor...</span>
 					</div>
 				) : allVisibleTasks.length === 0 ? (
-					<div className="card text-center p-8" data-testid="empty-tasks">
-						<div className="header-icon-badge mx-auto mb-3">
+					<div className="empty-state-card card" data-testid="empty-tasks">
+						<div className="header-icon-badge mb-3">
 							<TrendingUp size={28} aria-hidden="true" />
 						</div>
-						<h3 className="font-semibold mb-1">Görev Bulunamadı</h3>
-						<p className="text-muted text-sm mb-4">
+						<h3 className="empty-title">Görev Bulunamadı</h3>
+						<p className="empty-message">
 							{statusTab === "PENDING"
 								? "Bekleyen uzun vadeli yatırım transfer görevi bulunmuyor."
 								: statusTab === "SENT"
@@ -264,6 +264,7 @@ export function LongTermPage() {
 							<Link
 								to="/long-term/new"
 								className="btn btn-primary btn-sm"
+								style={{ marginTop: "var(--space-2)" }}
 								data-testid="create-first-task-btn"
 							>
 								<Plus size={16} aria-hidden="true" />

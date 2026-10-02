@@ -62,8 +62,8 @@ export function ImportBatchList() {
 		return (
 			<div className="card empty-state-card" data-testid="batches-empty">
 				<FileSpreadsheet size={40} className="empty-icon" aria-hidden="true" />
-				<h3>Henüz İçe Aktarma Yapılmadı</h3>
-				<p>Yukarıdaki formu kullanarak ilk CSV ekstrenizi yükleyebilirsiniz.</p>
+				<h3 className="empty-title">Henüz İçe Aktarma Yapılmadı</h3>
+				<p className="empty-message">Yukarıdaki formu kullanarak ilk CSV ekstrenizi yükleyebilirsiniz.</p>
 			</div>
 		);
 	}

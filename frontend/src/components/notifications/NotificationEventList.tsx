@@ -121,7 +121,7 @@ export function NotificationEventList() {
 				<div className="date-navigation-controls" data-testid="date-navigation">
 					<button
 						type="button"
-						className="btn btn-icon btn-sm"
+						className="btn btn-icon btn-secondary btn-sm"
 						onClick={() => setSelectedDate((d) => shiftDateString(d, -1))}
 						aria-label="Önceki Gün"
 						data-testid="btn-prev-day"
@@ -144,7 +144,7 @@ export function NotificationEventList() {
 
 					<button
 						type="button"
-						className="btn btn-icon btn-sm"
+						className="btn btn-icon btn-secondary btn-sm"
 						onClick={() => setSelectedDate((d) => shiftDateString(d, 1))}
 						aria-label="Sonraki Gün"
 						data-testid="btn-next-day"
@@ -155,7 +155,7 @@ export function NotificationEventList() {
 					{!isToday && (
 						<button
 							type="button"
-							className="btn btn-outline btn-sm"
+							className="btn btn-secondary btn-sm"
 							onClick={() => setSelectedDate(todayDateString)}
 							data-testid="btn-today"
 						>
@@ -178,9 +178,10 @@ export function NotificationEventList() {
 					<p>Bildirimler yüklenirken bir hata oluştu.</p>
 				</div>
 			) : allEvents.length === 0 ? (
-				<div className="empty-state card" data-testid="empty-events-message">
-					<Bell size={32} aria-hidden="true" className="empty-icon" />
-					<p>Bu tarihe ait bildirim bulunmuyor.</p>
+				<div className="empty-state-card card" data-testid="empty-events-message">
+					<Bell size={36} aria-hidden="true" className="empty-icon" />
+					<h3 className="empty-title">Bildirim Bulunmuyor</h3>
+					<p className="empty-message">Bu tarihe ait kayıtlı veya planlanan bir bildirim bulunmuyor.</p>
 				</div>
 			) : (
 				<div className="events-grid" data-testid="events-list">

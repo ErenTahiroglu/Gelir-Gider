@@ -85,109 +85,127 @@ export function IncomeOverviewPanel({ onSelectTab }: IncomeOverviewPanelProps) {
 
 	return (
 		<div className="income-overview-panel" data-testid="income-overview-panel">
-			<div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+			<div className="product-grid-3">
 				{/* 1. Reference income card */}
-				<div className="card p-5 bg-primary/5 border border-primary/20">
-					<div className="flex justify-between items-start mb-2">
-						<span className="text-xs font-semibold uppercase tracking-wider text-secondary">
+				<div className="metric-card">
+					<div className="metric-header">
+						<span className="metric-title">
 							Aylık Referans Gelir
 						</span>
-						<TrendingUp size={18} className="text-primary" aria-hidden="true" />
+						<TrendingUp size={18} className="metric-icon" aria-hidden="true" />
 					</div>
-					<span
-						className="text-3xl font-extrabold text-primary block"
-						data-testid="overview-reference-total"
-					>
-						{refIncomeData ? formatMoneyToTry(refIncomeData.total) : "—"}
-					</span>
-					<p className="text-xs text-secondary mt-2">
-						Bütçe harcama tavanlarınız için kullanılan temel baz gelir.
-					</p>
-					<button
-						type="button"
-						className="text-xs text-primary font-medium mt-3 block hover:underline"
-						onClick={() => onSelectTab("reference")}
-					>
-						Detayları ve Yöntemleri Gör →
-					</button>
+					<div className="metric-body">
+						<span
+							className="metric-value tabular-nums"
+							data-testid="overview-reference-total"
+						>
+							{refIncomeData ? formatMoneyToTry(refIncomeData.total) : "—"}
+						</span>
+					</div>
+					<div className="metric-footer">
+						<span className="metric-subtitle">
+							Bütçe harcama tavanlarınız için kullanılan temel baz gelir.
+						</span>
+						<button
+							type="button"
+							className="btn-link"
+							style={{ padding: 0, marginTop: "var(--space-2)", display: "block" }}
+							onClick={() => onSelectTab("reference")}
+						>
+							Detayları ve Yöntemleri Gör →
+						</button>
+					</div>
 				</div>
 
 				{/* 2. Expected income for this month */}
-				<div className="card p-5">
-					<div className="flex justify-between items-start mb-2">
-						<span className="text-xs font-semibold uppercase tracking-wider text-secondary">
+				<div className="metric-card">
+					<div className="metric-header">
+						<span className="metric-title">
 							{formatPeriodMonthTurkish(currentPeriodUi)} Beklenen
 						</span>
-						<Clock size={18} className="text-warning" aria-hidden="true" />
+						<Clock size={18} className="metric-icon" aria-hidden="true" />
 					</div>
-					<span className="text-3xl font-extrabold block">
-						{formatMoneyToTry(
-							formatCentsToCanonical(currentMonthExpectedCents),
-						)}
-					</span>
-					<p className="text-xs text-secondary mt-2">
-						Bu ay için öngörülen düzenli gelirler toplamı (tahakkuk).
-					</p>
-					<button
-						type="button"
-						className="text-xs text-primary font-medium mt-3 block hover:underline"
-						onClick={() => onSelectTab("entitlements")}
-					>
-						Beklenen Gelirleri Gör →
-					</button>
+					<div className="metric-body">
+						<span className="metric-value tabular-nums">
+							{formatMoneyToTry(
+								formatCentsToCanonical(currentMonthExpectedCents),
+							)}
+						</span>
+					</div>
+					<div className="metric-footer">
+						<span className="metric-subtitle">
+							Bu ay için öngörülen düzenli gelirler toplamı (tahakkuk).
+						</span>
+						<button
+							type="button"
+							className="btn-link"
+							style={{ padding: 0, marginTop: "var(--space-2)", display: "block" }}
+							onClick={() => onSelectTab("entitlements")}
+						>
+							Beklenen Gelirleri Gör →
+						</button>
+					</div>
 				</div>
 
 				{/* 3. Realized cash this month */}
-				<div className="card p-5">
-					<div className="flex justify-between items-start mb-2">
-						<span className="text-xs font-semibold uppercase tracking-wider text-secondary">
+				<div className="metric-card">
+					<div className="metric-header">
+						<span className="metric-title">
 							{formatPeriodMonthTurkish(currentPeriodUi)} Tahsil Edilen
 						</span>
 						<ArrowDownLeft
 							size={18}
-							className="text-success"
+							className="metric-icon"
 							aria-hidden="true"
 						/>
 					</div>
-					<span className="text-3xl font-extrabold text-success block">
-						{formatMoneyToTry(
-							formatCentsToCanonical(currentMonthRealizedCents),
-						)}
-					</span>
-					<p className="text-xs text-secondary mt-2">
-						Bu ay kasa ve banka hesaplarınıza fiilen giren toplam nakit.
-					</p>
-					<button
-						type="button"
-						className="text-xs text-primary font-medium mt-3 block hover:underline"
-						onClick={() => onSelectTab("receipts")}
-					>
-						Tahsilatları Gör →
-					</button>
+					<div className="metric-body">
+						<span className="metric-value tabular-nums" style={{ color: "var(--color-success-600)" }}>
+							{formatMoneyToTry(
+								formatCentsToCanonical(currentMonthRealizedCents),
+							)}
+						</span>
+					</div>
+					<div className="metric-footer">
+						<span className="metric-subtitle">
+							Bu ay kasa ve banka hesaplarınıza fiilen giren toplam nakit.
+						</span>
+						<button
+							type="button"
+							className="btn-link"
+							style={{ padding: 0, marginTop: "var(--space-2)", display: "block" }}
+							onClick={() => onSelectTab("receipts")}
+						>
+							Tahsilatları Gör →
+						</button>
+					</div>
 				</div>
 			</div>
 
 			{/* Quick actions */}
-			<div className="card p-6 mb-6">
-				<h3 className="font-semibold text-lg mb-3">Hızlı İşlemler</h3>
-				<div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+			<div className="card">
+				<h3 className="card-title" style={{ marginBottom: "var(--space-3)" }}>Hızlı İşlemler</h3>
+				<div className="product-grid-3" style={{ marginBottom: 0 }}>
 					<Link
 						to="/income/receipts/new"
-						className="btn btn-outline-primary flex items-center justify-center gap-2 p-4 text-center"
+						className="btn btn-primary"
+						style={{ display: "flex", gap: "var(--space-2)" }}
 					>
 						<ArrowDownLeft size={18} aria-hidden="true" />
 						<span>Gelir Girişi Yap</span>
 					</Link>
 					<Link
 						to="/income/entitlements/new"
-						className="btn btn-outline-secondary flex items-center justify-center gap-2 p-4 text-center"
+						className="btn btn-secondary"
+						style={{ display: "flex", gap: "var(--space-2)" }}
 					>
 						<Calendar size={18} aria-hidden="true" />
 						<span>Beklenen Gelir Ekle</span>
 					</Link>
 					<Link
 						to="/income/sources/new"
-						className="btn btn-outline-secondary flex items-center justify-center gap-2 p-4 text-center"
+						className="btn btn-secondary"
+						style={{ display: "flex", gap: "var(--space-2)" }}
 					>
 						<Plus size={18} aria-hidden="true" />
 						<span>Yeni Gelir Kaynağı</span>

@@ -17,14 +17,11 @@ export function IncomePage() {
 	const [activeTab, setActiveTab] = useState<IncomeTab>("overview");
 
 	return (
-		<div
-			className="income-page container mx-auto px-4 py-6"
-			data-testid="income-page"
-		>
-			<div className="flex flex-wrap justify-between items-center gap-4 mb-6">
-				<div>
-					<h1 className="page-title text-2xl font-bold">Gelir Yönetimi</h1>
-					<p className="text-secondary text-sm">
+		<div className="page-container income-page" data-testid="income-page">
+			<div className="page-header">
+				<div className="header-title-block">
+					<h1 className="page-title">Gelir Yönetimi</h1>
+					<p className="page-subtitle">
 						Gelir kaynaklarınızı, beklenen aylık hak edişlerinizi ve gerçekleşen
 						tahsilatları yönetin.
 					</p>
@@ -32,9 +29,9 @@ export function IncomePage() {
 			</div>
 
 			{/* Segmented Tab Controls */}
-			<div className="segmented-tabs-wrapper mb-6 overflow-x-auto">
+			<div className="segmented-tabs-wrapper">
 				<div
-					className="segmented-tabs flex gap-1 p-1 bg-secondary/15 rounded-lg w-max sm:w-auto"
+					className="segmented-tabs"
 					role="tablist"
 					aria-label="Gelir Sekmeleri"
 				>
@@ -42,11 +39,7 @@ export function IncomePage() {
 						type="button"
 						role="tab"
 						aria-selected={activeTab === "overview"}
-						className={`segmented-tab px-4 py-2 text-sm font-medium rounded-md transition-colors ${
-							activeTab === "overview"
-								? "bg-surface shadow text-primary font-semibold"
-								: "text-secondary hover:text-foreground"
-						}`}
+						className={`segmented-tab ${activeTab === "overview" ? "active" : ""}`}
 						onClick={() => setActiveTab("overview")}
 						data-testid="tab-overview"
 					>
@@ -57,11 +50,7 @@ export function IncomePage() {
 						type="button"
 						role="tab"
 						aria-selected={activeTab === "sources"}
-						className={`segmented-tab px-4 py-2 text-sm font-medium rounded-md transition-colors ${
-							activeTab === "sources"
-								? "bg-surface shadow text-primary font-semibold"
-								: "text-secondary hover:text-foreground"
-						}`}
+						className={`segmented-tab ${activeTab === "sources" ? "active" : ""}`}
 						onClick={() => setActiveTab("sources")}
 						data-testid="tab-sources"
 					>
@@ -72,11 +61,7 @@ export function IncomePage() {
 						type="button"
 						role="tab"
 						aria-selected={activeTab === "entitlements"}
-						className={`segmented-tab px-4 py-2 text-sm font-medium rounded-md transition-colors ${
-							activeTab === "entitlements"
-								? "bg-surface shadow text-primary font-semibold"
-								: "text-secondary hover:text-foreground"
-						}`}
+						className={`segmented-tab ${activeTab === "entitlements" ? "active" : ""}`}
 						onClick={() => setActiveTab("entitlements")}
 						data-testid="tab-entitlements"
 					>
@@ -87,11 +72,7 @@ export function IncomePage() {
 						type="button"
 						role="tab"
 						aria-selected={activeTab === "receipts"}
-						className={`segmented-tab px-4 py-2 text-sm font-medium rounded-md transition-colors ${
-							activeTab === "receipts"
-								? "bg-surface shadow text-primary font-semibold"
-								: "text-secondary hover:text-foreground"
-						}`}
+						className={`segmented-tab ${activeTab === "receipts" ? "active" : ""}`}
 						onClick={() => setActiveTab("receipts")}
 						data-testid="tab-receipts"
 					>
@@ -102,11 +83,7 @@ export function IncomePage() {
 						type="button"
 						role="tab"
 						aria-selected={activeTab === "reference"}
-						className={`segmented-tab px-4 py-2 text-sm font-medium rounded-md transition-colors ${
-							activeTab === "reference"
-								? "bg-surface shadow text-primary font-semibold"
-								: "text-secondary hover:text-foreground"
-						}`}
+						className={`segmented-tab ${activeTab === "reference" ? "active" : ""}`}
 						onClick={() => setActiveTab("reference")}
 						data-testid="tab-reference"
 					>

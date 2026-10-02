@@ -251,18 +251,18 @@ export function GoalsPage() {
 	return (
 		<div className="page-container goals-page" data-testid="goals-page">
 			{/* Header */}
-			<div className="page-header flex justify-between items-center">
-				<div>
+			<div className="page-header">
+				<div className="header-title-block">
 					<h1 className="page-title">Kısa Vadeli Hedefler</h1>
 					<p className="page-subtitle">
 						Öncelikli birikim ve harcama hedeflerinizin takibi
 					</p>
 				</div>
 
-				<div className="flex items-center gap-2">
+				<div className="header-actions">
 					<button
 						type="button"
-						className="btn btn-secondary btn-sm"
+						className="btn btn-secondary btn-icon btn-sm"
 						onClick={() => void refetch()}
 						disabled={isFetching}
 						title="Yenile"
@@ -553,12 +553,12 @@ export function GoalsPage() {
 							<span>Hedefler yükleniyor...</span>
 						</div>
 					) : allVisibleGoals.length === 0 ? (
-						<div className="card text-center p-8" data-testid="empty-goals">
-							<div className="header-icon-badge mx-auto mb-3">
+						<div className="empty-state-card card" data-testid="empty-goals">
+							<div className="header-icon-badge mb-3">
 								<Target size={28} aria-hidden="true" />
 							</div>
-							<h3 className="font-semibold mb-1">Hedef Bulunamadı</h3>
-							<p className="text-muted text-sm mb-4">
+							<h3 className="empty-title">Hedef Bulunamadı</h3>
+							<p className="empty-message">
 								{statusTab === "ACTIVE"
 									? "Henüz aktif bir birikim hedefi oluşturmadınız."
 									: statusTab === "COMPLETED"
@@ -569,6 +569,7 @@ export function GoalsPage() {
 								<Link
 									to="/goals/new"
 									className="btn btn-primary btn-sm"
+									style={{ marginTop: "var(--space-2)" }}
 									data-testid="create-first-goal-btn"
 								>
 									<Plus size={16} aria-hidden="true" />
