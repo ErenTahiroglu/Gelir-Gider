@@ -15,6 +15,14 @@ export interface AppEnv {
 	BACKUP_ENCRYPTION_KEY?: string | undefined;
 	BACKUP_ENCRYPTION_KEY_ID?: string | undefined;
 	BACKUP_BUCKET?: R2Bucket | undefined;
+	ASSETS?:
+		| {
+				fetch: (
+					request: Request | string,
+					init?: RequestInit,
+				) => Promise<Response>;
+		  }
+		| undefined;
 }
 
 export function getDatabaseUrl(env: AppEnv): string {

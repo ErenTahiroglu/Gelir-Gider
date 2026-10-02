@@ -37,6 +37,7 @@ import {
 	securityHeadersMiddleware,
 } from "./http/security-middleware";
 import { shortTermGoalsRouter } from "./http/short-term-goal-routes";
+import { isSpaDocumentNavigation } from "./http/spa-router";
 import { spendingCategoryRouter } from "./http/spending-category-routes";
 import { transactionsRouter } from "./http/transactions-routes";
 import { runNotificationScheduler } from "./notifications/scheduler";
@@ -159,7 +160,16 @@ const NOTIFICATION_CRON = "0 * * * *";
 const BACKUP_CRON = "17 2 * * *";
 
 export default {
-	fetch: app.fetch,
+	async fetch(
+		request: Request,
+		env: AppEnv,
+		ctx: ExecutionContext,
+	): Promise<Response> {
+		if (env.ASSETS && isSpaDocumentNavigation(request)) {
+			return env.ASSETS.fetch(request);
+		}
+		return app.fetch(request, env, ctx);
+	},
 	async scheduled(
 		controller: ScheduledController,
 		env: AppEnv,

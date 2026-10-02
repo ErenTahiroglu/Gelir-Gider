@@ -8,7 +8,7 @@ import { drizzle as drizzlePg } from "drizzle-orm/node-postgres";
 import pg from "pg";
 import type { AppEnv } from "../../src/config/env";
 import { setDatabaseFactoryOverrideForTest } from "../../src/db/client";
-import { app } from "../../src/index";
+import worker, { app } from "../../src/index";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "../..");
@@ -203,6 +203,18 @@ export function createTestEnv(): AppEnv {
 		WEB_PUSH_VAPID_PUBLIC_KEY:
 			"BNc8G_6oZ2W1Hq4d8B_x4q3a7Z6w1y_k2m4n5o6p7q8r9s0t1u2v3w4x5y6z",
 		WEB_PUSH_VAPID_PRIVATE_KEY: "test_vapid_private_key_placeholder",
+		ASSETS: {
+			fetch: async (assetReq: Request | string) => {
+				const indexPath = path.join(distDir, "index.html");
+				const html = fs.existsSync(indexPath)
+					? fs.readFileSync(indexPath)
+					: "<!DOCTYPE html><html><body><div id=\"root\"></div></body></html>";
+				return new Response(html, {
+					status: 200,
+					headers: { "Content-Type": "text/html; charset=utf-8" },
+				});
+			},
+		},
 	};
 }
 
@@ -277,8 +289,11 @@ export async function startTestServer(): Promise<ServerInstance> {
 					body: body && body.length > 0 ? body : undefined,
 				});
 
-				const webRes = await app.fetch(webReq, env);
-
+				const dummyCtx = {
+					waitUntil: () => {},
+					passThroughOnException: () => {},
+				} as unknown as ExecutionContext;
+				const webRes = await worker.fetch(webReq, env, dummyCtx);
 
 				res.statusCode = webRes.status;
 				for (const [k, v] of webRes.headers.entries()) {
@@ -291,21 +306,6 @@ export async function startTestServer(): Promise<ServerInstance> {
 				}
 
 				const arrayBuf = await webRes.arrayBuffer();
-
-				// If browser navigates directly to an SPA route that shares a prefix with API (e.g. /income)
-				if (
-					webRes.status === 404 &&
-					method === "GET" &&
-					req.headers.accept?.includes("text/html")
-				) {
-					const indexPath = path.join(distDir, "index.html");
-					if (fs.existsSync(indexPath)) {
-						res.statusCode = 200;
-						res.setHeader("Content-Type", "text/html; charset=utf-8");
-						res.end(fs.readFileSync(indexPath));
-						return;
-					}
-				}
 
 				if (webRes.status >= 400) {
 					console.error("[TEST_SERVER_HTTP_ERR]", method, pathname, webRes.status, Buffer.from(arrayBuf).toString("utf8"), "SENT BODY:", body ? body.toString("utf8") : "NO_BODY");
