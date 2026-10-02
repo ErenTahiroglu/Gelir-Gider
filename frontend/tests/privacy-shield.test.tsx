@@ -116,4 +116,110 @@ describe("App Privacy Shield (App Switcher Protection)", () => {
 		expect(screen.getByTestId("locked-overlay")).toBeInTheDocument();
 		expect(contentWrapper).toHaveAttribute("aria-hidden", "true");
 	});
+
+	it("activates privacy shield on window blur and restores on focus <120s, locks on focus >=120s", async () => {
+		render(
+			<AuthProvider
+				initialAuthState={{
+					status: "UNLOCKED",
+					user: { displayName: "Eren" },
+				}}
+			>
+				<AuthGate>
+					<div data-testid="sensitive-financial-portfolio">
+						Gizli Finansal Veriler
+					</div>
+				</AuthGate>
+			</AuthProvider>,
+		);
+
+		await screen.findByTestId("sensitive-financial-portfolio");
+
+		// Blur window
+		const t0 = 500_000;
+		vi.spyOn(Date, "now").mockReturnValue(t0);
+		await act(async () => {
+			window.dispatchEvent(new Event("blur"));
+		});
+
+		expect(screen.getByTestId("privacy-shield")).toBeInTheDocument();
+
+		// Focus <120s later (e.g. 15s)
+		vi.spyOn(Date, "now").mockReturnValue(t0 + 15_000);
+		await act(async () => {
+			window.dispatchEvent(new Event("focus"));
+		});
+
+		expect(screen.queryByTestId("privacy-shield")).not.toBeInTheDocument();
+		expect(screen.queryByTestId("locked-overlay")).not.toBeInTheDocument();
+
+		// Blur again and focus >=120s later (e.g. 125s)
+		const t1 = 600_000;
+		vi.spyOn(Date, "now").mockReturnValue(t1);
+		await act(async () => {
+			window.dispatchEvent(new Event("blur"));
+		});
+		expect(screen.getByTestId("privacy-shield")).toBeInTheDocument();
+
+		vi.spyOn(Date, "now").mockReturnValue(t1 + 125_000);
+		await act(async () => {
+			window.dispatchEvent(new Event("focus"));
+		});
+
+		expect(screen.queryByTestId("privacy-shield")).not.toBeInTheDocument();
+		expect(screen.getByTestId("locked-overlay")).toBeInTheDocument();
+	});
+
+	it("activates privacy shield on pagehide and restores on pageshow <120s, locks on pageshow >=120s", async () => {
+		render(
+			<AuthProvider
+				initialAuthState={{
+					status: "UNLOCKED",
+					user: { displayName: "Eren" },
+				}}
+			>
+				<AuthGate>
+					<div data-testid="sensitive-financial-portfolio">
+						Gizli Finansal Veriler
+					</div>
+				</AuthGate>
+			</AuthProvider>,
+		);
+
+		await screen.findByTestId("sensitive-financial-portfolio");
+
+		// Pagehide
+		const t0 = 700_000;
+		vi.spyOn(Date, "now").mockReturnValue(t0);
+		await act(async () => {
+			window.dispatchEvent(new Event("pagehide"));
+		});
+
+		expect(screen.getByTestId("privacy-shield")).toBeInTheDocument();
+
+		// Pageshow <120s later
+		vi.spyOn(Date, "now").mockReturnValue(t0 + 30_000);
+		await act(async () => {
+			window.dispatchEvent(new Event("pageshow"));
+		});
+
+		expect(screen.queryByTestId("privacy-shield")).not.toBeInTheDocument();
+		expect(screen.queryByTestId("locked-overlay")).not.toBeInTheDocument();
+
+		// Pagehide and pageshow >=120s later
+		const t1 = 800_000;
+		vi.spyOn(Date, "now").mockReturnValue(t1);
+		await act(async () => {
+			window.dispatchEvent(new Event("pagehide"));
+		});
+		expect(screen.getByTestId("privacy-shield")).toBeInTheDocument();
+
+		vi.spyOn(Date, "now").mockReturnValue(t1 + 120_500);
+		await act(async () => {
+			window.dispatchEvent(new Event("pageshow"));
+		});
+
+		expect(screen.queryByTestId("privacy-shield")).not.toBeInTheDocument();
+		expect(screen.getByTestId("locked-overlay")).toBeInTheDocument();
+	});
 });

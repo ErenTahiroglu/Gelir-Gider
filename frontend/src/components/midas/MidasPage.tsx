@@ -15,6 +15,7 @@ import {
 	Wallet,
 } from "lucide-react";
 import { useMemo, useState } from "react";
+import "../../api/domain-errors";
 import { fetchMidasLiquidity } from "../../api/f7-api";
 import type { MidasBucketProductDto } from "../../api/f7-types";
 import { classifyMidasLiquidityState } from "../../lib/midas-state";

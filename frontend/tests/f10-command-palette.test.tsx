@@ -130,4 +130,41 @@ describe("Command Palette (F10)", () => {
 			screen.queryByTestId("command-palette-dialog"),
 		).not.toBeInTheDocument();
 	});
+
+	it("resets/clamps keyboard selection when filtered commands list narrows, executing target on Enter", () => {
+		const handleClose = vi.fn();
+		render(<CommandPalette isOpen={true} onClose={handleClose} />);
+
+		const input = screen.getByTestId("command-palette-input");
+
+		// 1. Initially at index 0 (home)
+		expect(screen.getByTestId("command-item-home")).toHaveAttribute(
+			"aria-selected",
+			"true",
+		);
+
+		// 2. Move selection down 5 times to a high index (e.g. index 5 -> midas)
+		for (let i = 0; i < 5; i++) {
+			fireEvent.keyDown(window, { key: "ArrowDown" });
+		}
+		expect(screen.getByTestId("command-item-midas")).toHaveAttribute(
+			"aria-selected",
+			"true",
+		);
+
+		// 3. Type a query producing a much smaller list (e.g. "Kredi" matching only "cards")
+		fireEvent.change(input, { target: { value: "Kredi" } });
+
+		// 4. Verify selected item resets/clamps deterministically to index 0 of filtered list
+		const cardsItem = screen.getByTestId("command-item-cards");
+		expect(cardsItem).toBeInTheDocument();
+		expect(cardsItem).toHaveAttribute("aria-selected", "true");
+
+		// 5. Press Enter
+		fireEvent.keyDown(window, { key: "Enter" });
+
+		// 6. Verify the visible filtered command executes
+		expect(handleClose).toHaveBeenCalledTimes(1);
+		expect(mockNavigate).toHaveBeenCalledWith({ to: "/cards" });
+	});
 });

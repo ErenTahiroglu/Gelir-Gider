@@ -321,3 +321,18 @@ export function fromEntitlementPeriodMonth(
 		`Invalid entitlement period month: "${entitlementPeriodMonth}"`,
 	);
 }
+
+/**
+ * Returns the canonical UTC ISO instant representing the start of a period month
+ * in Europe/Istanbul (i.e. YYYY-MM-01 00:00:00 Europe/Istanbul converted to UTC ISO).
+ * If no periodMonth is provided, uses the current Istanbul period month.
+ */
+export function getIstanbulMonthStartUtcInstant(
+	periodMonthOrDate?: string,
+	now: Date = new Date(),
+): string {
+	const period = periodMonthOrDate
+		? periodMonthOrDate.slice(0, 7)
+		: getIstanbulPeriodMonth(now);
+	return parseIstanbulDateTimeLocalToIso(`${period}-01T00:00:00`);
+}

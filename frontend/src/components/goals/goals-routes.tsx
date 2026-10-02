@@ -1,4 +1,5 @@
 import { useNavigate, useParams } from "@tanstack/react-router";
+import "../../api/domain-errors";
 import { GoalDetailPage } from "./GoalDetailPage";
 import { GoalForm } from "./GoalForm";
 

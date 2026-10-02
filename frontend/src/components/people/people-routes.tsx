@@ -1,4 +1,5 @@
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import "../../api/domain-errors";
 import type { PersonObligationDirection } from "../../api/people-types";
 import { ObligationDetailPage } from "./obligations/ObligationDetailPage";
 import { ObligationForm } from "./obligations/ObligationForm";

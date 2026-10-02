@@ -1,4 +1,5 @@
 import { useParams } from "@tanstack/react-router";
+import "../../api/domain-errors";
 import { EntitlementDetail } from "./EntitlementDetail";
 import { EntitlementForm } from "./EntitlementForm";
 import { IncomeReceiptDetail } from "./IncomeReceiptDetail";

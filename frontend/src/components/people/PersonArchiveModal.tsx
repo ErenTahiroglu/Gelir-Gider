@@ -2,6 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, AlertTriangle } from "lucide-react";
 import { useRef, useState } from "react";
 import { ApiError, isNetworkUncertainError } from "../../api/errors";
+import "../../api/domain-errors";
 import { archivePerson } from "../../api/people-api";
 import type { PersonProductDto } from "../../api/people-types";
 import { parseMoneyToCents } from "../../lib/money";

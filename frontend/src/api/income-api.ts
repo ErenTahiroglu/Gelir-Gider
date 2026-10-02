@@ -227,8 +227,8 @@ export async function voidIncomeEntitlement(
 export async function fetchIncomeReceipts(params?: {
 	limit?: number;
 	sourceId?: string;
-	from?: string; // YYYY-MM-DD
-	to?: string; // YYYY-MM-DD
+	from?: string; // Canonical UTC ISO instant (e.g. 2026-09-30T21:00:00.000Z)
+	to?: string; // Canonical UTC ISO instant (e.g. 2026-10-31T20:59:59.999Z)
 	includeVoided?: boolean;
 	beforeReceivedAt?: string;
 	beforeIncomeReceiptId?: string;

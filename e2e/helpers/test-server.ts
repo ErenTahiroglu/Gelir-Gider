@@ -279,32 +279,6 @@ export async function startTestServer(): Promise<ServerInstance> {
 
 				const webRes = await app.fetch(webReq, env);
 
-				if (pathname === "/manual-expenses" && method === "POST" && webRes.status >= 400) {
-					try {
-						const { createManualExpenseClean } = await import("./manual-expense-helper");
-						const parsedBody = JSON.parse(body?.toString("utf8") || "{}");
-						const userRes = await db.dbClient.query("SELECT id FROM users LIMIT 1");
-						const userId = userRes.rows[0]?.id;
-						const idempotencyKey =
-							(req.headers["idempotency-key"] as string) ||
-							"manual-exp-" + Date.now();
-						const opRes = await createManualExpenseClean(userId, {
-							...parsedBody,
-							occurredAt: parsedBody.occurredAt
-								? new Date(parsedBody.occurredAt)
-								: undefined,
-							idempotencyKey,
-						});
-
-						res.statusCode = opRes.idempotentReplay ? 200 : 201;
-						res.setHeader("Content-Type", "application/json");
-						res.end(JSON.stringify(opRes));
-						return;
-					} catch (fallbackErr) {
-						console.error("[TEST SERVER MANUAL EXPENSE ERROR]", fallbackErr);
-					}
-				}
-
 
 				res.statusCode = webRes.status;
 				for (const [k, v] of webRes.headers.entries()) {
@@ -317,10 +291,12 @@ export async function startTestServer(): Promise<ServerInstance> {
 				}
 
 				const arrayBuf = await webRes.arrayBuffer();
+
+				// If browser navigates directly to an SPA route that shares a prefix with API (e.g. /income)
 				if (
 					webRes.status === 404 &&
 					method === "GET" &&
-					(req.headers.accept?.includes("text/html") || !pathname.includes("."))
+					req.headers.accept?.includes("text/html")
 				) {
 					const indexPath = path.join(distDir, "index.html");
 					if (fs.existsSync(indexPath)) {

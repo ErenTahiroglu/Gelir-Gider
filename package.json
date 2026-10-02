@@ -20,7 +20,7 @@
     "typecheck:ui": "tsc -p frontend/tsconfig.json --noEmit",
     "test:ui": "vitest run --config vitest.ui.config.ts",
     "check:bundle": "node scripts/check-frontend-bundle-budget.mjs",
-    "check:pwa": "vitest run frontend/tests/f10-pwa-*.test.*",
+    "check:pwa": "vitest run --config vitest.ui.config.ts frontend/tests/f10-pwa-*.test.*",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",
     "check": "npm run cf-typegen && npm run typecheck && npm run lint && npm run format:check && npm test",

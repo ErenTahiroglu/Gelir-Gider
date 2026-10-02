@@ -23,6 +23,7 @@ import {
 	Wallet,
 } from "lucide-react";
 import { useMemo, useState } from "react";
+import type { CreditCardItem } from "../../api/dashboard-types";
 import { ApiError } from "../../api/errors";
 import { fetchAllActiveIncomeSources } from "../../api/income-api";
 import {
@@ -109,7 +110,9 @@ export function TemplateManagement() {
 		[categoriesData?.categories],
 	);
 
-	const activeCards = cards ?? [];
+	const activeCards = Array.isArray(cards)
+		? cards
+		: ((cards as unknown as { cards?: CreditCardItem[] })?.cards ?? []);
 	const activePeople = peopleData ?? [];
 	const activeIncomeSources = useMemo(
 		() => (incomeSourcesData ?? []).filter((s) => !s.archivedAt),

@@ -12,6 +12,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { Archive, CreditCard as CardIcon, Edit3, Plus } from "lucide-react";
 import { useEffect, useState } from "react";
+import "../../api/domain-errors";
 import {
 	fetchAllActiveCreditCards,
 	fetchCreditCardStatements,
@@ -44,7 +45,9 @@ export function CardsPage() {
 		queryFn: () => fetchAllActiveCreditCards(100),
 	});
 
-	const cardList = cards ?? [];
+	const cardList: CreditCardItem[] = Array.isArray(cards)
+		? cards
+		: ((cards as unknown as { cards?: CreditCardItem[] })?.cards ?? []);
 
 	// Automatically select first card if none selected
 	useEffect(() => {

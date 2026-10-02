@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { ApiError, isNetworkUncertainError } from "../../api/errors";
+import "../../api/domain-errors";
 import {
 	fetchAllActiveShortTermGoals,
 	fetchMidasLiquidity,

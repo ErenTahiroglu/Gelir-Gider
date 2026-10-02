@@ -172,9 +172,10 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
 	}, [commands, query]);
 
 	// Reset selected index on filter change
+	// biome-ignore lint/correctness/useExhaustiveDependencies: Reset index when filtered list changes
 	useEffect(() => {
 		setSelectedIndex(0);
-	}, []);
+	}, [filteredCommands]);
 
 	// Save and restore previous active element
 	useEffect(() => {
@@ -226,7 +227,11 @@ export function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
 
 			if (e.key === "Enter") {
 				e.preventDefault();
-				const targetCmd = filteredCommands[selectedIndex];
+				const targetIndex =
+					filteredCommands.length > 0
+						? Math.min(selectedIndex, filteredCommands.length - 1)
+						: 0;
+				const targetCmd = filteredCommands[targetIndex];
 				if (targetCmd) {
 					onClose();
 					targetCmd.action();

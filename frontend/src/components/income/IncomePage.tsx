@@ -1,4 +1,5 @@
 import { useState } from "react";
+import "../../api/domain-errors";
 import { IncomeEntitlementsPanel } from "./IncomeEntitlementsPanel";
 import { IncomeOverviewPanel } from "./IncomeOverviewPanel";
 import { IncomeReceiptsPanel } from "./IncomeReceiptsPanel";

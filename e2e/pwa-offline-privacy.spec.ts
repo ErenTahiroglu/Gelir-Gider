@@ -50,12 +50,27 @@ test.describe("PWA, Offline Resiliency & Cache Privacy (F10)", () => {
 	}) => {
 		await page.goto("/");
 
-		// Wait for root service worker registration
-		const hasRootSw = await page.evaluate(async () => {
-			if (!("serviceWorker" in navigator)) return false;
+		// Wait for root service worker registration (scope: /)
+		await page.waitForFunction(
+			async () => {
+				if (!("serviceWorker" in navigator)) return false;
+				const regs = await navigator.serviceWorker.getRegistrations();
+				return regs.some((r) => new URL(r.scope).pathname === "/");
+			},
+			undefined,
+			{ timeout: 10000 },
+		);
+
+		// Assert root registration exists and has NOT subscribed to push
+		const rootPreCheck = await page.evaluate(async () => {
 			const regs = await navigator.serviceWorker.getRegistrations();
-			return regs.some((r) => new URL(r.scope).pathname === "/");
+			const root = regs.find((r) => new URL(r.scope).pathname === "/");
+			if (!root) return { hasRoot: false, hasSub: false };
+			const sub = await root.pushManager.getSubscription();
+			return { hasRoot: true, hasSub: Boolean(sub) };
 		});
+		expect(rootPreCheck.hasRoot).toBe(true);
+		expect(rootPreCheck.hasSub).toBe(false); // No silent push subscription!
 
 		// Now register F9 push worker with scope /push/
 		const coexistenceResult = await page.evaluate(async () => {
@@ -77,13 +92,26 @@ test.describe("PWA, Offline Resiliency & Cache Privacy (F10)", () => {
 			return {
 				total: registrations.length,
 				hasRoot: Boolean(rootReg),
+				rootScope: rootReg ? new URL(rootReg.scope).pathname : null,
 				hasPush: Boolean(pushReg),
+				pushScope: pushReg ? new URL(pushReg.scope).pathname : null,
 			};
 		});
 
-		if (coexistenceResult) {
-			expect(coexistenceResult.hasPush).toBe(true);
-		}
+		expect(coexistenceResult).not.toBeNull();
+		expect(coexistenceResult?.hasRoot).toBe(true);
+		expect(coexistenceResult?.rootScope).toBe("/");
+		expect(coexistenceResult?.hasPush).toBe(true);
+		expect(coexistenceResult?.pushScope).toBe("/push/");
+		expect(coexistenceResult?.total).toBeGreaterThanOrEqual(2);
+
+		// Assert root service worker still has not created a push subscription
+		const rootPostSub = await page.evaluate(async () => {
+			const rootReg = await navigator.serviceWorker.getRegistration("/");
+			if (!rootReg) return null;
+			return await rootReg.pushManager.getSubscription();
+		});
+		expect(rootPostSub).toBeNull();
 	});
 
 	test("verifies CacheStorage NEVER caches financial API responses (Cache Privacy Gate)", async ({
@@ -151,13 +179,13 @@ test.describe("PWA, Offline Resiliency & Cache Privacy (F10)", () => {
 		expect(cachedApiUrls).toEqual([]);
 	});
 
-	test("verifies Privacy Shield visually obscures sensitive financial balances on blur/hidden", async ({
+	test("verifies Privacy Shield visually obscures sensitive financial balances on blur/hidden/pagehide and enforces reauth after >=120s", async ({
 		page,
 	}) => {
 		await attachVirtualAuthenticator(page);
 		await authenticateOrUnlock(page);
 
-		// Trigger visibilityState hidden
+		// 1. Trigger visibilityState hidden
 		await page.evaluate(() => {
 			Object.defineProperty(document, "visibilityState", {
 				value: "hidden",
@@ -181,6 +209,66 @@ test.describe("PWA, Offline Resiliency & Cache Privacy (F10)", () => {
 		});
 
 		await expect(shield).not.toBeVisible();
+		await expect(
+			page.locator('[data-testid="dashboard-page"]'),
+		).toBeVisible();
+
+		// 2. Trigger window blur
+		await page.evaluate(() => {
+			window.dispatchEvent(new Event("blur"));
+		});
+		await expect(shield).toBeVisible();
+
+		// Window focus <120s restores app
+		await page.evaluate(() => {
+			window.dispatchEvent(new Event("focus"));
+		});
+		await expect(shield).not.toBeVisible();
+		await expect(
+			page.locator('[data-testid="dashboard-page"]'),
+		).toBeVisible();
+
+		// 3. Trigger pagehide
+		await page.evaluate(() => {
+			window.dispatchEvent(new Event("pagehide"));
+		});
+		await expect(shield).toBeVisible();
+
+		// 4. Simulate >=120s elapsed duration by advancing Date.now before pageshow
+		await page.evaluate(() => {
+			(window as unknown as { __origNow?: typeof Date.now }).__origNow =
+				Date.now;
+			const realNow = Date.now();
+			Date.now = () => realNow + 130_000;
+			window.dispatchEvent(new Event("pageshow"));
+		});
+
+		// Privacy shield hides, but locked overlay is displayed
+		await expect(shield).not.toBeVisible();
+		const lockedOverlay = page.locator('[data-testid="locked-overlay"]');
+		await expect(lockedOverlay).toBeVisible();
+		await expect(lockedOverlay).toContainText("Gelir-Gider kilitli");
+
+		// Protected content is marked inert and aria-hidden
+		const protectedContent = page.locator(".protected-content");
+		await expect(protectedContent).toHaveAttribute("aria-hidden", "true");
+
+		// Restore Date.now for subsequent interaction
+		await page.evaluate(() => {
+			const orig = (window as unknown as { __origNow?: typeof Date.now })
+				.__origNow;
+			if (orig) {
+				Date.now = orig;
+			}
+		});
+
+		// 5. Unlock with Passkey using virtual authenticator
+		const unlockButton = page.locator('[data-testid="reauth-passkey-button"]');
+		await expect(unlockButton).toBeVisible();
+		await unlockButton.click();
+
+		// Dashboard is restored
+		await expect(lockedOverlay).not.toBeVisible();
 		await expect(
 			page.locator('[data-testid="dashboard-page"]'),
 		).toBeVisible();

@@ -8,6 +8,7 @@ import {
 	useNavigate,
 } from "@tanstack/react-router";
 import React, { Suspense, useEffect } from "react";
+import { ensureDomainErrorsLoaded } from "./api/errors";
 import { AuthProvider, useAuth } from "./auth/auth-context";
 import { AuthGate } from "./components/auth/AuthGate";
 import { UnlockScreen } from "./components/auth/UnlockScreen";
@@ -34,243 +35,256 @@ export function RouteLoadingFallback() {
 }
 
 // ============================================================================
-// Phase F10: Lazy-loaded Domain Boundaries
+// Phase F10: Lazy-loaded Domain Boundaries with Shared Domain Error Registry
 // ============================================================================
 
+// biome-ignore lint/suspicious/noExplicitAny: component generic
+function lazyDomainRoute<T extends React.ComponentType<any>>(
+	importer: () => Promise<{ default: T }>,
+): React.LazyExoticComponent<T> {
+	return React.lazy(async () => {
+		const [module] = await Promise.all([
+			importer(),
+			ensureDomainErrorsLoaded(),
+		]);
+		return module;
+	});
+}
+
 // Dashboard
-const DashboardPage = React.lazy(() =>
+const DashboardPage = lazyDomainRoute(() =>
 	import("./components/dashboard/DashboardPage").then((m) => ({
 		default: m.DashboardPage,
 	})),
 );
 
 // Transactions & Manual Expenses
-const TransactionsListPage = React.lazy(() =>
+const TransactionsListPage = lazyDomainRoute(() =>
 	import("./components/transactions/transactions-routes").then((m) => ({
 		default: m.TransactionsListPage,
 	})),
 );
-const TransactionDetailPage = React.lazy(() =>
+const TransactionDetailPage = lazyDomainRoute(() =>
 	import("./components/transactions/transactions-routes").then((m) => ({
 		default: m.TransactionDetailPage,
 	})),
 );
-const ManualExpenseNewPage = React.lazy(() =>
+const ManualExpenseNewPage = lazyDomainRoute(() =>
 	import("./components/manual-expenses/manual-expenses-routes").then((m) => ({
 		default: m.ManualExpenseNewPage,
 	})),
 );
-const ManualExpenseEditPage = React.lazy(() =>
+const ManualExpenseEditPage = lazyDomainRoute(() =>
 	import("./components/manual-expenses/manual-expenses-routes").then((m) => ({
 		default: m.ManualExpenseEditPage,
 	})),
 );
 
 // Quick Templates
-const TemplateManagement = React.lazy(() =>
+const TemplateManagement = lazyDomainRoute(() =>
 	import("./components/quick-entry/TemplateManagement").then((m) => ({
 		default: m.TemplateManagement,
 	})),
 );
 
 // Cards
-const CardsPage = React.lazy(() =>
+const CardsPage = lazyDomainRoute(() =>
 	import("./components/cards/CardsPage").then((m) => ({
 		default: m.CardsPage,
 	})),
 );
-const CardNewPage = React.lazy(() =>
+const CardNewPage = lazyDomainRoute(() =>
 	import("./components/cards/card-routes").then((m) => ({
 		default: m.CardNewPage,
 	})),
 );
-const CardDetailPage = React.lazy(() =>
+const CardDetailPage = lazyDomainRoute(() =>
 	import("./components/cards/card-routes").then((m) => ({
 		default: m.CardDetailPageWrapper,
 	})),
 );
-const CardEditPage = React.lazy(() =>
+const CardEditPage = lazyDomainRoute(() =>
 	import("./components/cards/card-routes").then((m) => ({
 		default: m.CardEditPage,
 	})),
 );
-const StatementNewPage = React.lazy(() =>
+const StatementNewPage = lazyDomainRoute(() =>
 	import("./components/cards/card-routes").then((m) => ({
 		default: m.StatementNewPage,
 	})),
 );
-const StatementDetailPage = React.lazy(() =>
+const StatementDetailPage = lazyDomainRoute(() =>
 	import("./components/cards/card-routes").then((m) => ({
 		default: m.StatementDetailPageWrapper,
 	})),
 );
-const PurchaseNewPage = React.lazy(() =>
+const PurchaseNewPage = lazyDomainRoute(() =>
 	import("./components/cards/card-routes").then((m) => ({
 		default: m.PurchaseNewPage,
 	})),
 );
-const PurchaseDetailPage = React.lazy(() =>
+const PurchaseDetailPage = lazyDomainRoute(() =>
 	import("./components/cards/card-routes").then((m) => ({
 		default: m.PurchaseDetailPageWrapper,
 	})),
 );
-const SplitDetailPage = React.lazy(() =>
+const SplitDetailPage = lazyDomainRoute(() =>
 	import("./components/cards/card-routes").then((m) => ({
 		default: m.SplitDetailPageWrapper,
 	})),
 );
 
 // People
-const PeoplePage = React.lazy(() =>
+const PeoplePage = lazyDomainRoute(() =>
 	import("./components/people/PeoplePage").then((m) => ({
 		default: m.PeoplePage,
 	})),
 );
-const PersonNewPage = React.lazy(() =>
+const PersonNewPage = lazyDomainRoute(() =>
 	import("./components/people/people-routes").then((m) => ({
 		default: m.PersonNewPage,
 	})),
 );
-const PersonDetailPage = React.lazy(() =>
+const PersonDetailPage = lazyDomainRoute(() =>
 	import("./components/people/people-routes").then((m) => ({
 		default: m.PersonDetailPageWrapper,
 	})),
 );
-const PersonEditPage = React.lazy(() =>
+const PersonEditPage = lazyDomainRoute(() =>
 	import("./components/people/people-routes").then((m) => ({
 		default: m.PersonEditPage,
 	})),
 );
-const ObligationNewPage = React.lazy(() =>
+const ObligationNewPage = lazyDomainRoute(() =>
 	import("./components/people/people-routes").then((m) => ({
 		default: m.ObligationNewPage,
 	})),
 );
-const ObligationDetailPage = React.lazy(() =>
+const ObligationDetailPage = lazyDomainRoute(() =>
 	import("./components/people/people-routes").then((m) => ({
 		default: m.ObligationDetailPageWrapper,
 	})),
 );
-const PersonSettlePage = React.lazy(() =>
+const PersonSettlePage = lazyDomainRoute(() =>
 	import("./components/people/people-routes").then((m) => ({
 		default: m.PersonSettlePageWrapper,
 	})),
 );
 
 // Goals
-const GoalsPage = React.lazy(() =>
+const GoalsPage = lazyDomainRoute(() =>
 	import("./components/goals/GoalsPage").then((m) => ({
 		default: m.GoalsPage,
 	})),
 );
-const GoalNewPage = React.lazy(() =>
+const GoalNewPage = lazyDomainRoute(() =>
 	import("./components/goals/goals-routes").then((m) => ({
 		default: m.GoalNewPage,
 	})),
 );
-const GoalDetailPage = React.lazy(() =>
+const GoalDetailPage = lazyDomainRoute(() =>
 	import("./components/goals/goals-routes").then((m) => ({
 		default: m.GoalDetailPageWrapper,
 	})),
 );
-const GoalEditPage = React.lazy(() =>
+const GoalEditPage = lazyDomainRoute(() =>
 	import("./components/goals/goals-routes").then((m) => ({
 		default: m.GoalEditPage,
 	})),
 );
 
 // Midas
-const MidasPage = React.lazy(() =>
+const MidasPage = lazyDomainRoute(() =>
 	import("./components/midas/MidasPage").then((m) => ({
 		default: m.MidasPage,
 	})),
 );
 
 // Long Term
-const LongTermPage = React.lazy(() =>
+const LongTermPage = lazyDomainRoute(() =>
 	import("./components/long-term/LongTermPage").then((m) => ({
 		default: m.LongTermPage,
 	})),
 );
-const LongTermNewPage = React.lazy(() =>
+const LongTermNewPage = lazyDomainRoute(() =>
 	import("./components/long-term/long-term-routes").then((m) => ({
 		default: m.LongTermNewPage,
 	})),
 );
-const LongTermDetailPage = React.lazy(() =>
+const LongTermDetailPage = lazyDomainRoute(() =>
 	import("./components/long-term/long-term-routes").then((m) => ({
 		default: m.LongTermTaskDetailPageWrapper,
 	})),
 );
 
 // Income
-const IncomePage = React.lazy(() =>
+const IncomePage = lazyDomainRoute(() =>
 	import("./components/income/IncomePage").then((m) => ({
 		default: m.IncomePage,
 	})),
 );
-const IncomeSourceNewPage = React.lazy(() =>
+const IncomeSourceNewPage = lazyDomainRoute(() =>
 	import("./components/income/income-routes").then((m) => ({
 		default: m.IncomeSourceNewPage,
 	})),
 );
-const EntitlementNewPage = React.lazy(() =>
+const EntitlementNewPage = lazyDomainRoute(() =>
 	import("./components/income/income-routes").then((m) => ({
 		default: m.EntitlementNewPage,
 	})),
 );
-const EntitlementDetailPage = React.lazy(() =>
+const EntitlementDetailPage = lazyDomainRoute(() =>
 	import("./components/income/income-routes").then((m) => ({
 		default: m.EntitlementDetailPageWrapper,
 	})),
 );
-const IncomeReceiptNewPage = React.lazy(() =>
+const IncomeReceiptNewPage = lazyDomainRoute(() =>
 	import("./components/income/income-routes").then((m) => ({
 		default: m.IncomeReceiptNewPage,
 	})),
 );
-const IncomeReceiptDetailPage = React.lazy(() =>
+const IncomeReceiptDetailPage = lazyDomainRoute(() =>
 	import("./components/income/income-routes").then((m) => ({
 		default: m.IncomeReceiptDetailPageWrapper,
 	})),
 );
 
 // Month Close
-const MonthClosePage = React.lazy(() =>
+const MonthClosePage = lazyDomainRoute(() =>
 	import("./components/month-close/MonthClosePage").then((m) => ({
 		default: m.MonthClosePage,
 	})),
 );
-const MonthCloseWizardPage = React.lazy(() =>
+const MonthCloseWizardPage = lazyDomainRoute(() =>
 	import("./components/month-close/month-close-routes").then((m) => ({
 		default: m.MonthCloseWizardPage,
 	})),
 );
-const MonthCloseDetailPage = React.lazy(() =>
+const MonthCloseDetailPage = lazyDomainRoute(() =>
 	import("./components/month-close/month-close-routes").then((m) => ({
 		default: m.MonthCloseDetailPageWrapper,
 	})),
 );
 
 // Imports
-const ImportsPage = React.lazy(() =>
+const ImportsPage = lazyDomainRoute(() =>
 	import("./components/imports/ImportsPage").then((m) => ({
 		default: m.ImportsPage,
 	})),
 );
-const ImportBatchPage = React.lazy(() =>
+const ImportBatchPage = lazyDomainRoute(() =>
 	import("./components/imports/ImportBatchPage").then((m) => ({
 		default: m.ImportBatchPage,
 	})),
 );
-const ImportRowsReview = React.lazy(() =>
+const ImportRowsReview = lazyDomainRoute(() =>
 	import("./components/imports/ImportRowsReview").then((m) => ({
 		default: m.ImportRowsReview,
 	})),
 );
 
 // Notifications
-const NotificationsPage = React.lazy(() =>
+const NotificationsPage = lazyDomainRoute(() =>
 	import("./components/notifications/NotificationsPage").then((m) => ({
 		default: m.NotificationsPage,
 	})),

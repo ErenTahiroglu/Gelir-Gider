@@ -1,6 +1,7 @@
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { CalendarCheck, RefreshCw } from "lucide-react";
+import "../../api/domain-errors";
 import { fetchMonthCloses } from "../../api/month-close-api";
 import type { MonthCloseProductDto } from "../../api/month-close-types";
 import {

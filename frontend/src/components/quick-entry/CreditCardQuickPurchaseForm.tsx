@@ -16,6 +16,7 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { CreditCardItem } from "../../api/dashboard-types";
 import { ApiError } from "../../api/errors";
 import { fetchSpendingCategories } from "../../api/manual-expenses-api";
 import {
@@ -60,7 +61,13 @@ export function CreditCardQuickPurchaseForm({
 		staleTime: 60_000,
 	});
 
-	const activeCards = useMemo(() => cards ?? [], [cards]);
+	const activeCards = useMemo(
+		() =>
+			Array.isArray(cards)
+				? cards
+				: ((cards as unknown as { cards?: CreditCardItem[] })?.cards ?? []),
+		[cards],
+	);
 
 	const activeCategories = useMemo(
 		() =>

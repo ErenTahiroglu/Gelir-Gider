@@ -10,6 +10,7 @@ import {
 import {
 	formatPeriodMonthTurkish,
 	getIstanbulCalendarDate,
+	getIstanbulMonthStartUtcInstant,
 	toEntitlementPeriodMonth,
 } from "../../lib/istanbul-date";
 import {
@@ -26,7 +27,7 @@ export function IncomeOverviewPanel({ onSelectTab }: IncomeOverviewPanelProps) {
 	const currentIstanbul = getIstanbulCalendarDate();
 	const currentPeriodUi = currentIstanbul.periodMonth; // "YYYY-MM"
 	const currentPeriodApi = toEntitlementPeriodMonth(currentPeriodUi); // "YYYY-MM-01"
-	const startOfMonthDate = `${currentPeriodUi}-01`;
+	const startOfMonthInstant = getIstanbulMonthStartUtcInstant(currentPeriodUi);
 
 	// 1. Reference income
 	const { data: refIncomeData } = useQuery({
@@ -52,10 +53,10 @@ export function IncomeOverviewPanel({ onSelectTab }: IncomeOverviewPanelProps) {
 
 	// 3. Receipts for this month
 	const { data: receiptsData } = useQuery({
-		queryKey: ["income-receipts", { from: startOfMonthDate }],
+		queryKey: ["income-receipts", { from: startOfMonthInstant }],
 		queryFn: () =>
 			fetchIncomeReceipts({
-				from: startOfMonthDate,
+				from: startOfMonthInstant,
 				limit: 100,
 			}),
 		staleTime: 30_000,

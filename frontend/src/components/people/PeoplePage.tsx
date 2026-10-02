@@ -2,6 +2,7 @@ import { useInfiniteQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { AlertCircle, Plus, Users } from "lucide-react";
 import { useMemo, useState } from "react";
+import "../../api/domain-errors";
 import { fetchPeople } from "../../api/people-api";
 import type {
 	PersonProductDto,

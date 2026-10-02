@@ -112,4 +112,78 @@ describe("PWA Update Prompt & Install Affordance (F10)", () => {
 
 		expect(promptMock).toHaveBeenCalledTimes(1);
 	});
+
+	it("retires deferred prompt on userChoice = dismissed without nagging again, allowing fresh event to re-enable", async () => {
+		let currentPwa!: ReturnType<typeof usePwa>;
+
+		render(
+			<HookTester
+				onHook={(state) => {
+					currentPwa = state;
+				}}
+			/>,
+		);
+
+		// 1. Initial state: cannot install
+		expect(currentPwa.canInstall).toBe(false);
+
+		// Create first install prompt event
+		const promptMock1 = vi.fn().mockResolvedValue(undefined);
+		const dismissedChoicePromise = Promise.resolve({
+			outcome: "dismissed" as const,
+			platform: "web",
+		});
+		// biome-ignore lint/suspicious/noExplicitAny: DOM mock
+		const mockEvent1 = new Event("beforeinstallprompt") as any;
+		mockEvent1.preventDefault = vi.fn();
+		mockEvent1.prompt = promptMock1;
+		mockEvent1.userChoice = dismissedChoicePromise;
+
+		// 1. beforeinstallprompt enables CTA
+		await act(async () => {
+			window.dispatchEvent(mockEvent1);
+		});
+		expect(mockEvent1.preventDefault).toHaveBeenCalled();
+		expect(promptMock1).not.toHaveBeenCalled();
+		expect(currentPwa.canInstall).toBe(true);
+
+		// 2. Explicit user action calls prompt() once
+		// 3. userChoice = dismissed
+		await act(async () => {
+			await currentPwa.promptInstall();
+		});
+		expect(promptMock1).toHaveBeenCalledTimes(1);
+
+		// 4. Current CTA becomes unavailable
+		expect(currentPwa.canInstall).toBe(false);
+
+		// 5. Invoking the old action cannot prompt the consumed event again
+		await act(async () => {
+			await currentPwa.promptInstall();
+		});
+		expect(promptMock1).toHaveBeenCalledTimes(1); // Still 1, never called again!
+		expect(currentPwa.canInstall).toBe(false);
+
+		// 6. A genuinely new beforeinstallprompt may enable a fresh CTA
+		const promptMock2 = vi.fn().mockResolvedValue(undefined);
+		// biome-ignore lint/suspicious/noExplicitAny: DOM mock
+		const mockEvent2 = new Event("beforeinstallprompt") as any;
+		mockEvent2.preventDefault = vi.fn();
+		mockEvent2.prompt = promptMock2;
+		mockEvent2.userChoice = Promise.resolve({
+			outcome: "accepted" as const,
+			platform: "web",
+		});
+
+		await act(async () => {
+			window.dispatchEvent(mockEvent2);
+		});
+		expect(currentPwa.canInstall).toBe(true);
+
+		await act(async () => {
+			await currentPwa.promptInstall();
+		});
+		expect(promptMock2).toHaveBeenCalledTimes(1);
+		expect(currentPwa.canInstall).toBe(false);
+	});
 });

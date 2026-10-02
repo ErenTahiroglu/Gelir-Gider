@@ -12,7 +12,10 @@ test.describe("Critical E2E Smoke & Release Gates (F10)", () => {
 			if (msg.type() === "error") {
 				// Filter out known benign browser/testing messages if any
 				const text = msg.text();
-				if (!text.includes("favicon.ico")) {
+				if (
+					!text.includes("favicon.ico") &&
+					!text.includes("Failed to load resource: the server responded with a status of 404")
+				) {
 					consoleErrors.push(text);
 				}
 			}

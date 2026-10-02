@@ -11,6 +11,7 @@ import {
 	Wallet,
 } from "lucide-react";
 import { useMemo, useState } from "react";
+import "../../api/domain-errors";
 import { fetchLongTermTasks, fetchMidasLiquidity } from "../../api/f7-api";
 import type {
 	LongTermTaskProductDto,

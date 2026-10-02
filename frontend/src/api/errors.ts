@@ -77,6 +77,15 @@ const CORE_ERROR_MESSAGES: Record<string, string> = {
 
 const domainErrorRegistry: Record<string, string> = {};
 
+let domainErrorsPromise: Promise<void> | null = null;
+
+export function ensureDomainErrorsLoaded(): Promise<void> {
+	if (!domainErrorsPromise) {
+		domainErrorsPromise = import("./domain-errors").then(() => undefined);
+	}
+	return domainErrorsPromise;
+}
+
 export function registerDomainErrorMessages(
 	messages: Record<string, string>,
 ): void {

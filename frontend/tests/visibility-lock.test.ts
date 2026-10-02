@@ -116,4 +116,78 @@ describe("Background Lock Timing & Suspension Resilience", () => {
 
 		cleanup();
 	});
+
+	it("evaluates lock correctly on window blur / focus events", () => {
+		const onHide = vi.fn();
+		const onRestoreUnlocked = vi.fn();
+		const onRequireReauth = vi.fn();
+
+		const cleanup = setupVisibilityLock(
+			{ onHide, onRestoreUnlocked, onRequireReauth },
+			() => true,
+		);
+
+		// 1. Blur window
+		const t0 = 500_000;
+		vi.spyOn(Date, "now").mockReturnValue(t0);
+		window.dispatchEvent(new Event("blur"));
+
+		expect(onHide).toHaveBeenCalledWith(t0);
+
+		// 2. Focus window <120s later (e.g. 10s)
+		vi.spyOn(Date, "now").mockReturnValue(t0 + 10_000);
+		window.dispatchEvent(new Event("focus"));
+
+		expect(onRestoreUnlocked).toHaveBeenCalledTimes(1);
+		expect(onRequireReauth).not.toHaveBeenCalled();
+
+		// 3. Blur again and focus >=120s later (e.g. 121s)
+		const t1 = 600_000;
+		vi.spyOn(Date, "now").mockReturnValue(t1);
+		window.dispatchEvent(new Event("blur"));
+
+		vi.spyOn(Date, "now").mockReturnValue(t1 + 121_000);
+		window.dispatchEvent(new Event("focus"));
+
+		expect(onRequireReauth).toHaveBeenCalledTimes(1);
+
+		cleanup();
+	});
+
+	it("evaluates lock correctly on window pagehide / pageshow events", () => {
+		const onHide = vi.fn();
+		const onRestoreUnlocked = vi.fn();
+		const onRequireReauth = vi.fn();
+
+		const cleanup = setupVisibilityLock(
+			{ onHide, onRestoreUnlocked, onRequireReauth },
+			() => true,
+		);
+
+		// 1. Pagehide
+		const t0 = 700_000;
+		vi.spyOn(Date, "now").mockReturnValue(t0);
+		window.dispatchEvent(new Event("pagehide"));
+
+		expect(onHide).toHaveBeenCalledWith(t0);
+
+		// 2. Pageshow <120s later
+		vi.spyOn(Date, "now").mockReturnValue(t0 + 45_000);
+		window.dispatchEvent(new Event("pageshow"));
+
+		expect(onRestoreUnlocked).toHaveBeenCalledTimes(1);
+		expect(onRequireReauth).not.toHaveBeenCalled();
+
+		// 3. Pagehide again and pageshow >=120s later
+		const t1 = 800_000;
+		vi.spyOn(Date, "now").mockReturnValue(t1);
+		window.dispatchEvent(new Event("pagehide"));
+
+		vi.spyOn(Date, "now").mockReturnValue(t1 + 120_001);
+		window.dispatchEvent(new Event("pageshow"));
+
+		expect(onRequireReauth).toHaveBeenCalledTimes(1);
+
+		cleanup();
+	});
 });

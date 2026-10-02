@@ -90,14 +90,14 @@ export function usePwa(): PwaState {
 	}, []);
 
 	const promptInstall = useCallback(async () => {
-		if (!deferredInstallPrompt) return;
+		const promptEvent = deferredInstallPrompt;
+		if (!promptEvent) return;
+		deferredInstallPrompt = null;
+		setCanInstall(false);
+
 		try {
-			await deferredInstallPrompt.prompt();
-			const choice = await deferredInstallPrompt.userChoice;
-			if (choice.outcome === "accepted") {
-				setCanInstall(false);
-				deferredInstallPrompt = null;
-			}
+			await promptEvent.prompt();
+			await promptEvent.userChoice;
 		} catch {
 			// Ignore rejection
 		}

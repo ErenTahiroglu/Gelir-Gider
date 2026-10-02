@@ -1,4 +1,5 @@
 import { useParams } from "@tanstack/react-router";
+import "../../api/domain-errors";
 import { LongTermTaskDetailPage } from "./LongTermTaskDetailPage";
 import { LongTermTaskForm } from "./LongTermTaskForm";
 

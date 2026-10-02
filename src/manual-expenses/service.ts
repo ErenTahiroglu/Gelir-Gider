@@ -225,11 +225,19 @@ export async function createManualExpense(
 				amount,
 				sourceAssetAccountId,
 				budgetCategory,
-				spendingCategoryId,
-				merchant,
-				description,
-				shortTermGoalId,
 			};
+			if (spendingCategoryId !== undefined) {
+				payload.spendingCategoryId = spendingCategoryId;
+			}
+			if (merchant !== undefined) {
+				payload.merchant = merchant;
+			}
+			if (description !== undefined) {
+				payload.description = description;
+			}
+			if (shortTermGoalId !== undefined) {
+				payload.shortTermGoalId = shortTermGoalId;
+			}
 
 			const lines: JournalLineInput[] = [
 				{
@@ -403,10 +411,31 @@ export async function updateManualExpense(
 				amount,
 				sourceAssetAccountId,
 				budgetCategory,
-				spendingCategoryId,
-				merchant,
-				description,
 			};
+
+			if (spendingCategoryId !== undefined) {
+				payload.spendingCategoryId = spendingCategoryId;
+			} else {
+				delete payload.spendingCategoryId;
+			}
+
+			if (merchant !== undefined) {
+				payload.merchant = merchant;
+			} else {
+				delete payload.merchant;
+			}
+
+			if (description !== undefined) {
+				payload.description = description;
+			} else {
+				delete payload.description;
+			}
+
+			for (const key of Object.keys(payload)) {
+				if (payload[key] === undefined) {
+					delete payload[key];
+				}
+			}
 
 			const lines: JournalLineInput[] = [
 				{

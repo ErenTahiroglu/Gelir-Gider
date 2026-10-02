@@ -1,4 +1,5 @@
 import { Bell, Settings } from "lucide-react";
+import "../../api/domain-errors";
 import { useState } from "react";
 import { NotificationEventList } from "./NotificationEventList";
 import { PushSettings } from "./PushSettings";

@@ -11,6 +11,7 @@ import {
 	Sparkles,
 } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
+import type { CreditCardItem } from "../../api/dashboard-types";
 import { ApiError, isNetworkUncertainError } from "../../api/errors";
 import {
 	commitMonthClose,
@@ -99,6 +100,10 @@ export function MonthCloseWizard() {
 		queryFn: () => fetchAllActiveCreditCards(100),
 		staleTime: 30_000,
 	});
+
+	const cardList: CreditCardItem[] = Array.isArray(cards)
+		? cards
+		: ((cards as unknown as { cards?: CreditCardItem[] })?.cards ?? []);
 
 	// Calendar check in Europe/Istanbul
 	const isPeriodEnded = isIstanbulPeriodEnded(selectedPeriod);
@@ -628,13 +633,13 @@ export function MonthCloseWizard() {
 							Kart yükümlülükleri şu anda doğrulanamadı. (Bu durum kapanışı
 							engellemez).
 						</div>
-					) : (cards ?? []).length === 0 ? (
+					) : cardList.length === 0 ? (
 						<div className="p-4 bg-secondary/10 rounded text-center text-sm text-secondary mb-4">
 							Tanımlı aktif kredi kartı bulunmuyor.
 						</div>
 					) : (
 						<div className="cards-review-list flex flex-col gap-3 mb-4">
-							{(cards ?? []).map((card) => (
+							{cardList.map((card) => (
 								<div
 									key={card.cardId}
 									className="p-3 border rounded flex justify-between items-center text-sm"

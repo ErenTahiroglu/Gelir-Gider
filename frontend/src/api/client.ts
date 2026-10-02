@@ -1,4 +1,8 @@
-import { ApiError, type ApiErrorPayload } from "./errors";
+import {
+	ApiError,
+	type ApiErrorPayload,
+	ensureDomainErrorsLoaded,
+} from "./errors";
 
 type SessionLossListener = () => void;
 const sessionLossListeners = new Set<SessionLossListener>();
@@ -80,6 +84,12 @@ export async function apiFetch<T>(
 		: null;
 
 	if (!response.ok) {
+		try {
+			await ensureDomainErrorsLoaded();
+		} catch {
+			// gracefully fallback if dynamic chunk cannot load
+		}
+
 		let errorCode = "INTERNAL_ERROR";
 		let errorMessage = "An error occurred";
 
