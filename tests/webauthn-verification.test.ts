@@ -1126,8 +1126,9 @@ describe("Authorized Passkey Enrollment & Authentication Service", () => {
 			expect(result.purpose).toBe("BOOTSTRAP");
 			expect(result.user.displayName).toBe("Eren");
 			expect(result.credential.credentialId).toBe("cred-abc-123");
-			expect(result.recoveryCode.canonical.length).toBe(32);
-			expect(result.recoveryCode.display.split(".").length).toBe(8);
+			expect(result.recoveryCode).not.toBeNull();
+			expect(result.recoveryCode!.canonical.length).toBe(32);
+			expect(result.recoveryCode!.display.split(".").length).toBe(8);
 
 			expect(credentialInserted).toBe(true);
 			expect(authInitUpdated).toBe(true);

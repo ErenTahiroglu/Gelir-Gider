@@ -9,6 +9,7 @@ import {
 	Home,
 	PieChart,
 	Repeat,
+	Smartphone,
 	Target,
 	TrendingUp,
 	Users,
@@ -41,6 +42,7 @@ export function DesktopSidebar({
 	const isMonthCloseActive = currentPath.startsWith("/month-close");
 	const isImportsActive = currentPath.startsWith("/imports");
 	const isNotificationsActive = currentPath.startsWith("/notifications");
+	const isDevicesActive = currentPath.startsWith("/settings/devices");
 	// Keyboard shortcut: Cmd/Ctrl + B to toggle sidebar
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -239,6 +241,19 @@ export function DesktopSidebar({
 						>
 							<Bell size={20} aria-hidden="true" />
 							{!collapsed && <span className="nav-label">Bildirimler</span>}
+						</Link>
+					</li>
+
+					<li className="nav-item">
+						<Link
+							to="/settings/devices"
+							className={`nav-link ${isDevicesActive ? "active" : ""}`}
+							aria-current={isDevicesActive ? "page" : undefined}
+							title={collapsed ? "Cihazlar" : undefined}
+							data-testid="nav-link-devices"
+						>
+							<Smartphone size={20} aria-hidden="true" />
+							{!collapsed && <span className="nav-label">Cihazlar</span>}
 						</Link>
 					</li>
 				</ul>

@@ -107,3 +107,23 @@ export async function logout(): Promise<void> {
 		method: "POST",
 	});
 }
+
+export async function fetchDevices(): Promise<
+	import("./auth-types").DevicesResponse
+> {
+	return apiFetch<import("./auth-types").DevicesResponse>("/auth/devices", {
+		method: "GET",
+	});
+}
+
+export async function createPairingGrant(data: {
+	response: import("./auth-types").AuthenticationVerifyRequest["response"];
+}): Promise<import("./auth-types").PairingGrantResponse> {
+	return apiFetch<import("./auth-types").PairingGrantResponse>(
+		"/auth/devices/pairing-grant",
+		{
+			method: "POST",
+			json: data,
+		},
+	);
+}

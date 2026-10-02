@@ -9,7 +9,10 @@ import {
 export const AUTH_ENROLLMENT_GRANT_TTL_SECONDS = 10 * 60; // 10 minutes
 export const ENROLLMENT_GRANT_TOKEN_BYTES = 32;
 
-export type EnrollmentGrantPurpose = "BOOTSTRAP" | "RECOVERY";
+export type EnrollmentGrantPurpose =
+	| "BOOTSTRAP"
+	| "RECOVERY"
+	| "ADD_CREDENTIAL";
 
 /**
  * Generates an enrollment grant raw token.

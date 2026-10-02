@@ -217,6 +217,13 @@ export async function beginAuthorizedPasskeyEnrollment({
 					"Instance has already been initialized",
 				);
 			}
+		} else if (freshGrant.purpose === "ADD_CREDENTIAL") {
+			if (user.authInitializedAt === null) {
+				throw new WebAuthnServiceError(
+					"RECOVERY_NOT_INITIALIZED",
+					"Instance has not been initialized yet",
+				);
+			}
 		} else if (freshGrant.purpose === "RECOVERY") {
 			if (user.authInitializedAt === null) {
 				throw new WebAuthnServiceError(
@@ -341,7 +348,7 @@ export interface CompleteAuthorizedPasskeyEnrollmentParams {
 
 export interface CompleteAuthorizedPasskeyEnrollmentResult {
 	verified: true;
-	purpose: "BOOTSTRAP" | "RECOVERY";
+	purpose: "BOOTSTRAP" | "RECOVERY" | "ADD_CREDENTIAL";
 	user: {
 		id: string;
 		displayName: string;
@@ -354,7 +361,7 @@ export interface CompleteAuthorizedPasskeyEnrollmentResult {
 	recoveryCode: {
 		canonical: string;
 		display: string;
-	};
+	} | null;
 }
 
 /**
@@ -724,6 +731,70 @@ export async function completeAuthorizedPasskeyEnrollment({
 				codeHash: newRecoveryCodeHash,
 				createdAt: now,
 			});
+		} else if (grant.purpose === "ADD_CREDENTIAL") {
+			// ADD_CREDENTIAL Guard: Must be initialized
+			if (user.authInitializedAt === null) {
+				throw new WebAuthnServiceError(
+					"RECOVERY_NOT_INITIALIZED",
+					"Instance has not been initialized yet",
+				);
+			}
+
+			// Insert verified credential
+			try {
+				const [created] = await tx
+					.insert(webauthnCredentials)
+					.values({
+						userId: user.id,
+						credentialId: credential.id,
+						publicKey: new Uint8Array(credential.publicKey),
+						signCount: credential.counter,
+						deviceName: trimmedDeviceName,
+						deviceType: credentialDeviceType,
+						transports: credential.transports ?? null,
+						backedUp: credentialBackedUp,
+						createdAt: now,
+					})
+					.returning();
+
+				if (!created) {
+					throw new Error("Failed to insert credential");
+				}
+				savedCredential = {
+					id: created.id,
+					credentialId: created.credentialId,
+					deviceName: created.deviceName,
+				};
+			} catch (err: unknown) {
+				const error = err as { code?: string; message?: string };
+				if (
+					error?.code === "23505" ||
+					error?.message?.includes("unique") ||
+					error?.message?.includes("duplicate key")
+				) {
+					throw new WebAuthnServiceError(
+						"CREDENTIAL_ALREADY_REGISTERED",
+						"This credential has already been registered",
+					);
+				}
+				throw new WebAuthnServiceError(
+					"WEBAUTHN_REGISTRATION_FAILED",
+					"Failed to save credential",
+				);
+			}
+
+			// Revoke other pending ADD_CREDENTIAL enrollment grants for this user
+			await tx
+				.update(authEnrollmentGrants)
+				.set({ revokedAt: now })
+				.where(
+					and(
+						eq(authEnrollmentGrants.userId, user.id),
+						eq(authEnrollmentGrants.purpose, "ADD_CREDENTIAL"),
+						isNull(authEnrollmentGrants.consumedAt),
+						isNull(authEnrollmentGrants.revokedAt),
+					),
+				);
 		} else {
 			throw new WebAuthnServiceError(
 				"ENROLLMENT_GRANT_INVALID",
@@ -733,13 +804,13 @@ export async function completeAuthorizedPasskeyEnrollment({
 
 		return {
 			verified: true,
-			purpose: grant.purpose as "BOOTSTRAP" | "RECOVERY",
+			purpose: grant.purpose as "BOOTSTRAP" | "RECOVERY" | "ADD_CREDENTIAL",
 			user: {
 				id: user.id,
 				displayName: user.displayName,
 			},
 			credential: savedCredential,
-			recoveryCode: newRecoveryCode,
+			recoveryCode: grant.purpose === "ADD_CREDENTIAL" ? null : newRecoveryCode,
 		};
 	});
 }

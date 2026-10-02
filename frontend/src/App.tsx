@@ -290,6 +290,13 @@ const NotificationsPage = lazyDomainRoute(() =>
 	})),
 );
 
+// Device Management
+const DeviceManagementPage = lazyDomainRoute(() =>
+	import("./components/devices/DeviceManagementPage").then((m) => ({
+		default: m.DeviceManagementPage,
+	})),
+);
+
 function UnlockRouteComponent() {
 	const { state } = useAuth();
 	const navigate = useNavigate();
@@ -587,6 +594,12 @@ const notificationsRoute = createRoute({
 	component: NotificationsPage,
 });
 
+const devicesRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/settings/devices",
+	component: DeviceManagementPage,
+});
+
 const routeTree = rootRoute.addChildren([
 	indexRoute,
 	unlockRoute,
@@ -635,6 +648,7 @@ const routeTree = rootRoute.addChildren([
 	importBatchRoute,
 	importReviewRoute,
 	notificationsRoute,
+	devicesRoute,
 ]);
 
 export const router = createRouter({

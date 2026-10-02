@@ -71,7 +71,10 @@ export function MonthClosePage() {
 		data?.pages.flatMap((p) => p.monthCloses) ?? [];
 
 	return (
-		<div className="page-container month-close-page" data-testid="month-close-page">
+		<div
+			className="page-container month-close-page"
+			data-testid="month-close-page"
+		>
 			<div className="page-header">
 				<div className="header-title-block">
 					<h1 className="page-title">
@@ -100,11 +103,20 @@ export function MonthClosePage() {
 			</div>
 
 			{isLoading ? (
-				<div className="card text-center text-secondary" style={{ padding: "var(--space-8)" }}>
+				<div
+					className="card text-center text-secondary"
+					style={{ padding: "var(--space-8)" }}
+				>
 					Kapanış geçmişi yükleniyor...
 				</div>
 			) : isError ? (
-				<div className="card text-center" style={{ padding: "var(--space-8)", color: "var(--color-danger-500)" }}>
+				<div
+					className="card text-center"
+					style={{
+						padding: "var(--space-8)",
+						color: "var(--color-danger-500)",
+					}}
+				>
 					<p>Kapanış kayıtları alınırken bir hata oluştu.</p>
 					<button
 						type="button"
@@ -121,9 +133,14 @@ export function MonthClosePage() {
 					<CalendarCheck size={36} aria-hidden="true" className="empty-icon" />
 					<h3 className="empty-title">Henüz Tamamlanmış Dönem Yok</h3>
 					<p className="empty-message">
-						Henüz tamamlanmış bir dönem kapanışı bulunmuyor. Geçmiş ayların fazlalıklarını değerlendirmek için sihirbazı başlatın.
+						Henüz tamamlanmış bir dönem kapanışı bulunmuyor. Geçmiş ayların
+						fazlalıklarını değerlendirmek için sihirbazı başlatın.
 					</p>
-					<Link to="/month-close/wizard" className="btn btn-primary" style={{ marginTop: "var(--space-2)" }}>
+					<Link
+						to="/month-close/wizard"
+						className="btn btn-primary"
+						style={{ marginTop: "var(--space-2)" }}
+					>
 						<CalendarCheck size={16} aria-hidden="true" />
 						<span>Geçmiş Bir Ayı Tamamlayın</span>
 					</Link>

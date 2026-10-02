@@ -1,7 +1,12 @@
 import { useAuth } from "../../auth/auth-context";
 
 export function UnlockScreen() {
-	const { state, authenticateWithPasskey, startRecoveryFlow } = useAuth();
+	const {
+		state,
+		authenticateWithPasskey,
+		startRecoveryFlow,
+		startPairingFlow,
+	} = useAuth();
 
 	const isAuthenticating = state.status === "AUTHENTICATING";
 	const errorMessage =
@@ -41,6 +46,16 @@ export function UnlockScreen() {
 
 					<button
 						type="button"
+						className="btn btn-secondary"
+						onClick={startPairingFlow}
+						disabled={isAuthenticating}
+						data-testid="start-pairing-button"
+					>
+						Yeni cihaz bağla
+					</button>
+
+					<button
+						type="button"
 						className="btn btn-link"
 						onClick={startRecoveryFlow}
 						disabled={isAuthenticating}
@@ -53,3 +68,4 @@ export function UnlockScreen() {
 		</main>
 	);
 }
+export default UnlockScreen;

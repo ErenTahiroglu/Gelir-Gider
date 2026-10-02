@@ -89,9 +89,7 @@ export function IncomeOverviewPanel({ onSelectTab }: IncomeOverviewPanelProps) {
 				{/* 1. Reference income card */}
 				<div className="metric-card">
 					<div className="metric-header">
-						<span className="metric-title">
-							Aylık Referans Gelir
-						</span>
+						<span className="metric-title">Aylık Referans Gelir</span>
 						<TrendingUp size={18} className="metric-icon" aria-hidden="true" />
 					</div>
 					<div className="metric-body">
@@ -109,7 +107,11 @@ export function IncomeOverviewPanel({ onSelectTab }: IncomeOverviewPanelProps) {
 						<button
 							type="button"
 							className="btn-link"
-							style={{ padding: 0, marginTop: "var(--space-2)", display: "block" }}
+							style={{
+								padding: 0,
+								marginTop: "var(--space-2)",
+								display: "block",
+							}}
 							onClick={() => onSelectTab("reference")}
 						>
 							Detayları ve Yöntemleri Gör →
@@ -139,7 +141,11 @@ export function IncomeOverviewPanel({ onSelectTab }: IncomeOverviewPanelProps) {
 						<button
 							type="button"
 							className="btn-link"
-							style={{ padding: 0, marginTop: "var(--space-2)", display: "block" }}
+							style={{
+								padding: 0,
+								marginTop: "var(--space-2)",
+								display: "block",
+							}}
 							onClick={() => onSelectTab("entitlements")}
 						>
 							Beklenen Gelirleri Gör →
@@ -160,7 +166,10 @@ export function IncomeOverviewPanel({ onSelectTab }: IncomeOverviewPanelProps) {
 						/>
 					</div>
 					<div className="metric-body">
-						<span className="metric-value tabular-nums" style={{ color: "var(--color-success-600)" }}>
+						<span
+							className="metric-value tabular-nums"
+							style={{ color: "var(--color-success-600)" }}
+						>
 							{formatMoneyToTry(
 								formatCentsToCanonical(currentMonthRealizedCents),
 							)}
@@ -173,7 +182,11 @@ export function IncomeOverviewPanel({ onSelectTab }: IncomeOverviewPanelProps) {
 						<button
 							type="button"
 							className="btn-link"
-							style={{ padding: 0, marginTop: "var(--space-2)", display: "block" }}
+							style={{
+								padding: 0,
+								marginTop: "var(--space-2)",
+								display: "block",
+							}}
 							onClick={() => onSelectTab("receipts")}
 						>
 							Tahsilatları Gör →
@@ -184,7 +197,9 @@ export function IncomeOverviewPanel({ onSelectTab }: IncomeOverviewPanelProps) {
 
 			{/* Quick actions */}
 			<div className="card">
-				<h3 className="card-title" style={{ marginBottom: "var(--space-3)" }}>Hızlı İşlemler</h3>
+				<h3 className="card-title" style={{ marginBottom: "var(--space-3)" }}>
+					Hızlı İşlemler
+				</h3>
 				<div className="product-grid-3" style={{ marginBottom: 0 }}>
 					<Link
 						to="/income/receipts/new"

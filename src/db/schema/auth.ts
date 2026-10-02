@@ -182,11 +182,11 @@ export const authEnrollmentGrants = pgTable(
 	(table) => [
 		check(
 			"auth_enrollment_grants_purpose_check",
-			sql`${table.purpose} IN ('BOOTSTRAP', 'RECOVERY')`,
+			sql`${table.purpose} IN ('BOOTSTRAP', 'RECOVERY', 'ADD_CREDENTIAL')`,
 		),
 		check(
 			"auth_enrollment_grants_purpose_recovery_relation_check",
-			sql`(${table.purpose} = 'BOOTSTRAP' AND ${table.recoveryCodeId} IS NULL) OR (${table.purpose} = 'RECOVERY' AND ${table.recoveryCodeId} IS NOT NULL)`,
+			sql`(${table.purpose} IN ('BOOTSTRAP', 'ADD_CREDENTIAL') AND ${table.recoveryCodeId} IS NULL) OR (${table.purpose} = 'RECOVERY' AND ${table.recoveryCodeId} IS NOT NULL)`,
 		),
 		check(
 			"auth_enrollment_grants_expires_at_check",

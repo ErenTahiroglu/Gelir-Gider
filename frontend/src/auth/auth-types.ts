@@ -76,6 +76,23 @@ export interface ReauthVerifyResponse {
 	};
 }
 
+export interface RegisteredDevice {
+	id: string;
+	deviceName: string;
+	deviceType: string | null;
+	createdAt: string;
+	lastUsedAt: string | null;
+}
+
+export interface DevicesResponse {
+	devices: RegisteredDevice[];
+}
+
+export interface PairingGrantResponse {
+	enrollmentGrantToken: string;
+	expiresAt: string;
+}
+
 // --- Frontend Auth State Machine ---
 
 export type AuthState =
@@ -96,6 +113,7 @@ export type AuthState =
 	  }
 	| { status: "AUTH_REQUIRED"; error?: string | undefined }
 	| { status: "AUTHENTICATING" }
+	| { status: "PAIRING_REQUIRED"; error?: string | undefined }
 	| { status: "RECOVERY_REQUIRED"; error?: string | undefined }
 	| { status: "RECOVERING" }
 	| { status: "UNLOCKED"; user: { displayName: string } }

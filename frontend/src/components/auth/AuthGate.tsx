@@ -22,6 +22,12 @@ const LazyRecoveryFlow = React.lazy(() =>
 	})),
 );
 
+const LazyPairingFlow = React.lazy(() =>
+	import("./PairingFlow").then((m) => ({
+		default: m.PairingFlow,
+	})),
+);
+
 export function AuthGate({ children }: { children: React.ReactNode }) {
 	const { state, retryBootstrapOrInit, logout } = useAuth();
 
@@ -122,6 +128,14 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 		return (
 			<Suspense fallback={null}>
 				<LazyRecoveryFlow />
+			</Suspense>
+		);
+	}
+
+	if (state.status === "PAIRING_REQUIRED") {
+		return (
+			<Suspense fallback={null}>
+				<LazyPairingFlow />
 			</Suspense>
 		);
 	}

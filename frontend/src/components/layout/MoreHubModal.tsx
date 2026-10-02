@@ -7,6 +7,7 @@ import {
 	FileSpreadsheet,
 	PieChart,
 	Sliders,
+	Smartphone,
 	Target,
 	TrendingUp,
 	Users,
@@ -34,6 +35,7 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 	const isMonthCloseActive = currentPath.startsWith("/month-close");
 	const isImportsActive = currentPath.startsWith("/imports");
 	const isNotificationsActive = currentPath.startsWith("/notifications");
+	const isDevicesActive = currentPath.startsWith("/settings/devices");
 
 	return (
 		<AccessibleModal
@@ -84,6 +86,29 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 									<span className="more-hub-item-name">Bildirimler</span>
 									<span className="more-hub-item-desc">
 										Bildirim geçmişi ve Web Push ayarları
+									</span>
+								</div>
+							</Link>
+						</li>
+
+						{/* Active item: Güvenlik & Cihazlar */}
+						<li className="more-hub-item">
+							<Link
+								to="/settings/devices"
+								className={`more-hub-link ${isDevicesActive ? "active" : ""}`}
+								onClick={onClose}
+								aria-current={isDevicesActive ? "page" : undefined}
+								data-testid="more-hub-link-devices"
+							>
+								<div className="more-hub-icon-wrapper">
+									<Smartphone size={20} aria-hidden="true" />
+								</div>
+								<div className="more-hub-item-info">
+									<span className="more-hub-item-name">
+										Güvenlik & Cihazlar
+									</span>
+									<span className="more-hub-item-desc">
+										Passkey cihazları ve yeni cihaz eşleme
 									</span>
 								</div>
 							</Link>

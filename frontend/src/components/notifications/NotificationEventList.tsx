@@ -178,10 +178,15 @@ export function NotificationEventList() {
 					<p>Bildirimler yüklenirken bir hata oluştu.</p>
 				</div>
 			) : allEvents.length === 0 ? (
-				<div className="empty-state-card card" data-testid="empty-events-message">
+				<div
+					className="empty-state-card card"
+					data-testid="empty-events-message"
+				>
 					<Bell size={36} aria-hidden="true" className="empty-icon" />
 					<h3 className="empty-title">Bildirim Bulunmuyor</h3>
-					<p className="empty-message">Bu tarihe ait kayıtlı veya planlanan bir bildirim bulunmuyor.</p>
+					<p className="empty-message">
+						Bu tarihe ait kayıtlı veya planlanan bir bildirim bulunmuyor.
+					</p>
 				</div>
 			) : (
 				<div className="events-grid" data-testid="events-list">

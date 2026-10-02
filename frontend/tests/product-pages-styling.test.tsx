@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { PushSettings } from "../src/components/notifications/PushSettings";
 
 vi.mock("@tanstack/react-router", () => ({

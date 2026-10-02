@@ -24,6 +24,12 @@ export interface AuthContextValue {
 	startRecoveryFlow: () => void;
 	cancelRecoveryFlow: () => void;
 	submitRecoveryCode: (recoveryCode: string) => Promise<void>;
+	startPairingFlow: () => void;
+	cancelPairingFlow: () => void;
+	submitPairingCode: (
+		pairingCode: string,
+		deviceName?: string,
+	) => Promise<void>;
 	logout: () => Promise<void>;
 	retryBootstrapOrInit: () => Promise<void>;
 	lockNow: () => void;
@@ -289,6 +295,27 @@ export function AuthProvider({
 					? (rawCode as any).display || (rawCode as any).canonical || ""
 					: String(rawCode ?? "");
 
+			// ADD_CREDENTIAL pairing flow: non-destructive, no recovery code generated
+			if (
+				!normalizedCode ||
+				normalizedCode === "null" ||
+				normalizedCode === "undefined"
+			) {
+				if (verifyRes.authenticated) {
+					const user = currentUserRef.current ?? {
+						displayName: displayName || "Kullanıcı",
+					};
+					setState({ status: "UNLOCKED", user });
+				} else {
+					setState({
+						status: "AUTH_REQUIRED",
+						error:
+							"Yeni cihaz başarıyla bağlandı. Devam etmek için lütfen giriş yapın.",
+					});
+				}
+				return;
+			}
+
 			setState({
 				status: "RECOVERY_CODE_REQUIRED",
 				recoveryCode: normalizedCode,
@@ -331,6 +358,58 @@ export function AuthProvider({
 	const cancelRecoveryFlow = useCallback(() => {
 		setState({ status: "AUTH_REQUIRED" });
 	}, []);
+
+	const startPairingFlow = useCallback(() => {
+		setState({ status: "PAIRING_REQUIRED" });
+	}, []);
+
+	const cancelPairingFlow = useCallback(() => {
+		setState({ status: "AUTH_REQUIRED" });
+	}, []);
+
+	const submitPairingCode = useCallback(
+		async (pairingCode: string, deviceName = "Yeni Cihaz") => {
+			const trimmedGrantToken = pairingCode.trim();
+			const trimmedDeviceName = deviceName.trim() || "Yeni Cihaz";
+			try {
+				const options = await authApi.fetchEnrollmentOptions(trimmedGrantToken);
+				const adapter = getWebAuthnAdapter();
+				const registration = await adapter.register(options);
+				const verifyRes = await authApi.verifyEnrollment({
+					response: registration,
+					deviceName: trimmedDeviceName,
+				});
+
+				const user = { displayName: trimmedDeviceName };
+				currentUserRef.current = user;
+				if (verifyRes.authenticated) {
+					setState({
+						status: "UNLOCKED",
+						user,
+					});
+				} else {
+					setState({
+						status: "AUTH_REQUIRED",
+						error:
+							"Yeni cihaz başarıyla bağlandı. Devam etmek için lütfen giriş yapın.",
+					});
+				}
+			} catch (err) {
+				const userMessage =
+					err instanceof ApiError
+						? err.userMessage
+						: err instanceof Error
+							? err.message
+							: "Passkey kaydı yapılamadı.";
+				setState({
+					status: "PAIRING_REQUIRED",
+					error: userMessage,
+				});
+				throw new Error(userMessage);
+			}
+		},
+		[],
+	);
 
 	const logout = useCallback(async () => {
 		try {
@@ -379,6 +458,9 @@ export function AuthProvider({
 				startRecoveryFlow,
 				cancelRecoveryFlow,
 				submitRecoveryCode,
+				startPairingFlow,
+				cancelPairingFlow,
+				submitPairingCode,
 				logout,
 				retryBootstrapOrInit,
 				lockNow,

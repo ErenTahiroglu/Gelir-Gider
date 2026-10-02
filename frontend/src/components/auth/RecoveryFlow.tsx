@@ -36,6 +36,25 @@ export function RecoveryFlow() {
 					</p>
 				</header>
 
+				<div
+					className="auth-alert"
+					style={{
+						backgroundColor: "var(--color-warning-50)",
+						color: "var(--color-warning-700)",
+						borderColor: "var(--color-warning-100)",
+						marginBottom: "var(--space-4)",
+						fontSize: "var(--font-size-xs)",
+						lineHeight: "1.4",
+					}}
+					role="note"
+					data-testid="recovery-destructive-warning"
+				>
+					<strong>Önemli Uyarı:</strong> Kurtarma işlemi mevcut tüm cihazların
+					Passkey anahtarlarını ve açık oturumlarını sıfırlar. Sadece ikinci bir
+					cihaz eklemek istiyorsanız lütfen giriş ekranından{" "}
+					<strong>"Yeni cihaz bağla"</strong> seçeneğini kullanın.
+				</div>
+
 				{errorMessage && (
 					<div
 						className="auth-alert"

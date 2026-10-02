@@ -3,7 +3,7 @@ import type {
 	AuthenticatorTransportFuture,
 	RegistrationResponseJSON,
 } from "@simplewebauthn/server";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -13,6 +13,7 @@ import {
 	authorizeBootstrapAndIssueGrant,
 	authorizeRecoveryAndIssueGrant,
 } from "../auth/bootstrap";
+import { issueEnrollmentGrant } from "../auth/enrollment-grants";
 import {
 	generateReauthOptionsForUser,
 	verifyReauthForUser,
@@ -76,6 +77,7 @@ const JSON_BODY_PATHS = new Set([
 	"/auth/passkey/enrollment/verify",
 	"/auth/passkey/authentication/verify",
 	"/auth/passkey/reauth/verify",
+	"/auth/devices/pairing-grant",
 ]);
 
 // Helper to create sanitized error response
@@ -730,6 +732,79 @@ authRouter.post(
 		}
 	},
 );
+
+// POST /auth/devices/pairing-grant
+authRouter.post(
+	"/devices/pairing-grant",
+	requireAuthenticatedSession,
+	async (c) => {
+		const body = await parseJsonBody<{
+			response?: AuthenticationResponseJSON;
+		}>(c);
+		if (!body?.response) {
+			return c.json(
+				{ error: { code: "INVALID_REQUEST", message: "Invalid request body" } },
+				400,
+			);
+		}
+
+		try {
+			const auth = c.get("auth");
+			const db = createDatabase(getDatabaseUrl(c.env));
+			const config = getWebAuthnConfig(c.env);
+
+			// Fresh passkey reauthentication is mandatory
+			await verifyReauthForUser({
+				db,
+				config,
+				user: { id: auth.userId },
+				response: body.response,
+			});
+
+			const result = await issueEnrollmentGrant({
+				db,
+				userId: auth.userId,
+				purpose: "ADD_CREDENTIAL",
+			});
+
+			return c.json({
+				enrollmentGrantToken: result.token,
+				expiresAt: result.grant.expiresAt,
+			});
+		} catch (err) {
+			return handleAuthError(c, err);
+		}
+	},
+);
+
+// GET /auth/devices
+authRouter.get("/devices", requireAuthenticatedSession, async (c) => {
+	try {
+		const auth = c.get("auth");
+		const db = createDatabase(getDatabaseUrl(c.env));
+
+		const activeCredentials = await db
+			.select({
+				id: webauthnCredentials.id,
+				deviceName: webauthnCredentials.deviceName,
+				deviceType: webauthnCredentials.deviceType,
+				createdAt: webauthnCredentials.createdAt,
+				lastUsedAt: webauthnCredentials.lastUsedAt,
+			})
+			.from(webauthnCredentials)
+			.where(
+				and(
+					eq(webauthnCredentials.userId, auth.userId),
+					isNull(webauthnCredentials.revokedAt),
+				),
+			)
+			.orderBy(desc(webauthnCredentials.createdAt));
+
+		return c.json({ devices: activeCredentials });
+	} catch (err) {
+		return handleAuthError(c, err);
+	}
+});
 
 // GET /auth/session
 authRouter.get("/session", async (c) => {

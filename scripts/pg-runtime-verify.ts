@@ -21597,12 +21597,63 @@ async function resolverRuntime7B9R1R6() {
 			await db.transaction(async (tx: any) => {
 				const pending = await listActivePushSubscriptionsInTransaction(tx, USER_M05, 200, undefined, EVT_M05);
 				eqD(pending.length, 1, "PRE-7B.9 R1-R6 M-05: Exactly 1 pending subscription returned when first 200 are TERMINAL_FAILURE");
-				eqD(pending[0]?.subscriptionId, sub201Id, "PRE-7B.9 R1-R6 M-05: Subscription 201 is reached without starvation");
+			eqD(pending[0]?.subscriptionId, sub201Id, "PRE-7B.9 R1-R6 M-05: Subscription 201 is reached without starvation");
 			});
 		} finally {
 			setDatabaseFactoryOverrideForTest(null);
 			await pg.close();
 		}
+	}
+}
+
+async function migration0079Runtime() {
+	console.log("\n== PHASE 7B.10: MIGRATION 0079 & ADD_CREDENTIAL ENROLLMENT GRANT CONSTRAINTS ==");
+	const pg = new PGlite();
+	try {
+		await applyChain(pg, 79);
+		const USER_AUTH_TEST = "77777777-7777-7777-7777-777777777777";
+		await pg.query(
+			"INSERT INTO users (id, display_name, currency, timezone, auth_initialized_at) VALUES ($1, 'User Auth Test', 'TRY', 'Europe/Istanbul', now())",
+			[USER_AUTH_TEST],
+		);
+
+		// 1. ADD_CREDENTIAL grant with recovery_code_id = null -> accepted
+		await expectAccept(
+			pg,
+			`INSERT INTO auth_enrollment_grants (id, user_id, purpose, token_hash, recovery_code_id, expires_at)
+			 VALUES (gen_random_uuid(), $1, 'ADD_CREDENTIAL', $2, NULL, now() + interval '10 minutes')`,
+			[USER_AUTH_TEST, "a".repeat(64)],
+			"0079: ADD_CREDENTIAL enrollment grant with NULL recovery_code_id is accepted",
+		);
+
+		// 2. Invalid purpose -> rejected by check constraint
+		await expectReject(
+			pg,
+			`INSERT INTO auth_enrollment_grants (id, user_id, purpose, token_hash, recovery_code_id, expires_at)
+			 VALUES (gen_random_uuid(), $1, 'INVALID_PURPOSE', $2, NULL, now() + interval '10 minutes')`,
+			[USER_AUTH_TEST, "b".repeat(64)],
+			"0079: auth_enrollment_grants_purpose_check rejects invalid purpose",
+		);
+
+		// 3. ADD_CREDENTIAL with non-null recovery_code_id -> rejected by relation check
+		await expectReject(
+			pg,
+			`INSERT INTO auth_enrollment_grants (id, user_id, purpose, token_hash, recovery_code_id, expires_at)
+			 VALUES (gen_random_uuid(), $1, 'ADD_CREDENTIAL', $2, $3, now() + interval '10 minutes')`,
+			[USER_AUTH_TEST, "c".repeat(64), crypto.randomUUID()],
+			"0079: auth_enrollment_grants_purpose_recovery_relation_check rejects ADD_CREDENTIAL with non-null recovery_code_id",
+		);
+
+		// 4. BOOTSTRAP and RECOVERY constraints remain preserved
+		await expectAccept(
+			pg,
+			`INSERT INTO auth_enrollment_grants (id, user_id, purpose, token_hash, recovery_code_id, expires_at)
+			 VALUES (gen_random_uuid(), $1, 'BOOTSTRAP', $2, NULL, now() + interval '10 minutes')`,
+			[USER_AUTH_TEST, "d".repeat(64)],
+			"0079: BOOTSTRAP enrollment grant with NULL recovery_code_id is accepted",
+		);
+	} finally {
+		await pg.close();
 	}
 }
 
@@ -21644,6 +21695,7 @@ if (probed) {
 	await resolverRuntime7B9R1R2();
 	await resolverRuntime7B9R1R5();
 	await resolverRuntime7B9R1R6();
+	await migration0079Runtime();
 }
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
