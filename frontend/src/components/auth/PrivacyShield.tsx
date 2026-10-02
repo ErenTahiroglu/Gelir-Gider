@@ -8,6 +8,7 @@ export function PrivacyShield() {
 		>
 			<div className="privacy-shield-content">
 				<span className="privacy-shield-logo">Gelir-Gider</span>
+				<p className="privacy-shield-subtitle">Finansal bilgiler gizlendi</p>
 			</div>
 		</div>
 	);

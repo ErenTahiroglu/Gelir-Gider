@@ -3,6 +3,7 @@ import {
 	Award,
 	Bell,
 	Calendar,
+	Download,
 	FileSpreadsheet,
 	PieChart,
 	Sliders,
@@ -11,6 +12,7 @@ import {
 	Users,
 	Wallet,
 } from "lucide-react";
+import { usePwa } from "../../lib/pwa/usePwa";
 import { AccessibleModal } from "../common/AccessibleModal";
 
 interface MoreHubModalProps {
@@ -21,6 +23,7 @@ interface MoreHubModalProps {
 export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 	const routerState = useRouterState();
 	const currentPath = routerState.location.pathname;
+	const { canInstall, promptInstall } = usePwa();
 
 	const isPeopleActive = currentPath.startsWith("/people");
 	const isTemplatesActive = currentPath.startsWith("/settings/quick-templates");
@@ -236,6 +239,35 @@ export function MoreHubModal({ isOpen, onClose }: MoreHubModalProps) {
 						</li>
 					</ul>
 				</div>
+
+				{canInstall && (
+					<div className="more-hub-section">
+						<h3 className="more-hub-section-title">Uygulama</h3>
+						<ul className="more-hub-list">
+							<li className="more-hub-item">
+								<button
+									type="button"
+									className="more-hub-link"
+									onClick={() => {
+										onClose();
+										void promptInstall();
+									}}
+									data-testid="more-hub-install-btn"
+								>
+									<div className="more-hub-icon-wrapper">
+										<Download size={20} aria-hidden="true" />
+									</div>
+									<div className="more-hub-item-info">
+										<span className="more-hub-item-name">Uygulamayı Yükle</span>
+										<span className="more-hub-item-desc">
+											Cihazınıza hızlı erişim için ana ekrana ekleyin
+										</span>
+									</div>
+								</button>
+							</li>
+						</ul>
+					</div>
+				)}
 
 				<div className="more-hub-section">
 					<h3 className="more-hub-section-title">Gelecek Özellikler</h3>

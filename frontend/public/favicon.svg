@@ -1,0 +1,14 @@
+
+	<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+		<defs>
+			<linearGradient id="brandGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+				<stop offset="0%" stop-color="#6366f1" />
+				<stop offset="100%" stop-color="#4338ca" />
+			</linearGradient>
+			<filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+				<feDropShadow dx="0" dy="1.92" stdDeviation="2.56" flood-color="#000000" flood-opacity="0.25" />
+			</filter>
+		</defs>
+		<rect x="3.2" y="3.2" width="57.6" height="57.6" rx="14.08" fill="url(#brandGrad)" filter="url(#shadow)" />
+		<text x="32" y="41" font-family="system-ui, -apple-system, sans-serif" font-size="25" font-weight="800" fill="#ffffff" text-anchor="middle" letter-spacing="-0.04em">GG</text>
+	</svg>

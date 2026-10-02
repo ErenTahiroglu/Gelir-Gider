@@ -283,9 +283,15 @@ export function AuthProvider({
 
 			currentUserRef.current = { displayName };
 
+			const rawCode = verifyRes.recoveryCode as unknown;
+			const normalizedCode =
+				typeof rawCode === "object" && rawCode !== null
+					? (rawCode as any).display || (rawCode as any).canonical || ""
+					: String(rawCode ?? "");
+
 			setState({
 				status: "RECOVERY_CODE_REQUIRED",
-				recoveryCode: verifyRes.recoveryCode,
+				recoveryCode: normalizedCode,
 				warning: verifyRes.warning?.message,
 				authenticatedAfterEnroll: verifyRes.authenticated,
 			});

@@ -46,6 +46,14 @@ jobs:
       - name: Run Frontend Quality Gate (Typecheck, UI Tests, Production Build)
         run: npm run check:ui
 
+      - name: Install Playwright Browsers (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Frontend E2E / PWA / Accessibility Verification
+        env:
+          DATABASE_URL: "postgresql://test:test@127.0.0.1:5432/gelirgider_test"
+        run: npm run test:e2e
+
       - name: PostgreSQL Runtime Verification (PGlite)
         run: npm run test:pg
 

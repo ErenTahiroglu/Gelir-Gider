@@ -1,8 +1,11 @@
 import { Link, useRouterState } from "@tanstack/react-router";
 import { CreditCard, Home, MoreHorizontal, Plus, Repeat } from "lucide-react";
-import { useState } from "react";
+import React, { Suspense, useState } from "react";
 import { useQuickEntry } from "../../context/QuickEntryContext";
-import { MoreHubModal } from "./MoreHubModal";
+
+const LazyMoreHubModal = React.lazy(() =>
+	import("./MoreHubModal").then((m) => ({ default: m.MoreHubModal })),
+);
 
 export function MobileNav() {
 	const { openQuickEntry } = useQuickEntry();
@@ -95,10 +98,14 @@ export function MobileNav() {
 				</div>
 			</nav>
 
-			<MoreHubModal
-				isOpen={isMoreHubOpen}
-				onClose={() => setIsMoreHubOpen(false)}
-			/>
+			{isMoreHubOpen && (
+				<Suspense fallback={null}>
+					<LazyMoreHubModal
+						isOpen={isMoreHubOpen}
+						onClose={() => setIsMoreHubOpen(false)}
+					/>
+				</Suspense>
+			)}
 		</>
 	);
 }

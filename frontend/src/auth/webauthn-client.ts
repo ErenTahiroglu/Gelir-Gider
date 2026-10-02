@@ -1,8 +1,3 @@
-import {
-	browserSupportsWebAuthn,
-	startAuthentication,
-	startRegistration,
-} from "@simplewebauthn/browser";
 import { ApiError } from "../api/errors";
 import type {
 	AuthenticationResponseJSON,
@@ -20,20 +15,14 @@ export interface BrowserWebAuthnClient {
 	}) => Promise<RegistrationResponseJSON>;
 }
 
-let activeBrowserClient: BrowserWebAuthnClient = {
-	startAuthentication,
-	startRegistration,
-};
+let activeBrowserClient: BrowserWebAuthnClient | null = null;
 
 export function setBrowserWebAuthnClient(client: BrowserWebAuthnClient): void {
 	activeBrowserClient = client;
 }
 
 export function resetBrowserWebAuthnClient(): void {
-	activeBrowserClient = {
-		startAuthentication,
-		startRegistration,
-	};
+	activeBrowserClient = null;
 }
 
 export interface WebAuthnAdapter {
@@ -49,7 +38,13 @@ export interface WebAuthnAdapter {
 export const defaultWebAuthnAdapter: WebAuthnAdapter = {
 	isSupported(): boolean {
 		try {
-			return browserSupportsWebAuthn();
+			return (
+				typeof window !== "undefined" &&
+				Boolean(
+					window.PublicKeyCredential &&
+						typeof window.PublicKeyCredential === "function",
+				)
+			);
 		} catch {
 			return false;
 		}
@@ -67,7 +62,13 @@ export const defaultWebAuthnAdapter: WebAuthnAdapter = {
 		}
 
 		try {
-			return await activeBrowserClient.startAuthentication({
+			if (activeBrowserClient) {
+				return await activeBrowserClient.startAuthentication({
+					optionsJSON: options,
+				});
+			}
+			const { startAuthentication } = await import("@simplewebauthn/browser");
+			return await startAuthentication({
 				optionsJSON: options,
 			});
 		} catch (err: unknown) {
@@ -113,7 +114,13 @@ export const defaultWebAuthnAdapter: WebAuthnAdapter = {
 		}
 
 		try {
-			return await activeBrowserClient.startRegistration({
+			if (activeBrowserClient) {
+				return await activeBrowserClient.startRegistration({
+					optionsJSON: options,
+				});
+			}
+			const { startRegistration } = await import("@simplewebauthn/browser");
+			return await startRegistration({
 				optionsJSON: options,
 			});
 		} catch (err: unknown) {

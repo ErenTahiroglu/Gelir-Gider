@@ -51,33 +51,75 @@ export function setupVisibilityLock(
 ): () => void {
 	let inMemoryHiddenAt: number | null = getStoredHiddenTimestamp();
 
-	const handleVisibilityChange = () => {
-		if (document.visibilityState === "hidden") {
-			if (isUnlocked()) {
-				const now = Date.now();
+	const handleHide = () => {
+		if (isUnlocked()) {
+			const now = Date.now();
+			if (inMemoryHiddenAt === null) {
 				inMemoryHiddenAt = now;
 				saveHiddenTimestamp(now);
-				callbacks.onHide(now);
 			}
-		} else if (document.visibilityState === "visible") {
-			const hiddenAt = inMemoryHiddenAt ?? getStoredHiddenTimestamp();
-			if (hiddenAt !== null) {
-				const { shouldLock } = evaluateElapsedHiddenDuration(hiddenAt);
-				inMemoryHiddenAt = null;
-				clearStoredHiddenTimestamp();
+			callbacks.onHide(inMemoryHiddenAt);
+		}
+	};
 
-				if (shouldLock) {
-					callbacks.onRequireReauth();
-				} else {
-					callbacks.onRestoreUnlocked();
-				}
+	const handleRestore = () => {
+		const hiddenAt = inMemoryHiddenAt ?? getStoredHiddenTimestamp();
+		if (hiddenAt !== null) {
+			const { shouldLock } = evaluateElapsedHiddenDuration(hiddenAt);
+			inMemoryHiddenAt = null;
+			clearStoredHiddenTimestamp();
+
+			if (shouldLock) {
+				callbacks.onRequireReauth();
+			} else {
+				callbacks.onRestoreUnlocked();
 			}
 		}
 	};
 
+	const handleVisibilityChange = () => {
+		if (document.visibilityState === "hidden") {
+			handleHide();
+		} else if (document.visibilityState === "visible") {
+			handleRestore();
+		}
+	};
+
+	const handlePageHide = () => {
+		handleHide();
+	};
+
+	const handlePageShow = () => {
+		if (document.visibilityState !== "hidden") {
+			handleRestore();
+		}
+	};
+
+	const handleBlur = () => {
+		handleHide();
+	};
+
+	const handleFocus = () => {
+		if (document.visibilityState !== "hidden") {
+			handleRestore();
+		}
+	};
+
 	document.addEventListener("visibilitychange", handleVisibilityChange);
+	if (typeof window !== "undefined") {
+		window.addEventListener("pagehide", handlePageHide);
+		window.addEventListener("pageshow", handlePageShow);
+		window.addEventListener("blur", handleBlur);
+		window.addEventListener("focus", handleFocus);
+	}
 
 	return () => {
 		document.removeEventListener("visibilitychange", handleVisibilityChange);
+		if (typeof window !== "undefined") {
+			window.removeEventListener("pagehide", handlePageHide);
+			window.removeEventListener("pageshow", handlePageShow);
+			window.removeEventListener("blur", handleBlur);
+			window.removeEventListener("focus", handleFocus);
+		}
 	};
 }

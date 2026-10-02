@@ -10,7 +10,12 @@ export function RecoveryCodePanel() {
 		return null;
 	}
 
-	const { recoveryCode, warning } = state;
+	const rawCode = state.recoveryCode as unknown;
+	const recoveryCode =
+		typeof rawCode === "object" && rawCode !== null
+			? (rawCode as any).display || (rawCode as any).canonical || ""
+			: String(rawCode ?? "");
+	const warning = state.warning;
 
 	const handleCopy = async () => {
 		try {

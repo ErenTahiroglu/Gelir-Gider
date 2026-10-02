@@ -1,5 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { vi } from "vitest";
+import "../src/api/domain-errors";
 
 // Polyfill window.scrollTo for jsdom / router scroll restoration
 if (typeof window !== "undefined") {

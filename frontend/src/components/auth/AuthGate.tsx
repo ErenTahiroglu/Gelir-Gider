@@ -1,11 +1,26 @@
-import type React from "react";
+import React, { Suspense } from "react";
 import { useAuth } from "../../auth/auth-context";
-import { BootstrapEnrollment } from "./BootstrapEnrollment";
 import { LockedOverlay } from "./LockedOverlay";
 import { PrivacyShield } from "./PrivacyShield";
-import { RecoveryCodePanel } from "./RecoveryCodePanel";
-import { RecoveryFlow } from "./RecoveryFlow";
 import { UnlockScreen } from "./UnlockScreen";
+
+const LazyBootstrapEnrollment = React.lazy(() =>
+	import("./BootstrapEnrollment").then((m) => ({
+		default: m.BootstrapEnrollment,
+	})),
+);
+
+const LazyRecoveryCodePanel = React.lazy(() =>
+	import("./RecoveryCodePanel").then((m) => ({
+		default: m.RecoveryCodePanel,
+	})),
+);
+
+const LazyRecoveryFlow = React.lazy(() =>
+	import("./RecoveryFlow").then((m) => ({
+		default: m.RecoveryFlow,
+	})),
+);
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
 	const { state, retryBootstrapOrInit, logout } = useAuth();
@@ -88,15 +103,27 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 		state.status === "BOOTSTRAP_AUTHORIZING" ||
 		state.status === "ENROLLING"
 	) {
-		return <BootstrapEnrollment />;
+		return (
+			<Suspense fallback={null}>
+				<LazyBootstrapEnrollment />
+			</Suspense>
+		);
 	}
 
 	if (state.status === "RECOVERY_CODE_REQUIRED") {
-		return <RecoveryCodePanel />;
+		return (
+			<Suspense fallback={null}>
+				<LazyRecoveryCodePanel />
+			</Suspense>
+		);
 	}
 
 	if (state.status === "RECOVERY_REQUIRED" || state.status === "RECOVERING") {
-		return <RecoveryFlow />;
+		return (
+			<Suspense fallback={null}>
+				<LazyRecoveryFlow />
+			</Suspense>
+		);
 	}
 
 	if (state.status === "AUTH_REQUIRED" || state.status === "AUTHENTICATING") {

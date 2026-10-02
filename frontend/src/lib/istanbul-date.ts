@@ -68,25 +68,12 @@ export function getIstanbulCalendarDate(
 	};
 }
 
-/**
- * Returns the current Europe/Istanbul period month in "YYYY-MM" format.
- * Example: 2026-09-30T21:30:00Z -> "2026-10" (because Istanbul is UTC+3)
- */
-export function getIstanbulPeriodMonth(now: Date = new Date()): string {
-	return getIstanbulCalendarDate(now).periodMonth;
-}
+import {
+	formatPeriodMonthTurkish,
+	getIstanbulPeriodMonth,
+} from "./period-month";
 
-/**
- * Formats a "YYYY-MM" period month string into natural Turkish text.
- * Example: "2026-09" -> "Eylül 2026"
- */
-export function formatPeriodMonthTurkish(periodMonth: string): string {
-	const [yearStr, monthStr] = periodMonth.split("-");
-	if (!yearStr || !monthStr || !TURKISH_MONTH_NAMES[monthStr]) {
-		return periodMonth;
-	}
-	return `${TURKISH_MONTH_NAMES[monthStr]} ${yearStr}`;
-}
+export { formatPeriodMonthTurkish, getIstanbulPeriodMonth };
 
 /**
  * Parses a "YYYY-MM-DD" Gregorian calendar date string into year, month, day.

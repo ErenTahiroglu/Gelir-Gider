@@ -7,6 +7,10 @@ export default defineConfig({
 	resolve: {
 		alias: {
 			"@": resolve(__dirname, "frontend/src"),
+			"virtual:pwa-register": resolve(
+				__dirname,
+				"frontend/tests/mocks/pwa-register.ts",
+			),
 		},
 	},
 	test: {

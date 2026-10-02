@@ -1,13 +1,15 @@
 import { Link } from "@tanstack/react-router";
-import { Bell, Calendar, Lock, LogOut } from "lucide-react";
+import { Bell, Calendar, Lock, LogOut, Plus } from "lucide-react";
 import { useAuth } from "../../auth/auth-context";
+import { useQuickEntry } from "../../context/QuickEntryContext";
 import {
 	formatPeriodMonthTurkish,
 	getIstanbulPeriodMonth,
-} from "../../lib/istanbul-date";
+} from "../../lib/period-month";
 
 export function TopBar() {
 	const { state, lockNow, logout } = useAuth();
+	const { openQuickEntry } = useQuickEntry();
 	const currentPeriod = getIstanbulPeriodMonth();
 	const periodLabel = formatPeriodMonthTurkish(currentPeriod);
 	const displayName = state.status === "UNLOCKED" ? state.user.displayName : "";
@@ -31,6 +33,18 @@ export function TopBar() {
 						{displayName}
 					</span>
 				)}
+
+				<button
+					type="button"
+					className="topbar-btn quick-entry-btn"
+					onClick={() => openQuickEntry()}
+					data-testid="desktop-quick-entry-btn"
+					aria-label="Hızlı Kayıt (+)"
+					title="Hızlı Kayıt (+)"
+				>
+					<Plus size={16} aria-hidden="true" />
+					<span className="btn-text">Hızlı Kayıt</span>
+				</button>
 
 				<Link
 					to="/notifications"

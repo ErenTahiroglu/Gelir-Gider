@@ -386,16 +386,17 @@ A closed phase is **never reopened** unless an explicit regression is reproduced
 - **Goal:** Finalize service worker caching, app manifest, install prompts, full keyboard accessibility, responsive verification on Honor 90 and macOS, and lock frontend.
 - **Deliverables:**
   - `manifest.webmanifest`: App icons, colors, display standalone.
-  - Service Worker configuration via `vite-plugin-pwa`.
+  - Dual Service Worker Architecture: Root-scope (`/`) PWA Service Worker via `vite-plugin-pwa` for precache, static shell, and safe prompt update; coexisting with the preserved F9 Web Push worker (`/push-sw.js` scoped to `/push/`). F9 Web Push registration is never unregistered or replaced.
+  - Runtime Network-Only policy: Absolute network authoritativeness for all financial API endpoints; zero financial caching in CacheStorage; zero offline mutation queues.
   - Full E2E smoke suite (Playwright): Unlock → Dashboard → Quick Entry → Card Payment → Settle Debt → Month Close.
   - Accessibility audit (WCAG 2.2 AA target).
 - **Verification Viewports:**
   - Mobile: `390px × 844px` (Honor 90 / Android Brave simulation).
   - Desktop: `1440px × 900px` (macOS Brave desktop simulation).
 - **Acceptance Criteria:**
-  1. App installable as PWA on Android Brave and macOS.
+  1. App installable as PWA on Android Brave and macOS with root SW and preserved /push/ SW.
   2. Zero console errors, zero accessibility violations.
-  3. Production build bundled under 120 KB initial JS shell.
+  3. Production build bundled under 120 KB initial JS shell (deterministic manifest/gzip budget gate).
   4. Final frontend freeze signed off.
 
 ---
