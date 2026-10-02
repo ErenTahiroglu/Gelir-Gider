@@ -101,6 +101,28 @@ export async function createTestDatabase(): Promise<{
 	// Test if real PostgreSQL is available
 	let isRealPg = false;
 	try {
+		const parsedUrl = new URL(dbUrl);
+		const targetDb = parsedUrl.pathname.replace(/^\//, "");
+		if (targetDb && targetDb !== "postgres") {
+			const adminUrl = new URL(dbUrl);
+			adminUrl.pathname = "/postgres";
+			const adminPool = new pg.Pool({
+				connectionString: adminUrl.toString(),
+				connectionTimeoutMillis: 1500,
+			});
+			try {
+				const checkRes = await adminPool.query(
+					"SELECT 1 FROM pg_database WHERE datname = $1",
+					[targetDb],
+				);
+				if (checkRes.rowCount === 0) {
+					await adminPool.query(`CREATE DATABASE "${targetDb}"`);
+				}
+			} finally {
+				await adminPool.end().catch(() => {});
+			}
+		}
+
 		const testPool = new pg.Pool({
 			connectionString: dbUrl,
 			connectionTimeoutMillis: 1500,
@@ -376,11 +398,16 @@ export async function startTestServer(): Promise<ServerInstance> {
 		close: async () => {
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 			if (activePgPool) {
-				await activePgPool.end();
+				try {
+					await activePgPool.query(
+						"DROP SCHEMA public CASCADE; CREATE SCHEMA public;",
+					);
+				} catch {}
+				await activePgPool.end().catch(() => {});
 				activePgPool = null;
 			}
 			if (activePglite) {
-				await activePglite.close();
+				await activePglite.close().catch(() => {});
 				activePglite = null;
 			}
 		},

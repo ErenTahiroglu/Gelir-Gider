@@ -51,8 +51,10 @@ jobs:
 
       - name: Frontend E2E / PWA / Accessibility Verification
         env:
-          DATABASE_URL: "postgresql://test:test@127.0.0.1:5432/gelirgider_test"
-        run: npm run test:e2e
+          DATABASE_URL: "postgresql://test:test@127.0.0.1:5432/gelirgider_e2e"
+        run: |
+          PGPASSWORD=test psql -h 127.0.0.1 -U test -d postgres -c "CREATE DATABASE gelirgider_e2e;" || true
+          npm run test:e2e
 
       - name: PostgreSQL Runtime Verification (PGlite)
         run: npm run test:pg
