@@ -39,4 +39,20 @@ describe("Static Routing & Backend Precedence", () => {
 		expect(body.error?.code).toBe("UNAUTHENTICATED");
 		expect(body.error?.message).toBe("Authentication required");
 	});
+
+	it("backend API collection root /credit-cards returns backend JSON (NEVER index.html)", async () => {
+		const res = await app.request("/credit-cards?status=ACTIVE&limit=100");
+		expect(res.status).toBe(401);
+		expect(res.headers.get("content-type")).toContain("application/json");
+
+		const body = (await res.json()) as {
+			error?: { code?: string; message?: string };
+		};
+		expect(body.error?.code).toBe("UNAUTHENTICATED");
+		expect(body.error?.message).toBe("Authentication required");
+
+		const rawText = JSON.stringify(body);
+		expect(rawText).not.toContain("<!DOCTYPE html>");
+		expect(rawText).not.toContain("<html");
+	});
 });

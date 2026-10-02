@@ -14196,6 +14196,16 @@ async function resolverRuntime7B3() {
 			[midasAccId, USER_A, midasAssetAccountId],
 		);
 
+		// 1b. Verify True Empty State on Real PostgreSQL (Phase F10 Cutover Closure)
+		const emptyCardsRes = await httpCall("/credit-cards?status=ACTIVE&limit=100", {
+			method: "GET",
+			token: tokenA,
+		});
+		eqD(emptyCardsRes.status, 200, "7B.3/1b: GET /credit-cards?status=ACTIVE&limit=100 returns 200 for empty state");
+		eqD(emptyCardsRes.json?.cards?.length, 0, "7B.3/1b: empty cards list returned");
+		eqD(emptyCardsRes.json?.hasMore, false, "7B.3/1b: hasMore is false");
+		eqD(emptyCardsRes.json?.nextCursor, null, "7B.3/1b: nextCursor is null");
+
 		// 2. User A Creates Credit Card via POST /credit-cards
 		const cardCreateRes = await httpCall("/credit-cards", {
 			method: "POST",

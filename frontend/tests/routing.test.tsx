@@ -23,10 +23,41 @@ describe("Routing & SPA Fallback Configuration", () => {
 		const runWorkerFirst = config.assets.run_worker_first as string[];
 		expect(runWorkerFirst).toContain("/health");
 		expect(runWorkerFirst).toContain("/ready");
-		expect(runWorkerFirst).toContain("/auth/*");
-		expect(runWorkerFirst).toContain("/budget-v2/*");
-		expect(runWorkerFirst).toContain("/transactions/*");
-		expect(runWorkerFirst).toContain("/credit-cards/*");
+
+		// Crucial production routing invariant: Both exact root (e.g. /credit-cards)
+		// and wildcard subpaths (e.g. /credit-cards/*) must run worker first so collection
+		// GET/POST requests are not intercepted by SPA static asset fallback.
+		const requiredRoots = [
+			"/auth",
+			"/budget-v2",
+			"/credit-cards",
+			"/transactions",
+			"/manual-expenses",
+			"/quick-entry",
+			"/spending",
+			"/people",
+			"/short-term-goals",
+			"/midas",
+			"/long-term",
+			"/income",
+			"/month-close",
+			"/imports",
+			"/notifications",
+			"/rewards",
+			"/campaigns",
+			"/ledger",
+		];
+
+		for (const root of requiredRoots) {
+			expect(
+				runWorkerFirst,
+				`run_worker_first must contain exact root "${root}" to prevent SPA HTML interception`,
+			).toContain(root);
+			expect(
+				runWorkerFirst,
+				`run_worker_first must contain subpath pattern "${root}/*"`,
+			).toContain(`${root}/*`);
+		}
 	});
 
 	it("renders /unlock surface via router", async () => {

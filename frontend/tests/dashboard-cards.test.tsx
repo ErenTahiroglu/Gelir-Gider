@@ -179,4 +179,30 @@ describe("Dashboard Credit Cards — Aggregate Balances & Active Card List", () 
 			await screen.findByText("Kayıtlı aktif kredi kartı bulunmuyor."),
 		).toBeInTheDocument();
 	});
+
+	it("renders non-error empty state in SummaryMetrics when no active cards exist", async () => {
+		vi.spyOn(dashboardApi, "fetchActiveCreditCards").mockResolvedValue({
+			cards: [],
+			limit: 100,
+			hasMore: false,
+			nextCursor: null,
+		});
+
+		renderWithQuery(<SummaryMetrics isUnlocked={true} />);
+
+		expect(
+			await screen.findByText("Aktif kart bulunmuyor"),
+		).toBeInTheDocument();
+		expect(screen.getByTestId("value-kartlarda-bu-donem")).toHaveTextContent(
+			"₺0,00",
+		);
+		expect(screen.getByText("Yaklaşan ödeme yok")).toBeInTheDocument();
+		expect(screen.getByTestId("value-yaklasan-odeme")).toHaveTextContent("—");
+		expect(
+			screen.queryByText("Kart bilgisi alınamadı"),
+		).not.toBeInTheDocument();
+		expect(
+			screen.queryByText("Ödeme bilgisi alınamadı"),
+		).not.toBeInTheDocument();
+	});
 });
