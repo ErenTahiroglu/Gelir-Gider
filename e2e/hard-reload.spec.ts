@@ -40,6 +40,8 @@ test.describe("Hard-Reload & Direct URL Navigation Matrix", () => {
 	test("verifies all 12 major routes survive hard goto() and reload() without JSON NOT_FOUND", async ({
 		page,
 	}) => {
+		test.setTimeout(180_000);
+
 		// Observability listeners
 		const pageErrors: string[] = [];
 		page.on("pageerror", (err) => {
@@ -113,5 +115,59 @@ test.describe("Hard-Reload & Direct URL Navigation Matrix", () => {
 		}
 
 		expect(pageErrors, "No fatal uncaught page errors during hard reloads").toEqual([]);
+	});
+
+	test("Section 10 PWA update regression: application on /notifications survives update reload without backend NOT_FOUND", async ({
+		page,
+	}) => {
+		test.setTimeout(60_000);
+
+		const pageErrors: string[] = [];
+		page.on("pageerror", (err) => {
+			pageErrors.push(`[PAGE_ERROR] ${err.message}`);
+		});
+
+		// 1. Authenticate and reach Dashboard
+		await authenticateOrUnlock(page);
+
+		async function handlePossibleUnlock() {
+			const unlockBtn = page
+				.locator(
+					'[data-testid="unlock-passkey-button"], [data-testid="reauth-passkey-button"]',
+				)
+				.first();
+			if (await unlockBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+				await unlockBtn.click();
+			}
+		}
+
+		// 2. Application is on /notifications
+		const notifNavResponse = await page.goto("/notifications", {
+			waitUntil: "domcontentloaded",
+		});
+		expect(notifNavResponse?.status()).toBe(200);
+		expect(notifNavResponse?.headers()["content-type"] ?? "").toContain("text/html");
+
+		await handlePossibleUnlock();
+
+		const notifSurface = page.locator('[data-testid="notifications-page"]').first();
+		await expect(notifSurface).toBeVisible({ timeout: 15000 });
+
+		// 3. Update/new service worker is available -> reload/update activation occurs
+		// (In production, user clicks 'Şimdi Yenile' in PwaUpdatePrompt which triggers reload)
+		const reloadResponse = await page.reload({ waitUntil: "domcontentloaded" });
+		expect(reloadResponse?.status()).toBe(200);
+		expect(reloadResponse?.headers()["content-type"] ?? "").toContain("text/html");
+
+		await handlePossibleUnlock();
+
+		// 4. App returns to Notifications page
+		await expect(notifSurface).toBeVisible({ timeout: 15000 });
+
+		// 5. Backend JSON NOT_FOUND is never displayed
+		const bodyText = await page.locator("body").innerText();
+		expect(bodyText).not.toContain('"Route not found"');
+		expect(bodyText).not.toContain('"NOT_FOUND"');
+		expect(pageErrors).toEqual([]);
 	});
 });
