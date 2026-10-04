@@ -5,6 +5,8 @@ coverage
 .dev.vars
 .env
 .env.*
+# Exception: public VAPID key committed intentionally (public material, not a secret)
+!frontend/.env.production
 .DS_Store
 .scratch/
 graphify-out/
