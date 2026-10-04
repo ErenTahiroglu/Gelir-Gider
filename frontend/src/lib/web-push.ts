@@ -89,23 +89,104 @@ export const getStoredPushSubscriptionId = getLocalSubscriptionId;
 export const setStoredPushSubscriptionId = setLocalSubscriptionId;
 export const removeStoredPushSubscriptionId = clearLocalSubscriptionId;
 
+const PUSH_SCOPE_PATH = "/push/";
+const PUSH_ACTIVATION_TIMEOUT_MS = 10_000;
+
 /**
- * Registers or retrieves the dedicated push-only service worker registered under /push/ scope.
+ * Finds ONLY the registration whose scope pathname is exactly /push/.
+ * getRegistration("/push/") is unsafe: it also matches the root "/" PWA scope.
+ */
+export async function findPushRegistration(): Promise<
+	ServiceWorkerRegistration | undefined
+> {
+	const regs = await navigator.serviceWorker.getRegistrations();
+	return regs.find((r) => {
+		try {
+			const u = new URL(r.scope, window.location.href);
+			return (
+				u.origin === window.location.origin && u.pathname === PUSH_SCOPE_PATH
+			);
+		} catch {
+			return false;
+		}
+	});
+}
+
+/**
+ * Bounded wait until the target registration has an activated worker.
+ * Never uses navigator.serviceWorker.ready (it resolves the root registration).
+ */
+export function waitForActivatedWorker(
+	reg: ServiceWorkerRegistration,
+	timeoutMs: number = PUSH_ACTIVATION_TIMEOUT_MS,
+): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const watched = new Set<ServiceWorker>();
+		let settled = false;
+		const finish = (err?: Error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			for (const w of watched) w.removeEventListener("statechange", check);
+			if (err) reject(err);
+			else resolve();
+		};
+		const timer = setTimeout(() => {
+			const e = new Error("Push service worker activation timed out");
+			e.name = "PushActivationTimeout";
+			finish(e);
+		}, timeoutMs);
+		function check() {
+			if (reg.active?.state === "activated") return finish();
+			const w = reg.installing ?? reg.waiting ?? reg.active;
+			if (!w) return;
+			if (w.state === "redundant") {
+				const e = new Error("Push service worker became redundant");
+				e.name = "PushActivationFailed";
+				return finish(e);
+			}
+			if (w.state === "activated") return finish();
+			if (!watched.has(w)) {
+				watched.add(w);
+				w.addEventListener("statechange", check);
+			}
+		}
+		check();
+	});
+}
+
+/**
+ * Returns the dedicated, ACTIVATED push-only registration under exact /push/ scope.
  */
 export async function getOrRegisterPushServiceWorker(): Promise<ServiceWorkerRegistration> {
 	if (!isPushSupported()) {
 		throw new Error("Web Push is not supported in this browser");
 	}
 
-	// First check if already registered
-	const existing = await navigator.serviceWorker.getRegistration("/push/");
-	if (existing) {
-		return existing;
+	const reg =
+		(await findPushRegistration()) ??
+		(await navigator.serviceWorker.register("/push-sw.js", {
+			scope: PUSH_SCOPE_PATH,
+		}));
+
+	if (new URL(reg.scope, window.location.href).pathname !== PUSH_SCOPE_PATH) {
+		const e = new Error("Push service worker scope mismatch");
+		e.name = "PushScopeMismatch";
+		throw e;
 	}
 
-	return await navigator.serviceWorker.register("/push-sw.js", {
-		scope: "/push/",
-	});
+	await waitForActivatedWorker(reg);
+	return reg;
+}
+
+/**
+ * Safe diagnostic name only (never the error object/message: may carry key material).
+ */
+export function safeErrorName(err: unknown): string {
+	const n = (err as { name?: unknown } | null)?.name;
+	return typeof n === "string" && /^[A-Za-z]{1,40}$/.test(n)
+		? n
+		: "UnknownError";
 }
 
 /**

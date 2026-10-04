@@ -27,10 +27,12 @@ import {
 } from "../../api/notifications-api";
 import { formatIstanbulDateTime } from "../../lib/istanbul-date";
 import {
+	findPushRegistration,
 	getOrRegisterPushServiceWorker,
 	getStoredPushSubscriptionId,
 	isPushSupported,
 	removeStoredPushSubscriptionId,
+	safeErrorName,
 	serializeBrowserPushSubscription,
 	setStoredPushSubscriptionId,
 	urlBase64ToUint8Array,
@@ -87,7 +89,7 @@ export function PushSettings() {
 		let mounted = true;
 		async function checkSub() {
 			try {
-				const reg = await navigator.serviceWorker.getRegistration("/push/");
+				const reg = await findPushRegistration();
 				if (reg && mounted) {
 					const sub = await reg.pushManager.getSubscription();
 					if (mounted) setLocalSubscription(sub);
@@ -250,6 +252,7 @@ export function PushSettings() {
 		}
 
 		setStatusMessage(null);
+		let stage = "permission";
 
 		try {
 			// Explicit user action permission request
@@ -267,7 +270,9 @@ export function PushSettings() {
 				return;
 			}
 
+			stage = "worker";
 			const reg = await getOrRegisterPushServiceWorker();
+			stage = "subscribe";
 			let sub = await reg.pushManager.getSubscription();
 
 			if (!sub) {
@@ -278,6 +283,7 @@ export function PushSettings() {
 				});
 			}
 
+			stage = "serialize";
 			setLocalSubscription(sub);
 			const serialized = serializeBrowserPushSubscription(sub);
 
@@ -291,13 +297,15 @@ export function PushSettings() {
 				occurredAt: new Date().toISOString(),
 			};
 
+			stage = "register";
 			setFrozenRegister(attempt);
 			registerMutation.mutate(attempt);
 		} catch (err) {
-			console.error("Enable push error:", err);
+			const code = `${stage}/${safeErrorName(err)}`;
+			console.error("Enable push failed:", code);
 			setStatusMessage({
 				type: "error",
-				text: "Bildirim aboneliği oluşturulurken bir hata meydana geldi.",
+				text: `Bildirim aboneliği oluşturulurken bir hata meydana geldi. (Kod: ${code})`,
 			});
 		}
 	};

@@ -187,6 +187,8 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		};
 
 		const mockReg = {
+			scope: `${window.location.origin}/push/`,
+			active: { state: "activated" },
 			pushManager: {
 				getSubscription: vi.fn().mockResolvedValue(null),
 				subscribe: vi.fn().mockResolvedValue(mockSub),
@@ -199,7 +201,7 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		});
 		Object.defineProperty(navigator, "serviceWorker", {
 			value: {
-				getRegistration: vi.fn().mockResolvedValue(null),
+				getRegistrations: vi.fn().mockResolvedValue([]),
 				register: vi.fn().mockResolvedValue(mockReg),
 			},
 			writable: true,
@@ -290,6 +292,8 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		};
 
 		const mockReg = {
+			scope: `${window.location.origin}/push/`,
+			active: { state: "activated" },
 			pushManager: {
 				getSubscription: vi.fn().mockResolvedValue(null),
 				subscribe: vi.fn().mockResolvedValue(mockSub),
@@ -302,7 +306,7 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		});
 		Object.defineProperty(navigator, "serviceWorker", {
 			value: {
-				getRegistration: vi.fn().mockResolvedValue(null),
+				getRegistrations: vi.fn().mockResolvedValue([]),
 				register: vi.fn().mockResolvedValue(mockReg),
 			},
 			writable: true,
@@ -388,6 +392,8 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		};
 
 		const mockReg = {
+			scope: `${window.location.origin}/push/`,
+			active: { state: "activated" },
 			pushManager: {
 				getSubscription: vi.fn().mockResolvedValue(mockSub),
 			},
@@ -399,7 +405,7 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		});
 		Object.defineProperty(navigator, "serviceWorker", {
 			value: {
-				getRegistration: vi.fn().mockResolvedValue(mockReg),
+				getRegistrations: vi.fn().mockResolvedValue([mockReg]),
 			},
 			writable: true,
 		});
@@ -445,6 +451,8 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		};
 
 		const mockReg = {
+			scope: `${window.location.origin}/push/`,
+			active: { state: "activated" },
 			pushManager: {
 				getSubscription: vi.fn().mockResolvedValue(mockSub),
 			},
@@ -456,7 +464,7 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		});
 		Object.defineProperty(navigator, "serviceWorker", {
 			value: {
-				getRegistration: vi.fn().mockResolvedValue(mockReg),
+				getRegistrations: vi.fn().mockResolvedValue([mockReg]),
 			},
 			writable: true,
 		});
@@ -520,6 +528,8 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		};
 
 		const mockReg = {
+			scope: `${window.location.origin}/push/`,
+			active: { state: "activated" },
 			pushManager: {
 				getSubscription: vi.fn().mockResolvedValue(mockSub),
 			},
@@ -531,7 +541,7 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		});
 		Object.defineProperty(navigator, "serviceWorker", {
 			value: {
-				getRegistration: vi.fn().mockResolvedValue(mockReg),
+				getRegistrations: vi.fn().mockResolvedValue([mockReg]),
 			},
 			writable: true,
 		});
@@ -599,6 +609,8 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		};
 
 		const mockReg = {
+			scope: `${window.location.origin}/push/`,
+			active: { state: "activated" },
 			pushManager: {
 				getSubscription: vi.fn().mockResolvedValue(mockSub),
 				subscribe: vi.fn(),
@@ -611,7 +623,7 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		});
 		Object.defineProperty(navigator, "serviceWorker", {
 			value: {
-				getRegistration: vi.fn().mockResolvedValue(mockReg),
+				getRegistrations: vi.fn().mockResolvedValue([mockReg]),
 			},
 			writable: true,
 		});
@@ -699,6 +711,8 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		};
 
 		const mockReg = {
+			scope: `${window.location.origin}/push/`,
+			active: { state: "activated" },
 			pushManager: {
 				getSubscription: vi.fn().mockResolvedValue(mockSub),
 			},
@@ -710,7 +724,7 @@ describe("F9 — Notification Center & Web Push Test Suite", () => {
 		});
 		Object.defineProperty(navigator, "serviceWorker", {
 			value: {
-				getRegistration: vi.fn().mockResolvedValue(mockReg),
+				getRegistrations: vi.fn().mockResolvedValue([mockReg]),
 			},
 			writable: true,
 		});

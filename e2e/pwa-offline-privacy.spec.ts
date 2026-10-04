@@ -115,6 +115,89 @@ test.describe("PWA, Offline Resiliency & Cache Privacy (F10)", () => {
 		expect(rootPostSub).toBeNull();
 	});
 
+	test("push enable resolves the exact /push/ registration, never the root PWA one", async ({
+		page,
+		context,
+	}) => {
+		// Headless Chromium reports Notification.permission "denied" regardless of
+		// grantPermissions; the permission prompt is not under test, the SW lifecycle is.
+		await context.addInitScript(() => {
+			Object.defineProperty(Notification, "permission", {
+				get: () => "granted",
+				configurable: true,
+			});
+		});
+		await attachVirtualAuthenticator(page);
+		await authenticateOrUnlock(page);
+
+		await page.waitForFunction(
+			async () => {
+				const regs = await navigator.serviceWorker.getRegistrations();
+				return regs.some((r) => new URL(r.scope).pathname === "/");
+			},
+			undefined,
+			{ timeout: 10000 },
+		);
+
+		// Clean slate: root PWA worker only, no /push/ registration.
+		await page.evaluate(async () => {
+			for (const r of await navigator.serviceWorker.getRegistrations()) {
+				if (new URL(r.scope).pathname === "/push/") await r.unregister();
+			}
+		});
+
+		await page.evaluate(() => {
+			window.history.pushState({}, "", "/notifications");
+			window.dispatchEvent(new PopStateEvent("popstate"));
+		});
+		await page.getByTestId("tab-push-settings").click();
+
+		// No silent registration/subscription on page load.
+		const before = await page.evaluate(async () => {
+			const regs = await navigator.serviceWorker.getRegistrations();
+			return regs.map((r) => new URL(r.scope).pathname);
+		});
+		expect(before).not.toContain("/push/");
+
+		await page.getByTestId("btn-enable-push").click();
+
+		await page.waitForFunction(
+			async () => {
+				const regs = await navigator.serviceWorker.getRegistrations();
+				return regs.some(
+					(r) =>
+						new URL(r.scope).pathname === "/push/" &&
+						r.active?.state === "activated",
+				);
+			},
+			undefined,
+			{ timeout: 15000 },
+		);
+
+		const after = await page.evaluate(async () => {
+			const regs = await navigator.serviceWorker.getRegistrations();
+			const root = regs.find((r) => new URL(r.scope).pathname === "/");
+			const push = regs.find((r) => new URL(r.scope).pathname === "/push/");
+			return {
+				hasRoot: Boolean(root),
+				hasPush: Boolean(push),
+				rootHasSub: root ? Boolean(await root.pushManager.getSubscription()) : null,
+			};
+		});
+		expect(after.hasRoot).toBe(true);
+		expect(after.hasPush).toBe(true);
+		// Root registration must never own a PushSubscription.
+		expect(after.rootHasSub).toBe(false);
+
+		// Headless Chromium may have no push service: subscribe may legitimately
+		// fail, but only AFTER the dedicated worker lifecycle (stage "subscribe").
+		const alert = page.getByTestId("push-status-alert");
+		if (await alert.isVisible().catch(() => false)) {
+			const text = (await alert.textContent()) ?? "";
+			expect(text).not.toContain("worker/");
+		}
+	});
+
 	test("verifies CacheStorage NEVER caches financial API responses (Cache Privacy Gate)", async ({
 		page,
 	}) => {
