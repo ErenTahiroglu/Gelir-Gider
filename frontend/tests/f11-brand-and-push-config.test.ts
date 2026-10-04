@@ -145,12 +145,13 @@ describe("approved brand assets", () => {
 			"utf8",
 		);
 		expect(sidebar).not.toMatch(/>\s*GG\s*</);
-		expect(sidebar).toContain("/brand/mark-light-ui.svg");
-		expect(sidebar).toContain("/brand/mark-dark-ui.svg");
+		expect(sidebar).toContain('className="brand-mark theme-brand-mark"');
 		const css = fs.readFileSync(
 			path.join(root, "frontend/src/styles/global.css"),
 			"utf8",
 		);
+		expect(css).toContain("/brand/mark-light-ui.svg");
+		expect(css).toContain("/brand/mark-dark-ui.svg");
 		expect(css).toContain(':root:not([data-theme="light"]) .theme-brand-mark');
 		expect(css).toContain('[data-theme="dark"] .theme-brand-mark');
 	});

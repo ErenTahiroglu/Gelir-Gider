@@ -164,34 +164,16 @@ body {
 .theme-brand-mark {
   position: relative;
   vertical-align: middle;
+  background: url("/brand/mark-light-ui.svg") center / contain no-repeat;
 }
 
-.theme-brand-mark img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-}
-
-.theme-brand-mark .theme-brand-mark-dark {
-  display: none;
-}
-
-[data-theme="dark"] .theme-brand-mark .theme-brand-mark-light {
-  display: none;
-}
-
-[data-theme="dark"] .theme-brand-mark .theme-brand-mark-dark {
-  display: block;
+[data-theme="dark"] .theme-brand-mark {
+  background-image: url("/brand/mark-dark-ui.svg");
 }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .theme-brand-mark .theme-brand-mark-light {
-    display: none;
-  }
-
-  :root:not([data-theme="light"]) .theme-brand-mark .theme-brand-mark-dark {
-    display: block;
+  :root:not([data-theme="light"]) .theme-brand-mark {
+    background-image: url("/brand/mark-dark-ui.svg");
   }
 }
 
