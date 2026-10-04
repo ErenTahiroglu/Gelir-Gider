@@ -73,9 +73,22 @@ export function DesktopSidebar({
 		>
 			<div className="sidebar-header">
 				<div className="sidebar-brand">
-					<div className="brand-logo" aria-hidden="true">
-						GG
-					</div>
+					<span className="brand-mark theme-brand-mark" aria-hidden="true">
+						<img
+							src="/brand/mark-light-ui.svg"
+							alt=""
+							width="32"
+							height="32"
+							className="theme-brand-mark-light"
+						/>
+						<img
+							src="/brand/mark-dark-ui.svg"
+							alt=""
+							width="32"
+							height="32"
+							className="theme-brand-mark-dark"
+						/>
+					</span>
 					{!collapsed && <span className="brand-name">Gelir-Gider</span>}
 				</div>
 

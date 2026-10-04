@@ -16,6 +16,22 @@ export function UnlockScreen() {
 		<main className="auth-surface" data-testid="unlock-screen">
 			<div className="auth-card">
 				<header className="auth-header">
+					<span className="auth-brand-mark theme-brand-mark" aria-hidden="true">
+						<img
+							src="/brand/mark-light-ui.svg"
+							alt=""
+							width="48"
+							height="48"
+							className="theme-brand-mark-light"
+						/>
+						<img
+							src="/brand/mark-dark-ui.svg"
+							alt=""
+							width="48"
+							height="48"
+							className="theme-brand-mark-dark"
+						/>
+					</span>
 					<h1 className="auth-title">Gelir-Gider</h1>
 					<p className="auth-subtitle">
 						Finansal bilgilerinizi görmek için Passkey ile doğrulayın.

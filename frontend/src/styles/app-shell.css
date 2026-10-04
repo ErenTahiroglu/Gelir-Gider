@@ -200,19 +200,20 @@
   overflow: hidden;
 }
 
-.brand-logo {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.brand-mark {
+  display: inline-flex;
   width: 36px;
   height: 36px;
-  background: linear-gradient(135deg, var(--color-primary-600), var(--color-primary-800));
-  color: #ffffff;
-  border-radius: var(--radius-md);
-  font-weight: var(--font-weight-bold);
-  font-size: var(--font-size-base);
-  letter-spacing: -0.05em;
   flex-shrink: 0;
+}
+
+.desktop-sidebar.collapsed .sidebar-header {
+  height: auto;
+  min-height: 84px;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--space-1);
+  padding: var(--space-2) 0;
 }
 
 .brand-name {
@@ -3328,7 +3329,6 @@
     display: none;
   }
 }
-
 
 
 

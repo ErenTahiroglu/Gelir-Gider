@@ -34,7 +34,9 @@ describe("PWA Manifest & Asset Structure (F10)", () => {
 		expect(manifest.start_url).toBe("/");
 		expect(manifest.scope).toBe("/");
 		expect(manifest.display).toBe("standalone");
-		expect(manifest.theme_color).toBe("#4f46e5");
+		// Approved brand identity — Navy 950
+		expect(manifest.theme_color).toBe("#08111F");
+		expect(manifest.background_color).toBe("#08111F");
 		expect(manifest.lang).toBe("tr");
 	});
 
@@ -56,6 +58,7 @@ describe("PWA Manifest & Asset Structure (F10)", () => {
 				i.sizes === "192x192" && (i.purpose?.includes("any") || !i.purpose),
 		);
 		expect(icon192).toBeDefined();
+		expect(icon192?.src).toBe("/icons/icon-192.png");
 
 		// 512x512 any
 		const icon512 = icons.find(
@@ -63,12 +66,41 @@ describe("PWA Manifest & Asset Structure (F10)", () => {
 				i.sizes === "512x512" && (i.purpose?.includes("any") || !i.purpose),
 		);
 		expect(icon512).toBeDefined();
+		expect(icon512?.src).toBe("/icons/icon-512.png");
+
+		// 192x192 maskable
+		const iconMaskable192 = icons.find(
+			(i) => i.sizes === "192x192" && i.purpose?.includes("maskable"),
+		);
+		expect(iconMaskable192).toBeDefined();
+		expect(iconMaskable192?.src).toBe("/icons/maskable-192.png");
 
 		// 512x512 maskable
-		const iconMaskable = icons.find(
+		const iconMaskable512 = icons.find(
 			(i) => i.sizes === "512x512" && i.purpose?.includes("maskable"),
 		);
-		expect(iconMaskable).toBeDefined();
+		expect(iconMaskable512).toBeDefined();
+		expect(iconMaskable512?.src).toBe("/icons/maskable-512.png");
+
+		// Both any and maskable purposes present
+		const anyPurpose = icons.filter((i) => i.purpose?.includes("any"));
+		const maskablePurpose = icons.filter((i) =>
+			i.purpose?.includes("maskable"),
+		);
+		expect(anyPurpose.length).toBeGreaterThanOrEqual(2);
+		expect(maskablePurpose.length).toBeGreaterThanOrEqual(2);
+
+		// No legacy icon paths
+		const legacyPaths = [
+			"icon-192x192.png",
+			"icon-512x512.png",
+			"icon-512x512-maskable.png",
+		];
+		for (const icon of icons) {
+			for (const legacy of legacyPaths) {
+				expect(icon.src).not.toContain(legacy);
+			}
+		}
 
 		// Verify files exist in dist
 		for (const icon of icons) {

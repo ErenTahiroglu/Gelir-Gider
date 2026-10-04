@@ -18,7 +18,8 @@ test.describe("PWA, Offline Resiliency & Cache Privacy (F10)", () => {
 		expect(manifest.start_url).toBe("/");
 		expect(manifest.scope).toBe("/");
 		expect(manifest.display).toBe("standalone");
-		expect(manifest.theme_color).toBe("#4f46e5");
+		expect(manifest.theme_color).toBe("#08111F");
+		expect(manifest.background_color).toBe("#08111F");
 
 		// Validate icons
 		const icons = manifest.icons as Array<{
