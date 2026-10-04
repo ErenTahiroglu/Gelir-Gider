@@ -14,7 +14,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:pg": "node --import tsx scripts/pg-runtime-verify.ts",
-    "test:pg:real": "node --import tsx scripts/pg-real-concurrency-verify.ts",
+    "test:pg:real": "node --import tsx scripts/pg-real-concurrency-verify.ts && node --import tsx scripts/restore-query-real-pg-verify.ts",
     "build": "vite build",
     "prebuild": "npm run check:push-config",
     "dev:ui": "vite",

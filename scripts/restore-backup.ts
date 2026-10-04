@@ -344,15 +344,25 @@ async function countRowsPerTable(
  * complementary, coarser guard against a target DB whose migrations simply
  * haven't been applied yet.
  */
-async function fetchActualShapes(
+export async function fetchActualShapes(
 	// biome-ignore lint/suspicious/noExplicitAny: dynamically typed Database
 	db: any,
 	tableNames: string[],
 ): Promise<TableShapeDescriptor[]> {
+	if (tableNames.length === 0) {
+		return [];
+	}
+	// Drizzle expands a JS array into a parenthesised parameter list `($1, $2, ...)`,
+	// which PostgreSQL treats as a ROW, not an array (so `= ANY(...)` fails). Use an
+	// explicit parameterized IN-list instead.
+	const namesSql = sql.join(
+		tableNames.map((name) => sql`${name}`),
+		sql`, `,
+	);
 	const result = await db.execute(sql`
 		SELECT table_name, column_name
 		FROM information_schema.columns
-		WHERE table_schema = 'public' AND table_name = ANY(${tableNames})
+		WHERE table_schema = 'public' AND table_name IN (${namesSql})
 	`);
 	const rows: { table_name: string; column_name: string }[] =
 		result.rows ?? result;
